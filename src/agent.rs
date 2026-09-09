@@ -22,6 +22,13 @@ impl Agent {
         Self { api, session }
     }
 
+    /// 控制面唯一入口：`/new`、`/resume` 等 shell 命令经此替换机器的持久
+    /// 状态（机器 = 日志，换会话即整体替换）。会话级渲染状态（统计清零、
+    /// 状态栏模型）由调用方（shell）同步刷新。
+    pub fn adopt(&mut self, session: Session) {
+        self.session = session;
+    }
+
     fn build_request(&self) -> ChatRequest {
         let mut messages = Vec::with_capacity(self.session.messages.len() + 1);
         messages.push(Message::system(SYSTEM_PROMPT));

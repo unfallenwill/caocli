@@ -194,7 +194,7 @@ async fn run(cli: Cli) -> Result<()> {
                     "/new" => match Session::create(&sdir, agent.session.meta.clone()) {
                         Ok(s) => {
                             ui.info(&format!("新会话 {}", s.id));
-                            agent.session = s;
+                            agent.adopt(s);
                             ui.reset_stats();
                             ui.set_model(&agent.session.meta.model);
                         }
@@ -211,7 +211,7 @@ async fn run(cli: Cli) -> Result<()> {
                                     s.messages.len()
                                 ));
                                 ui.replay(&s.messages);
-                                agent.session = s;
+                                agent.adopt(s);
                                 ui.reset_stats();
                                 ui.set_model(&agent.session.meta.model);
                             }
