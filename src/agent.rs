@@ -5,7 +5,7 @@ use crate::config::DEFAULT_EFFORT;
 use crate::session::Session;
 use crate::tools;
 use crate::types::{ChatRequest, Message, Thinking, TurnAccumulator, Usage};
-use crate::ui::Renderer;
+use crate::ui::Ui;
 
 /// 参与请求前缀（KVCache）。禁止注入时间、cwd、随机 id 等任何动态内容，
 /// 否则每个请求的前缀都不同，缓存全 miss。
@@ -44,9 +44,9 @@ impl Agent {
     }
 
     /// 一轮对话：可能包含多个子请求（模型调用工具后继续，直到 finish_reason=stop）。
-    /// 渲染器由调用方持有并传入：状态栏与流式输出必须走同一个 `Renderer`，
+    /// 渲染器由调用方持有并传入：状态栏与流式输出必须走同一个 `Ui` 实现，
     /// 否则 `usage()` 记录到的缓存统计不会反映到已建栏的实例上。
-    pub async fn turn(&mut self, input: &str, ui: &mut Renderer) -> Result<()> {
+    pub async fn turn(&mut self, input: &str, ui: &mut impl Ui) -> Result<()> {
         self.session.append_message(&Message::user(input))?;
         loop {
             let req = self.build_request();
@@ -99,6 +99,7 @@ mod tests {
     use super::*;
     use crate::session::SessionMeta;
     use crate::types::Role;
+    use crate::ui::Renderer;
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

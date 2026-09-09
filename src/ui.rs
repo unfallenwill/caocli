@@ -134,6 +134,24 @@ enum Mode {
     Content,
 }
 
+/// 机器 → UI 的通知词汇表（Notice 通道）。
+/// 纪律：只收通知、不回传数据；实现不得阻塞，终端写失败视为致命。
+/// 机器（agent）只依赖此 trait，不依赖具体渲染器；进程内唯一实现是 [`Renderer`]。
+pub trait Ui {
+    /// 思维链片段（先于正文到达）。
+    fn reasoning_delta(&mut self, s: &str);
+    /// 正文片段。
+    fn content_delta(&mut self, s: &str);
+    /// 一轮流式输出结束，块复位。
+    fn finish_turn(&mut self);
+    /// 工具开始执行：回显工具名与参数摘要。
+    fn tool_start(&mut self, name: &str, args: &str);
+    /// 工具结果摘要。
+    fn tool_result(&mut self, result: &str);
+    /// 子请求 token 用量（同时累计会话级缓存统计）。
+    fn usage(&mut self, u: &Usage);
+}
+
 /// 流式渲染器。思维链与正文是两个独立渲染块：
 /// - 思维链灰色（DIM），正文正常色
 /// - 块与块之间换行分隔；思维链转正文时额外空一行
@@ -272,49 +290,6 @@ impl Renderer {
         }
     }
 
-    pub fn reasoning_delta(&mut self, s: &str) {
-        if self.mode != Mode::Reasoning {
-            self.close_block(self.mode == Mode::Content);
-            if self.color {
-                self.raw(DIM);
-            }
-            self.mode = Mode::Reasoning;
-        }
-        self.raw(s);
-    }
-
-    pub fn content_delta(&mut self, s: &str) {
-        if self.mode != Mode::Content {
-            self.close_block(self.mode == Mode::Reasoning);
-            self.mode = Mode::Content;
-        }
-        self.raw(s);
-    }
-
-    /// 一轮流式输出结束，复位到 Idle。
-    pub fn finish_turn(&mut self) {
-        self.close_block(false);
-        self.mode = Mode::Idle;
-    }
-
-    /// 工具调用回显：黄色工具名 + 提取出的 shell 命令。
-    pub fn tool_start(&mut self, name: &str, args: &str) {
-        let hint = serde_json::from_str::<serde_json::Value>(args)
-            .ok()
-            .and_then(|v| {
-                v.get("command")
-                    .or_else(|| v.get("file_path"))
-                    .and_then(|c| c.as_str())
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| args.chars().take(80).collect());
-        self.raw(&format!(
-            "\n{}",
-            self.paint(YELLOW, &format!("▸ {name} {hint}"))
-        ));
-        self.raw("\n");
-    }
-
     /// 回放历史消息（恢复会话时用），样式与实时渲染保持一致：
     /// 用户消息带 `›` 前缀，assistant 思维链灰色、正文正常、工具调用黄色，
     /// tool 消息只显示摘要（与实时一致，不刷 10KB 原文）。
@@ -358,15 +333,66 @@ impl Renderer {
         self.raw("\n");
     }
 
-    /// 工具结果摘要：exit 行 + 字节数。
-    pub fn tool_result(&mut self, result: &str) {
+    pub fn info(&mut self, s: &str) {
+        self.raw(&self.paint(DIM, s));
+        self.raw("\n");
+    }
+
+    pub fn error(&self, s: &str) {
+        eprintln!("{}", self.paint("\x1b[31m", s));
+    }
+}
+
+impl Ui for Renderer {
+    fn reasoning_delta(&mut self, s: &str) {
+        if self.mode != Mode::Reasoning {
+            self.close_block(self.mode == Mode::Content);
+            if self.color {
+                self.raw(DIM);
+            }
+            self.mode = Mode::Reasoning;
+        }
+        self.raw(s);
+    }
+
+    fn content_delta(&mut self, s: &str) {
+        if self.mode != Mode::Content {
+            self.close_block(self.mode == Mode::Reasoning);
+            self.mode = Mode::Content;
+        }
+        self.raw(s);
+    }
+
+    fn finish_turn(&mut self) {
+        self.close_block(false);
+        self.mode = Mode::Idle;
+    }
+
+    fn tool_start(&mut self, name: &str, args: &str) {
+        let hint = serde_json::from_str::<serde_json::Value>(args)
+            .ok()
+            .and_then(|v| {
+                v.get("command")
+                    .or_else(|| v.get("file_path"))
+                    .and_then(|c| c.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| args.chars().take(80).collect());
+        self.raw(&format!(
+            "\n{}",
+            self.paint(YELLOW, &format!("▸ {name} {hint}"))
+        ));
+        self.raw("\n");
+    }
+
+    fn tool_result(&mut self, result: &str) {
         let exit_line = result.lines().next().unwrap_or("").to_owned();
         let total = result.len();
         self.raw(&self.paint(DIM, &format!("{exit_line} · {total} bytes")));
         self.raw("\n");
     }
 
-    pub fn usage(&mut self, u: &Usage) {
+    fn usage(&mut self, u: &Usage) {
         let cache = match u.cache() {
             Some(c) => format!("hit {}/miss {}", c.hit, c.miss),
             None => "cache —".to_string(),
@@ -379,15 +405,6 @@ impl Renderer {
         self.raw("\n");
         self.stats.record(u);
         self.redraw_status_bar();
-    }
-
-    pub fn info(&mut self, s: &str) {
-        self.raw(&self.paint(DIM, s));
-        self.raw("\n");
-    }
-
-    pub fn error(&self, s: &str) {
-        eprintln!("{}", self.paint("\x1b[31m", s));
     }
 }
 
