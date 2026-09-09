@@ -8,7 +8,7 @@ use crate::ui::Renderer;
 
 /// 参与请求前缀（KVCache）。禁止注入时间、cwd、随机 id 等任何动态内容，
 /// 否则每个请求的前缀都不同，缓存全 miss。
-pub const SYSTEM_PROMPT: &str = "You are caocli, a terminal coding agent. You can run shell commands on the local machine via the run_shell tool. Prefer running commands to gather facts before answering. Keep answers concise.";
+pub const SYSTEM_PROMPT: &str = "You are caocli, a terminal coding agent. You can run shell commands on the local machine via the Bash tool. Prefer running commands to gather facts before answering. Keep answers concise.";
 
 pub struct Agent {
     api: Client,
@@ -178,12 +178,12 @@ mod tests {
         assert_eq!(req.messages[0].role, Role::System);
         assert_eq!(req.messages[0].content.as_deref(), Some(SYSTEM_PROMPT));
         assert_eq!(req.messages[1], Message::user("q1"));
-        assert_eq!(req.tools.as_ref().unwrap()[0].function.name, "run_shell");
+        assert_eq!(req.tools.as_ref().unwrap()[0].function.name, "Bash");
         assert_eq!(req.tool_choice.as_deref(), Some("auto"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 端到端：tool_calls（arguments 分片）→ 真实执行 run_shell → 第二轮带
+    /// 端到端：tool_calls（arguments 分片）→ 真实执行 Bash → 第二轮带
     /// reasoning_content 回传 → 最终回答。钉住 DeepSeek "带 tools 必须回传
     /// reasoning_content" 硬约束与历史逐字节回放。
     #[tokio::test]
@@ -191,7 +191,7 @@ mod tests {
         let server = MockServer::start().await;
         let turn1 = [
             sse(json!({"role":"assistant","reasoning_content":"我需要执行命令。"}), None, None),
-            sse(json!({"tool_calls":[{"index":0,"id":"call_mock_1","type":"function","function":{"name":"run_shell","arguments":"{\"comm"}}]}), None, None),
+            sse(json!({"tool_calls":[{"index":0,"id":"call_mock_1","type":"function","function":{"name":"Bash","arguments":"{\"comm"}}]}), None, None),
             sse(json!({"tool_calls":[{"index":0,"function":{"arguments":"and\":\"echo caocli-mock-marker\"}"}}]}), None, None),
             sse(json!({"content":""}), Some("tool_calls"), Some(json!({"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":10}))),
             "data: [DONE]\n\n".to_string(),
@@ -219,7 +219,7 @@ mod tests {
         );
         let calls = assistant1.tool_calls.as_ref().unwrap();
         assert_eq!(calls[0].id, "call_mock_1");
-        assert_eq!(calls[0].function.name, "run_shell");
+        assert_eq!(calls[0].function.name, "Bash");
         assert_eq!(
             calls[0].function.arguments,
             r#"{"command":"echo caocli-mock-marker"}"#
@@ -227,7 +227,7 @@ mod tests {
         let tool_msg = &agent.session.messages[2];
         assert_eq!(tool_msg.role, Role::Tool);
         assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call_mock_1"));
-        // run_shell 真的执行了
+        // Bash 真的执行了
         assert!(
             tool_msg
                 .content
@@ -257,7 +257,7 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["reasoning_effort"], "high");
-        assert_eq!(body["tools"][0]["function"]["name"], "run_shell");
+        assert_eq!(body["tools"][0]["function"]["name"], "Bash");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -301,7 +301,7 @@ mod tests {
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, vec!["run_shell", "Read", "Edit", "Write"]);
+        assert_eq!(names, vec!["Bash", "Read", "Edit", "Write"]);
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&file_dir).unwrap();
     }

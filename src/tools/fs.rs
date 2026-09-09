@@ -15,7 +15,7 @@ pub fn read_definition() -> ToolDef {
             name: READ_NAME.into(),
             description: Some(
                 "读取本地文本文件的完整内容。修改文件前应先用本工具确认原文。\
-                 超大文件会被截断，可用 run_shell 分段读取剩余部分。"
+                 超大文件会被截断，可用 Bash 分段读取剩余部分。"
                     .into(),
             ),
             parameters: Some(json!({
@@ -90,7 +90,7 @@ pub fn read(args_json: &str) -> String {
         Ok(text) => {
             let (out, cut) = truncate(&text, MAX_OUTPUT);
             if cut {
-                format!("{out}\n[已截断到 {MAX_OUTPUT} 字节；剩余内容请用 run_shell 分段读取]")
+                format!("{out}\n[已截断到 {MAX_OUTPUT} 字节；剩余内容请用 Bash 分段读取]")
             } else {
                 out
             }
@@ -181,7 +181,7 @@ fn read_text(path: &str) -> Result<String, String> {
     }
     if meta.len() > MAX_FILE_BYTES {
         return Err(format!(
-            "error: 文件 {path} 大小 {} 字节，超过 {MAX_FILE_BYTES} 字节上限；请用 run_shell 分段读取（如 sed -n '1,200p'）",
+            "error: 文件 {path} 大小 {} 字节，超过 {MAX_FILE_BYTES} 字节上限；请用 Bash 分段读取（如 sed -n '1,200p'）",
             meta.len()
         ));
     }

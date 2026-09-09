@@ -263,7 +263,7 @@ mod tests {
                 id: "call_1".into(),
                 r#type: "function".into(),
                 function: crate::types::ToolCallFunction {
-                    name: "run_shell".into(),
+                    name: "Bash".into(),
                     arguments: r#"{"command":"ls"}"#.into(),
                 },
             }]),

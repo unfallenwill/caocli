@@ -4,7 +4,7 @@ use std::time::Duration;
 use super::truncate;
 use crate::types::{FunctionDef, ToolDef};
 
-pub const NAME: &str = "run_shell";
+pub const NAME: &str = "Bash";
 pub const TIMEOUT_SECS: u64 = 120;
 
 pub fn definition() -> ToolDef {

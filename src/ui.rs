@@ -238,11 +238,11 @@ mod tests {
     #[test]
     fn tool_start_extracts_command_hint() {
         let (mut r, buf) = Renderer::with_buffer(true);
-        r.tool_start("run_shell", r#"{"command":"ls -la"}"#);
+        r.tool_start("Bash", r#"{"command":"ls -la"}"#);
         r.tool_start("Read", r#"{"file_path":"/a/b.txt"}"#);
         r.tool_start("Write", "not json at all");
         let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert!(s.contains("▸ run_shell ls -la"), "{s}");
+        assert!(s.contains("▸ Bash ls -la"), "{s}");
         assert!(s.contains("▸ Read /a/b.txt"), "{s}");
         assert!(s.contains("▸ Write not json at all"), "{s}"); // 坏 JSON 回落成原文
     }

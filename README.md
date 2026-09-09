@@ -1,6 +1,6 @@
 # caocli
 
-终端 AI agent，Rust 实现。后端 DeepSeek `/chat/completions`，思考模式（`reasoning_content` 思维链流式灰色渲染）+ `run_shell` 工具循环，会话以 JSONL 追加日志持久化于 `~/.caocli/sessions/`，支持恢复与 KVCache 前缀缓存友好的逐字节历史回放。
+终端 AI agent，Rust 实现。后端 DeepSeek `/chat/completions`，思考模式（`reasoning_content` 思维链流式灰色渲染）+ `Bash` 工具循环，会话以 JSONL 追加日志持久化于 `~/.caocli/sessions/`，支持恢复与 KVCache 前缀缓存友好的逐字节历史回放。
 
 ```bash
 export DEEPSEEK_API_KEY=sk-...

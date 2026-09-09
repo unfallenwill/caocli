@@ -27,7 +27,7 @@ pub async fn execute(name: &str, args_json: &str) -> String {
         fs::EDIT_NAME => fs::edit(args_json),
         fs::WRITE_NAME => fs::write(args_json),
         other => format!(
-            "error: 未知工具 {other:?}。可用工具: run_shell, {}, {}, {}",
+            "error: 未知工具 {other:?}。可用工具: Bash, {}, {}, {}",
             fs::READ_NAME,
             fs::EDIT_NAME,
             fs::WRITE_NAME
@@ -79,19 +79,19 @@ mod tests {
     #[test]
     fn definitions_are_stable_and_named() {
         let names: Vec<String> = definitions().into_iter().map(|d| d.function.name).collect();
-        assert_eq!(names, vec!["run_shell", "Read", "Edit", "Write"]);
+        assert_eq!(names, vec!["Bash", "Read", "Edit", "Write"]);
     }
 
     #[tokio::test]
     async fn unknown_tool_returns_error_text() {
         let out = execute("Delete", "{}").await;
         assert!(out.contains("未知工具"));
-        assert!(out.contains("run_shell"));
+        assert!(out.contains("Bash"));
     }
 
     #[tokio::test]
     async fn dispatch_reaches_shell() {
-        let out = execute("run_shell", r#"{"command":"echo dispatched"}"#).await;
+        let out = execute("Bash", r#"{"command":"echo dispatched"}"#).await;
         assert!(out.contains("dispatched"));
     }
 }

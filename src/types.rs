@@ -287,7 +287,7 @@ mod tests {
                 id: "call_1".into(),
                 r#type: "function".into(),
                 function: ToolCallFunction {
-                    name: "run_shell".into(),
+                    name: "Bash".into(),
                     arguments: r#"{"command":"ls"}"#.into(),
                 },
             }]),
@@ -343,7 +343,7 @@ mod tests {
                 index: 0,
                 id: Some("call_1".into()),
                 function: Some(DeltaFunctionCall {
-                    name: Some("run_shell".into()),
+                    name: Some("Bash".into()),
                     arguments: Some("{\"comm".into()),
                 }),
             }]),
@@ -366,7 +366,7 @@ mod tests {
         let tcs = msg.tool_calls.unwrap();
         assert_eq!(tcs.len(), 1);
         assert_eq!(tcs[0].id, "call_1");
-        assert_eq!(tcs[0].function.name, "run_shell");
+        assert_eq!(tcs[0].function.name, "Bash");
         assert_eq!(tcs[0].function.arguments, r#"{"command":"ls"}"#);
     }
 
@@ -403,12 +403,7 @@ mod tests {
             Some("_path\":\"a.txt\"}"),
         )]));
         // 0 号占位随后补齐，且重复 id 更新不产生新条目
-        acc.feed(&mk(vec![dtc(
-            0,
-            Some("call_z"),
-            Some("run_shell"),
-            Some("{}"),
-        )]));
+        acc.feed(&mk(vec![dtc(0, Some("call_z"), Some("Bash"), Some("{}"))]));
         let tcs = acc.finish().tool_calls.unwrap();
         assert_eq!(tcs.len(), 3);
         assert_eq!(tcs[0].id, "call_z");
