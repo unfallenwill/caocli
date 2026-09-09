@@ -129,9 +129,15 @@ Limits: 10 KiB of output per tool result, 10 MB per file read/write.
 
 ## Design notes
 
-- **One loop, deliberately minimal.** Providers are a static table, not a
-  trait or dynamic registry — the whole agent is still the request → stream
-  → tool_calls → execute → continue cycle.
+- **One loop, deliberately minimal.** Providers are a static table, not a trait
+  or dynamic registry. The turn loop is an interpreter over a pure decision
+  function: `machine::next_action` folds the committed history and returns the
+  next step (call the model / run the next declared tool / done). The loop
+  itself carries no state — the session log is the only source of truth.
+- **The machine decides, it never executes.** Tool execution, streaming, and
+  persistence live in the interpreter; the decision function is pure and
+  table-testable. The `Ui` trait is the machine's notification vocabulary —
+  callbacks receive notices and never return decisions.
 - **Thinking-mode streaming.** `delta.reasoning_content` arrives before
   `delta.content`; they render as separate blocks (dim gray thinking,
   normal-colored answer). `NO_COLOR` or a non-TTY drops the color codes.
@@ -141,6 +147,11 @@ Limits: 10 KiB of output per tool result, 10 MB per file read/write.
   store the full assistant messages.
 - **Append-only session logs.** Files are never rewritten, so a crash costs
   at most a trailing partial line. Corrupt lines are skipped on load.
+- **Crash healing at load.** A session interrupted between an assistant
+  message with `tool_calls` and its tool results would otherwise produce an
+  invalid request on resume. `Session::load` synthesizes deterministic
+  placeholder results for the interrupted calls — in memory only; the file is
+  never rewritten, and re-loading recomputes the same view byte-for-byte.
 - **Prefix-cache friendly.** `SYSTEM_PROMPT` is a compile-time constant and
   history is replayed byte-for-byte — no trimming, reordering, or
   compaction. Injecting volatile data (time, cwd) or changing the tool set
