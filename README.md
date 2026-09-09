@@ -58,7 +58,7 @@ newlines also works (bracketed paste).
 | `-p <PROMPT>` | Run one prompt (including the tool loop), then exit |
 | `--provider <NAME>` | Backend provider: `deepseek` (default) or `glm` |
 | `--model <MODEL>` | Model id; defaults to the provider's default model |
-| `--effort <EFFORT>` | Reasoning effort: `low`, `high`, or `max` |
+| `--effort <EFFORT>` | Reasoning effort: `low`, `high`, or `max`; other values are rejected locally. On GLM, `low` answers without emitting `reasoning_content`. |
 | `-c, --cont` | Continue the most recent session |
 | `--resume <ID>` | Resume a specific session by id |
 | `--list` | List sessions and exit |

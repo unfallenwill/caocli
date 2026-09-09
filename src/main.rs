@@ -7,7 +7,7 @@ mod tools;
 mod types;
 mod ui;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers};
 
@@ -66,7 +66,22 @@ fn enable_multiline(rl: &mut rustyline::DefaultEditor) {
     let _ = rl.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
 }
 
+/// `--effort` 只接受 `low|high|max`。DeepSeek 对越界值返回 400，
+/// GLM 则静默接受并退化成默认档——所以本地先拒，行为才一致。
+fn validate_effort(cli: &Cli) -> Result<()> {
+    if let Some(e) = &cli.effort
+        && !config::EFFORTS.contains(&e.as_str())
+    {
+        bail!(
+            "无效的 --effort {e:?}；可用: {}",
+            config::EFFORTS.join(" | ")
+        );
+    }
+    Ok(())
+}
+
 async fn run(cli: Cli) -> Result<()> {
+    validate_effort(&cli)?;
     let mut ui = Renderer::new();
     let sdir = config::sessions_dir()?;
 
@@ -338,6 +353,20 @@ mod tests {
     fn provider_flag_parses() {
         assert_eq!(cli(&["--provider", "glm"]).provider.as_deref(), Some("glm"));
         assert!(cli(&[]).provider.is_none());
+    }
+
+    #[test]
+    fn validate_effort_accepts_known_tiers_and_rejects_others() {
+        for ok in ["low", "high", "max"] {
+            assert!(validate_effort(&cli(&["--effort", ok])).is_ok(), "{ok}");
+        }
+        assert!(validate_effort(&cli(&[])).is_ok()); // 不传 = 后端默认档
+        for bad in ["none", "minimal", "medium", "xhigh", "HIGH", "bogus", ""] {
+            let err = validate_effort(&cli(&["--effort", bad]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("low | high | max"), "{bad}: {err}");
+        }
     }
 
     #[test]

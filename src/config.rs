@@ -37,6 +37,11 @@ pub const DEFAULT_PROVIDER: &str = "deepseek";
 /// 通用 API key 覆盖，优先级高于供应商专用变量。
 const UNIVERSAL_KEY_ENV: &str = "CAOCLI_API_KEY";
 
+/// reasoning_effort 的合法档位。两家后端都只支持这三档：
+/// GLM 的 low 不产出 reasoning_content，DeepSeek 的 low 仍会思考。
+/// 非法值必须本地拒绝——DeepSeek 会 400，GLM 会静默按默认档处理。
+pub const EFFORTS: &[&str] = &["low", "high", "max"];
+
 /// 按 id 查供应商。
 pub fn provider(id: &str) -> Result<Provider> {
     PROVIDERS
