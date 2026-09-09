@@ -323,4 +323,92 @@ mod tests {
         assert!(edit(r#"{"file_path":"/x"}"#).contains("缺少必填参数 old_string"));
         assert!(write(r#"{"file_path":"/x"}"#).contains("缺少必填参数 content"));
     }
+
+    #[test]
+    fn bad_json_and_missing_args_across_tools() {
+        for call in [
+            read("not json"),
+            edit("not json"),
+            write("not json"),
+            edit("{}"),                                     // 缺 file_path
+            edit(r#"{"file_path":"/x","old_string":"a"}"#), // 缺 new_string
+            write("{}"),                                    // 缺 file_path
+        ] {
+            assert!(call.starts_with("error:"), "{call}");
+        }
+    }
+
+    #[test]
+    fn read_rejects_directory_and_oversized_file() {
+        let dir = tmpdir();
+        // 目录：报"是目录"
+        let out = read(&args(&dir, ""));
+        assert!(out.contains("是目录"), "{out}");
+        // 超过单文件上限
+        let big = dir.join("huge.bin");
+        std::fs::write(&big, vec![b'x'; MAX_FILE_BYTES as usize + 1]).unwrap();
+        let out = read(&args(&big, ""));
+        assert!(out.contains("超过"), "{out}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_rejects_oversized_content() {
+        let dir = tmpdir();
+        let p = dir.join("too-big.txt");
+        let content = "x".repeat(MAX_FILE_BYTES as usize + 1);
+        let out = write(&format!(
+            r#"{{"file_path":{:?},"content":"{content}"}}"#,
+            p.to_string_lossy()
+        ));
+        assert!(out.contains("超过"), "{out}");
+        assert!(!p.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_fails_when_parent_not_writable() {
+        let dir = tmpdir();
+        let ro = dir.join("ro");
+        std::fs::create_dir_all(&ro).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let p = ro.join("sub/x.txt"); // 父目录只读，create_dir_all 失败
+            let out = write(&format!(
+                r#"{{"file_path":{:?},"content":"hi"}}"#,
+                p.to_string_lossy()
+            ));
+            assert!(out.contains("创建目录"), "{out}");
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn edit_and_write_report_atomic_write_failure() {
+        let dir = tmpdir();
+        let ro = dir.join("ro");
+        std::fs::create_dir_all(&ro).unwrap();
+        let target = ro.join("f.txt");
+        std::fs::write(&target, "内容").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+            // Edit：读成功、tmp 写入失败
+            let out = edit(&args(&target, r#","old_string":"内容","new_string":"改""#));
+            assert!(out.contains("写入"), "{out}");
+            // Write：tmp 写入失败
+            let out = write(&format!(
+                r#"{{"file_path":{:?},"content":"overwrite"}}"#,
+                target.to_string_lossy()
+            ));
+            assert!(out.contains("写入"), "{out}");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "内容"); // 原文件未被破坏
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -209,9 +209,12 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 fn print_help() {
-    println!(
-        "命令:\n  /exit /quit /q   退出\n  /new             开新会话\n  /sessions        列出会话\n  /resume <id>     切换到指定会话\n启动参数:\n  -c / --continue  继续最近会话\n  --resume <id>    恢复指定会话\n  --no-think --effort low|high|max --model <id>\n  -p \"prompt\"     单次执行后退出"
-    );
+    println!("{}", help_text());
+}
+
+fn help_text() -> String {
+    "命令:\n  /exit /quit /q   退出\n  /new             开新会话\n  /sessions        列出会话\n  /resume <id>     切换到指定会话\n启动参数:\n  -c / --continue  继续最近会话\n  --resume <id>    恢复指定会话\n  --no-think --effort low|high|max --model <id>\n  -p \"prompt\"     单次执行后退出"
+        .to_string()
 }
 
 #[cfg(test)]
@@ -280,5 +283,41 @@ mod tests {
         };
         assert!(!apply_overrides(&mut off, &cli(&["--effort", "low"])));
         assert_eq!(off.reasoning_effort, None);
+    }
+
+    #[test]
+    fn fresh_meta_defaults() {
+        let meta = fresh_meta(&cli(&[]));
+        assert_eq!(meta.model, config::DEFAULT_MODEL);
+        assert!(meta.thinking.is_enabled());
+        assert_eq!(meta.reasoning_effort, None);
+    }
+
+    #[test]
+    fn fresh_meta_carries_model_and_effort() {
+        let meta = fresh_meta(&cli(&["--model", "deepseek-v4-pro", "--effort", "max"]));
+        assert_eq!(meta.model, "deepseek-v4-pro");
+        assert!(meta.thinking.is_enabled());
+        assert_eq!(meta.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn fresh_meta_no_think_ignores_effort() {
+        let meta = fresh_meta(&cli(&["--no-think", "--effort", "low"]));
+        assert!(!meta.thinking.is_enabled());
+        assert_eq!(meta.reasoning_effort, None);
+    }
+
+    #[test]
+    fn help_text_lists_slash_commands_and_flags() {
+        let t = help_text();
+        for expected in [
+            "/resume <id>",
+            "-c / --continue",
+            "--no-think",
+            "-p \"prompt\"",
+        ] {
+            assert!(t.contains(expected), "缺少 {expected:?}\n{t}");
+        }
     }
 }

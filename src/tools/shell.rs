@@ -107,4 +107,18 @@ mod tests {
         assert!(out.contains("hello"));
         assert!(out.contains("err"));
     }
+
+    #[tokio::test]
+    async fn execute_truncates_stdout_and_stderr() {
+        let out = execute(
+            r#"{"command":"head -c 30000 /dev/zero | tr '\\0' 'a'; head -c 30000 /dev/zero | tr '\\0' 'b' >&2"}"#,
+        )
+        .await;
+        assert!(out.contains("[stdout 已截断]"), "{out}");
+        assert!(out.contains("[stderr 已截断]"), "{out}");
+        assert!(
+            out.len() < crate::tools::MAX_OUTPUT * 2 + 512,
+            "输出应被截断"
+        );
+    }
 }

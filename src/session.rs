@@ -338,4 +338,77 @@ mod tests {
         assert_eq!(infos[0].message_count, 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn load_errors_when_header_missing() {
+        let dir = tmpdir();
+        let path = dir.join("orphan.jsonl");
+        std::fs::write(
+            &path,
+            br#"{"t":"msg","message":{"role":"user","content":"hi"}}\n"#,
+        )
+        .unwrap();
+        let err = match Session::load(&path) {
+            Ok(_) => panic!("缺少 header 应当报错"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("缺少有效 header"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn list_skips_non_jsonl_and_unreadable() {
+        let dir = tmpdir();
+        let mut s = Session::create(&dir, test_meta()).unwrap();
+        s.append_message(&Message::user("真实会话")).unwrap();
+        // 非 jsonl：list 忽略
+        std::fs::write(dir.join("notes.txt"), "ignored").unwrap();
+        // 名为 .jsonl 的目录：summarize 读失败，list 静默跳过
+        std::fs::create_dir(dir.join("broken.jsonl")).unwrap();
+
+        let infos = list(&dir).unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].id, s.id);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn list_tolerates_corrupt_lines_and_meta() {
+        let dir = tmpdir();
+        let mut s = Session::create(&dir, test_meta()).unwrap();
+        s.append_message(&Message::user("长".repeat(60))).unwrap();
+        s.set_meta(SessionMeta {
+            model: "deepseek-v4-pro".into(),
+            thinking: Thinking::disabled(),
+            reasoning_effort: None,
+        })
+        .unwrap();
+        // 追加一条崩溃写一半的坏行
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&s.path)
+            .unwrap();
+        f.write_all(br#"{"t":"msg","message":{"role":"use"#)
+            .unwrap();
+        drop(f);
+
+        let infos = list(&dir).unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].preview.chars().count(), 40); // 坏行/meta 不计消息数，preview 截断
+        assert_eq!(infos[0].message_count, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn latest_returns_most_recent_or_none() {
+        let dir = tmpdir();
+        assert!(latest(dir.clone()).unwrap().is_none()); // 空目录
+        let mut s1 = Session::create(&dir, test_meta()).unwrap();
+        s1.append_message(&Message::user("旧")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let mut s2 = Session::create(&dir, test_meta()).unwrap();
+        s2.append_message(&Message::user("新")).unwrap();
+        assert_eq!(latest(dir.clone()).unwrap().unwrap(), s2.path);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

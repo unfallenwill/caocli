@@ -371,6 +371,54 @@ mod tests {
     }
 
     #[test]
+    fn accumulator_fills_gaps_and_updates_existing_tool_calls() {
+        let mk = |tcs: Vec<DeltaToolCall>| Delta {
+            role: None,
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(tcs),
+        };
+        let dtc =
+            |index: u32, id: Option<&str>, name: Option<&str>, args: Option<&str>| DeltaToolCall {
+                index,
+                id: id.map(str::to_owned),
+                function: Some(DeltaFunctionCall {
+                    name: name.map(str::to_owned),
+                    arguments: args.map(str::to_owned),
+                }),
+            };
+        let mut acc = TurnAccumulator::default();
+        // 首片直接落在 index=2：中间的 0/1 用占位补齐（gap 分支）
+        acc.feed(&mk(vec![dtc(
+            2,
+            Some("call_a"),
+            Some("read"),
+            Some("{\"file"),
+        )]));
+        // 后续分片带完整 id/name + 追加 arguments（走已有条目更新分支）
+        acc.feed(&mk(vec![dtc(
+            2,
+            Some("call_a"),
+            Some("read"),
+            Some("_path\":\"a.txt\"}"),
+        )]));
+        // 0 号占位随后补齐，且重复 id 更新不产生新条目
+        acc.feed(&mk(vec![dtc(
+            0,
+            Some("call_z"),
+            Some("run_shell"),
+            Some("{}"),
+        )]));
+        let tcs = acc.finish().tool_calls.unwrap();
+        assert_eq!(tcs.len(), 3);
+        assert_eq!(tcs[0].id, "call_z");
+        assert_eq!(tcs[1].id, ""); // 纯占位
+        assert_eq!(tcs[2].id, "call_a");
+        assert_eq!(tcs[2].function.name, "read");
+        assert_eq!(tcs[2].function.arguments, r#"{"file_path":"a.txt"}"#);
+    }
+
+    #[test]
     fn parse_real_stream_chunk_with_reasoning() {
         let line = r#"{"id":"x","choices":[{"index":0,"delta":{"reasoning_content":"嗯"},"finish_reason":null,"logprobs":null}],"created":1,"model":"deepseek-v4-flash","object":"chat.completion.chunk"}"#;
         let chunk: ChatChunk = serde_json::from_str(line).unwrap();

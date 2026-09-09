@@ -161,6 +161,7 @@ impl Write for SharedBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Usage;
 
     #[test]
     fn reasoning_then_content_are_separate_blocks() {
@@ -217,6 +218,78 @@ mod tests {
         assert_eq!(
             String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
             "\x1b[2mhmm\x1b[0m\n"
+        );
+    }
+
+    #[test]
+    fn same_mode_deltas_do_not_reopen_block() {
+        let (mut r, buf) = Renderer::with_buffer(true);
+        r.reasoning_delta("a");
+        r.reasoning_delta("b"); // 仍是 Reasoning：不重复发色码
+        r.content_delta("x");
+        r.content_delta("y"); // 仍是 Content：不换块
+        r.finish_turn();
+        assert_eq!(
+            String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
+            "\x1b[2mab\x1b[0m\n\nxy\x1b[0m\n"
+        );
+    }
+
+    #[test]
+    fn tool_start_extracts_command_hint() {
+        let (mut r, buf) = Renderer::with_buffer(true);
+        r.tool_start("run_shell", r#"{"command":"ls -la"}"#);
+        r.tool_start("Read", r#"{"file_path":"/a/b.txt"}"#);
+        r.tool_start("Write", "not json at all");
+        let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(s.contains("▸ run_shell ls -la"), "{s}");
+        assert!(s.contains("▸ Read /a/b.txt"), "{s}");
+        assert!(s.contains("▸ Write not json at all"), "{s}"); // 坏 JSON 回落成原文
+    }
+
+    #[test]
+    fn tool_result_shows_exit_line_and_bytes() {
+        let (mut r, buf) = Renderer::with_buffer(false);
+        r.tool_result("exit_code: 3\n--- stdout ---\nhello");
+        r.tool_result("");
+        let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(s.contains("exit_code: 3 · 33 bytes"), "{s}");
+        assert!(s.contains(" · 0 bytes"), "{s}"); // 空结果
+    }
+
+    #[test]
+    fn usage_and_info_render_dims() {
+        let (mut r, buf) = Renderer::with_buffer(false);
+        r.usage(&Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            prompt_cache_hit_tokens: 6,
+            prompt_cache_miss_tokens: 4,
+        });
+        r.info("会话 abc");
+        let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(s.contains("tokens: in 10/15 (hit 6/miss 4) · out 5"), "{s}");
+        assert!(s.contains("会话 abc"), "{s}");
+    }
+
+    #[test]
+    fn color_variants_render_codes_and_plain() {
+        // color=true：info/usage 走 paint 的染色分支；error 走红色
+        let (mut r, buf) = Renderer::with_buffer(true);
+        r.info("ok");
+        let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert_eq!(s, "\x1b[2mok\x1b[0m\n");
+        r.error("boom"); // eprintln，不写 buf；仅保证不 panic 且覆盖 paint(红)
+    }
+
+    #[test]
+    fn no_color_paint_returns_plain_text() {
+        let (mut r, buf) = Renderer::with_buffer(false);
+        r.info("plain");
+        assert_eq!(
+            String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
+            "plain\n"
         );
     }
 }
