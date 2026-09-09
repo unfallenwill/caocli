@@ -2,6 +2,7 @@ mod agent;
 mod api;
 mod cli;
 mod config;
+mod machine;
 mod session;
 mod tools;
 mod types;

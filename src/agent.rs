@@ -2,6 +2,7 @@ use anyhow::Result;
 
 use crate::api::Client;
 use crate::config::DEFAULT_EFFORT;
+use crate::machine::{self, Action};
 use crate::session::Session;
 use crate::tools;
 use crate::types::{ChatRequest, Message, Thinking, TurnAccumulator, Usage};
@@ -48,49 +49,53 @@ impl Agent {
     /// 否则 `usage()` 记录到的缓存统计不会反映到已建栏的实例上。
     pub async fn turn(&mut self, input: &str, ui: &mut impl Ui) -> Result<()> {
         self.session.append_message(&Message::user(input))?;
+        // 解释器循环：每拍向机器要决策（日志折叠出的 Action），执行后把
+        // 结果写回日志，直到 Done。循环本身不携带状态——历史只有日志一处。
         loop {
-            let req = self.build_request();
-            let mut stream = self.api.stream_chat(&req).await?;
-            let mut acc = TurnAccumulator::default();
-            let mut usage: Option<Usage> = None;
-            while let Some(chunk) = stream.next_chunk().await? {
-                for choice in chunk.choices {
-                    let Some(delta) = choice.delta else { continue };
-                    if let Some(s) = &delta.reasoning_content {
-                        ui.reasoning_delta(s);
+            match machine::next_action(&self.session.messages) {
+                Some(Action::CallModel) => {
+                    let req = self.build_request();
+                    let (msg, usage) = self.pump(&req, ui).await?;
+                    self.session.append_message(&msg)?;
+                    if let Some(u) = usage {
+                        ui.usage(&u);
                     }
-                    if let Some(s) = &delta.content {
-                        ui.content_delta(s);
-                    }
-                    acc.feed(&delta);
                 }
-                if chunk.usage.is_some() {
-                    usage = chunk.usage;
+                Some(Action::ExecTool(call)) => {
+                    ui.tool_start(&call.function.name, &call.function.arguments);
+                    let out = tools::execute(&call.function.name, &call.function.arguments).await;
+                    ui.tool_result(&out);
+                    self.session.append_message(&Message::tool(&call.id, out))?;
                 }
+                Some(Action::Done) | None => break,
             }
-            ui.finish_turn();
-
-            let msg = acc.finish();
-            self.session.append_message(&msg)?;
-            if let Some(u) = usage {
-                ui.usage(&u);
-            }
-
-            let Some(calls) = msg.tool_calls.clone() else {
-                break;
-            };
-            if calls.is_empty() {
-                break;
-            }
-            for call in calls {
-                ui.tool_start(&call.function.name, &call.function.arguments);
-                let out = tools::execute(&call.function.name, &call.function.arguments).await;
-                ui.tool_result(&out);
-                self.session.append_message(&Message::tool(&call.id, out))?;
-            }
-            // 工具结果已入历史，继续子请求让模型消化
         }
         Ok(())
+    }
+
+    /// 执行一次子请求：消费 SSE 流（逐 delta 通知 UI），聚合出完整 assistant 消息。
+    /// 错误向上抛，此时 assistant 消息未落盘，会话停留在合法前缀。
+    async fn pump(&self, req: &ChatRequest, ui: &mut impl Ui) -> Result<(Message, Option<Usage>)> {
+        let mut stream = self.api.stream_chat(req).await?;
+        let mut acc = TurnAccumulator::default();
+        let mut usage: Option<Usage> = None;
+        while let Some(chunk) = stream.next_chunk().await? {
+            for choice in chunk.choices {
+                let Some(delta) = choice.delta else { continue };
+                if let Some(s) = &delta.reasoning_content {
+                    ui.reasoning_delta(s);
+                }
+                if let Some(s) = &delta.content {
+                    ui.content_delta(s);
+                }
+                acc.feed(&delta);
+            }
+            if chunk.usage.is_some() {
+                usage = chunk.usage;
+            }
+        }
+        ui.finish_turn();
+        Ok((acc.finish(), usage))
     }
 }
 
@@ -285,6 +290,64 @@ mod tests {
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["tools"][0]["function"]["name"], "Bash");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 端到端：一次声明两个工具调用。解释器必须按声明顺序把两个都执行完
+    /// 才发第二个子请求——若只执行一个就发请求，历史缺 tool 结果（API 400）。
+    #[tokio::test]
+    async fn mock_multi_call_loop_executes_all_before_next_request() {
+        let server = MockServer::start().await;
+        let turn1 = [
+            sse(json!({"tool_calls":[
+                {"index":0,"id":"call_m1","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"echo one\"}"}},
+                {"index":1,"id":"call_m2","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"echo two\"}"}}
+            ]}), None, None),
+            sse(json!({"content":""}), Some("tool_calls"), None),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let turn2 = [
+            sse(json!({"content":"都执行完了。"}), None, None),
+            sse(json!({"content":""}), Some("stop"), None),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        mount_chat(&server, turn1, Some(1)).await;
+        mount_chat(&server, turn2, None).await;
+
+        let dir = tmpdir();
+        let mut agent = test_agent(&server, &dir);
+        let mut ui = Renderer::new();
+        agent.turn("跑两个命令", &mut ui).await.unwrap();
+
+        let msgs = &agent.session.messages;
+        assert_eq!(
+            msgs.len(),
+            5,
+            "user / assistant(2 calls) / tool×2 / assistant"
+        );
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("call_m1"));
+        assert_eq!(msgs[3].tool_call_id.as_deref(), Some("call_m2"));
+        assert!(msgs[2].content.as_deref().unwrap().contains("one"));
+        assert!(msgs[3].content.as_deref().unwrap().contains("two"));
+
+        // 第二个子请求的历史里，两个结果必须都已就位
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 2);
+        let body: serde_json::Value = serde_json::from_slice(&reqs[1].body).unwrap();
+        let results: Vec<&str> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| m["tool_call_id"].as_str())
+            .collect();
+        assert_eq!(
+            results,
+            vec!["call_m1", "call_m2"],
+            "第二个请求必须携带全部工具结果"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

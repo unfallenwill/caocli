@@ -128,6 +128,15 @@ impl Session {
         if bad_lines > 0 {
             eprintln!("警告: {} 中有 {bad_lines} 行损坏已跳过", path.display());
         }
+        // 崩溃自愈：为中断的工具调用合成占位结果，只改内存视图。
+        // append-only：文件永不重写，下次 load 确定性地重新合成同样内容。
+        let healed = crate::machine::heal(&mut messages);
+        if healed > 0 {
+            eprintln!(
+                "警告: {} 有 {healed} 个中断的工具调用，已合成占位结果",
+                path.display()
+            );
+        }
         let file = std::fs::OpenOptions::new()
             .append(true)
             .open(path)
@@ -299,6 +308,60 @@ mod tests {
 
         let loaded = Session::load(&s.path).unwrap();
         assert_eq!(loaded.messages.len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 崩溃现场：call_2 的结果因中断丢失。load 后内存视图被修复成合法历史，
+    /// 但文件保持原样（append-only），修复是确定性的读取时视图。
+    #[test]
+    fn load_heals_orphan_tool_calls_in_memory_only() {
+        let dir = tmpdir();
+        let mut s = Session::create(&dir, test_meta()).unwrap();
+        s.append_message(&Message::user("q")).unwrap();
+        s.append_message(&crate::types::Message {
+            role: Role::Assistant,
+            content: Some(String::new()),
+            reasoning_content: None,
+            tool_calls: Some(vec![
+                crate::types::ToolCall {
+                    id: "call_1".into(),
+                    r#type: "function".into(),
+                    function: crate::types::ToolCallFunction {
+                        name: "Bash".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                crate::types::ToolCall {
+                    id: "call_2".into(),
+                    r#type: "function".into(),
+                    function: crate::types::ToolCallFunction {
+                        name: "Read".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+            ]),
+            tool_call_id: None,
+        })
+        .unwrap();
+        s.append_message(&Message::tool("call_1", "ok")).unwrap();
+        s.append_message(&Message::user("下一问")).unwrap();
+
+        let loaded = Session::load(&s.path).unwrap();
+        let msgs = &loaded.messages;
+        assert_eq!(msgs.len(), 5, "补插一条 call_2 的占位结果");
+        assert_eq!(msgs[3].tool_call_id.as_deref(), Some("call_2"));
+        assert_eq!(
+            msgs[3].content.as_deref(),
+            Some(crate::machine::INTERRUPTED_RESULT)
+        );
+        // 文件没有被重写：仍是 header + 4 行消息
+        let raw = std::fs::read_to_string(&s.path).unwrap();
+        assert_eq!(raw.lines().count(), 5);
+        // 修复后的历史对决策函数合法：可以直接发请求
+        assert_eq!(
+            crate::machine::next_action(msgs),
+            Some(crate::machine::Action::CallModel)
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
