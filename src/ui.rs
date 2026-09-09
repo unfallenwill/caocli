@@ -1,6 +1,6 @@
 use std::io::{IsTerminal, Write};
 
-use crate::types::Usage;
+use crate::types::{Message, Role, Usage};
 
 const DIM: &str = "\x1b[2m";
 const YELLOW: &str = "\x1b[33m";
@@ -204,6 +204,12 @@ impl Renderer {
         bar.render(self.out.as_mut(), &visible, &painted);
     }
 
+    /// 当前会话累计的缓存统计（状态栏数据源）。仅测试读取。
+    #[cfg(test)]
+    pub fn stats(&self) -> CacheStats {
+        self.stats
+    }
+
     /// 切换会话时清零缓存统计。
     pub fn reset_stats(&mut self) {
         self.stats = CacheStats::default();
@@ -283,6 +289,49 @@ impl Renderer {
             "\n{}",
             self.paint(YELLOW, &format!("▸ {name} {hint}"))
         ));
+        self.raw("\n");
+    }
+
+    /// 回放历史消息（恢复会话时用），样式与实时渲染保持一致：
+    /// 用户消息带 `›` 前缀，assistant 思维链灰色、正文正常、工具调用黄色，
+    /// tool 消息只显示摘要（与实时一致，不刷 10KB 原文）。
+    /// 会话文件不含 system 消息（SYSTEM_PROMPT 是编译期常量），无需过滤。
+    pub fn replay(&mut self, messages: &[Message]) {
+        for m in messages {
+            match m.role {
+                Role::User => {
+                    if let Some(c) = &m.content {
+                        self.raw("\n");
+                        self.raw(&self.paint(DIM, "› "));
+                        self.raw(c);
+                        self.raw("\n");
+                    }
+                }
+                Role::Assistant => {
+                    if let Some(r) = &m.reasoning_content
+                        && !r.is_empty()
+                    {
+                        self.raw(&self.paint(DIM, r));
+                        self.raw("\n");
+                    }
+                    if let Some(c) = &m.content
+                        && !c.is_empty()
+                    {
+                        self.raw(c);
+                        self.raw("\n");
+                    }
+                    for call in m.tool_calls.iter().flatten() {
+                        self.tool_start(&call.function.name, &call.function.arguments);
+                    }
+                }
+                Role::Tool => {
+                    if let Some(c) = &m.content {
+                        self.tool_result(c);
+                    }
+                }
+                Role::System => {}
+            }
+        }
         self.raw("\n");
     }
 
@@ -420,6 +469,66 @@ mod tests {
         assert!(s.contains("▸ Bash ls -la"), "{s}");
         assert!(s.contains("▸ Read /a/b.txt"), "{s}");
         assert!(s.contains("▸ Write not json at all"), "{s}"); // 坏 JSON 回落成原文
+    }
+
+    #[test]
+    fn replay_renders_history_compactly_with_colors() {
+        use crate::types::{ToolCall, ToolCallFunction};
+        let (mut r, buf) = Renderer::with_buffer(true);
+        r.replay(&[
+            Message::user("帮我看看"),
+            Message {
+                role: Role::Assistant,
+                content: Some("先执行".into()),
+                reasoning_content: Some("想一下".into()),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".into(),
+                    r#type: "function".into(),
+                    function: ToolCallFunction {
+                        name: "Bash".into(),
+                        arguments: r#"{"command":"ls -la"}"#.into(),
+                    },
+                }]),
+                tool_call_id: None,
+            },
+            Message::tool("call_1", "exit_code: 0\n--- stdout ---\nSECRET_BODY"),
+            Message::system("不该出现"),
+        ]);
+        let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(s.contains("\x1b[2m› \x1b[0m帮我看看"), "{s}");
+        assert!(s.contains("\x1b[2m想一下\x1b[0m"), "思维链灰色: {s}");
+        assert!(s.contains("先执行"), "{s}");
+        assert!(s.contains("▸ Bash ls -la"), "工具调用黄色: {s}");
+        // tool 消息只给摘要，不刷全文
+        assert!(s.contains("exit_code: 0 · 39 bytes"), "{s}");
+        assert!(!s.contains("SECRET_BODY"), "不应回放工具全文: {s}");
+        assert!(!s.contains("不该出现"), "system 消息不回放: {s}");
+    }
+
+    #[test]
+    fn replay_empty_history_emits_only_blank_line() {
+        let (mut r, buf) = Renderer::with_buffer(false);
+        r.replay(&[]);
+        assert_eq!(
+            String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
+            "\n"
+        );
+    }
+
+    #[test]
+    fn replay_skips_empty_assistant_fields() {
+        let (mut r, buf) = Renderer::with_buffer(false);
+        r.replay(&[Message {
+            role: Role::Assistant,
+            content: Some(String::new()),
+            reasoning_content: Some(String::new()),
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+        assert_eq!(
+            String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
+            "\n"
+        );
     }
 
     #[test]

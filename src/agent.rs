@@ -13,16 +13,11 @@ pub const SYSTEM_PROMPT: &str = "You are caocli, a terminal coding agent. You ca
 pub struct Agent {
     api: Client,
     pub session: Session,
-    renderer: Renderer,
 }
 
 impl Agent {
     pub fn new(api: Client, session: Session) -> Self {
-        Self {
-            api,
-            session,
-            renderer: Renderer::new(),
-        }
+        Self { api, session }
     }
 
     fn build_request(&self) -> ChatRequest {
@@ -41,7 +36,9 @@ impl Agent {
     }
 
     /// 一轮对话：可能包含多个子请求（模型调用工具后继续，直到 finish_reason=stop）。
-    pub async fn turn(&mut self, input: &str) -> Result<()> {
+    /// 渲染器由调用方持有并传入：状态栏与流式输出必须走同一个 `Renderer`，
+    /// 否则 `usage()` 记录到的缓存统计不会反映到已建栏的实例上。
+    pub async fn turn(&mut self, input: &str, ui: &mut Renderer) -> Result<()> {
         self.session.append_message(&Message::user(input))?;
         loop {
             let req = self.build_request();
@@ -52,10 +49,10 @@ impl Agent {
                 for choice in chunk.choices {
                     let Some(delta) = choice.delta else { continue };
                     if let Some(s) = &delta.reasoning_content {
-                        self.renderer.reasoning_delta(s);
+                        ui.reasoning_delta(s);
                     }
                     if let Some(s) = &delta.content {
-                        self.renderer.content_delta(s);
+                        ui.content_delta(s);
                     }
                     acc.feed(&delta);
                 }
@@ -63,12 +60,12 @@ impl Agent {
                     usage = chunk.usage;
                 }
             }
-            self.renderer.finish_turn();
+            ui.finish_turn();
 
             let msg = acc.finish();
             self.session.append_message(&msg)?;
             if let Some(u) = usage {
-                self.renderer.usage(&u);
+                ui.usage(&u);
             }
 
             let Some(calls) = msg.tool_calls.clone() else {
@@ -78,10 +75,9 @@ impl Agent {
                 break;
             }
             for call in calls {
-                self.renderer
-                    .tool_start(&call.function.name, &call.function.arguments);
+                ui.tool_start(&call.function.name, &call.function.arguments);
                 let out = tools::execute(&call.function.name, &call.function.arguments).await;
-                self.renderer.tool_result(&out);
+                ui.tool_result(&out);
                 self.session.append_message(&Message::tool(&call.id, out))?;
             }
             // 工具结果已入历史，继续子请求让模型消化
@@ -171,7 +167,6 @@ mod tests {
         let agent = Agent {
             api: Client::new("k".into(), crate::config::BASE_URL.into()).unwrap(),
             session: s,
-            renderer: Renderer::new(),
         };
         let req = agent.build_request();
         assert_eq!(req.messages.len(), 2);
@@ -208,7 +203,15 @@ mod tests {
 
         let dir = tmpdir();
         let mut agent = test_agent(&server, &dir);
-        agent.turn("用工具打个标记").await.unwrap();
+        let mut ui = Renderer::new();
+        agent.turn("用工具打个标记", &mut ui).await.unwrap();
+
+        // usage 必须喂给调用方持有的渲染器，否则状态栏缓存统计永远不更新
+        assert_eq!(
+            ui.stats(),
+            crate::ui::CacheStats { hit: 12, miss: 18 },
+            "两个子请求的 hit/miss 应累计到同一渲染器"
+        );
 
         // 会话历史：user / assistant(思维链+tool_calls) / tool(执行结果) / assistant
         assert_eq!(agent.session.messages.len(), 4);
@@ -287,7 +290,8 @@ mod tests {
 
         let dir = tmpdir();
         let mut agent = test_agent(&server, &dir);
-        agent.turn("写个文件").await.unwrap();
+        let mut ui = Renderer::new();
+        agent.turn("写个文件", &mut ui).await.unwrap();
 
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "written by mock");
         let tool_msg = &agent.session.messages[2];
@@ -319,7 +323,8 @@ mod tests {
 
         let dir = tmpdir();
         let mut agent = test_agent(&server, &dir);
-        let err = agent.turn("hi").await.unwrap_err();
+        let mut ui = Renderer::new();
+        let err = agent.turn("hi", &mut ui).await.unwrap_err();
         let s = format!("{err:#}");
         assert!(s.contains("400"), "错误信息应含状态码: {s}");
         assert!(
@@ -340,7 +345,8 @@ mod tests {
 
         let dir = tmpdir();
         let mut agent = test_agent(&server, &dir);
-        let err = agent.turn("hi").await.unwrap_err();
+        let mut ui = Renderer::new();
+        let err = agent.turn("hi", &mut ui).await.unwrap_err();
         assert!(format!("{err:#}").contains("解析 SSE chunk 失败"));
         std::fs::remove_dir_all(&dir).unwrap();
     }

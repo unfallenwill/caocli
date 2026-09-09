@@ -9,6 +9,7 @@ mod ui;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers};
 
 use crate::agent::Agent;
 use crate::api::Client;
@@ -72,6 +73,12 @@ fn apply_overrides(meta: &mut SessionMeta, cli: &Cli) -> bool {
     changed
 }
 
+/// Ctrl-J 插入换行而不是提交，用于多行输入；Enter 仍然提交整段。
+/// rustyline 默认把 Ctrl-J 和 Enter 都绑到 AcceptOrInsertLine，这里覆盖 Ctrl-J。
+fn enable_multiline(rl: &mut rustyline::DefaultEditor) {
+    let _ = rl.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
+}
+
 async fn run(cli: Cli) -> Result<()> {
     let mut ui = Renderer::new();
     let sdir = config::sessions_dir()?;
@@ -129,7 +136,7 @@ async fn run(cli: Cli) -> Result<()> {
                 .map(|e| format!("({e})"))
                 .unwrap_or_default()
         ));
-        if let Err(e) = agent.turn(prompt).await {
+        if let Err(e) = agent.turn(prompt, &mut ui).await {
             ui.error(&format!("{e:#}"));
             std::process::exit(1);
         }
@@ -138,6 +145,7 @@ async fn run(cli: Cli) -> Result<()> {
 
     // REPL
     let mut rl = rustyline::DefaultEditor::new()?;
+    enable_multiline(&mut rl);
     let hist_path = config::history_file()?;
     let _ = rl.load_history(&hist_path);
 
@@ -154,6 +162,10 @@ async fn run(cli: Cli) -> Result<()> {
         agent.session.path.display(),
         agent.session.meta.model
     ));
+    // 恢复的会话把历史回放到屏幕，否则只有提示行、看不到上下文
+    if !agent.session.messages.is_empty() {
+        ui.replay(&agent.session.messages);
+    }
 
     loop {
         // 每轮输入前同步状态栏（顺带处理窗口缩放）
@@ -193,6 +205,7 @@ async fn run(cli: Cli) -> Result<()> {
                                     s.id,
                                     s.messages.len()
                                 ));
+                                ui.replay(&s.messages);
                                 agent.session = s;
                                 ui.reset_stats();
                             }
@@ -201,7 +214,7 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                     _ if line.starts_with('/') => ui.info("未知命令，/help 查看可用命令"),
                     _ => {
-                        if let Err(e) = agent.turn(line).await {
+                        if let Err(e) = agent.turn(line, &mut ui).await {
                             ui.error(&format!("{e:#}"));
                         }
                     }
@@ -225,7 +238,7 @@ fn print_help() {
 }
 
 fn help_text() -> String {
-    "命令:\n  /exit /quit /q   退出\n  /new             开新会话\n  /sessions        列出会话\n  /resume <id>     切换到指定会话\n启动参数:\n  -c / --continue  继续最近会话\n  --resume <id>    恢复指定会话\n  --no-think --effort low|high|max --model <id>\n  -p \"prompt\"     单次执行后退出"
+    "命令:\n  /exit /quit /q   退出\n  /new             开新会话\n  /sessions        列出会话\n  /resume <id>     切换到指定会话\n输入:\n  Enter            提交\n  Ctrl-J           换行（多行输入）\n启动参数:\n  -c / --continue  继续最近会话\n  --resume <id>    恢复指定会话\n  --no-think --effort low|high|max --model <id>\n  -p \"prompt\"     单次执行后退出"
         .to_string()
 }
 
@@ -334,8 +347,19 @@ mod tests {
             "-c / --continue",
             "--no-think",
             "-p \"prompt\"",
+            "Ctrl-J",
         ] {
             assert!(t.contains(expected), "缺少 {expected:?}\n{t}");
         }
+    }
+
+    #[test]
+    fn ctrl_j_is_bound_to_newline() {
+        let mut rl = rustyline::DefaultEditor::new().unwrap();
+        enable_multiline(&mut rl);
+        // 已绑定的键再绑一次会返回旧处理器：证明 Ctrl-J 确实被占用，
+        // 否则它仍走默认的 AcceptOrInsertLine（Enter 语义，无法换行）。
+        let prev = rl.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
+        assert!(prev.is_some());
     }
 }

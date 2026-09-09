@@ -24,7 +24,7 @@
 | `src/tools/fs.rs` | `Read`/`Edit`/`Write`（UTF-8 文本，Edit 要求 old_string 唯一匹配，写回 tmp+rename 原子替换） |
 | `src/session.rs` | JSONL append-only 会话存储 |
 | `src/api.rs` | HTTP + SSE 解析（`parse_sse_line`/`take_line` 纯函数可测） |
-| `src/ui.rs` | 终端渲染（思维链 DIM 灰色，工具调用黄色，块间空行分隔）+ 底部状态栏（`StatusBar` 占最后一行，滚动区域 1..rows-1） |
+| `src/ui.rs` | 终端渲染（思维链 DIM 灰色，工具调用黄色，块间空行分隔）+ `replay()` 历史回放 + 底部状态栏（`StatusBar` 占最后一行，滚动区域 1..rows-1） |
 | `src/agent.rs` | 核心循环：请求→渲染→tool_calls→执行工具→继续 |
 | `src/cli.rs` | clap 参数 |
 | `src/main.rs` | REPL / `-p` 单次模式 / 会话解析 |
@@ -72,9 +72,12 @@
 
 ## 行为约定
 
+- REPL 输入：`Enter` 提交，`Ctrl-J` 插入换行（多行输入，`enable_multiline` 覆盖 rustyline 默认的 `AcceptOrInsertLine` 绑定）；`Shift-Enter` 无效（终端发同一个字节）。改键位后必须用 pty 冒烟：`( sleep 3; printf '/help\x0aX\r/exit\r' ) | script -qec "stty rows 24 cols 80; DEEPSEEK_API_KEY=x cargo run -q" /dev/null | cat -v`——看到「未知命令」说明 Ctrl-J 换行生效，看到 `/help` 帮助文本说明没生效
 - 工具执行不 y/N 确认（本机信任模型），但必须回显命令
 - 状态栏只在 REPL + TTY（`rows >= 3`）启用；`--no-status-bar` 关闭。退出路径必须 `ui.teardown()` 复位滚动区域，否则终端会残留滚动区域
 - 状态栏统计是**进程内、会话级**累加（切换会话 `ui.reset_stats()`）；会话文件不存 hit/miss，恢复会话从 0 起算
+- 恢复会话（`-c` / `--resume` / `/resume`）必须调用 `ui.replay(&messages)` 把历史回放到屏幕，否则只有提示行、看不到上下文；回放只给 tool 结果摘要（与实时渲染一致），system 消息不在会话文件里（`SYSTEM_PROMPT` 是编译期常量，请求时才拼）
+- **全进程只有一个 `Renderer`**：`main` 持有，`Agent::turn(&mut ui)` 借用。禁止让 `Agent` 自建 `Renderer`——`usage()` 会把 hit/miss 记到另一个没建栏的实例上，状态栏永远停在 `cache —`（已有测试钉住 `turn` 必须把 usage 写进传入的 renderer）
 - 改 `StatusBar` 的转义序列后，用 pty 冒烟验证：`printf '/exit\n' | script -qec "stty rows 24 cols 80; DEEPSEEK_API_KEY=x cargo run -q" /dev/null | cat -v`
 - 工具输出截断 10KB（stdout/stderr 各自），截断须落在 UTF-8 字符边界
 - `-p` 模式是 agent 自测主通道：改完代码先 `cargo test`，再跑一次 `-p` 冒烟

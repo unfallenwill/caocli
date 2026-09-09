@@ -36,8 +36,17 @@ cargo run -- --list                     # list sessions and exit
 | `/help` | Show available commands |
 | `/new` | Start a new session, inheriting the current model/thinking settings |
 | `/sessions` | List sessions (id, message count, last user message preview) |
-| `/resume <id>` | Switch to an existing session |
+| `/resume <id>` | Switch to an existing session, replaying its history to the screen |
 | `/exit`, `/quit`, `/q` | Quit |
+
+### Multi-line input
+
+`Enter` submits; `Ctrl-J` inserts a newline, so the whole buffer is sent as
+one prompt. Note that once the buffer spans lines, `Enter` only submits when
+the cursor sits at the end of the input — elsewhere it inserts a newline.
+`Shift-Enter` is not supported: most terminals send the same byte as `Enter`,
+and rustyline 18 does not parse CSI-u key reports. Pasting text that contains
+newlines also works (bracketed paste).
 
 ### CLI flags
 
@@ -54,7 +63,10 @@ cargo run -- --list                     # list sessions and exit
 | `-h, --help` / `-V, --version` | Print help / version |
 
 With no `-p`, caocli starts a REPL. CLI flags override the settings stored
-in a resumed session only when explicitly provided.
+in a resumed session only when explicitly provided. Resuming a session
+(`-c`, `--resume`, `/resume`) replays the stored history to the screen: user
+messages with a `›` prefix, assistant reasoning dimmed, tool calls and tool
+result summaries as they were rendered live (full tool output is not replayed).
 
 ### Status bar
 
