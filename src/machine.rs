@@ -20,6 +20,62 @@ use std::collections::HashSet;
 
 use crate::types::{Message, Role, ToolCall};
 
+// ============================================================================
+// 历史合法性规范（可执行形式）。
+// "发给后端的请求历史必须满足什么"从此以这里为权威定义：
+//   is_request_valid = windows_complete ∧ no_stray_tools
+// 不满足的形状会被 DeepSeek/GLM 直接 400。`heal` 与请求构造都以它为
+// 目标不变量；下方测试用有界全形状族穷举钉住「崩溃点自愈必合法」。
+// ============================================================================
+
+/// 每条带 tool_calls 的 assistant：其后的 tool 结果窗口与声明一一对应
+/// （数量相等、id 集合相同）。
+pub fn windows_complete(messages: &[Message]) -> bool {
+    for (i, m) in messages.iter().enumerate() {
+        let Some(calls) = &m.tool_calls else { continue };
+        let mut j = i + 1;
+        while j < messages.len() && messages[j].role == Role::Tool {
+            j += 1;
+        }
+        let window = &messages[i + 1..j];
+        if window.len() != calls.len() {
+            return false;
+        }
+        let declared: HashSet<&str> = calls.iter().map(|c| c.id.as_str()).collect();
+        let answered: HashSet<&str> = window
+            .iter()
+            .filter_map(|t| t.tool_call_id.as_deref())
+            .collect();
+        if declared != answered {
+            return false;
+        }
+    }
+    true
+}
+
+/// 所有 tool 结果都落在某个带（非空）调用的 assistant 的结果窗口内，无野结果。
+pub fn no_stray_tools(messages: &[Message]) -> bool {
+    let mut under_calls = false;
+    for m in messages {
+        match m.role {
+            Role::Tool => {
+                if !under_calls {
+                    return false;
+                }
+            }
+            _ => {
+                under_calls = m.tool_calls.as_deref().is_some_and(|c| !c.is_empty());
+            }
+        }
+    }
+    true
+}
+
+/// 请求历史合法性。请求构造处有 debug tripwire 强制；heal 的目标不变量。
+pub fn is_request_valid(messages: &[Message]) -> bool {
+    windows_complete(messages) && no_stray_tools(messages)
+}
+
 /// 崩溃自愈为未执行的工具调用合成的占位结果。必须是确定性常量：
 /// 同一份日志每次 load 都要合成出逐字节相同的历史（前缀缓存依赖）。
 pub const INTERRUPTED_RESULT: &str = "error: interrupted before execution; no result was recorded";
@@ -99,10 +155,13 @@ pub fn heal(messages: &mut Vec<Message>) -> usize {
             .map(|c| c.id.clone())
             .collect();
         for (n, id) in missing.iter().enumerate() {
-            messages.insert(j + inserted + n, Message::tool(id, INTERRUPTED_RESULT));
+            // j 已是当前向量的坐标：同一窗口内逐个追加只需 + n。
+            // 不得混入跨窗口的累计插入数——那会让第二个窗口越界。
+            messages.insert(j + n, Message::tool(id, INTERRUPTED_RESULT));
         }
         inserted += missing.len();
-        i = j + inserted;
+        // 跳过整个窗口（含新插入的占位结果）
+        i = j + missing.len();
     }
     inserted
 }
@@ -279,6 +338,146 @@ mod tests {
         let once = msgs.clone();
         assert_eq!(heal(&mut msgs), 0, "第二次自愈不得再插入");
         assert_eq!(msgs, once, "第二次自愈不得改动任何消息");
+    }
+
+    /// 可执行规范自身的定向用例：接受健康形状，拒绝已知会被 400 的形状。
+    #[test]
+    fn spec_predicate_directed_cases() {
+        let ok = |msgs: &[Message]| assert!(is_request_valid(msgs), "应为合法: {msgs:?}");
+        let bad = |msgs: &[Message]| assert!(!is_request_valid(msgs), "应非法: {msgs:?}");
+
+        ok(&[]);
+        ok(&[Message::user("q"), assistant(vec![]), Message::user("再问")]);
+        ok(&[
+            Message::user("q"),
+            assistant(vec![call("a"), call("b")]),
+            Message::tool("a", "1"),
+            Message::tool("b", "2"),
+        ]);
+        ok(&[
+            assistant(vec![call("a")]),
+            Message::tool("a", "1"),
+            Message::user("下一轮"),
+            assistant(vec![call("b")]),
+            Message::tool("b", "2"),
+        ]);
+        // 孤儿声明（崩溃形态）：结果缺失
+        bad(&[Message::user("q"), assistant(vec![call("a")])]);
+        // 野结果：前面没有带调用的 assistant
+        bad(&[Message::user("q"), Message::tool("a", "1")]);
+        bad(&[assistant(vec![]), Message::tool("a", "1")]);
+        // 重复结果
+        bad(&[
+            assistant(vec![call("a")]),
+            Message::tool("a", "1"),
+            Message::tool("a", "2"),
+        ]);
+        // id 对不上
+        bad(&[assistant(vec![call("a")]), Message::tool("b", "1")]);
+        // 窗口已被非 tool 消息关闭，结果迟到
+        bad(&[
+            assistant(vec![call("a")]),
+            Message::user("x"),
+            Message::tool("a", "1"),
+        ]);
+    }
+
+    /// 有界穷举族：长度 ≤ 5、字母表 7 种消息（User；Assistant ∅/{a}/{b}/{a,b}；
+    /// Tool(a)/Tool(b)）的全部 7^0+…+7^5 = 19608 个序列。
+    fn bounded_family() -> Vec<Vec<Message>> {
+        fn kind(d: u32) -> Message {
+            match d {
+                0 => Message::user("q"),
+                1 => assistant(vec![]),
+                2 => assistant(vec![call("a")]),
+                3 => assistant(vec![call("b")]),
+                4 => assistant(vec![call("a"), call("b")]),
+                5 => Message::tool("a", "ok"),
+                _ => Message::tool("b", "ok"),
+            }
+        }
+        let mut out = Vec::new();
+        for len in 0..=5u32 {
+            for code in 0..7u32.pow(len) {
+                let mut seq = Vec::with_capacity(len as usize);
+                let mut c = code;
+                for _ in 0..len {
+                    seq.push(kind(c % 7));
+                    c /= 7;
+                }
+                out.push(seq);
+            }
+        }
+        out
+    }
+
+    /// 定理 A（有界穷举 · 全族 19608 形状）：任意历史经 heal 后，每个声明
+    /// 的调用都在其结果窗口内得到应答（declared ⊆ answered）。
+    /// 注意 heal 只补缺、不去重：完整合法性属于定理 B 的崩溃可达族——
+    /// 这个定理边界本身就是规范的一部分。
+    #[test]
+    fn theorem_a_heal_answers_every_declared_call_exhaustive() {
+        for mut seq in bounded_family() {
+            heal(&mut seq);
+            for (i, m) in seq.iter().enumerate() {
+                let Some(calls) = &m.tool_calls else { continue };
+                let mut j = i + 1;
+                while j < seq.len() && seq[j].role == Role::Tool {
+                    j += 1;
+                }
+                let answered: HashSet<&str> = seq[i + 1..j]
+                    .iter()
+                    .filter_map(|t| t.tool_call_id.as_deref())
+                    .collect();
+                for c in calls {
+                    assert!(
+                        answered.contains(c.id.as_str()),
+                        "heal 后仍有未应答调用 {c:?}，形状: {seq:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 定理 B（有界穷举 · 崩溃可达族）：合法历史的每个前缀 = 进程可停在
+    /// 的每个崩溃点。全部前缀经 heal 后必须满足可执行规范。
+    /// 这把「六个崩溃点各有恢复路径」的人工枚举升级为机械检查。
+    #[test]
+    fn theorem_b_every_crash_prefix_of_valid_history_recovers() {
+        let mut checked = 0usize;
+        for seq in bounded_family() {
+            if !is_request_valid(&seq) {
+                continue;
+            }
+            for cut in 0..=seq.len() {
+                let mut prefix = seq[..cut].to_vec();
+                heal(&mut prefix);
+                assert!(
+                    is_request_valid(&prefix),
+                    "截断点 {cut}/{} 自愈后仍非法: {prefix:?}（原序列 {seq:?}）",
+                    seq.len()
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 1000, "穷举族意外缩水：仅 {checked} 个前缀");
+    }
+
+    /// 回归：多个窗口同时缺结果时，插入坐标必须逐窗口局部。
+    /// 此形状曾使 heal 越界 panic（insertion index out of bounds）——
+    /// 由定理 A 的穷举率先暴露。
+    #[test]
+    fn heal_two_deficient_windows_inserts_locally() {
+        let mut msgs = vec![
+            assistant(vec![call("a")]),
+            assistant(vec![call("b")]),
+            Message::tool("b", "ok"),
+        ];
+        assert_eq!(heal(&mut msgs), 1);
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[1].tool_call_id.as_deref(), Some("a"));
+        assert_eq!(msgs[3].tool_call_id.as_deref(), Some("b"));
+        assert!(is_request_valid(&msgs));
     }
 
     #[test]

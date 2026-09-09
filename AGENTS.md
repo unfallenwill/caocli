@@ -54,6 +54,7 @@ cargo llvm-cov --fail-under-lines 90   # 行覆盖率门禁
 以官方文档为准（thinking_mode、kv_cache 指南）。最容易被踩的两条：
 
 - **请求带 `tools` 时，历史 assistant 消息的 `reasoning_content` 必须原样回传（DeepSeek 缺失即 400）。**
+- **历史合法性有可执行规范**：`machine::is_request_valid`（每个声明的调用在紧随窗口内恰好一个结果；无野 tool 结果）。`heal` 与请求构造都以它为目标不变量；其测试用有界全形状族（19608 形状）穷举钉住「任意崩溃前缀自愈后必合法」。改 heal/请求构造前先跑这两个定理测试。
 - 流式响应中，思考内容先于正文；token 用量附在最后一个内容块上，没有独立用量事件。
 
 ## 工作方式

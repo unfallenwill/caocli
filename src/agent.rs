@@ -33,6 +33,12 @@ impl Agent {
         let mut messages = Vec::with_capacity(self.session.messages.len() + 1);
         messages.push(Message::system(SYSTEM_PROMPT));
         messages.extend(self.session.messages.iter().cloned());
+        // 规范 tripwire（仅 debug 构建）：发出去的历史必须满足可执行规范，
+        // 违反即后端 400 的形状——开发期拦住，而不是等线上。
+        debug_assert!(
+            machine::is_request_valid(&messages),
+            "请求历史违反 tool_calls 窗口规范: {messages:?}"
+        );
         ChatRequest {
             model: self.session.meta.model.clone(),
             messages,

@@ -151,7 +151,10 @@ Limits: 10 KiB of output per tool result, 10 MB per file read/write.
   message with `tool_calls` and its tool results would otherwise produce an
   invalid request on resume. `Session::load` synthesizes deterministic
   placeholder results for the interrupted calls — in memory only; the file is
-  never rewritten, and re-loading recomputes the same view byte-for-byte.
+  never rewritten, and re-loading recomputes the same view byte-for-byte. The
+  validity spec itself is executable (`machine::is_request_valid`), and
+  bounded-exhaustive checks pin that every prefix of a valid history heals
+  back to a valid one.
 - **Prefix-cache friendly.** `SYSTEM_PROMPT` is a compile-time constant and
   history is replayed byte-for-byte — no trimming, reordering, or
   compaction. Injecting volatile data (time, cwd) or changing the tool set
