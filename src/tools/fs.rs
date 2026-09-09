@@ -14,8 +14,10 @@ pub fn read_definition() -> ToolDef {
         function: FunctionDef {
             name: READ_NAME.into(),
             description: Some(
-                "读取本地文本文件的完整内容。修改文件前应先用本工具确认原文。\
-                 超大文件会被截断，可用 Bash 分段读取剩余部分。"
+                "读取一个文本文件的完整内容。修改文件前应先用本工具确认原文。\
+                 仅支持 UTF-8 文本：目录会报错，二进制文件会被解码成乱码而不报错。\
+                 超过 10240 字节会按字节截断并提示，文件超过 10MB 直接报错；\
+                 两种情况都请改用 Bash 分段读取，如 sed -n '100,200p'。"
                     .into(),
             ),
             parameters: Some(json!({
@@ -36,8 +38,11 @@ pub fn edit_definition() -> ToolDef {
             name: EDIT_NAME.into(),
             description: Some(
                 "对已有文件做精确字符串替换（old_string -> new_string）。\
-                 old_string 必须在文件中唯一出现，未找到或出现多次都会报错；\
-                 报错时请用 Read 查看原文，补充上下文使其唯一后重试。"
+                 不能创建新文件；新建或整文件重写请用 Write。\
+                 old_string 必须与文件内容逐字符完全一致，包括缩进、tab 与空格的差异、换行符——\
+                 差一个字符就会报「未找到」，缩进不确定时先用 Read 查看原文。\
+                 old_string 必须在文件中唯一出现（0 次或多次都报错），一次只替换这一处，\
+                 多处修改需多次调用。old_string 不能为空；new_string 为空字符串表示删除匹配内容。"
                     .into(),
             ),
             parameters: Some(json!({
@@ -59,8 +64,10 @@ pub fn write_definition() -> ToolDef {
         function: FunctionDef {
             name: WRITE_NAME.into(),
             description: Some(
-                "新建文件或整文件覆盖写入。父目录不存在会自动创建。\
-                 已有文件会被完全覆盖；修改已有文件请优先用 Edit。"
+                "新建文件或整文件覆盖写入，父目录不存在会自动创建。\
+                 已有文件会被完全覆盖且不可恢复，覆盖前请先用 Read 确认；\
+                 仅用于新建或整体重写，对已有文件做局部修改请用 Edit。\
+                 content 超过 10MB 会被拒绝。"
                     .into(),
             ),
             parameters: Some(json!({

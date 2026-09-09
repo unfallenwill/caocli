@@ -13,8 +13,15 @@ pub fn definition() -> ToolDef {
         function: FunctionDef {
             name: NAME.into(),
             description: Some(
-                "在本地机器上用 bash 执行一条 shell 命令，返回 exit code、stdout、stderr。\
-                 用于查看文件、运行程序、修改系统状态等。超时 120 秒会被强制终止。"
+                "在本地机器上执行一条 bash 命令，返回 exit_code、stdout、stderr（三者分开返回）。\
+                 每次调用都是全新的 shell：工作目录和环境变量不会保留，\
+                 需要特定目录时请在同一条命令里写 cd /abs/path && ...，并优先用绝对路径。\
+                 适用：运行程序、构建、测试、git、目录操作、批量文本处理。\
+                 不适用：读文本文件用 Read，改已有文件用 Edit，新建或整文件重写用 Write；\
+                 不要用 cat/sed -i/tee 代替它们。\
+                 stdout/stderr 各超过 10240 字节会被截断并标记 [已截断]，\
+                 请用 head/tail/grep/wc 主动收窄输出。\
+                 不要执行交互式或常驻命令（vim、top、裸 read 等），会阻塞至 120 秒超时被杀且输出丢失。"
                     .into(),
             ),
             parameters: Some(json!({
