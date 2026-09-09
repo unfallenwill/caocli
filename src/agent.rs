@@ -32,7 +32,7 @@ impl Agent {
         ChatRequest {
             model: self.session.meta.model.clone(),
             messages,
-            tools: Some(vec![tools::definition()]),
+            tools: Some(tools::definitions()),
             tool_choice: Some("auto".into()),
             stream: true,
             thinking: Some(self.session.meta.thinking.clone()),
@@ -80,7 +80,7 @@ impl Agent {
             for call in calls {
                 self.renderer
                     .tool_start(&call.function.name, &call.function.arguments);
-                let out = tools::execute(&call.function.arguments).await;
+                let out = tools::execute(&call.function.name, &call.function.arguments).await;
                 self.renderer.tool_result(&out);
                 self.session.append_message(&Message::tool(&call.id, out))?;
             }
@@ -259,6 +259,51 @@ mod tests {
         assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["tools"][0]["function"]["name"], "run_shell");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 端到端：Write 工具分派 —— 模型调用 Write，文件真的被创建，且
+    /// 第二轮请求携带全部四个工具定义。
+    #[tokio::test]
+    async fn mock_write_tool_creates_file() {
+        let server = MockServer::start().await;
+        let file_dir = tmpdir();
+        let target = file_dir.join("written.txt");
+        let args = json!({"file_path": target.to_string_lossy(), "content": "written by mock"})
+            .to_string();
+        let turn1 = [
+            sse(json!({"tool_calls":[{"index":0,"id":"call_w1","type":"function","function":{"name":"Write","arguments":args}}]}), None, None),
+            sse(json!({"content":""}), Some("tool_calls"), None),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let turn2 = [
+            sse(json!({"content":"文件已创建。"}), None, None),
+            sse(json!({"content":""}), Some("stop"), None),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        mount_chat(&server, turn1, Some(1)).await;
+        mount_chat(&server, turn2, None).await;
+
+        let dir = tmpdir();
+        let mut agent = test_agent(&server, &dir);
+        agent.turn("写个文件").await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "written by mock");
+        let tool_msg = &agent.session.messages[2];
+        assert!(tool_msg.content.as_deref().unwrap().starts_with("ok:"));
+
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[1].body).unwrap();
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["run_shell", "Read", "Edit", "Write"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&file_dir).unwrap();
     }
 
     /// HTTP 错误必须带状态码和响应体，且不破坏已落盘的会话。

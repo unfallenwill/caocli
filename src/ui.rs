@@ -97,13 +97,18 @@ impl Renderer {
 
     /// 工具调用回显：黄色工具名 + 提取出的 shell 命令。
     pub fn tool_start(&mut self, name: &str, args: &str) {
-        let cmd = serde_json::from_str::<serde_json::Value>(args)
+        let hint = serde_json::from_str::<serde_json::Value>(args)
             .ok()
-            .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_owned))
+            .and_then(|v| {
+                v.get("command")
+                    .or_else(|| v.get("file_path"))
+                    .and_then(|c| c.as_str())
+                    .map(str::to_owned)
+            })
             .unwrap_or_else(|| args.chars().take(80).collect());
         self.raw(&format!(
             "\n{}",
-            self.paint(YELLOW, &format!("▸ {name} {cmd}"))
+            self.paint(YELLOW, &format!("▸ {name} {hint}"))
         ));
         self.raw("\n");
     }

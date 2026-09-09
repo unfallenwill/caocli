@@ -18,13 +18,25 @@
 |---|---|
 | `src/types.rs` | API wire 类型（字段名=API 字段名）+ `TurnAccumulator` 流式聚合 |
 | `src/config.rs` | `DEEPSEEK_API_KEY`、`~/.caocli` 路径、默认常量 |
-| `src/tools.rs` | `run_shell` 工具定义与执行（永不返回 Err，错误作为 tool 结果文本回传） |
+| `src/tools/mod.rs` | 工具定义汇总、按名字分派、截断/参数解析公共件 |
+| `src/tools/shell.rs` | `run_shell`（120s 超时，永不返回 Err） |
+| `src/tools/fs.rs` | `Read`/`Edit`/`Write`（UTF-8 文本，Edit 要求 old_string 唯一匹配，写回 tmp+rename 原子替换） |
 | `src/session.rs` | JSONL append-only 会话存储 |
 | `src/api.rs` | HTTP + SSE 解析（`parse_sse_line`/`take_line` 纯函数可测） |
-| `src/ui.rs` | 终端渲染（思维链 DIM 灰色，工具调用黄色） |
-| `src/agent.rs` | 核心循环：请求→渲染→tool_calls→run_shell→继续 |
+| `src/ui.rs` | 终端渲染（思维链 DIM 灰色，工具调用黄色，块间空行分隔） |
+| `src/agent.rs` | 核心循环：请求→渲染→tool_calls→执行工具→继续 |
 | `src/cli.rs` | clap 参数 |
 | `src/main.rs` | REPL / `-p` 单次模式 / 会话解析 |
+
+## 工具
+
+- `run_shell`: bash -c 执行命令，120s 超时，stdout/stderr 各截断 10KB
+- `Read`: 读 UTF-8 文本文件，输出截断 10KB
+- `Edit`: `file_path` + `old_string` + `new_string` 精确替换；old_string 必须唯一，否则报错让模型补上下文；tmp+rename 原子写
+- `Write`: 新建/整文件覆盖，自动建父目录
+- 工具输出上限 10KB/项，单文件读写上限 10MB
+- `definitions()` 顺序固定（run_shell, Read, Edit, Write）：**改变工具集或顺序会改变请求前缀，导致 KVCache 全量 miss（预期行为，但要有意识）**
+- 工具执行结果永远是文本，永不 Err：错误也回传给模型让它自己纠偏
 
 ## DeepSeek API 硬约束（改代码前必读）
 
