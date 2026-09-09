@@ -160,6 +160,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures-util",
+ "libc",
  "reqwest",
  "rustyline",
  "serde",

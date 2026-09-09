@@ -24,7 +24,7 @@
 | `src/tools/fs.rs` | `Read`/`Edit`/`Write`（UTF-8 文本，Edit 要求 old_string 唯一匹配，写回 tmp+rename 原子替换） |
 | `src/session.rs` | JSONL append-only 会话存储 |
 | `src/api.rs` | HTTP + SSE 解析（`parse_sse_line`/`take_line` 纯函数可测） |
-| `src/ui.rs` | 终端渲染（思维链 DIM 灰色，工具调用黄色，块间空行分隔） |
+| `src/ui.rs` | 终端渲染（思维链 DIM 灰色，工具调用黄色，块间空行分隔）+ 底部状态栏（`StatusBar` 占最后一行，滚动区域 1..rows-1） |
 | `src/agent.rs` | 核心循环：请求→渲染→tool_calls→执行工具→继续 |
 | `src/cli.rs` | clap 参数 |
 | `src/main.rs` | REPL / `-p` 单次模式 / 会话解析 |
@@ -73,5 +73,8 @@
 ## 行为约定
 
 - 工具执行不 y/N 确认（本机信任模型），但必须回显命令
+- 状态栏只在 REPL + TTY（`rows >= 3`）启用；`--no-status-bar` 关闭。退出路径必须 `ui.teardown()` 复位滚动区域，否则终端会残留滚动区域
+- 状态栏统计是**进程内、会话级**累加（切换会话 `ui.reset_stats()`）；会话文件不存 hit/miss，恢复会话从 0 起算
+- 改 `StatusBar` 的转义序列后，用 pty 冒烟验证：`printf '/exit\n' | script -qec "stty rows 24 cols 80; DEEPSEEK_API_KEY=x cargo run -q" /dev/null | cat -v`
 - 工具输出截断 10KB（stdout/stderr 各自），截断须落在 UTF-8 字符边界
 - `-p` 模式是 agent 自测主通道：改完代码先 `cargo test`，再跑一次 `-p` 冒烟

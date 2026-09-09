@@ -141,6 +141,11 @@ async fn run(cli: Cli) -> Result<()> {
     let hist_path = config::history_file()?;
     let _ = rl.load_history(&hist_path);
 
+    // 底部状态栏：只在 REPL + TTY 下启用
+    if !cli.no_status_bar {
+        ui.refresh_status_bar();
+    }
+
     // --continue / --resume 恢复后提示来源文件，path 有诊断价值
     ui.info(&format!(
         "caocli · 会话 {}（{} 条历史，{}）· {} · /help 查看命令",
@@ -151,6 +156,10 @@ async fn run(cli: Cli) -> Result<()> {
     ));
 
     loop {
+        // 每轮输入前同步状态栏（顺带处理窗口缩放）
+        if !cli.no_status_bar {
+            ui.refresh_status_bar();
+        }
         match rl.readline("› ") {
             Ok(raw) => {
                 let line = raw.trim();
@@ -170,6 +179,7 @@ async fn run(cli: Cli) -> Result<()> {
                         Ok(s) => {
                             ui.info(&format!("新会话 {}", s.id));
                             agent.session = s;
+                            ui.reset_stats();
                         }
                         Err(e) => ui.error(&format!("{e:#}")),
                     },
@@ -184,6 +194,7 @@ async fn run(cli: Cli) -> Result<()> {
                                     s.messages.len()
                                 ));
                                 agent.session = s;
+                                ui.reset_stats();
                             }
                             Err(e) => ui.error(&format!("{e:#}")),
                         }
@@ -205,6 +216,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
     }
     let _ = rl.save_history(&hist_path);
+    ui.teardown();
     Ok(())
 }
 
@@ -306,6 +318,12 @@ mod tests {
         let meta = fresh_meta(&cli(&["--no-think", "--effort", "low"]));
         assert!(!meta.thinking.is_enabled());
         assert_eq!(meta.reasoning_effort, None);
+    }
+
+    #[test]
+    fn no_status_bar_flag_parses() {
+        assert!(cli(&["--no-status-bar"]).no_status_bar);
+        assert!(!cli(&[]).no_status_bar);
     }
 
     #[test]

@@ -34,4 +34,8 @@ pub struct Cli {
     /// 列出会话后退出
     #[arg(long)]
     pub list: bool,
+
+    /// 关闭 REPL 底部状态栏（缓存命中率）
+    #[arg(long)]
+    pub no_status_bar: bool,
 }

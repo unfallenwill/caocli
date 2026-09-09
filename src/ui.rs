@@ -6,6 +6,123 @@ const DIM: &str = "\x1b[2m";
 const YELLOW: &str = "\x1b[33m";
 const RESET: &str = "\x1b[0m";
 
+/// 会话级缓存统计（状态栏用）。累加本次进程内每个子请求的 hit/miss。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CacheStats {
+    pub hit: u64,
+    pub miss: u64,
+}
+
+impl CacheStats {
+    pub fn record(&mut self, u: &Usage) {
+        self.hit += u.prompt_cache_hit_tokens;
+        self.miss += u.prompt_cache_miss_tokens;
+    }
+
+    /// 命中率百分比；尚无数据时 None。
+    pub fn hit_rate(&self) -> Option<f64> {
+        let total = self.hit + self.miss;
+        (total > 0).then(|| self.hit as f64 * 100.0 / total as f64)
+    }
+
+    /// 状态栏文本（不含左填充）。
+    pub fn label(&self) -> String {
+        match self.hit_rate() {
+            Some(rate) => format!("cache {rate:.1}% · hit {} · miss {}", self.hit, self.miss),
+            None => "cache —".to_string(),
+        }
+    }
+}
+
+/// 终端尺寸（行, 列）。非 unix 或 ioctl 失败时 None。
+#[cfg(unix)]
+fn terminal_size() -> Option<(u16, u16)> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: STDOUT_FILENO 是有效 fd，ws 是 TIOCGWINSZ 要求的 winsize 布局
+    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    (rc == 0 && ws.ws_row > 0 && ws.ws_col > 0).then_some((ws.ws_row, ws.ws_col))
+}
+
+#[cfg(not(unix))]
+fn terminal_size() -> Option<(u16, u16)> {
+    None
+}
+
+/// 底部固定状态栏：占用终端最后一行，滚动区域限制为 1..rows-1，
+/// 所以输出滚动不会把状态栏顶掉。
+/// 代价：滚动区域内的行滚出屏幕后不进终端回滚缓冲（历史需靠会话文件）。
+/// 用 `--no-status-bar` 或非 TTY 时完全不启用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatusBar {
+    rows: u16,
+    cols: u16,
+}
+
+impl StatusBar {
+    /// 至少 3 行才启用：最后一行状态栏 + 至少一行输出区 + 一行余量。
+    const MIN_ROWS: u16 = 3;
+
+    /// `tty=false` 或 TERM=dumb 时直接放弃，不发 ioctl。
+    fn detect(tty: bool) -> Option<Self> {
+        if !tty || std::env::var("TERM").is_ok_and(|t| t == "dumb") {
+            return None;
+        }
+        Self::from_size(terminal_size())
+    }
+
+    fn from_size(size: Option<(u16, u16)>) -> Option<Self> {
+        match size {
+            Some((rows, cols)) if rows >= Self::MIN_ROWS && cols > 1 => Some(Self { rows, cols }),
+            _ => None,
+        }
+    }
+
+    /// 可用宽度：留出最后一列，避免在末列写字触发自动换行。
+    fn width(&self) -> usize {
+        self.cols as usize - 1
+    }
+
+    /// 设滚动区域 → 光标移到区域底部。
+    fn setup(&self, out: &mut dyn Write) {
+        let _ = write!(
+            out,
+            "\x1b[{};1H\x1b[2K\x1b[1;{}r\x1b[{};1H",
+            self.rows,
+            self.rows - 1,
+            self.rows - 1
+        );
+        let _ = out.flush();
+    }
+
+    /// 复位滚动区域 → 清掉状态栏行 → 换行，让 shell 提示符落在干净行。
+    fn teardown(&self, out: &mut dyn Write) {
+        let _ = write!(out, "\x1b[r\x1b[{};1H\x1b[2K\r\n", self.rows);
+        let _ = out.flush();
+    }
+
+    /// 右对齐重绘：保存光标 → 清行 → 写填充+文本 → 恢复光标。
+    /// `visible` 用于算宽度（不含色码），`painted` 是实际写出的内容。
+    fn render(&self, out: &mut dyn Write, visible: &str, painted: &str) {
+        let pad = self.width().saturating_sub(visible.chars().count());
+        let _ = write!(
+            out,
+            "\x1b7\x1b[{};1H\x1b[2K{}{}\x1b8",
+            self.rows,
+            " ".repeat(pad),
+            painted
+        );
+        let _ = out.flush();
+    }
+}
+
+/// 按字符数截断，保证不会写超出状态栏宽度。
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    s.chars().take(max).collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Mode {
     Idle,
@@ -21,6 +138,8 @@ pub struct Renderer {
     out: Box<dyn Write>,
     color: bool,
     mode: Mode,
+    stats: CacheStats,
+    bar: Option<StatusBar>,
 }
 
 impl Renderer {
@@ -30,6 +149,8 @@ impl Renderer {
             out: Box::new(std::io::stdout()),
             color,
             mode: Mode::Idle,
+            stats: CacheStats::default(),
+            bar: None,
         }
     }
 
@@ -40,8 +161,60 @@ impl Renderer {
             out: Box::new(SharedBuf(buf.clone())),
             color,
             mode: Mode::Idle,
+            stats: CacheStats::default(),
+            bar: None,
         };
         (r, buf)
+    }
+
+    /// 按当前终端尺寸同步状态栏：REPL 启动时和每轮输入前调用，
+    /// 顺带处理窗口缩放（尺寸变了就拆了重建）。
+    pub fn refresh_status_bar(&mut self) {
+        let current = StatusBar::detect(std::io::stdout().is_terminal());
+        self.apply_status_bar(current);
+    }
+
+    fn apply_status_bar(&mut self, current: Option<StatusBar>) {
+        match (self.bar, current) {
+            (None, None) => {}
+            (None, Some(bar)) => {
+                bar.setup(self.out.as_mut());
+                self.bar = Some(bar);
+                self.redraw_status_bar();
+            }
+            (Some(old), None) => {
+                old.teardown(self.out.as_mut());
+                self.bar = None;
+            }
+            (Some(old), Some(bar)) if old == bar => self.redraw_status_bar(),
+            (Some(old), Some(bar)) => {
+                old.teardown(self.out.as_mut());
+                bar.setup(self.out.as_mut());
+                self.bar = Some(bar);
+                self.redraw_status_bar();
+            }
+        }
+    }
+
+    /// 重绘状态栏（不重新探测尺寸）。
+    fn redraw_status_bar(&mut self) {
+        let Some(bar) = self.bar else { return };
+        let visible = truncate_chars(&self.stats.label(), bar.width());
+        let painted = self.paint(DIM, &visible);
+        bar.render(self.out.as_mut(), &visible, &painted);
+    }
+
+    /// 切换会话时清零缓存统计。
+    pub fn reset_stats(&mut self) {
+        self.stats = CacheStats::default();
+        self.redraw_status_bar();
+    }
+
+    /// 退出前还原终端（复位滚动区域、清掉状态栏行）。幂等。
+    pub fn teardown(&mut self) {
+        if let Some(bar) = self.bar.take() {
+            bar.teardown(self.out.as_mut());
+        }
     }
 
     fn raw(&mut self, s: &str) {
@@ -132,6 +305,8 @@ impl Renderer {
         );
         self.raw(&self.paint(DIM, &s));
         self.raw("\n");
+        self.stats.record(u);
+        self.redraw_status_bar();
     }
 
     pub fn info(&mut self, s: &str) {
@@ -291,5 +466,169 @@ mod tests {
             String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
             "plain\n"
         );
+    }
+
+    fn usage_fixture(hit: u64, miss: u64) -> Usage {
+        Usage {
+            prompt_tokens: hit + miss,
+            completion_tokens: 0,
+            total_tokens: hit + miss,
+            prompt_cache_hit_tokens: hit,
+            prompt_cache_miss_tokens: miss,
+        }
+    }
+
+    fn buf_of(buf: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(buf.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn cache_stats_accumulate_and_label() {
+        let mut s = CacheStats::default();
+        assert_eq!(s.hit_rate(), None);
+        assert_eq!(s.label(), "cache —");
+        s.record(&usage_fixture(6, 4));
+        s.record(&usage_fixture(32378, 457));
+        assert_eq!((s.hit, s.miss), (32384, 461));
+        assert!((s.hit_rate().unwrap() - 98.6).abs() < 0.05, "{s:?}");
+        assert_eq!(s.label(), "cache 98.6% · hit 32384 · miss 461");
+    }
+
+    #[test]
+    fn status_bar_from_size_guards() {
+        assert_eq!(StatusBar::from_size(None), None);
+        assert_eq!(StatusBar::from_size(Some((2, 80))), None); // 行数不足
+        assert_eq!(StatusBar::from_size(Some((24, 1))), None); // 宽度不足
+        assert_eq!(
+            StatusBar::from_size(Some((24, 80))),
+            Some(StatusBar { rows: 24, cols: 80 })
+        );
+    }
+
+    #[test]
+    fn status_bar_detect_rejects_non_tty() {
+        assert_eq!(StatusBar::detect(false), None);
+    }
+
+    #[test]
+    fn truncate_chars_keeps_char_boundaries() {
+        assert_eq!(truncate_chars("abc", 5), "abc");
+        assert_eq!(truncate_chars("abcd", 2), "ab");
+        assert_eq!(truncate_chars("命中率", 2), "命中"); // 多字节不切坏
+    }
+
+    #[test]
+    fn status_bar_setup_teardown_sequences() {
+        let bar = StatusBar { rows: 10, cols: 40 };
+        let (mut r, buf) = Renderer::with_buffer(false);
+        bar.setup(r.out.as_mut());
+        bar.teardown(r.out.as_mut());
+        let s = buf_of(&buf);
+        assert!(s.contains("\x1b[10;1H\x1b[2K\x1b[1;9r\x1b[9;1H"), "{s:?}");
+        assert!(s.contains("\x1b[r\x1b[10;1H\x1b[2K\r\n"), "{s:?}");
+    }
+
+    #[test]
+    fn status_bar_render_right_aligns_and_paints() {
+        let bar = StatusBar { rows: 10, cols: 40 }; // width = 39
+        let (mut r, buf) = Renderer::with_buffer(true);
+        let label = "cache 98.6% · hit 32384 · miss 461"; // 34 字符
+        let painted = r.paint(DIM, label);
+        bar.render(r.out.as_mut(), label, &painted);
+        let s = buf_of(&buf);
+        // 39 - 34 = 5 个空格左填充，右对齐
+        assert!(
+            s.contains(&format!(
+                "\x1b7\x1b[10;1H\x1b[2K     \x1b[2m{label}\x1b[0m\x1b8"
+            )),
+            "{s:?}"
+        );
+    }
+
+    #[test]
+    fn status_bar_render_truncates_to_width() {
+        let bar = StatusBar { rows: 10, cols: 20 }; // width = 19
+        let (mut r, buf) = Renderer::with_buffer(false);
+        let visible = truncate_chars(
+            &CacheStats {
+                hit: 32384,
+                miss: 461,
+            }
+            .label(),
+            bar.width(),
+        );
+        bar.render(r.out.as_mut(), &visible, &visible);
+        let s = buf_of(&buf);
+        assert!(
+            s.contains("\x1b[10;1H\x1b[2Kcache 98.6% · hit 3\x1b8"),
+            "{s:?}"
+        );
+    }
+
+    #[test]
+    fn apply_status_bar_transitions() {
+        let a = StatusBar { rows: 10, cols: 40 };
+        let b = StatusBar { rows: 12, cols: 50 };
+
+        // (None, None)：无输出
+        let (mut r, buf) = Renderer::with_buffer(false);
+        r.apply_status_bar(None);
+        assert!(buf_of(&buf).is_empty());
+
+        // (None, Some)：建栏 + 首绘
+        r.apply_status_bar(Some(a));
+        let s = buf_of(&buf);
+        assert!(s.contains("\x1b[1;9r"), "{s:?}");
+        assert!(s.contains("cache —"), "{s:?}");
+        assert_eq!(r.bar, Some(a));
+
+        // (Some, Some(相同))：只重绘
+        let before = buf_of(&buf).len();
+        r.apply_status_bar(Some(a));
+        assert!(buf_of(&buf)[before..].contains("\x1b[10;1H\x1b[2K"));
+
+        // (Some, Some(不同))：拆旧建新
+        let before = buf_of(&buf).len();
+        r.apply_status_bar(Some(b));
+        let tail = &buf_of(&buf)[before..];
+        assert!(tail.contains("\x1b[r"), "{tail:?}");
+        assert!(tail.contains("\x1b[1;11r"), "{tail:?}");
+        assert_eq!(r.bar, Some(b));
+
+        // (Some, None)：拆栏
+        let before = buf_of(&buf).len();
+        r.apply_status_bar(None);
+        assert!(buf_of(&buf)[before..].contains("\x1b[r"));
+        assert_eq!(r.bar, None);
+    }
+
+    #[test]
+    fn usage_paints_session_cache_bar_and_reset_clears_it() {
+        let bar = StatusBar { rows: 10, cols: 60 };
+        let (mut r, buf) = Renderer::with_buffer(false);
+        r.apply_status_bar(Some(bar));
+        r.usage(&usage_fixture(6, 4));
+        r.usage(&usage_fixture(12, 8));
+        let s = buf_of(&buf);
+        assert!(
+            s.contains("tokens: in 10/10 (hit 6/miss 4) · out 0"),
+            "{s:?}"
+        );
+        // 会话累计：18 hit / 12 miss = 60.0%
+        assert!(s.contains("cache 60.0% · hit 18 · miss 12"), "{s:?}");
+
+        r.reset_stats();
+        let tail = &buf_of(&buf)[s.len()..];
+        assert!(tail.contains("cache —\x1b8"), "{tail:?}");
+        assert_eq!(r.stats, CacheStats::default());
+    }
+
+    #[test]
+    fn refresh_status_bar_without_tty_is_noop_and_teardown_idempotent() {
+        let (mut r, buf) = Renderer::with_buffer(false);
+        r.refresh_status_bar(); // cargo test 的 stdout 是管道 → 不启用
+        assert!(buf_of(&buf).is_empty());
+        r.teardown(); // 未启用时幂等
+        assert!(buf_of(&buf).is_empty());
     }
 }

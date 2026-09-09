@@ -50,10 +50,27 @@ cargo run -- --list                     # list sessions and exit
 | `-c, --cont` | Continue the most recent session |
 | `--resume <ID>` | Resume a specific session by id |
 | `--list` | List sessions and exit |
+| `--no-status-bar` | Disable the REPL status bar |
 | `-h, --help` / `-V, --version` | Print help / version |
 
 With no `-p`, caocli starts a REPL. CLI flags override the settings stored
 in a resumed session only when explicitly provided.
+
+### Status bar
+
+In the REPL, a status bar pinned to the bottom line shows the session's
+cumulative cache hit rate, right-aligned:
+
+```
+cache 98.6% · hit 32384 · miss 461
+```
+
+It appears only when stdout is a TTY and the terminal has at least 3 rows;
+`--no-status-bar` turns it off. The bar reserves the last terminal line via
+a scroll region, so output scrolls above it — the trade-off is that lines
+scrolled out of the region do not enter the terminal's scrollback buffer.
+Stats reset when you switch sessions (`/new`, `/resume`), and the bar is
+restored on exit.
 
 ### Environment
 
@@ -97,6 +114,9 @@ Limits: 10 KiB of output per tool result, 10 MB per file read/write.
   reports `hit`/`miss` prompt tokens from `usage`.
 - **Token usage** is attached to the final content chunk of the stream, not
   to a separate SSE event.
+- **Two levels of cache visibility.** Every sub-request prints a `tokens:`
+  line (`in/total`, `hit/miss`, `out`); the status bar aggregates `hit`/`miss`
+  across the whole session.
 
 ## Session storage
 
