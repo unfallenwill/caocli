@@ -236,6 +236,51 @@ mod tests {
         assert_eq!(msgs[4].role, Role::User, "原有消息不被挪动");
     }
 
+    /// 转移函数的穷举论证：assistant 声明 n 个调用后，紧随结果串是 2^n 个
+    /// 子集之一。对 n ≤ 3 全枚举，检查每种情况的决策恰好是"按声明顺序的
+    /// 第一个未执行调用"，全部执行完才转 CallModel。
+    /// 这是对可达抽象状态的完备性检查，不是抽样覆盖。
+    #[test]
+    fn exhaustive_answer_subsets_yield_first_unanswered_call() {
+        for n in 1..=3usize {
+            let ids: Vec<String> = (0..n).map(|i| format!("c{i}")).collect();
+            let calls: Vec<ToolCall> = ids.iter().map(|id| call(id)).collect();
+            for mask in 0..(1u32 << n) {
+                let mut msgs = vec![Message::user("q"), assistant(calls.clone())];
+                for (i, id) in ids.iter().enumerate() {
+                    if mask & (1 << i) != 0 {
+                        msgs.push(Message::tool(id, "ok"));
+                    }
+                }
+                let expected = match (0..n).find(|&i| mask & (1 << i) == 0) {
+                    Some(i) => Action::ExecTool(call(&ids[i])),
+                    None => Action::CallModel,
+                };
+                assert_eq!(
+                    next_action(&msgs),
+                    Some(expected),
+                    "n={n}, 已落盘结果掩码={mask:#b}"
+                );
+            }
+        }
+    }
+
+    /// heal 幂等：自愈过的历史再次自愈必须零插入、零改动。
+    /// 这是"同一份日志每次 load 得到同一视图"的必要条件（前缀缓存依赖）。
+    #[test]
+    fn heal_is_idempotent() {
+        let mut msgs = vec![
+            Message::user("问"),
+            assistant(vec![call("a"), call("b")]),
+            Message::tool("a", "ok"),
+            Message::user("下一问"),
+        ];
+        assert_eq!(heal(&mut msgs), 1);
+        let once = msgs.clone();
+        assert_eq!(heal(&mut msgs), 0, "第二次自愈不得再插入");
+        assert_eq!(msgs, once, "第二次自愈不得改动任何消息");
+    }
+
     #[test]
     fn healed_history_yields_callmodel() {
         let mut msgs = vec![Message::user("问"), assistant(vec![call("a")])];
