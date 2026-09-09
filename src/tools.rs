@@ -50,16 +50,20 @@ pub async fn execute(args_json: &str) -> String {
 
     let output = match child {
         Err(e) => return format!("exit_code: 127\n--- stderr ---\n无法启动 bash: {e}"),
-        Ok(child) => match tokio::time::timeout(Duration::from_secs(TIMEOUT_SECS), child.wait_with_output()).await {
-            Err(_) => {
-                return format!(
-                    "exit_code: 124\ntimeout: 命令超过 {TIMEOUT_SECS}s 已被终止，输出丢失。\
+        Ok(child) => {
+            match tokio::time::timeout(Duration::from_secs(TIMEOUT_SECS), child.wait_with_output())
+                .await
+            {
+                Err(_) => {
+                    return format!(
+                        "exit_code: 124\ntimeout: 命令超过 {TIMEOUT_SECS}s 已被终止，输出丢失。\
                      请改用更快的命令或将长任务放入后台并轮询输出文件。"
-                )
+                    );
+                }
+                Ok(Err(e)) => return format!("exit_code: -1\nerror: {e}"),
+                Ok(Ok(out)) => out,
             }
-            Ok(Err(e)) => return format!("exit_code: -1\nerror: {e}"),
-            Ok(Ok(out)) => out,
-        },
+        }
     };
 
     let exit_code = output.status.code().unwrap_or(-1);

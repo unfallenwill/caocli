@@ -23,7 +23,10 @@ pub struct Renderer {
 impl Renderer {
     pub fn new() -> Self {
         let color = std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal();
-        Self { mode: Mode::Idle, color }
+        Self {
+            mode: Mode::Idle,
+            color,
+        }
     }
 
     fn raw(&self, s: &str) {
@@ -82,7 +85,10 @@ impl Renderer {
             .ok()
             .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_owned))
             .unwrap_or_else(|| args.chars().take(80).collect());
-        self.raw(&format!("\n{}", self.paint(YELLOW, &format!("▸ {name} {cmd}"))));
+        self.raw(&format!(
+            "\n{}",
+            self.paint(YELLOW, &format!("▸ {name} {cmd}"))
+        ));
         self.raw("\n");
     }
 

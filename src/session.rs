@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -34,8 +34,13 @@ struct Header {
 #[serde(tag = "t", rename_all = "lowercase")]
 enum Line {
     Header(Header),
-    Msg { message: Message },
-    Meta { #[serde(flatten)] meta: SessionMeta },
+    Msg {
+        message: Message,
+    },
+    Meta {
+        #[serde(flatten)]
+        meta: SessionMeta,
+    },
 }
 
 pub struct Session {
@@ -71,14 +76,32 @@ impl Session {
             .open(&path)
             .with_context(|| format!("创建会话文件失败: {}", path.display()))?;
         let created_at = Utc::now().timestamp();
-        write_line(&mut file, &Line::Header(Header { id: id.clone(), created_at, meta: meta.clone() }))?;
-        Ok(Self { id, path, created_at, meta, messages: Vec::new(), file })
+        write_line(
+            &mut file,
+            &Line::Header(Header {
+                id: id.clone(),
+                created_at,
+                meta: meta.clone(),
+            }),
+        )?;
+        Ok(Self {
+            id,
+            path,
+            created_at,
+            meta,
+            messages: Vec::new(),
+            file,
+        })
     }
 
     /// 读取会话并打开追加句柄。损坏行跳过（仅尾部行可能因崩溃损坏）。
     pub fn load(path: &Path) -> Result<Self> {
-        let data = std::fs::read(path).with_context(|| format!("读取会话文件失败: {}", path.display()))?;
-        let mut id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let data =
+            std::fs::read(path).with_context(|| format!("读取会话文件失败: {}", path.display()))?;
+        let mut id = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let mut created_at = 0i64;
         let mut meta: Option<SessionMeta> = None;
         let mut messages = Vec::new();
@@ -110,7 +133,14 @@ impl Session {
             .append(true)
             .open(path)
             .with_context(|| format!("打开会话文件（追加模式）失败: {}", path.display()))?;
-        Ok(Self { id, path: path.to_path_buf(), created_at, meta, messages, file })
+        Ok(Self {
+            id,
+            path: path.to_path_buf(),
+            created_at,
+            meta,
+            messages,
+            file,
+        })
     }
 
     pub fn append_message(&mut self, m: &Message) -> Result<()> {
@@ -137,7 +167,8 @@ pub struct SessionInfo {
 
 pub fn list(dir: &Path) -> Result<Vec<SessionInfo>> {
     let mut out = Vec::new();
-    let entries = std::fs::read_dir(dir).with_context(|| format!("读取目录失败: {}", dir.display()))?;
+    let entries =
+        std::fs::read_dir(dir).with_context(|| format!("读取目录失败: {}", dir.display()))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().map_or(true, |x| x != "jsonl") {
@@ -157,7 +188,10 @@ fn summarize(path: &Path) -> Result<SessionInfo> {
         .modified()?
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
-    let mut id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut id = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let mut count = 0usize;
     let mut preview = String::from("(空会话)");
     for raw in data.split(|&b| b == b'\n') {
@@ -180,7 +214,13 @@ fn summarize(path: &Path) -> Result<SessionInfo> {
             Line::Meta { .. } => {}
         }
     }
-    Ok(SessionInfo { id, path: path.to_path_buf(), modified, message_count: count, preview })
+    Ok(SessionInfo {
+        id,
+        path: path.to_path_buf(),
+        modified,
+        message_count: count,
+        preview,
+    })
 }
 
 pub fn latest(dir: PathBuf) -> Result<Option<PathBuf>> {
@@ -203,7 +243,11 @@ mod tests {
     }
 
     fn test_meta() -> SessionMeta {
-        SessionMeta { model: "deepseek-v4-flash".into(), thinking: Thinking::enabled(), reasoning_effort: Some("high".into()) }
+        SessionMeta {
+            model: "deepseek-v4-flash".into(),
+            thinking: Thinking::enabled(),
+            reasoning_effort: Some("high".into()),
+        }
     }
 
     #[test]
@@ -226,13 +270,17 @@ mod tests {
             tool_call_id: None,
         })
         .unwrap();
-        s.append_message(&Message::tool("call_1", "file.txt")).unwrap();
+        s.append_message(&Message::tool("call_1", "file.txt"))
+            .unwrap();
 
         let loaded = Session::load(&s.path).unwrap();
         assert_eq!(loaded.id, s.id);
         assert_eq!(loaded.meta, test_meta());
         assert_eq!(loaded.messages.len(), 3);
-        assert_eq!(loaded.messages[1].reasoning_content.as_deref(), Some("推理过程"));
+        assert_eq!(
+            loaded.messages[1].reasoning_content.as_deref(),
+            Some("推理过程")
+        );
         assert_eq!(loaded.messages[2].tool_call_id.as_deref(), Some("call_1"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -243,8 +291,12 @@ mod tests {
         let mut s = Session::create(&dir, test_meta()).unwrap();
         s.append_message(&Message::user("ok")).unwrap();
         // 模拟崩溃写一半
-        let mut f = std::fs::OpenOptions::new().append(true).open(&s.path).unwrap();
-        f.write_all(br#"{"t":"msg","message":{"role":"user","cont"#).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&s.path)
+            .unwrap();
+        f.write_all(br#"{"t":"msg","message":{"role":"user","cont"#)
+            .unwrap();
         drop(f);
 
         let loaded = Session::load(&s.path).unwrap();
@@ -272,10 +324,12 @@ mod tests {
     fn list_orders_by_mtime_and_previews_last_user() {
         let dir = tmpdir();
         let mut s1 = Session::create(&dir, test_meta()).unwrap();
-        s1.append_message(&Message::user("第一个会话的问题")).unwrap();
+        s1.append_message(&Message::user("第一个会话的问题"))
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let mut s2 = Session::create(&dir, test_meta()).unwrap();
-        s2.append_message(&Message::user("第二个会话的问题")).unwrap();
+        s2.append_message(&Message::user("第二个会话的问题"))
+            .unwrap();
 
         let infos = list(&dir).unwrap();
         assert_eq!(infos.len(), 2);

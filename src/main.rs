@@ -27,10 +27,21 @@ fn main() -> Result<()> {
 
 /// 新会话的 meta：全部来自 CLI 参数或默认值。
 fn fresh_meta(cli: &Cli) -> SessionMeta {
-    let thinking = if cli.no_think { Thinking::disabled() } else { Thinking::enabled() };
-    let reasoning_effort = if cli.no_think { None } else { cli.effort.clone() };
+    let thinking = if cli.no_think {
+        Thinking::disabled()
+    } else {
+        Thinking::enabled()
+    };
+    let reasoning_effort = if cli.no_think {
+        None
+    } else {
+        cli.effort.clone()
+    };
     SessionMeta {
-        model: cli.model.clone().unwrap_or_else(|| config::DEFAULT_MODEL.to_string()),
+        model: cli
+            .model
+            .clone()
+            .unwrap_or_else(|| config::DEFAULT_MODEL.to_string()),
         thinking,
         reasoning_effort,
     }
@@ -66,7 +77,13 @@ async fn run(cli: Cli) -> Result<()> {
 
     if cli.list {
         for s in session::list(&sdir)? {
-            println!("{}\t{}条消息\t{}\t{}", s.id, s.message_count, s.preview, s.path.display());
+            println!(
+                "{}\t{}条消息\t{}\t{}",
+                s.id,
+                s.message_count,
+                s.preview,
+                s.path.display()
+            );
         }
         return Ok(());
     }
@@ -98,7 +115,11 @@ async fn run(cli: Cli) -> Result<()> {
             "会话 {} · {} · thinking={}{}",
             agent.session.id,
             agent.session.meta.model,
-            if agent.session.meta.thinking.is_enabled() { "on" } else { "off" },
+            if agent.session.meta.thinking.is_enabled() {
+                "on"
+            } else {
+                "off"
+            },
             agent
                 .session
                 .meta
@@ -175,7 +196,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
             Err(rustyline::error::ReadlineError::Interrupted) => continue, // Ctrl-C 清行
-            Err(rustyline::error::ReadlineError::Eof) => break,           // Ctrl-D 退出
+            Err(rustyline::error::ReadlineError::Eof) => break,            // Ctrl-D 退出
             Err(e) => {
                 ui.error(&format!("readline 错误: {e}"));
                 break;
@@ -220,7 +241,10 @@ mod tests {
             thinking: Thinking::enabled(),
             reasoning_effort: Some("high".into()),
         };
-        assert!(apply_overrides(&mut meta, &cli(&["--model", "deepseek-v4-pro"])));
+        assert!(apply_overrides(
+            &mut meta,
+            &cli(&["--model", "deepseek-v4-pro"])
+        ));
         assert_eq!(meta.model, "deepseek-v4-pro");
         assert!(meta.thinking.is_enabled());
         assert_eq!(meta.reasoning_effort.as_deref(), Some("high"));

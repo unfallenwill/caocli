@@ -18,7 +18,11 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(api: Client, session: Session) -> Self {
-        Self { api, session, renderer: Renderer::new() }
+        Self {
+            api,
+            session,
+            renderer: Renderer::new(),
+        }
     }
 
     fn build_request(&self) -> ChatRequest {
@@ -67,12 +71,15 @@ impl Agent {
                 self.renderer.usage(&u);
             }
 
-            let Some(calls) = msg.tool_calls.clone() else { break };
+            let Some(calls) = msg.tool_calls.clone() else {
+                break;
+            };
             if calls.is_empty() {
                 break;
             }
             for call in calls {
-                self.renderer.tool_start(&call.function.name, &call.function.arguments);
+                self.renderer
+                    .tool_start(&call.function.name, &call.function.arguments);
                 let out = tools::execute(&call.function.arguments).await;
                 self.renderer.tool_result(&out);
                 self.session.append_message(&Message::tool(&call.id, out))?;

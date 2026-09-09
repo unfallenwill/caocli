@@ -1,7 +1,11 @@
 use clap::Parser;
 
 #[derive(Debug, Parser)]
-#[command(name = "caocli", version, about = "终端 agent · DeepSeek 后端 · 思维链 + run_shell")]
+#[command(
+    name = "caocli",
+    version,
+    about = "终端 agent · DeepSeek 后端 · 思维链 + run_shell"
+)]
 pub struct Cli {
     /// 单次执行模式：执行该 prompt（含工具循环）后退出
     #[arg(short = 'p')]

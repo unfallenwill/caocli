@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use std::pin::Pin;
 use std::time::Duration;
@@ -43,7 +43,11 @@ impl Client {
             let body = resp.text().await.unwrap_or_default();
             bail!("API 返回 HTTP {status}\n响应体: {body}");
         }
-        Ok(SseStream { inner: Box::pin(resp.bytes_stream()), buf: Vec::new(), done: false })
+        Ok(SseStream {
+            inner: Box::pin(resp.bytes_stream()),
+            buf: Vec::new(),
+            done: false,
+        })
     }
 }
 
@@ -108,8 +112,8 @@ fn parse_sse_line(line: &str) -> Result<SseLine> {
     if data.trim().is_empty() {
         return Ok(SseLine::Ignored);
     }
-    let chunk: ChatChunk = serde_json::from_str(data)
-        .with_context(|| format!("解析 SSE chunk 失败: {data}"))?;
+    let chunk: ChatChunk =
+        serde_json::from_str(data).with_context(|| format!("解析 SSE chunk 失败: {data}"))?;
     Ok(SseLine::Chunk(chunk))
 }
 
@@ -129,7 +133,10 @@ mod tests {
         let line = chunk_with_content("hi");
         match parse_sse_line(&format!("data: {line}")).unwrap() {
             SseLine::Chunk(c) => {
-                assert_eq!(c.choices[0].delta.as_ref().unwrap().content.as_deref(), Some("hi"));
+                assert_eq!(
+                    c.choices[0].delta.as_ref().unwrap().content.as_deref(),
+                    Some("hi")
+                );
             }
             _ => panic!("应为 Chunk"),
         }
@@ -137,15 +144,27 @@ mod tests {
 
     #[test]
     fn parse_done_line() {
-        assert!(matches!(parse_sse_line("data: [DONE]").unwrap(), SseLine::Done));
-        assert!(matches!(parse_sse_line("data:[DONE]").unwrap(), SseLine::Done));
+        assert!(matches!(
+            parse_sse_line("data: [DONE]").unwrap(),
+            SseLine::Done
+        ));
+        assert!(matches!(
+            parse_sse_line("data:[DONE]").unwrap(),
+            SseLine::Done
+        ));
     }
 
     #[test]
     fn ignores_non_data_lines() {
         assert!(matches!(parse_sse_line("").unwrap(), SseLine::Ignored));
-        assert!(matches!(parse_sse_line(": keep-alive").unwrap(), SseLine::Ignored));
-        assert!(matches!(parse_sse_line("event: ping").unwrap(), SseLine::Ignored));
+        assert!(matches!(
+            parse_sse_line(": keep-alive").unwrap(),
+            SseLine::Ignored
+        ));
+        assert!(matches!(
+            parse_sse_line("event: ping").unwrap(),
+            SseLine::Ignored
+        ));
     }
 
     #[test]
@@ -179,12 +198,22 @@ mod tests {
             Ok(bytes::Bytes::from(p1.to_vec())),
             Ok(bytes::Bytes::from(p2.to_vec())),
         ]);
-        let mut sse = SseStream { inner: Box::pin(stream), buf: Vec::new(), done: false };
+        let mut sse = SseStream {
+            inner: Box::pin(stream),
+            buf: Vec::new(),
+            done: false,
+        };
 
         let c1 = sse.next_chunk().await.unwrap().unwrap();
-        assert_eq!(c1.choices[0].delta.as_ref().unwrap().content.as_deref(), Some("a"));
+        assert_eq!(
+            c1.choices[0].delta.as_ref().unwrap().content.as_deref(),
+            Some("a")
+        );
         let c2 = sse.next_chunk().await.unwrap().unwrap();
-        assert_eq!(c2.choices[0].delta.as_ref().unwrap().content.as_deref(), Some("b"));
+        assert_eq!(
+            c2.choices[0].delta.as_ref().unwrap().content.as_deref(),
+            Some("b")
+        );
         assert!(sse.next_chunk().await.unwrap().is_none());
         assert!(sse.next_chunk().await.unwrap().is_none());
     }

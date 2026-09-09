@@ -25,10 +25,14 @@ pub struct Thinking {
 
 impl Thinking {
     pub fn enabled() -> Self {
-        Self { r#type: "enabled".into() }
+        Self {
+            r#type: "enabled".into(),
+        }
     }
     pub fn disabled() -> Self {
-        Self { r#type: "disabled".into() }
+        Self {
+            r#type: "disabled".into(),
+        }
     }
     pub fn is_enabled(&self) -> bool {
         self.r#type == "enabled"
@@ -81,10 +85,18 @@ pub struct Message {
 
 impl Message {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: Role::System, content: Some(content.into()), ..Default::default() }
+        Self {
+            role: Role::System,
+            content: Some(content.into()),
+            ..Default::default()
+        }
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: Role::User, content: Some(content.into()), ..Default::default() }
+        Self {
+            role: Role::User,
+            content: Some(content.into()),
+            ..Default::default()
+        }
     }
     pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
@@ -236,7 +248,11 @@ impl TurnAccumulator {
                         id: dtc.id.unwrap_or_default(),
                         r#type: "function".into(),
                         function: ToolCallFunction {
-                            name: dtc.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default(),
+                            name: dtc
+                                .function
+                                .as_ref()
+                                .and_then(|f| f.name.clone())
+                                .unwrap_or_default(),
                             arguments: dtc.function.and_then(|f| f.arguments).unwrap_or_default(),
                         },
                     })
@@ -246,7 +262,11 @@ impl TurnAccumulator {
         Message {
             role: Role::Assistant,
             content: Some(self.content),
-            reasoning_content: if self.reasoning_content.is_empty() { None } else { Some(self.reasoning_content) },
+            reasoning_content: if self.reasoning_content.is_empty() {
+                None
+            } else {
+                Some(self.reasoning_content)
+            },
             tool_calls,
             tool_call_id: None,
         }
@@ -266,7 +286,10 @@ mod tests {
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".into(),
                 r#type: "function".into(),
-                function: ToolCallFunction { name: "run_shell".into(), arguments: r#"{"command":"ls"}"#.into() },
+                function: ToolCallFunction {
+                    name: "run_shell".into(),
+                    arguments: r#"{"command":"ls"}"#.into(),
+                },
             }]),
             tool_call_id: None,
         };
@@ -302,7 +325,9 @@ mod tests {
 
     #[test]
     fn accumulator_aggregates_split_deltas() {
-        let mk = |content: Option<&str>, reasoning: Option<&str>, tcs: Option<Vec<DeltaToolCall>>| Delta {
+        let mk = |content: Option<&str>,
+                  reasoning: Option<&str>,
+                  tcs: Option<Vec<DeltaToolCall>>| Delta {
             role: None,
             content: content.map(str::to_owned),
             reasoning_content: reasoning.map(str::to_owned),
@@ -311,16 +336,30 @@ mod tests {
         let mut acc = TurnAccumulator::default();
         acc.feed(&mk(Some("9.11 "), Some("let me "), None));
         acc.feed(&mk(Some("vs 9.8"), Some("compare."), None));
-        acc.feed(&mk(None, None, Some(vec![DeltaToolCall {
-            index: 0,
-            id: Some("call_1".into()),
-            function: Some(DeltaFunctionCall { name: Some("run_shell".into()), arguments: Some("{\"comm".into()) }),
-        }])));
-        acc.feed(&mk(None, None, Some(vec![DeltaToolCall {
-            index: 0,
-            id: None,
-            function: Some(DeltaFunctionCall { name: None, arguments: Some("and\":\"ls\"}".into()) }),
-        }])));
+        acc.feed(&mk(
+            None,
+            None,
+            Some(vec![DeltaToolCall {
+                index: 0,
+                id: Some("call_1".into()),
+                function: Some(DeltaFunctionCall {
+                    name: Some("run_shell".into()),
+                    arguments: Some("{\"comm".into()),
+                }),
+            }]),
+        ));
+        acc.feed(&mk(
+            None,
+            None,
+            Some(vec![DeltaToolCall {
+                index: 0,
+                id: None,
+                function: Some(DeltaFunctionCall {
+                    name: None,
+                    arguments: Some("and\":\"ls\"}".into()),
+                }),
+            }]),
+        ));
         let msg = acc.finish();
         assert_eq!(msg.content.as_deref(), Some("9.11 vs 9.8"));
         assert_eq!(msg.reasoning_content.as_deref(), Some("let me compare."));
@@ -335,7 +374,15 @@ mod tests {
     fn parse_real_stream_chunk_with_reasoning() {
         let line = r#"{"id":"x","choices":[{"index":0,"delta":{"reasoning_content":"嗯"},"finish_reason":null,"logprobs":null}],"created":1,"model":"deepseek-v4-flash","object":"chat.completion.chunk"}"#;
         let chunk: ChatChunk = serde_json::from_str(line).unwrap();
-        assert_eq!(chunk.choices[0].delta.as_ref().unwrap().reasoning_content.as_deref(), Some("嗯"));
+        assert_eq!(
+            chunk.choices[0]
+                .delta
+                .as_ref()
+                .unwrap()
+                .reasoning_content
+                .as_deref(),
+            Some("嗯")
+        );
     }
 
     #[test]
