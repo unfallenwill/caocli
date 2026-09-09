@@ -163,9 +163,10 @@ DEEPSEEK_API_KEY=... cargo run -- -p "what is 1+1" --no-think
 CI runs on every push to `master` and every pull request: fmt + clippy +
 tests + line coverage ≥ 90% + dependency audit. Any red gate blocks merging.
 
-[`AGENTS.md`](AGENTS.md) is the maintainer handbook for AI agents: API hard
-constraints, per-file responsibilities, and the KVCache rules. Read it
-before changing message construction.
+[`AGENTS.md`](AGENTS.md) is the behavior guide for AI agents working in this
+repo: the definition of done, verification channels, and the stable invariants
+(prefix-cache discipline, API contract, design principles). It deliberately
+omits code structure, which lives in the code itself.
 
 ## License
 
