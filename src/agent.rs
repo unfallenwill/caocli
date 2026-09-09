@@ -1,5 +1,7 @@
 use anyhow::Result;
 
+use std::future::Future;
+
 use crate::api::Client;
 use crate::config::DEFAULT_EFFORT;
 use crate::machine::{self, Action};
@@ -61,27 +63,86 @@ impl Agent {
     /// 渲染器由调用方持有并传入：状态栏与流式输出必须走同一个 `Ui` 实现，
     /// 否则 `usage()` 记录到的缓存统计不会反映到已建栏的实例上。
     pub async fn turn(&mut self, input: &str, ui: &mut impl Ui) -> Result<()> {
+        self.turn_with(input, ui, || async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+    }
+
+    /// 一轮对话的解释器循环，`interrupt` 是带外 Command（Ctrl-C）的来源：
+    /// 每个 await 点与之竞争（biased：效果先完成则保留结果）。
+    /// 触发时当前 effect 被丢弃——流断开、Bash 子进程被 kill_on_drop 杀死；
+    /// 已声明未应答的调用以 CANCELLED_RESULT 落盘闭合窗口，
+    /// 历史保持 is_request_valid，下一回合从合法前缀继续。
+    /// 取消在解释器层处理，不进 `next_action`（带外，任何状态可达）。
+    pub async fn turn_with<F, Fut>(
+        &mut self,
+        input: &str,
+        ui: &mut impl Ui,
+        mut interrupt: F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = ()>,
+    {
         self.session.append_message(&Message::user(input))?;
+        let mut cancelled = false;
         // 解释器循环：每拍向机器要决策（日志折叠出的 Action），执行后把
         // 结果写回日志，直到 Done。循环本身不携带状态——历史只有日志一处。
         loop {
             match machine::next_action(&self.session.messages) {
                 Some(Action::CallModel) => {
                     let req = self.build_request();
-                    let (msg, usage) = self.pump(&req, ui).await?;
-                    self.session.append_message(&msg)?;
-                    if let Some(u) = usage {
-                        ui.usage(&u);
+                    // select 表达式结束即弃未来，self 的借用随之结束
+                    let done = tokio::select! {
+                        biased;
+                        r = self.pump(&req, ui) => Some(r?),
+                        _ = interrupt() => None,
+                    };
+                    match done {
+                        Some((msg, usage)) => {
+                            self.session.append_message(&msg)?;
+                            if let Some(u) = usage {
+                                ui.usage(&u);
+                            }
+                        }
+                        None => cancelled = true,
                     }
                 }
                 Some(Action::ExecTool(call)) => {
                     ui.tool_start(&call.function.name, &call.function.arguments);
-                    let out = tools::execute(&call.function.name, &call.function.arguments).await;
+                    let out = tokio::select! {
+                        biased;
+                        out = tools::execute(&call.function.name, &call.function.arguments) => out,
+                        _ = interrupt() => machine::CANCELLED_RESULT.to_string(),
+                    };
+                    let cancelled_call = out == machine::CANCELLED_RESULT;
                     ui.tool_result(&out);
                     self.session.append_message(&Message::tool(&call.id, out))?;
+                    if cancelled_call {
+                        cancelled = true;
+                    }
                 }
                 Some(Action::Done) | None => break,
             }
+            if cancelled {
+                break;
+            }
+        }
+        if cancelled {
+            self.close_open_calls(ui)?;
+            ui.interrupted();
+        }
+        Ok(())
+    }
+
+    /// 取消收尾：把已声明但未应答的调用以取消标记落盘，闭合窗口。
+    /// 落盘而非仅内存视图——进程还活着，文件必须如实记录取消。
+    fn close_open_calls(&mut self, ui: &mut impl Ui) -> Result<()> {
+        for id in machine::open_call_ids(&self.session.messages) {
+            self.session
+                .append_message(&Message::tool(&id, machine::CANCELLED_RESULT))?;
+            ui.tool_result(machine::CANCELLED_RESULT);
         }
         Ok(())
     }
@@ -361,6 +422,74 @@ mod tests {
             vec!["call_m1", "call_m2"],
             "第二个请求必须携带全部工具结果"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Ctrl-C 在首轮流式中到达：assistant 未提交，历史停在 user。
+    /// 取消 = 活着的中断，最轻形态：无需任何标记，历史本就合法。
+    #[tokio::test]
+    async fn cancel_during_first_stream_keeps_history_at_user() {
+        let server = MockServer::start().await; // 不挂 mock：pump 必然 pending
+        let dir = tmpdir();
+        let mut agent = test_agent(&server, &dir);
+        let mut ui = Renderer::new();
+        // 第一个取消点（pump select）立即触发
+        agent
+            .turn_with("原始指令", &mut ui, || Box::pin(async {}))
+            .await
+            .unwrap();
+        assert_eq!(agent.session.messages.len(), 1);
+        assert_eq!(agent.session.messages[0].role, Role::User);
+        assert!(machine::is_request_valid(&agent.session.messages));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Ctrl-C 在工具执行中到达：被中断的调用与其后未执行的调用都以
+    /// 取消标记落盘，窗口闭合、历史合法——下一回合不会复活僵尸调用。
+    #[tokio::test]
+    async fn cancel_during_tool_marks_remaining_calls_cancelled() {
+        let server = MockServer::start().await;
+        let turn1 = [
+            sse(json!({"tool_calls":[
+                {"index":0,"id":"call_c1","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"sleep 30\"}"}},
+                {"index":1,"id":"call_c2","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"echo two\"}"}}
+            ]}), None, None),
+            sse(json!({"content":""}), Some("tool_calls"), None),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        mount_chat(&server, turn1, Some(1)).await;
+
+        let dir = tmpdir();
+        let mut agent = test_agent(&server, &dir);
+        let mut ui = Renderer::new();
+        // 取消点队列：pump 处永不触发（让流正常完成）；首个工具处立即触发
+        let mut steps: std::collections::VecDeque<std::pin::Pin<Box<dyn Future<Output = ()>>>> =
+            Default::default();
+        steps.push_back(Box::pin(std::future::pending::<()>()));
+        steps.push_back(Box::pin(async {}));
+        agent
+            .turn_with("跑两个慢命令", &mut ui, move || {
+                steps
+                    .pop_front()
+                    .unwrap_or_else(|| Box::pin(std::future::pending()))
+            })
+            .await
+            .unwrap();
+
+        let msgs = &agent.session.messages;
+        assert_eq!(msgs.len(), 4, "user / assistant(2 calls) / 取消标记×2");
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("call_c1"));
+        assert_eq!(msgs[3].tool_call_id.as_deref(), Some("call_c2"));
+        assert_eq!(
+            msgs[2].content.as_deref(),
+            Some(machine::CANCELLED_RESULT),
+            "被执行中被中断的调用也标记取消"
+        );
+        assert_eq!(msgs[3].content.as_deref(), Some(machine::CANCELLED_RESULT));
+        // 窗口闭合：历史合法，下一回合的决策是发请求而不是复活僵尸调用
+        assert!(machine::is_request_valid(msgs));
+        assert_eq!(machine::next_action(msgs), Some(machine::Action::CallModel));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

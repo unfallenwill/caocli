@@ -12,6 +12,9 @@ use crate::types::{Message, Role};
 // 文件永不重写；读取时跳过损坏行（进程崩溃写一半只影响尾部）。
 // KVCache 依赖历史逐字节回放：Message 字段名与 API wire 格式一致，
 // load 出来的 messages 直接原样进请求，无任何转换。
+// 单写者假设：同一会话文件不允许两个进程同时追加（无文件锁）。
+// 交错写入会产生无法自愈的非法历史（野 tool 结果），构建请求时会被
+// is_request_valid tripwire 拦截（debug panic / release 由后端 400）。
 // ============================================================================
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

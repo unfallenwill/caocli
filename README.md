@@ -147,6 +147,12 @@ Limits: 10 KiB of output per tool result, 10 MB per file read/write.
   store the full assistant messages.
 - **Append-only session logs.** Files are never rewritten, so a crash costs
   at most a trailing partial line. Corrupt lines are skipped on load.
+- **Ctrl-C mid-turn cancels gracefully.** The turn interpreter races every
+  await against SIGINT. On cancel the running command is killed
+  (`kill_on_drop`), unfinished tool calls get deterministic cancellation
+  markers committed to the log, and history stays request-valid — so the
+  next prompt simply continues from a clean, honest state instead of a
+  400-ing one.
 - **Crash healing at load.** A session interrupted between an assistant
   message with `tool_calls` and its tool results would otherwise produce an
   invalid request on resume. `Session::load` synthesizes deterministic

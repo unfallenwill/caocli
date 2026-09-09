@@ -150,6 +150,8 @@ pub trait Ui {
     fn tool_result(&mut self, result: &str);
     /// 子请求 token 用量（同时累计会话级缓存统计）。
     fn usage(&mut self, u: &Usage);
+    /// 回合被用户取消（Ctrl-C）：闭合流式块，打出中断提示。
+    fn interrupted(&mut self);
 }
 
 /// 流式渲染器。思维链与正文是两个独立渲染块：
@@ -392,6 +394,13 @@ impl Ui for Renderer {
         self.raw("\n");
     }
 
+    fn interrupted(&mut self) {
+        self.close_block(false);
+        self.mode = Mode::Idle;
+        self.raw(&self.paint(YELLOW, "⏹ 已中断（Ctrl-C）"));
+        self.raw("\n");
+    }
+
     fn usage(&mut self, u: &Usage) {
         let cache = match u.cache() {
             Some(c) => format!("hit {}/miss {}", c.hit, c.miss),
@@ -569,6 +578,16 @@ mod tests {
             String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
             "\n"
         );
+    }
+
+    #[test]
+    fn interrupted_closes_block_and_prints_notice() {
+        let (mut r, buf) = Renderer::with_buffer(true);
+        r.reasoning_delta("想");
+        r.interrupted();
+        let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(s.contains("已中断"), "{s}");
+        assert!(s.ends_with("\x1b[0m\n"), "复位颜色收尾: {s}");
     }
 
     #[test]

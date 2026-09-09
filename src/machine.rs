@@ -12,9 +12,9 @@
 //! | 词汇 | 状态 | 成员 |
 //! |---|---|---|
 //! | Input | 已落地（隐式） | UserLine（`turn` 入参）、Delta（SSE 流）、ToolFinished（execute 返回值） |
-//! | Command | 未落地 | Cancel / New / Resume / Exit —— 带外，任何状态可达 |
-//! | Notice | 已落地 | `ui::Ui` 的六个方法 |
-//! | Effect | 未落地 | 目前由解释器直写；出现第二个事件源（审批/取消）时提为显式枚举 |
+//! | Command | 部分落地 | Cancel 已落地（回合中 Ctrl-C；带外，在解释器层处理，不进 `next_action`）；New / Resume / Exit 未落地 |
+//! | Notice | 已落地 | `ui::Ui` 的七个方法 |
+//! | Effect | 未落地 | 目前由解释器直写；出现条件化效果组合（如审批门）时提为显式枚举 |
 
 use std::collections::HashSet;
 
@@ -80,6 +80,11 @@ pub fn is_request_valid(messages: &[Message]) -> bool {
 /// 同一份日志每次 load 都要合成出逐字节相同的历史（前缀缓存依赖）。
 pub const INTERRUPTED_RESULT: &str = "error: interrupted before execution; no result was recorded";
 
+/// 用户取消（Ctrl-C）时为未完成调用落盘的占位结果。确定性常量，理由同上。
+/// 与 INTERRUPTED_RESULT 区分：前者是崩溃后 load 时合成（只进内存视图），
+/// 后者是取消时真实落盘（进程还活着，必须写进文件）。
+pub const CANCELLED_RESULT: &str = "error: cancelled by user before a result was recorded";
+
 /// 下一拍该做什么。由日志折叠得出的机器决策出口。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -122,6 +127,36 @@ pub fn next_action(messages: &[Message]) -> Option<Action> {
         }
         Role::System => None,
     }
+}
+
+/// 已声明但结果窗口内未应答的调用 id（按声明顺序）。
+/// 取消收尾的依据：这些调用需要补 CANCELLED_RESULT 才能闭合窗口，
+/// 否则下一回合会复活僵尸调用（或构造请求时 400）。
+pub fn open_call_ids(messages: &[Message]) -> Vec<String> {
+    let mut open = Vec::new();
+    let mut i = 0;
+    while i < messages.len() {
+        let Some(calls) = &messages[i].tool_calls else {
+            i += 1;
+            continue;
+        };
+        let mut j = i + 1;
+        while j < messages.len() && messages[j].role == Role::Tool {
+            j += 1;
+        }
+        let answered: HashSet<&str> = messages[i + 1..j]
+            .iter()
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        open.extend(
+            calls
+                .iter()
+                .filter(|c| !answered.contains(c.id.as_str()))
+                .map(|c| c.id.clone()),
+        );
+        i = j;
+    }
+    open
 }
 
 /// 崩溃自愈：为「声明了 tool_calls 但结果不全」的 assistant 补上占位结果，
@@ -478,6 +513,22 @@ mod tests {
         assert_eq!(msgs[1].tool_call_id.as_deref(), Some("a"));
         assert_eq!(msgs[3].tool_call_id.as_deref(), Some("b"));
         assert!(is_request_valid(&msgs));
+    }
+
+    #[test]
+    fn open_call_ids_reports_unanswered_declarations() {
+        assert!(open_call_ids(&[Message::user("q")]).is_empty());
+        let two = vec![Message::user("q"), assistant(vec![call("a"), call("b")])];
+        assert_eq!(open_call_ids(&two), vec!["a", "b"]);
+        let partial = vec![
+            Message::user("q"),
+            assistant(vec![call("a"), call("b")]),
+            Message::tool("a", "ok"),
+        ];
+        assert_eq!(open_call_ids(&partial), vec!["b"]);
+        let mut closed = partial;
+        closed.push(Message::tool("b", "ok"));
+        assert!(open_call_ids(&closed).is_empty());
     }
 
     #[test]
