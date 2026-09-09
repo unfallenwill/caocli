@@ -171,7 +171,7 @@ pub fn list(dir: &Path) -> Result<Vec<SessionInfo>> {
         std::fs::read_dir(dir).with_context(|| format!("读取目录失败: {}", dir.display()))?;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().map_or(true, |x| x != "jsonl") {
+        if path.extension().is_none_or(|x| x != "jsonl") {
             continue;
         }
         if let Ok(info) = summarize(&path) {
@@ -204,10 +204,10 @@ fn summarize(path: &Path) -> Result<SessionInfo> {
         match line {
             Line::Header(h) => id = h.id,
             Line::Msg { message } => {
-                if message.role == Role::User {
-                    if let Some(c) = message.content {
-                        preview = c.chars().take(40).collect();
-                    }
+                if message.role == Role::User
+                    && let Some(c) = &message.content
+                {
+                    preview = c.chars().take(40).collect();
                 }
                 count += 1;
             }

@@ -51,22 +51,23 @@ fn fresh_meta(cli: &Cli) -> SessionMeta {
 /// 返回 true 表示 meta 发生变化（需要追加 meta 行）。
 fn apply_overrides(meta: &mut SessionMeta, cli: &Cli) -> bool {
     let mut changed = false;
-    if let Some(m) = &cli.model {
-        if meta.model != *m {
-            meta.model = m.clone();
-            changed = true;
-        }
+    if let Some(m) = &cli.model
+        && meta.model != *m
+    {
+        meta.model = m.clone();
+        changed = true;
     }
     if cli.no_think && meta.thinking.is_enabled() {
         meta.thinking = Thinking::disabled();
         meta.reasoning_effort = None;
         changed = true;
     }
-    if let Some(e) = &cli.effort {
-        if meta.thinking.is_enabled() && meta.reasoning_effort.as_deref() != Some(e.as_str()) {
-            meta.reasoning_effort = Some(e.clone());
-            changed = true;
-        }
+    if let Some(e) = &cli.effort
+        && meta.thinking.is_enabled()
+        && meta.reasoning_effort.as_deref() != Some(e.as_str())
+    {
+        meta.reasoning_effort = Some(e.clone());
+        changed = true;
     }
     changed
 }

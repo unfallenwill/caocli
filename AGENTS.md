@@ -4,10 +4,13 @@
 
 ## 命令
 
-- 构建: `cargo build`
+- 格式化: `cargo fmt`（CI 有 `--check` 门禁，提交前必须格式化）
+- Lint: `cargo clippy --all-targets -- -D warnings`（CI 门禁）
 - 测试: `cargo test`
+- 依赖安全审计: CI 每次推送跑 `rustsec/audit-check`；本地可 `cargo install cargo-audit && cargo audit`
 - 端到端冒烟: `DEEPSEEK_API_KEY=... cargo run -- -p "1+1 等于几" --no-think`
 - 会话列表: `cargo run -- --list`
+- 提交即触发 CI（.github/workflows/ci.yml）：fmt + clippy + test + audit，任一红不许合入
 
 ## 结构（一文件一职责，勿合并）
 
