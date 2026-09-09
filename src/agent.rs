@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use crate::api::Client;
+use crate::config::DEFAULT_EFFORT;
 use crate::session::Session;
 use crate::tools;
 use crate::types::{ChatRequest, Message, Thinking, TurnAccumulator, Usage};
@@ -31,7 +32,14 @@ impl Agent {
             tool_choice: Some("auto".into()),
             stream: true,
             thinking: Some(Thinking::enabled()),
-            reasoning_effort: self.session.meta.reasoning_effort.clone(),
+            // 后端默认档不一致（DeepSeek high / GLM max），未存值时钉成 DEFAULT_EFFORT。
+            reasoning_effort: Some(
+                self.session
+                    .meta
+                    .reasoning_effort
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_EFFORT.to_string()),
+            ),
         }
     }
 
@@ -174,6 +182,22 @@ mod tests {
         assert_eq!(req.messages[1], Message::user("q1"));
         assert_eq!(req.tools.as_ref().unwrap()[0].function.name, "Bash");
         assert_eq!(req.tool_choice.as_deref(), Some("auto"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn build_request_defaults_missing_effort_to_max() {
+        // 老会话 meta 里没有 effort 时，也要钉成 max 而不是留给后端各自默认。
+        let dir = tmpdir();
+        let mut s = Session::create(&dir, test_meta()).unwrap();
+        s.meta.reasoning_effort = None;
+        s.append_message(&Message::user("q1")).unwrap();
+        let agent = Agent {
+            api: Client::new("k".into(), crate::config::DEEPSEEK.url.into()).unwrap(),
+            session: s,
+        };
+        let req = agent.build_request();
+        assert_eq!(req.reasoning_effort.as_deref(), Some("max"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

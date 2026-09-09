@@ -42,6 +42,10 @@ const UNIVERSAL_KEY_ENV: &str = "CAOCLI_API_KEY";
 /// 非法值必须本地拒绝——DeepSeek 会 400，GLM 会静默按默认档处理。
 pub const EFFORTS: &[&str] = &["low", "high", "max"];
 
+/// 未指定 `--effort` 时使用的档位。后端各自的默认不同（DeepSeek high、
+/// GLM max），显式钉成 max 才能让两家行为一致。
+pub const DEFAULT_EFFORT: &str = "max";
+
 /// 按 id 查供应商。
 pub fn provider(id: &str) -> Result<Provider> {
     PROVIDERS

@@ -19,7 +19,7 @@ pub struct Cli {
     #[arg(long)]
     pub model: Option<String>,
 
-    /// 思考强度: low|high|max
+    /// 思考强度: low|high|max（默认 max）
     #[arg(long)]
     pub effort: Option<String>,
 

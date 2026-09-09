@@ -32,7 +32,10 @@ fn fresh_meta(cli: &Cli, provider: config::Provider) -> SessionMeta {
             .model
             .clone()
             .unwrap_or_else(|| provider.default_model.to_string()),
-        reasoning_effort: cli.effort.clone(),
+        reasoning_effort: cli
+            .effort
+            .clone()
+            .or_else(|| Some(config::DEFAULT_EFFORT.to_string())),
     }
 }
 
@@ -255,13 +258,14 @@ mod tests {
 
     #[test]
     fn no_cli_args_keeps_session_meta_untouched() {
+        // 不带 --effort 时不能把默认档 max 写进已有会话，必须沿用会话里存的值。
         let mut meta = SessionMeta {
             model: "deepseek-v4-pro".into(),
-            reasoning_effort: None,
+            reasoning_effort: Some("low".into()),
         };
         assert!(!apply_overrides(&mut meta, &cli(&[]), config::DEEPSEEK));
         assert_eq!(meta.model, "deepseek-v4-pro");
-        assert_eq!(meta.reasoning_effort, None);
+        assert_eq!(meta.reasoning_effort.as_deref(), Some("low"));
     }
 
     #[test]
@@ -330,7 +334,10 @@ mod tests {
     fn fresh_meta_defaults() {
         let meta = fresh_meta(&cli(&[]), config::DEEPSEEK);
         assert_eq!(meta.model, config::DEEPSEEK.default_model);
-        assert_eq!(meta.reasoning_effort, None);
+        assert_eq!(
+            meta.reasoning_effort.as_deref(),
+            Some(config::DEFAULT_EFFORT)
+        );
     }
 
     #[test]
