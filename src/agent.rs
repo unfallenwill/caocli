@@ -164,7 +164,7 @@ mod tests {
         let mut s = Session::create(&dir, test_meta()).unwrap();
         s.append_message(&Message::user("q1")).unwrap();
         let agent = Agent {
-            api: Client::new("k".into(), crate::config::BASE_URL.into()).unwrap(),
+            api: Client::new("k".into(), crate::config::DEEPSEEK.url.into()).unwrap(),
             session: s,
         };
         let req = agent.build_request();

@@ -3,26 +3,30 @@
 [![CI](https://github.com/unfallenwill/caocli/actions/workflows/ci.yml/badge.svg)](https://github.com/unfallenwill/caocli/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A minimal terminal coding agent in Rust, backed by the DeepSeek
-`/chat/completions` API. It streams the model's thinking
-(`reasoning_content`) in dim gray, then runs a tool loop over four tools:
-`Bash`, `Read`, `Edit`, and `Write`. Sessions are append-only JSONL logs
-under `~/.caocli/sessions/`, resumable across runs and replayed
-byte-for-byte so DeepSeek's prefix cache keeps hitting.
+A minimal terminal coding agent in Rust, backed by an OpenAI-compatible
+`/chat/completions` API: DeepSeek by default, Zhipu BigModel (GLM) via
+`--provider glm`. It streams the model's thinking (`reasoning_content`) in
+dim gray, then runs a tool loop over four tools: `Bash`, `Read`, `Edit`,
+and `Write`. Sessions are append-only JSONL logs under `~/.caocli/sessions/`,
+resumable across runs and replayed byte-for-byte so the backend's prefix
+cache keeps hitting.
 
 ## Requirements
 
 - Rust 1.85+ (edition 2024)
-- A DeepSeek API key in `DEEPSEEK_API_KEY`
+- An API key for the selected provider: `DEEPSEEK_API_KEY` (default) or
+  `ZAI_API_KEY` / `GLM_API_KEY` for `--provider glm` (or `CAOCLI_API_KEY`
+  to override either)
 
 ## Quick start
 
 ```bash
-export DEEPSEEK_API_KEY=sk-...
+export DEEPSEEK_API_KEY=sk-...          # or: export ZAI_API_KEY=...
 
-cargo run --                      # interactive REPL (type /help for commands)
+cargo run --                            # interactive REPL (/help for commands)
 cargo run -- -c -p "check disk usage"   # one-shot, continuing the latest session
 cargo run -- --effort max --model deepseek-v4-pro -p "..."
+cargo run -- --provider glm -p "1+1"    # Zhipu GLM-5.3-Flash
 cargo run -- --list                     # list sessions and exit
 ```
 
@@ -52,7 +56,8 @@ newlines also works (bracketed paste).
 | Flag | Description |
 |---|---|
 | `-p <PROMPT>` | Run one prompt (including the tool loop), then exit |
-| `--model <MODEL>` | Model id; defaults to `deepseek-v4.1-flash-expires-on-0910` |
+| `--provider <NAME>` | Backend provider: `deepseek` (default) or `glm` |
+| `--model <MODEL>` | Model id; defaults to the provider's default model |
 | `--effort <EFFORT>` | Reasoning effort: `low`, `high`, or `max` |
 | `-c, --cont` | Continue the most recent session |
 | `--resume <ID>` | Resume a specific session by id |
@@ -85,11 +90,27 @@ scrolled out of the region do not enter the terminal's scrollback buffer.
 Stats reset when you switch sessions (`/new`, `/resume`), and the bar is
 restored on exit.
 
+### Providers
+
+`--provider` selects a static preset (endpoint, default model, key env).
+It is a per-run choice and is not stored in the session, so resume a GLM
+session with `--provider glm` again (e.g. `caocli -c --provider glm`).
+
+| Provider | Endpoint | Default model |
+|---|---|---|
+| `deepseek` | `api.deepseek.com` | `deepseek-v4.1-flash-expires-on-0910` |
+| `glm` | `open.bigmodel.cn` (coding) | `GLM-5.3-Flash` |
+
+Both speak the same `thinking` / `reasoning_content` protocol, so the request
+builder and stream parser are shared. Thinking is always on.
+
 ### Environment
 
 | Variable | Description |
 |---|---|
-| `DEEPSEEK_API_KEY` | Required. API key for the DeepSeek endpoint. |
+| `DEEPSEEK_API_KEY` | API key for `--provider deepseek` (the default). |
+| `ZAI_API_KEY`, `GLM_API_KEY` | API key for `--provider glm`; either works. |
+| `CAOCLI_API_KEY` | If set, overrides the provider-specific key. |
 | `NO_COLOR` | If set, disable ANSI colors (block separation is preserved). |
 
 ## Tools
@@ -108,9 +129,9 @@ Limits: 10 KiB of output per tool result, 10 MB per file read/write.
 
 ## Design notes
 
-- **One backend, one loop, deliberately minimal.** No provider abstraction,
-  no plugin system — the whole agent is the request → stream → tool_calls →
-  execute → continue cycle.
+- **One loop, deliberately minimal.** Providers are a static table, not a
+  trait or dynamic registry — the whole agent is still the request → stream
+  → tool_calls → execute → continue cycle.
 - **Thinking-mode streaming.** `delta.reasoning_content` arrives before
   `delta.content`; they render as separate blocks (dim gray thinking,
   normal-colored answer). `NO_COLOR` or a non-TTY drops the color codes.

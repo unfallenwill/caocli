@@ -2,7 +2,7 @@
 name = "caocli"
 version = "0.1.0"
 edition = "2024"
-description = "Terminal AI agent backed by DeepSeek with thinking mode and a run_shell tool"
+description = "Terminal coding agent backed by DeepSeek or Zhipu GLM, with thinking mode and a Bash tool loop"
 license = "MIT"
 repository = "https://github.com/unfallenwill/caocli"
 

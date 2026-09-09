@@ -25,21 +25,26 @@ fn main() -> Result<()> {
     rt.block_on(run(cli))
 }
 
-/// 新会话的 meta：全部来自 CLI 参数或默认值。
-fn fresh_meta(cli: &Cli) -> SessionMeta {
+/// 新会话的 meta：模型来自 `--model`，否则用该供应商的默认模型。
+fn fresh_meta(cli: &Cli, provider: config::Provider) -> SessionMeta {
     SessionMeta {
         model: cli
             .model
             .clone()
-            .unwrap_or_else(|| config::DEFAULT_MODEL.to_string()),
+            .unwrap_or_else(|| provider.default_model.to_string()),
         reasoning_effort: cli.effort.clone(),
     }
 }
 
 /// 恢复会话时：CLI 显式给出的参数覆盖 meta，未给出的沿用会话内保存值。
 /// 返回 true 表示 meta 发生变化（需要追加 meta 行）。
-fn apply_overrides(meta: &mut SessionMeta, cli: &Cli) -> bool {
+fn apply_overrides(meta: &mut SessionMeta, cli: &Cli, provider: config::Provider) -> bool {
     let mut changed = false;
+    // 显式切供应商但未指定模型：跟随该供应商的默认模型，避免把旧模型名发给新后端
+    if cli.provider.is_some() && cli.model.is_none() && meta.model != provider.default_model {
+        meta.model = provider.default_model.to_string();
+        changed = true;
+    }
     if let Some(m) = &cli.model
         && meta.model != *m
     {
@@ -78,7 +83,9 @@ async fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    let api = Client::new(config::api_key()?, config::BASE_URL.to_string())?;
+    // 供应商与鉴权在会话之前确定：--provider 决定端点、默认模型与 key 环境变量
+    let provider = config::provider(cli.provider.as_deref().unwrap_or(config::DEFAULT_PROVIDER))?;
+    let api = Client::new(config::api_key(&provider)?, provider.url.to_string())?;
 
     // 会话解析优先级: --resume > --continue > 新建
     let mut session = if let Some(id) = &cli.resume {
@@ -87,13 +94,13 @@ async fn run(cli: Cli) -> Result<()> {
     } else if cli.cont {
         match session::latest(sdir.clone())? {
             Some(path) => Session::load(&path)?,
-            None => Session::create(&sdir, fresh_meta(&cli))?,
+            None => Session::create(&sdir, fresh_meta(&cli, provider))?,
         }
     } else {
-        Session::create(&sdir, fresh_meta(&cli))?
+        Session::create(&sdir, fresh_meta(&cli, provider))?
     };
 
-    if apply_overrides(&mut session.meta, &cli) {
+    if apply_overrides(&mut session.meta, &cli, provider) {
         session.set_meta(session.meta.clone())?;
     }
 
@@ -111,7 +118,7 @@ async fn run(cli: Cli) -> Result<()> {
                 .meta
                 .reasoning_effort
                 .as_deref()
-                .map(|e| format!("({e})"))
+                .map(|e| format!(" · effort {e}"))
                 .unwrap_or_default()
         ));
         if let Err(e) = agent.turn(prompt, &mut ui).await {
@@ -218,7 +225,7 @@ fn print_help() {
 }
 
 fn help_text() -> String {
-    "命令:\n  /exit /quit /q   退出\n  /new             开新会话\n  /sessions        列出会话\n  /resume <id>     切换到指定会话\n输入:\n  Enter            提交\n  Ctrl-J           换行（多行输入）\n启动参数:\n  -c / --continue  继续最近会话\n  --resume <id>    恢复指定会话\n  --effort low|high|max --model <id>\n  -p \"prompt\"     单次执行后退出"
+    "命令:\n  /exit /quit /q   退出\n  /new             开新会话\n  /sessions        列出会话\n  /resume <id>     切换到指定会话\n输入:\n  Enter            提交\n  Ctrl-J           换行（多行输入）\n启动参数:\n  -c / --continue  继续最近会话\n  --resume <id>    恢复指定会话\n  --provider deepseek|glm\n  --effort low|high|max --model <id>\n  -p \"prompt\"     单次执行后退出"
         .to_string()
 }
 
@@ -237,7 +244,7 @@ mod tests {
             model: "deepseek-v4-pro".into(),
             reasoning_effort: None,
         };
-        assert!(!apply_overrides(&mut meta, &cli(&[])));
+        assert!(!apply_overrides(&mut meta, &cli(&[]), config::DEEPSEEK));
         assert_eq!(meta.model, "deepseek-v4-pro");
         assert_eq!(meta.reasoning_effort, None);
     }
@@ -250,10 +257,37 @@ mod tests {
         };
         assert!(apply_overrides(
             &mut meta,
-            &cli(&["--model", "deepseek-v4-pro"])
+            &cli(&["--model", "deepseek-v4-pro"]),
+            config::DEEPSEEK
         ));
         assert_eq!(meta.model, "deepseek-v4-pro");
         assert_eq!(meta.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn switching_provider_without_model_follows_default_model() {
+        let mut meta = SessionMeta {
+            model: "deepseek-v4-flash".into(),
+            reasoning_effort: None,
+        };
+        assert!(apply_overrides(
+            &mut meta,
+            &cli(&["--provider", "glm"]),
+            config::GLM
+        ));
+        assert_eq!(meta.model, "GLM-5.3-Flash");
+
+        // 显式给了 --model 就听 --model
+        let mut meta2 = SessionMeta {
+            model: "deepseek-v4-flash".into(),
+            reasoning_effort: None,
+        };
+        assert!(apply_overrides(
+            &mut meta2,
+            &cli(&["--provider", "glm", "--model", "glm-4.6"]),
+            config::GLM
+        ));
+        assert_eq!(meta2.model, "glm-4.6");
     }
 
     #[test]
@@ -262,25 +296,48 @@ mod tests {
             model: "deepseek-v4-flash".into(),
             reasoning_effort: Some("high".into()),
         };
-        assert!(apply_overrides(&mut meta, &cli(&["--effort", "low"])));
+        assert!(apply_overrides(
+            &mut meta,
+            &cli(&["--effort", "low"]),
+            config::DEEPSEEK
+        ));
         assert_eq!(meta.reasoning_effort.as_deref(), Some("low"));
 
         // 相同值不触发写盘
-        assert!(!apply_overrides(&mut meta, &cli(&["--effort", "low"])));
+        assert!(!apply_overrides(
+            &mut meta,
+            &cli(&["--effort", "low"]),
+            config::DEEPSEEK
+        ));
     }
 
     #[test]
     fn fresh_meta_defaults() {
-        let meta = fresh_meta(&cli(&[]));
-        assert_eq!(meta.model, config::DEFAULT_MODEL);
+        let meta = fresh_meta(&cli(&[]), config::DEEPSEEK);
+        assert_eq!(meta.model, config::DEEPSEEK.default_model);
         assert_eq!(meta.reasoning_effort, None);
     }
 
     #[test]
+    fn fresh_meta_uses_provider_default_model() {
+        let meta = fresh_meta(&cli(&[]), config::GLM);
+        assert_eq!(meta.model, "GLM-5.3-Flash");
+    }
+
+    #[test]
     fn fresh_meta_carries_model_and_effort() {
-        let meta = fresh_meta(&cli(&["--model", "deepseek-v4-pro", "--effort", "max"]));
+        let meta = fresh_meta(
+            &cli(&["--model", "deepseek-v4-pro", "--effort", "max"]),
+            config::DEEPSEEK,
+        );
         assert_eq!(meta.model, "deepseek-v4-pro");
         assert_eq!(meta.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn provider_flag_parses() {
+        assert_eq!(cli(&["--provider", "glm"]).provider.as_deref(), Some("glm"));
+        assert!(cli(&[]).provider.is_none());
     }
 
     #[test]
@@ -292,7 +349,14 @@ mod tests {
     #[test]
     fn help_text_lists_slash_commands_and_flags() {
         let t = help_text();
-        for expected in ["/resume <id>", "-c / --continue", "-p \"prompt\"", "Ctrl-J"] {
+        for expected in [
+            "/resume <id>",
+            "-c / --continue",
+            "--provider deepseek|glm",
+            "--effort low|high|max",
+            "-p \"prompt\"",
+            "Ctrl-J",
+        ] {
             assert!(t.contains(expected), "缺少 {expected:?}\n{t}");
         }
     }

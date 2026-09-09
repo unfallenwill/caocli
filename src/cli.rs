@@ -4,14 +4,18 @@ use clap::Parser;
 #[command(
     name = "caocli",
     version,
-    about = "终端 agent · DeepSeek 后端 · 思维链 + Bash"
+    about = "终端 agent · DeepSeek / GLM 后端 · 思维链 + Bash"
 )]
 pub struct Cli {
     /// 单次执行模式：执行该 prompt（含工具循环）后退出
     #[arg(short = 'p')]
     pub prompt: Option<String>,
 
-    /// 模型 id（默认 deepseek-v4.1-flash-expires-on-0910）
+    /// 供应商: deepseek（默认）| glm
+    #[arg(long)]
+    pub provider: Option<String>,
+
+    /// 模型 id（默认取供应商的默认模型）
     #[arg(long)]
     pub model: Option<String>,
 
