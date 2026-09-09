@@ -1,31 +1,136 @@
 # caocli
 
-终端 AI agent，Rust 实现。后端 DeepSeek `/chat/completions`，思考模式（`reasoning_content` 思维链流式灰色渲染）+ `Bash` 工具循环，会话以 JSONL 追加日志持久化于 `~/.caocli/sessions/`，支持恢复与 KVCache 前缀缓存友好的逐字节历史回放。
+[![CI](https://github.com/unfallenwill/caocli/actions/workflows/ci.yml/badge.svg)](https://github.com/unfallenwill/caocli/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+A minimal terminal coding agent in Rust, backed by the DeepSeek
+`/chat/completions` API. It streams the model's thinking
+(`reasoning_content`) in dim gray, then runs a tool loop over four tools:
+`Bash`, `Read`, `Edit`, and `Write`. Sessions are append-only JSONL logs
+under `~/.caocli/sessions/`, resumable across runs and replayed
+byte-for-byte so DeepSeek's prefix cache keeps hitting.
+
+## Requirements
+
+- Rust 1.85+ (edition 2024)
+- A DeepSeek API key in `DEEPSEEK_API_KEY`
+
+## Quick start
 
 ```bash
 export DEEPSEEK_API_KEY=sk-...
 
-cargo run --                      # REPL（/help 查看 /new /sessions /resume /exit）
-cargo run -- -c -p "查看磁盘占用"  # 接最近会话单次执行
-cargo run -- --no-think -p "1+1"  # 关闭思考模式
+cargo run --                      # interactive REPL (type /help for commands)
+cargo run -- -c -p "check disk usage"   # one-shot, continuing the latest session
+cargo run -- --no-think -p "1+1"        # one-shot with thinking disabled
 cargo run -- --effort max --model deepseek-v4-pro -p "..."
-cargo run -- --list               # 列出会话
+cargo run -- --list                     # list sessions and exit
 ```
 
-## 构建 / 测试
+## Usage
+
+### REPL commands
+
+| Command | Description |
+|---|---|
+| `/help` | Show available commands |
+| `/new` | Start a new session, inheriting the current model/thinking settings |
+| `/sessions` | List sessions (id, message count, last user message preview) |
+| `/resume <id>` | Switch to an existing session |
+| `/exit`, `/quit`, `/q` | Quit |
+
+### CLI flags
+
+| Flag | Description |
+|---|---|
+| `-p <PROMPT>` | Run one prompt (including the tool loop), then exit |
+| `--model <MODEL>` | Model id; defaults to `deepseek-v4.1-flash-expires-on-0910` |
+| `--no-think` | Disable thinking mode (also clears any stored reasoning effort) |
+| `--effort <EFFORT>` | Reasoning effort: `low`, `high`, or `max`; ignored when thinking is disabled |
+| `-c, --cont` | Continue the most recent session |
+| `--resume <ID>` | Resume a specific session by id |
+| `--list` | List sessions and exit |
+| `-h, --help` / `-V, --version` | Print help / version |
+
+With no `-p`, caocli starts a REPL. CLI flags override the settings stored
+in a resumed session only when explicitly provided.
+
+### Environment
+
+| Variable | Description |
+|---|---|
+| `DEEPSEEK_API_KEY` | Required. API key for the DeepSeek endpoint. |
+| `NO_COLOR` | If set, disable ANSI colors (block separation is preserved). |
+
+## Tools
+
+The model can call four tools. Tool results are always plain text: failures
+are returned to the model as text so it can recover, never as a hard error.
+
+| Tool | Behavior |
+|---|---|
+| `Bash` | Run one `bash -c` command. 120s timeout; stdout and stderr are each truncated to 10 KiB. |
+| `Read` | Read a UTF-8 text file. Output truncated to 10 KiB. |
+| `Edit` | Replace `old_string` with `new_string`; `old_string` must match exactly once. Written atomically via tmp + rename. |
+| `Write` | Create or fully overwrite a file; parent directories are created automatically. |
+
+Limits: 10 KiB of output per tool result, 10 MB per file read/write.
+
+## Design notes
+
+- **One backend, one loop, deliberately minimal.** No provider abstraction,
+  no plugin system — the whole agent is the request → stream → tool_calls →
+  execute → continue cycle.
+- **Thinking-mode streaming.** `delta.reasoning_content` arrives before
+  `delta.content`; they render as separate blocks (dim gray thinking,
+  normal-colored answer). `NO_COLOR` or a non-TTY drops the color codes.
+- **`reasoning_content` must be replayed.** When a request carries `tools`,
+  DeepSeek requires the `reasoning_content` of every historical assistant
+  message to be sent back verbatim; omitting it is a 400. Sessions therefore
+  store the full assistant messages.
+- **Append-only session logs.** Files are never rewritten, so a crash costs
+  at most a trailing partial line. Corrupt lines are skipped on load.
+- **Prefix-cache friendly.** `SYSTEM_PROMPT` is a compile-time constant and
+  history is replayed byte-for-byte — no trimming, reordering, or
+  compaction. Injecting volatile data (time, cwd) or changing the tool set
+  or its order invalidates the cache. The `tokens:` line after each turn
+  reports `hit`/`miss` prompt tokens from `usage`.
+- **Token usage** is attached to the final content chunk of the stream, not
+  to a separate SSE event.
+
+## Session storage
+
+Sessions live in `~/.caocli/sessions/<YYYYMMDD-HHMMSS>.jsonl`. Each line is
+one JSON object tagged by `t`; `meta` lines override earlier ones on load.
+
+```jsonl
+{"t":"header","id":"20250101-120000","created_at":1735704000,"model":"deepseek-v4.1-flash-expires-on-0910","thinking":{"type":"enabled"},"reasoning_effort":"high"}
+{"t":"msg","message":{"role":"user","content":"check disk usage"}}
+{"t":"meta","model":"deepseek-v4-pro","thinking":{"type":"disabled"}}
+```
+
+## Development
 
 ```bash
-cargo build
+cargo fmt                                  # CI runs --check
+cargo clippy --all-targets -- -D warnings  # CI gate
 cargo test
+cargo llvm-cov --fail-under-lines 90       # CI gate; needs cargo-llvm-cov + llvm-tools-preview
+cargo audit                                # CI runs rustsec/audit-check
 ```
 
-## 设计要点
+End-to-end smoke test (the primary self-check channel after a change):
 
-- 单一后端、单一工具，刻意保持最小
-- 带 `tools` 的请求历史必须回传 `reasoning_content`（DeepSeek 硬约束），因此会话文件完整保存
-- 只追加不重写的会话日志：崩溃只损失尾部半行
-- `SYSTEM_PROMPT` 为编译期常量、历史逐字节回放——保住 DeepSeek 硬盘缓存命中
-- [`AGENTS.md`](AGENTS.md) 是给 AI agent 的维护手册（API 硬约束、结构、自测通道）
+```bash
+DEEPSEEK_API_KEY=... cargo run -- -p "what is 1+1" --no-think
+```
+
+CI runs on every push to `master` and every pull request: fmt + clippy +
+tests + line coverage ≥ 90% + dependency audit. Any red gate blocks merging.
+
+[`AGENTS.md`](AGENTS.md) is the maintainer handbook for AI agents: API hard
+constraints, per-file responsibilities, and the KVCache rules. Read it
+before changing message construction.
 
 ## License
 
