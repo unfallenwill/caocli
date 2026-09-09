@@ -191,3 +191,69 @@ fn print_help() {
         "命令:\n  /exit /quit /q   退出\n  /new             开新会话\n  /sessions        列出会话\n  /resume <id>     切换到指定会话\n启动参数:\n  -c / --continue  继续最近会话\n  --resume <id>    恢复指定会话\n  --no-think --effort low|high|max --model <id>\n  -p \"prompt\"     单次执行后退出"
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn cli(args: &[&str]) -> Cli {
+        Cli::parse_from(std::iter::once("caocli").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn no_cli_args_keeps_session_meta_untouched() {
+        let mut meta = SessionMeta {
+            model: "deepseek-v4-pro".into(),
+            thinking: Thinking::disabled(),
+            reasoning_effort: None,
+        };
+        assert!(!apply_overrides(&mut meta, &cli(&[])));
+        assert_eq!(meta.model, "deepseek-v4-pro");
+        assert!(!meta.thinking.is_enabled());
+    }
+
+    #[test]
+    fn explicit_model_overrides_only_model() {
+        let mut meta = SessionMeta {
+            model: "deepseek-v4-flash".into(),
+            thinking: Thinking::enabled(),
+            reasoning_effort: Some("high".into()),
+        };
+        assert!(apply_overrides(&mut meta, &cli(&["--model", "deepseek-v4-pro"])));
+        assert_eq!(meta.model, "deepseek-v4-pro");
+        assert!(meta.thinking.is_enabled());
+        assert_eq!(meta.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn no_think_disables_and_clears_effort() {
+        let mut meta = SessionMeta {
+            model: "deepseek-v4-flash".into(),
+            thinking: Thinking::enabled(),
+            reasoning_effort: Some("max".into()),
+        };
+        assert!(apply_overrides(&mut meta, &cli(&["--no-think"])));
+        assert!(!meta.thinking.is_enabled());
+        assert_eq!(meta.reasoning_effort, None);
+    }
+
+    #[test]
+    fn effort_only_applies_when_thinking_enabled() {
+        let mut on = SessionMeta {
+            model: "deepseek-v4-flash".into(),
+            thinking: Thinking::enabled(),
+            reasoning_effort: Some("high".into()),
+        };
+        assert!(apply_overrides(&mut on, &cli(&["--effort", "low"])));
+        assert_eq!(on.reasoning_effort.as_deref(), Some("low"));
+
+        let mut off = SessionMeta {
+            model: "deepseek-v4-flash".into(),
+            thinking: Thinking::disabled(),
+            reasoning_effort: None,
+        };
+        assert!(!apply_overrides(&mut off, &cli(&["--effort", "low"])));
+        assert_eq!(off.reasoning_effort, None);
+    }
+}
