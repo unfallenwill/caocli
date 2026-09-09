@@ -15,7 +15,6 @@ use crate::agent::Agent;
 use crate::api::Client;
 use crate::cli::Cli;
 use crate::session::{Session, SessionMeta};
-use crate::types::Thinking;
 use crate::ui::Renderer;
 
 fn main() -> Result<()> {
@@ -28,23 +27,12 @@ fn main() -> Result<()> {
 
 /// 新会话的 meta：全部来自 CLI 参数或默认值。
 fn fresh_meta(cli: &Cli) -> SessionMeta {
-    let thinking = if cli.no_think {
-        Thinking::disabled()
-    } else {
-        Thinking::enabled()
-    };
-    let reasoning_effort = if cli.no_think {
-        None
-    } else {
-        cli.effort.clone()
-    };
     SessionMeta {
         model: cli
             .model
             .clone()
             .unwrap_or_else(|| config::DEFAULT_MODEL.to_string()),
-        thinking,
-        reasoning_effort,
+        reasoning_effort: cli.effort.clone(),
     }
 }
 
@@ -58,13 +46,7 @@ fn apply_overrides(meta: &mut SessionMeta, cli: &Cli) -> bool {
         meta.model = m.clone();
         changed = true;
     }
-    if cli.no_think && meta.thinking.is_enabled() {
-        meta.thinking = Thinking::disabled();
-        meta.reasoning_effort = None;
-        changed = true;
-    }
     if let Some(e) = &cli.effort
-        && meta.thinking.is_enabled()
         && meta.reasoning_effort.as_deref() != Some(e.as_str())
     {
         meta.reasoning_effort = Some(e.clone());
@@ -121,14 +103,9 @@ async fn run(cli: Cli) -> Result<()> {
     // 单次执行模式（agent 自测的主通道）
     if let Some(prompt) = &cli.prompt {
         ui.info(&format!(
-            "会话 {} · {} · thinking={}{}",
+            "会话 {} · {}{}",
             agent.session.id,
             agent.session.meta.model,
-            if agent.session.meta.thinking.is_enabled() {
-                "on"
-            } else {
-                "off"
-            },
             agent
                 .session
                 .meta
@@ -241,7 +218,7 @@ fn print_help() {
 }
 
 fn help_text() -> String {
-    "命令:\n  /exit /quit /q   退出\n  /new             开新会话\n  /sessions        列出会话\n  /resume <id>     切换到指定会话\n输入:\n  Enter            提交\n  Ctrl-J           换行（多行输入）\n启动参数:\n  -c / --continue  继续最近会话\n  --resume <id>    恢复指定会话\n  --no-think --effort low|high|max --model <id>\n  -p \"prompt\"     单次执行后退出"
+    "命令:\n  /exit /quit /q   退出\n  /new             开新会话\n  /sessions        列出会话\n  /resume <id>     切换到指定会话\n输入:\n  Enter            提交\n  Ctrl-J           换行（多行输入）\n启动参数:\n  -c / --continue  继续最近会话\n  --resume <id>    恢复指定会话\n  --effort low|high|max --model <id>\n  -p \"prompt\"     单次执行后退出"
         .to_string()
 }
 
@@ -258,19 +235,17 @@ mod tests {
     fn no_cli_args_keeps_session_meta_untouched() {
         let mut meta = SessionMeta {
             model: "deepseek-v4-pro".into(),
-            thinking: Thinking::disabled(),
             reasoning_effort: None,
         };
         assert!(!apply_overrides(&mut meta, &cli(&[])));
         assert_eq!(meta.model, "deepseek-v4-pro");
-        assert!(!meta.thinking.is_enabled());
+        assert_eq!(meta.reasoning_effort, None);
     }
 
     #[test]
     fn explicit_model_overrides_only_model() {
         let mut meta = SessionMeta {
             model: "deepseek-v4-flash".into(),
-            thinking: Thinking::enabled(),
             reasoning_effort: Some("high".into()),
         };
         assert!(apply_overrides(
@@ -278,46 +253,26 @@ mod tests {
             &cli(&["--model", "deepseek-v4-pro"])
         ));
         assert_eq!(meta.model, "deepseek-v4-pro");
-        assert!(meta.thinking.is_enabled());
         assert_eq!(meta.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]
-    fn no_think_disables_and_clears_effort() {
+    fn effort_overrides_stored_value() {
         let mut meta = SessionMeta {
             model: "deepseek-v4-flash".into(),
-            thinking: Thinking::enabled(),
-            reasoning_effort: Some("max".into()),
-        };
-        assert!(apply_overrides(&mut meta, &cli(&["--no-think"])));
-        assert!(!meta.thinking.is_enabled());
-        assert_eq!(meta.reasoning_effort, None);
-    }
-
-    #[test]
-    fn effort_only_applies_when_thinking_enabled() {
-        let mut on = SessionMeta {
-            model: "deepseek-v4-flash".into(),
-            thinking: Thinking::enabled(),
             reasoning_effort: Some("high".into()),
         };
-        assert!(apply_overrides(&mut on, &cli(&["--effort", "low"])));
-        assert_eq!(on.reasoning_effort.as_deref(), Some("low"));
+        assert!(apply_overrides(&mut meta, &cli(&["--effort", "low"])));
+        assert_eq!(meta.reasoning_effort.as_deref(), Some("low"));
 
-        let mut off = SessionMeta {
-            model: "deepseek-v4-flash".into(),
-            thinking: Thinking::disabled(),
-            reasoning_effort: None,
-        };
-        assert!(!apply_overrides(&mut off, &cli(&["--effort", "low"])));
-        assert_eq!(off.reasoning_effort, None);
+        // 相同值不触发写盘
+        assert!(!apply_overrides(&mut meta, &cli(&["--effort", "low"])));
     }
 
     #[test]
     fn fresh_meta_defaults() {
         let meta = fresh_meta(&cli(&[]));
         assert_eq!(meta.model, config::DEFAULT_MODEL);
-        assert!(meta.thinking.is_enabled());
         assert_eq!(meta.reasoning_effort, None);
     }
 
@@ -325,15 +280,7 @@ mod tests {
     fn fresh_meta_carries_model_and_effort() {
         let meta = fresh_meta(&cli(&["--model", "deepseek-v4-pro", "--effort", "max"]));
         assert_eq!(meta.model, "deepseek-v4-pro");
-        assert!(meta.thinking.is_enabled());
         assert_eq!(meta.reasoning_effort.as_deref(), Some("max"));
-    }
-
-    #[test]
-    fn fresh_meta_no_think_ignores_effort() {
-        let meta = fresh_meta(&cli(&["--no-think", "--effort", "low"]));
-        assert!(!meta.thinking.is_enabled());
-        assert_eq!(meta.reasoning_effort, None);
     }
 
     #[test]
@@ -345,13 +292,7 @@ mod tests {
     #[test]
     fn help_text_lists_slash_commands_and_flags() {
         let t = help_text();
-        for expected in [
-            "/resume <id>",
-            "-c / --continue",
-            "--no-think",
-            "-p \"prompt\"",
-            "Ctrl-J",
-        ] {
+        for expected in ["/resume <id>", "-c / --continue", "-p \"prompt\"", "Ctrl-J"] {
             assert!(t.contains(expected), "缺少 {expected:?}\n{t}");
         }
     }

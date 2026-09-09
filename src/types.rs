@@ -17,7 +17,7 @@ pub enum Role {
     Tool,
 }
 
-/// thinking 开关。type: "enabled" | "disabled"，API 默认 enabled。
+/// 思维链开关。思维链恒定开启，这里只用来显式发出 `{"type":"enabled"}`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Thinking {
     pub r#type: String,
@@ -28,14 +28,6 @@ impl Thinking {
         Self {
             r#type: "enabled".into(),
         }
-    }
-    pub fn disabled() -> Self {
-        Self {
-            r#type: "disabled".into(),
-        }
-    }
-    pub fn is_enabled(&self) -> bool {
-        self.r#type == "enabled"
     }
 }
 

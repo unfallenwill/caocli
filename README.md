@@ -22,7 +22,6 @@ export DEEPSEEK_API_KEY=sk-...
 
 cargo run --                      # interactive REPL (type /help for commands)
 cargo run -- -c -p "check disk usage"   # one-shot, continuing the latest session
-cargo run -- --no-think -p "1+1"        # one-shot with thinking disabled
 cargo run -- --effort max --model deepseek-v4-pro -p "..."
 cargo run -- --list                     # list sessions and exit
 ```
@@ -34,7 +33,7 @@ cargo run -- --list                     # list sessions and exit
 | Command | Description |
 |---|---|
 | `/help` | Show available commands |
-| `/new` | Start a new session, inheriting the current model/thinking settings |
+| `/new` | Start a new session, inheriting the current model settings |
 | `/sessions` | List sessions (id, message count, last user message preview) |
 | `/resume <id>` | Switch to an existing session, replaying its history to the screen |
 | `/exit`, `/quit`, `/q` | Quit |
@@ -54,8 +53,7 @@ newlines also works (bracketed paste).
 |---|---|
 | `-p <PROMPT>` | Run one prompt (including the tool loop), then exit |
 | `--model <MODEL>` | Model id; defaults to `deepseek-v4.1-flash-expires-on-0910` |
-| `--no-think` | Disable thinking mode (also clears any stored reasoning effort) |
-| `--effort <EFFORT>` | Reasoning effort: `low`, `high`, or `max`; ignored when thinking is disabled |
+| `--effort <EFFORT>` | Reasoning effort: `low`, `high`, or `max` |
 | `-c, --cont` | Continue the most recent session |
 | `--resume <ID>` | Resume a specific session by id |
 | `--list` | List sessions and exit |
@@ -139,9 +137,9 @@ Sessions live in `~/.caocli/sessions/<YYYYMMDD-HHMMSS>.jsonl`. Each line is
 one JSON object tagged by `t`; `meta` lines override earlier ones on load.
 
 ```jsonl
-{"t":"header","id":"20250101-120000","created_at":1735704000,"model":"deepseek-v4.1-flash-expires-on-0910","thinking":{"type":"enabled"},"reasoning_effort":"high"}
+{"t":"header","id":"20250101-120000","created_at":1735704000,"model":"deepseek-v4.1-flash-expires-on-0910","reasoning_effort":"high"}
 {"t":"msg","message":{"role":"user","content":"check disk usage"}}
-{"t":"meta","model":"deepseek-v4-pro","thinking":{"type":"disabled"}}
+{"t":"meta","model":"deepseek-v4-pro","reasoning_effort":"max"}
 ```
 
 ## Development
@@ -157,7 +155,7 @@ cargo audit                                # CI runs rustsec/audit-check
 End-to-end smoke test (the primary self-check channel after a change):
 
 ```bash
-DEEPSEEK_API_KEY=... cargo run -- -p "what is 1+1" --no-think
+DEEPSEEK_API_KEY=... cargo run -- -p "what is 1+1"
 ```
 
 CI runs on every push to `master` and every pull request: fmt + clippy +

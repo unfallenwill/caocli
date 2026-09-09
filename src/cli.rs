@@ -15,10 +15,6 @@ pub struct Cli {
     #[arg(long)]
     pub model: Option<String>,
 
-    /// 关闭思考模式
-    #[arg(long)]
-    pub no_think: bool,
-
     /// 思考强度: low|high|max
     #[arg(long)]
     pub effort: Option<String>,

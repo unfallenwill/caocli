@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::types::{Message, Role, Thinking};
+use crate::types::{Message, Role};
 
 // ============================================================================
 // 会话存储：JSONL append-only。
@@ -17,7 +17,6 @@ use crate::types::{Message, Role, Thinking};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub model: String,
-    pub thinking: Thinking,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
 }
@@ -245,7 +244,6 @@ mod tests {
     fn test_meta() -> SessionMeta {
         SessionMeta {
             model: "deepseek-v4-flash".into(),
-            thinking: Thinking::enabled(),
             reasoning_effort: Some("high".into()),
         }
     }
@@ -310,13 +308,12 @@ mod tests {
         let mut s = Session::create(&dir, test_meta()).unwrap();
         s.set_meta(SessionMeta {
             model: "deepseek-v4-pro".into(),
-            thinking: Thinking::disabled(),
-            reasoning_effort: None,
+            reasoning_effort: Some("max".into()),
         })
         .unwrap();
         let loaded = Session::load(&s.path).unwrap();
         assert_eq!(loaded.meta.model, "deepseek-v4-pro");
-        assert!(!loaded.meta.thinking.is_enabled());
+        assert_eq!(loaded.meta.reasoning_effort.as_deref(), Some("max"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -379,7 +376,6 @@ mod tests {
         s.append_message(&Message::user("长".repeat(60))).unwrap();
         s.set_meta(SessionMeta {
             model: "deepseek-v4-pro".into(),
-            thinking: Thinking::disabled(),
             reasoning_effort: None,
         })
         .unwrap();

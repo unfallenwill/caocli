@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::api::Client;
 use crate::session::Session;
 use crate::tools;
-use crate::types::{ChatRequest, Message, TurnAccumulator, Usage};
+use crate::types::{ChatRequest, Message, Thinking, TurnAccumulator, Usage};
 use crate::ui::Renderer;
 
 /// 参与请求前缀（KVCache）。禁止注入时间、cwd、随机 id 等任何动态内容，
@@ -30,7 +30,7 @@ impl Agent {
             tools: Some(tools::definitions()),
             tool_choice: Some("auto".into()),
             stream: true,
-            thinking: Some(self.session.meta.thinking.clone()),
+            thinking: Some(Thinking::enabled()),
             reasoning_effort: self.session.meta.reasoning_effort.clone(),
         }
     }
@@ -90,7 +90,7 @@ impl Agent {
 mod tests {
     use super::*;
     use crate::session::SessionMeta;
-    use crate::types::{Role, Thinking};
+    use crate::types::Role;
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -109,7 +109,6 @@ mod tests {
     fn test_meta() -> SessionMeta {
         SessionMeta {
             model: "deepseek-v4-flash".into(),
-            thinking: Thinking::enabled(),
             reasoning_effort: Some("high".into()),
         }
     }
