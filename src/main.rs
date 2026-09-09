@@ -72,7 +72,7 @@ fn apply_overrides(meta: &mut SessionMeta, cli: &Cli) -> bool {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let ui = Renderer::new();
+    let mut ui = Renderer::new();
     let sdir = config::sessions_dir()?;
 
     if cli.list {
