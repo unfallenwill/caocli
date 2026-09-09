@@ -11,7 +11,7 @@ pub struct Cli {
     #[arg(short = 'p')]
     pub prompt: Option<String>,
 
-    /// 模型 id（默认 deepseek-v4-flash）
+    /// 模型 id（默认 deepseek-v4.1-flash-expires-on-0910）
     #[arg(long)]
     pub model: Option<String>,
 

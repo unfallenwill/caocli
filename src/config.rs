@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
 pub const BASE_URL: &str = "https://api.deepseek.com/chat/completions";
-pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+pub const DEFAULT_MODEL: &str = "deepseek-v4.1-flash-expires-on-0910";
 
 pub fn api_key() -> Result<String> {
     let key = std::env::var("DEEPSEEK_API_KEY").unwrap_or_default();
