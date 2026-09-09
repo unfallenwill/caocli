@@ -157,7 +157,22 @@ pub struct ChunkChoice {
     pub finish_reason: Option<String>,
 }
 
-/// usage。prompt_tokens = prompt_cache_hit_tokens + prompt_cache_miss_tokens。
+/// GLM / OpenAI 风格的缓存明细：`usage.prompt_tokens_details.cached_tokens`。
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: u64,
+}
+
+/// 归一化后的缓存 token 数。供应商的 wire 形状差异在 `Usage::cache()` 里收敛。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheTokens {
+    pub hit: u64,
+    pub miss: u64,
+}
+
+/// usage。DeepSeek 用扁平的 hit/miss 字段（prompt_tokens = hit + miss）；
+/// GLM / OpenAI 用嵌套的 prompt_tokens_details.cached_tokens。两种形状都兼容。
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct Usage {
     #[serde(default)]
@@ -170,6 +185,28 @@ pub struct Usage {
     pub prompt_cache_hit_tokens: u64,
     #[serde(default)]
     pub prompt_cache_miss_tokens: u64,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+impl Usage {
+    /// 缓存命中/未命中 token。两种 wire 形状都试；都不认识返回 None，
+    /// 调用方据此显示 `—`，而不是编造一个 0%。
+    pub fn cache(&self) -> Option<CacheTokens> {
+        // DeepSeek 扁平字段：全 miss 的首轮也会给 hit=0/miss=N，所以看 miss。
+        if self.prompt_cache_hit_tokens > 0 || self.prompt_cache_miss_tokens > 0 {
+            return Some(CacheTokens {
+                hit: self.prompt_cache_hit_tokens,
+                miss: self.prompt_cache_miss_tokens,
+            });
+        }
+        // GLM / OpenAI 只给命中数，未命中由 prompt_tokens 推导。
+        let details = self.prompt_tokens_details.as_ref()?;
+        Some(CacheTokens {
+            hit: details.cached_tokens,
+            miss: self.prompt_tokens.saturating_sub(details.cached_tokens),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -427,5 +464,62 @@ mod tests {
         let u = chunk.usage.unwrap();
         assert_eq!(u.prompt_cache_hit_tokens, 8);
         assert_eq!(u.prompt_cache_miss_tokens, 9);
+    }
+
+    #[test]
+    fn cache_reads_deepseek_flat_fields() {
+        let u = Usage {
+            prompt_tokens: 17,
+            prompt_cache_hit_tokens: 8,
+            prompt_cache_miss_tokens: 9,
+            ..Default::default()
+        };
+        assert_eq!(u.cache(), Some(CacheTokens { hit: 8, miss: 9 }));
+    }
+
+    #[test]
+    fn cache_reads_deepseek_all_miss() {
+        // 首轮全 miss：hit=0 但 miss>0，不能被当成"无缓存信息"。
+        let u = Usage {
+            prompt_tokens: 17,
+            prompt_cache_hit_tokens: 0,
+            prompt_cache_miss_tokens: 17,
+            ..Default::default()
+        };
+        assert_eq!(u.cache(), Some(CacheTokens { hit: 0, miss: 17 }));
+    }
+
+    #[test]
+    fn cache_reads_glm_nested_details() {
+        // GLM 只给 cached_tokens，miss 由 prompt_tokens 推导。
+        let line = r#"{"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":300,"total_tokens":1500,"prompt_tokens_details":{"cached_tokens":800}}}"#;
+        let chunk: ChatChunk = serde_json::from_str(line).unwrap();
+        let u = chunk.usage.unwrap();
+        assert_eq!(
+            u.cache(),
+            Some(CacheTokens {
+                hit: 800,
+                miss: 400
+            })
+        );
+    }
+
+    #[test]
+    fn cache_reads_glm_all_miss() {
+        let u = Usage {
+            prompt_tokens: 1200,
+            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 0 }),
+            ..Default::default()
+        };
+        assert_eq!(u.cache(), Some(CacheTokens { hit: 0, miss: 1200 }));
+    }
+
+    #[test]
+    fn cache_is_none_without_any_cache_field() {
+        let u = Usage {
+            prompt_tokens: 100,
+            ..Default::default()
+        };
+        assert_eq!(u.cache(), None);
     }
 }

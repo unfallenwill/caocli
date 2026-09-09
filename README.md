@@ -146,6 +146,12 @@ Limits: 10 KiB of output per tool result, 10 MB per file read/write.
   compaction. Injecting volatile data (time, cwd) or changing the tool set
   or its order invalidates the cache. The `tokens:` line after each turn
   reports `hit`/`miss` prompt tokens from `usage`.
+- **Cache usage is normalized across providers.** DeepSeek reports flat
+  `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`; GLM/OpenAI report
+  nested `prompt_tokens_details.cached_tokens` (miss derived as
+  `prompt_tokens - cached_tokens`). Both shapes land in the same hit/miss
+  counters; a provider that reports neither shows `cache —` rather than a
+  fake 0%.
 - **Token usage** is attached to the final content chunk of the stream, not
   to a separate SSE event.
 - **Two levels of cache visibility.** Every sub-request prints a `tokens:`

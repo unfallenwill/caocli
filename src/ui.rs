@@ -15,8 +15,12 @@ pub struct CacheStats {
 
 impl CacheStats {
     pub fn record(&mut self, u: &Usage) {
-        self.hit += u.prompt_cache_hit_tokens;
-        self.miss += u.prompt_cache_miss_tokens;
+        // 归一化：DeepSeek 扁平字段 / GLM 嵌套 details 都在 Usage::cache() 里收敛。
+        // 供应商不报告缓存时不记，避免把"未知"显示成 0% 命中。
+        if let Some(c) = u.cache() {
+            self.hit += c.hit;
+            self.miss += c.miss;
+        }
     }
 
     /// 命中率百分比；尚无数据时 None。
@@ -363,13 +367,13 @@ impl Renderer {
     }
 
     pub fn usage(&mut self, u: &Usage) {
+        let cache = match u.cache() {
+            Some(c) => format!("hit {}/miss {}", c.hit, c.miss),
+            None => "cache —".to_string(),
+        };
         let s = format!(
-            "tokens: in {}/{} (hit {}/miss {}) · out {}",
-            u.prompt_tokens,
-            u.total_tokens,
-            u.prompt_cache_hit_tokens,
-            u.prompt_cache_miss_tokens,
-            u.completion_tokens
+            "tokens: in {}/{} ({cache}) · out {}",
+            u.prompt_tokens, u.total_tokens, u.completion_tokens
         );
         self.raw(&self.paint(DIM, &s));
         self.raw("\n");
@@ -569,6 +573,7 @@ mod tests {
             total_tokens: 15,
             prompt_cache_hit_tokens: 6,
             prompt_cache_miss_tokens: 4,
+            ..Default::default()
         });
         r.info("会话 abc");
         let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
@@ -603,6 +608,7 @@ mod tests {
             total_tokens: hit + miss,
             prompt_cache_hit_tokens: hit,
             prompt_cache_miss_tokens: miss,
+            ..Default::default()
         }
     }
 
@@ -620,6 +626,31 @@ mod tests {
         assert_eq!((s.hit, s.miss), (32384, 461));
         assert!((s.hit_rate().unwrap() - 98.6).abs() < 0.05, "{s:?}");
         assert_eq!(s.label(), "cache 98.6% · hit 32384 · miss 461");
+    }
+
+    #[test]
+    fn cache_stats_read_glm_nested_details() {
+        // GLM 形状：只给 prompt_tokens_details.cached_tokens，miss 需推导。
+        let mut s = CacheStats::default();
+        s.record(&Usage {
+            prompt_tokens: 1200,
+            completion_tokens: 300,
+            total_tokens: 1500,
+            prompt_tokens_details: Some(crate::types::PromptTokensDetails { cached_tokens: 800 }),
+            ..Default::default()
+        });
+        assert_eq!((s.hit, s.miss), (800, 400));
+        assert_eq!(s.label(), "cache 66.7% · hit 800 · miss 400");
+    }
+
+    #[test]
+    fn cache_stats_ignore_provider_without_cache_reporting() {
+        let mut s = CacheStats::default();
+        s.record(&Usage {
+            prompt_tokens: 100,
+            ..Default::default()
+        });
+        assert_eq!(s.label(), "cache —");
     }
 
     #[test]
