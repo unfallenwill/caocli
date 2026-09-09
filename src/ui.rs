@@ -139,6 +139,8 @@ pub struct Renderer {
     color: bool,
     mode: Mode,
     stats: CacheStats,
+    /// 状态栏左段显示的模型 id（建立/切换会话时更新）。
+    model: Option<String>,
     bar: Option<StatusBar>,
 }
 
@@ -150,6 +152,7 @@ impl Renderer {
             color,
             mode: Mode::Idle,
             stats: CacheStats::default(),
+            model: None,
             bar: None,
         }
     }
@@ -162,6 +165,7 @@ impl Renderer {
             color,
             mode: Mode::Idle,
             stats: CacheStats::default(),
+            model: None,
             bar: None,
         };
         (r, buf)
@@ -199,9 +203,24 @@ impl Renderer {
     /// 重绘状态栏（不重新探测尺寸）。
     fn redraw_status_bar(&mut self) {
         let Some(bar) = self.bar else { return };
-        let visible = truncate_chars(&self.stats.label(), bar.width());
+        let visible = truncate_chars(&self.status_label(), bar.width());
         let painted = self.paint(DIM, &visible);
         bar.render(self.out.as_mut(), &visible, &painted);
+    }
+
+    /// 状态栏文本：`<model> · cache ...`；模型未知时退化为纯缓存统计。
+    fn status_label(&self) -> String {
+        let cache = self.stats.label();
+        match &self.model {
+            Some(m) if !m.is_empty() => format!("{m} · {cache}"),
+            _ => cache,
+        }
+    }
+
+    /// 设置状态栏显示的模型 id（建立/切换会话时调用，随会话 meta 变化）。
+    pub fn set_model(&mut self, model: &str) {
+        self.model = Some(model.to_owned());
+        self.redraw_status_bar();
     }
 
     /// 当前会话累计的缓存统计（状态栏数据源）。仅测试读取。
@@ -730,6 +749,52 @@ mod tests {
         let tail = &buf_of(&buf)[s.len()..];
         assert!(tail.contains("cache —\x1b8"), "{tail:?}");
         assert_eq!(r.stats, CacheStats::default());
+    }
+
+    #[test]
+    fn status_label_prepends_model_when_set() {
+        let (mut r, _buf) = Renderer::with_buffer(false);
+        assert_eq!(r.status_label(), "cache —");
+        r.set_model("deepseek-v4-flash");
+        assert_eq!(r.status_label(), "deepseek-v4-flash · cache —");
+        r.usage(&usage_fixture(6, 4));
+        assert_eq!(
+            r.status_label(),
+            "deepseek-v4-flash · cache 60.0% · hit 6 · miss 4"
+        );
+    }
+
+    #[test]
+    fn empty_model_falls_back_to_cache_only_label() {
+        let (mut r, _buf) = Renderer::with_buffer(false);
+        r.set_model("");
+        assert_eq!(r.status_label(), "cache —");
+    }
+
+    #[test]
+    fn status_bar_shows_model_and_updates_on_switch() {
+        let bar = StatusBar { rows: 10, cols: 80 };
+        let (mut r, buf) = Renderer::with_buffer(false);
+        r.apply_status_bar(Some(bar));
+        r.set_model("deepseek-v4-flash");
+        r.usage(&usage_fixture(6, 4));
+        let s = buf_of(&buf);
+        assert!(
+            s.contains("deepseek-v4-flash · cache 60.0% · hit 6 · miss 4"),
+            "{s:?}"
+        );
+
+        // 切换模型：重绘后只剩新模型
+        r.set_model("deepseek-v4-pro");
+        let tail = &buf_of(&buf)[s.len()..];
+        assert!(tail.contains("deepseek-v4-pro · cache 60.0%"), "{tail:?}");
+        assert!(!tail.contains("deepseek-v4-flash"), "{tail:?}");
+
+        // reset_stats 只清缓存统计，模型保留
+        let before = buf_of(&buf).len();
+        r.reset_stats();
+        let tail = &buf_of(&buf)[before..];
+        assert!(tail.contains("deepseek-v4-pro · cache —"), "{tail:?}");
     }
 
     #[test]

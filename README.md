@@ -70,12 +70,15 @@ result summaries as they were rendered live (full tool output is not replayed).
 
 ### Status bar
 
-In the REPL, a status bar pinned to the bottom line shows the session's
-cumulative cache hit rate, right-aligned:
+In the REPL, a status bar pinned to the bottom line shows the active model
+and the session's cumulative cache hit rate, right-aligned:
 
 ```
-cache 98.6% · hit 32384 · miss 461
+deepseek-v4.1-flash-expires-on-0910 · cache 98.6% · hit 32384 · miss 461
 ```
+
+The model segment mirrors the active session's meta and is refreshed on
+`/new`, `/resume`, and CLI overrides.
 
 It appears only when stdout is a TTY and the terminal has at least 3 rows;
 `--no-status-bar` turns it off. The bar reserves the last terminal line via

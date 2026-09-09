@@ -116,6 +116,7 @@ async fn run(cli: Cli) -> Result<()> {
     }
 
     let mut agent = Agent::new(api, session);
+    ui.set_model(&agent.session.meta.model);
 
     // 单次执行模式（agent 自测的主通道）
     if let Some(prompt) = &cli.prompt {
@@ -192,6 +193,7 @@ async fn run(cli: Cli) -> Result<()> {
                             ui.info(&format!("新会话 {}", s.id));
                             agent.session = s;
                             ui.reset_stats();
+                            ui.set_model(&agent.session.meta.model);
                         }
                         Err(e) => ui.error(&format!("{e:#}")),
                     },
@@ -208,6 +210,7 @@ async fn run(cli: Cli) -> Result<()> {
                                 ui.replay(&s.messages);
                                 agent.session = s;
                                 ui.reset_stats();
+                                ui.set_model(&agent.session.meta.model);
                             }
                             Err(e) => ui.error(&format!("{e:#}")),
                         }
