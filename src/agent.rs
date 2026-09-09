@@ -95,6 +95,66 @@ mod tests {
     use super::*;
     use crate::session::SessionMeta;
     use crate::types::{Role, Thinking};
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn tmpdir() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "caocli-agent-mock-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn test_meta() -> SessionMeta {
+        SessionMeta {
+            model: "deepseek-v4-flash".into(),
+            thinking: Thinking::enabled(),
+            reasoning_effort: Some("high".into()),
+        }
+    }
+
+    /// 构造一个 SSE chunk 行（含空行分隔）。
+    fn sse(
+        delta: serde_json::Value,
+        finish: Option<&str>,
+        usage: Option<serde_json::Value>,
+    ) -> String {
+        let mut obj = json!({
+            "id": "mock-1",
+            "model": "deepseek-v4-flash",
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        });
+        if let Some(u) = usage {
+            obj["usage"] = u;
+        }
+        format!("data: {obj}\n\n")
+    }
+
+    async fn mount_chat(server: &MockServer, body: String, times: Option<u64>) {
+        let mock = Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body));
+        match times {
+            Some(n) => mock.up_to_n_times(n).mount(server).await,
+            None => mock.mount(server).await,
+        }
+    }
+
+    fn test_agent(server: &MockServer, dir: &std::path::Path) -> Agent {
+        let api = Client::new(
+            "test-key".into(),
+            format!("{}/chat/completions", server.uri()),
+        )
+        .unwrap();
+        let session = Session::create(dir, test_meta()).unwrap();
+        Agent::new(api, session)
+    }
 
     #[test]
     fn system_prompt_is_stable_constant() {
@@ -105,14 +165,8 @@ mod tests {
 
     #[test]
     fn build_request_prepends_system_and_keeps_history_order() {
-        let dir = std::env::temp_dir().join(format!("caocli-agent-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let meta = SessionMeta {
-            model: "deepseek-v4-flash".into(),
-            thinking: Thinking::enabled(),
-            reasoning_effort: Some("high".into()),
-        };
-        let mut s = Session::create(&dir, meta).unwrap();
+        let dir = tmpdir();
+        let mut s = Session::create(&dir, test_meta()).unwrap();
         s.append_message(&Message::user("q1")).unwrap();
         let agent = Agent {
             api: Client::new("k".into(), crate::config::BASE_URL.into()).unwrap(),
@@ -126,6 +180,123 @@ mod tests {
         assert_eq!(req.messages[1], Message::user("q1"));
         assert_eq!(req.tools.as_ref().unwrap()[0].function.name, "run_shell");
         assert_eq!(req.tool_choice.as_deref(), Some("auto"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 端到端：tool_calls（arguments 分片）→ 真实执行 run_shell → 第二轮带
+    /// reasoning_content 回传 → 最终回答。钉住 DeepSeek "带 tools 必须回传
+    /// reasoning_content" 硬约束与历史逐字节回放。
+    #[tokio::test]
+    async fn mock_full_tool_loop_replays_reasoning_content() {
+        let server = MockServer::start().await;
+        let turn1 = [
+            sse(json!({"role":"assistant","reasoning_content":"我需要执行命令。"}), None, None),
+            sse(json!({"tool_calls":[{"index":0,"id":"call_mock_1","type":"function","function":{"name":"run_shell","arguments":"{\"comm"}}]}), None, None),
+            sse(json!({"tool_calls":[{"index":0,"function":{"arguments":"and\":\"echo caocli-mock-marker\"}"}}]}), None, None),
+            sse(json!({"content":""}), Some("tool_calls"), Some(json!({"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":10}))),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let turn2 = [
+            sse(json!({"content":"已执行完毕。"}), None, None),
+            sse(json!({"content":""}), Some("stop"), Some(json!({"prompt_tokens":20,"completion_tokens":8,"total_tokens":28,"prompt_cache_hit_tokens":12,"prompt_cache_miss_tokens":8}))),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        mount_chat(&server, turn1, Some(1)).await;
+        mount_chat(&server, turn2, None).await;
+
+        let dir = tmpdir();
+        let mut agent = test_agent(&server, &dir);
+        agent.turn("用工具打个标记").await.unwrap();
+
+        // 会话历史：user / assistant(思维链+tool_calls) / tool(执行结果) / assistant
+        assert_eq!(agent.session.messages.len(), 4);
+        let assistant1 = &agent.session.messages[1];
+        assert_eq!(
+            assistant1.reasoning_content.as_deref(),
+            Some("我需要执行命令。")
+        );
+        let calls = assistant1.tool_calls.as_ref().unwrap();
+        assert_eq!(calls[0].id, "call_mock_1");
+        assert_eq!(calls[0].function.name, "run_shell");
+        assert_eq!(
+            calls[0].function.arguments,
+            r#"{"command":"echo caocli-mock-marker"}"#
+        );
+        let tool_msg = &agent.session.messages[2];
+        assert_eq!(tool_msg.role, Role::Tool);
+        assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call_mock_1"));
+        // run_shell 真的执行了
+        assert!(
+            tool_msg
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("caocli-mock-marker")
+        );
+        assert_eq!(
+            agent.session.messages[3].content.as_deref(),
+            Some("已执行完毕。")
+        );
+
+        // 第二轮请求体：核心硬约束 —— reasoning_content 原样回传
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 2);
+        let body: serde_json::Value = serde_json::from_slice(&reqs[1].body).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4); // system + user + assistant + tool
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["reasoning_content"], "我需要执行命令。");
+        assert_eq!(msgs[2]["tool_calls"][0]["id"], "call_mock_1");
+        assert_eq!(msgs[3]["role"], "tool");
+        assert_eq!(msgs[3]["tool_call_id"], "call_mock_1");
+        // 请求参数形状
+        assert_eq!(body["model"], "deepseek-v4-flash");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["tools"][0]["function"]["name"], "run_shell");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// HTTP 错误必须带状态码和响应体，且不破坏已落盘的会话。
+    #[tokio::test]
+    async fn mock_http_error_includes_status_and_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"error":{"message":"reasoning_content must be passed back","type":"invalid_request_error"}}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let dir = tmpdir();
+        let mut agent = test_agent(&server, &dir);
+        let err = agent.turn("hi").await.unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("400"), "错误信息应含状态码: {s}");
+        assert!(
+            s.contains("reasoning_content must be passed back"),
+            "错误信息应含响应体: {s}"
+        );
+        // user 消息已落盘，assistant 未落盘
+        assert_eq!(agent.session.messages.len(), 1);
+        assert_eq!(agent.session.messages[0].role, Role::User);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 坏 SSE chunk 报错并带上下文。
+    #[tokio::test]
+    async fn mock_broken_sse_chunk_fails_with_context() {
+        let server = MockServer::start().await;
+        mount_chat(&server, "data: {\"broken\":\n\n".to_string(), None).await;
+
+        let dir = tmpdir();
+        let mut agent = test_agent(&server, &dir);
+        let err = agent.turn("hi").await.unwrap_err();
+        assert!(format!("{err:#}").contains("解析 SSE chunk 失败"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
