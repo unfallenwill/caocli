@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use std::future::Future;
+use std::pin::Pin;
 
 use crate::api::Client;
 use crate::config::DEFAULT_EFFORT;
@@ -22,6 +23,29 @@ pub struct Agent {
     /// 单回合工具步上限（终止性的产品兜底）。
     pub max_tool_steps: usize,
     tool_steps: usize,
+}
+
+/// 带外取消（Ctrl-C）源：整回合持有一个长生命周期监听者，按需借出
+/// 可丢弃的等待 future。等待是 cancel-safe 的：future 被丢弃不丢信号
+/// （状态在监听者里），未消费的信号让下一次 `wait()` 立即就绪。
+/// 输出生命周期绑 `&mut self`——`Fn` 家族表达不了「返回值借用接收者」。
+trait Interrupt {
+    fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>>;
+}
+
+/// 真实 SIGINT 监听者。构造即向 tokio 的 watch 订阅（无需 poll），
+/// 因此从 turn 开始到结束的任何时刻，信号都不会因「无监听空窗」而丢失。
+struct Sigint(
+    #[cfg(unix)] tokio::signal::unix::Signal,
+    #[cfg(not(unix))] tokio::signal::windows::CtrlC,
+);
+
+impl Interrupt for Sigint {
+    fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+        Box::pin(async {
+            self.0.recv().await;
+        })
+    }
 }
 
 impl Agent {
@@ -73,29 +97,32 @@ impl Agent {
     /// 一轮对话：可能包含多个子请求（模型调用工具后继续，直到 finish_reason=stop）。
     /// 渲染器由调用方持有并传入：状态栏与流式输出必须走同一个 `Ui` 实现，
     /// 否则 `usage()` 记录到的缓存统计不会反映到已建栏的实例上。
+    ///
+    /// SIGINT 监听者整回合只建一个：tokio 的信号通知挂在 watch 上，若每个
+    /// select 现建监听者，两个 select 之间的空窗里到达的 SIGINT 会在新监听者
+    /// 订阅前被 broadcast 掉，永远丢失（pty 冒烟实测，毫秒级窗口）。
     pub async fn turn(&mut self, input: &str, ui: &mut impl Ui) -> Result<()> {
-        self.turn_with(
-            input,
-            ui,
-            || async {
-                let _ = tokio::signal::ctrl_c().await;
-            },
-            |_call| async {
-                // 审批应答（Input 事件）：一行 stdin，默认拒绝。
-                // 用阻塞读包进 spawn_blocking：全局 stdin 缓冲跨调用共享，
-                // 多余的预输入不会丢。（代价：取消时残留一个阻塞线程，
-                // 之后的第一行输入会被它吞掉——已知取舍。）
-                tokio::task::spawn_blocking(|| {
-                    let mut line = String::new();
-                    let read = std::io::stdin().read_line(&mut line);
-                    let line = line.trim();
-                    read.map(|n| n > 0).unwrap_or(false)
-                        && (line.eq_ignore_ascii_case("y") || line.starts_with('y'))
-                })
-                .await
-                .unwrap_or(false)
-            },
-        )
+        #[cfg(unix)]
+        let mut sigint = Sigint(tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::interrupt(),
+        )?);
+        #[cfg(not(unix))]
+        let mut sigint = Sigint(tokio::signal::windows::ctrl_c()?);
+        self.turn_with(input, ui, &mut sigint, |_call| async {
+            // 审批应答（Input 事件）：一行 stdin，默认拒绝。
+            // 用阻塞读包进 spawn_blocking：全局 stdin 缓冲跨调用共享，
+            // 多余的预输入不会丢。（代价：取消时残留一个阻塞线程，
+            // 之后的第一行输入会被它吞掉——已知取舍。）
+            tokio::task::spawn_blocking(|| {
+                let mut line = String::new();
+                let read = std::io::stdin().read_line(&mut line);
+                let line = line.trim();
+                read.map(|n| n > 0).unwrap_or(false)
+                    && (line.eq_ignore_ascii_case("y") || line.starts_with('y'))
+            })
+            .await
+            .unwrap_or(false)
+        })
         .await
     }
 
@@ -105,16 +132,14 @@ impl Agent {
     /// 已声明未应答的调用以 CANCELLED_RESULT 落盘闭合窗口，
     /// 历史保持 is_request_valid，下一回合从合法前缀继续。
     /// 取消在解释器层处理，不进 `next_action`（带外，任何状态可达）。
-    async fn turn_with<F, Fut, A, FutA>(
+    async fn turn_with<A, FutA>(
         &mut self,
         input: &str,
         ui: &mut impl Ui,
-        mut interrupt: F,
+        interrupt: &mut dyn Interrupt,
         mut approve: A,
     ) -> Result<()>
     where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = ()>,
         A: FnMut(&ToolCall) -> FutA,
         FutA: Future<Output = bool>,
     {
@@ -130,7 +155,7 @@ impl Agent {
                     let done = tokio::select! {
                         biased;
                         r = self.pump(&req, ui) => Some(r?),
-                        _ = interrupt() => None,
+                        _ = interrupt.wait() => None,
                     };
                     match done {
                         Some((msg, usage)) => {
@@ -163,7 +188,7 @@ impl Agent {
                         let approved = tokio::select! {
                             biased;
                             ok = approve(&call) => ok,
-                            _ = interrupt() => { cancelled = true; false }
+                            _ = interrupt.wait() => { cancelled = true; false }
                         };
                         if cancelled {
                             break;
@@ -181,7 +206,7 @@ impl Agent {
                         let out = tokio::select! {
                             biased;
                             out = tools::execute(&call.function.name, &call.function.arguments) => out,
-                            _ = interrupt() => machine::CANCELLED_RESULT.to_string(),
+                            _ = interrupt.wait() => machine::CANCELLED_RESULT.to_string(),
                         };
                         let cancelled_call = out == machine::CANCELLED_RESULT;
                         ui.tool_result(&out);
@@ -242,6 +267,24 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
+    /// 测试替身：第一个等待点立即触发（模拟信号早已到达）。
+    struct Immediate;
+    impl Interrupt for Immediate {
+        fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+            Box::pin(async {})
+        }
+    }
+
+    /// 测试替身：按序弹出游走的取消点；耗尽后永不触发。
+    struct Steps(std::collections::VecDeque<Pin<Box<dyn Future<Output = ()>>>>);
+    impl Interrupt for Steps {
+        fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+            self.0
+                .pop_front()
+                .unwrap_or_else(|| Box::pin(std::future::pending()))
+        }
+    }
+
     use super::*;
     use crate::session::SessionMeta;
     use crate::types::Role;
@@ -501,13 +544,11 @@ mod tests {
         let mut agent = test_agent(&server, &dir);
         let mut ui = Renderer::new();
         // 第一个取消点（pump select）立即触发
+        let mut interrupt = Immediate;
         agent
-            .turn_with(
-                "原始指令",
-                &mut ui,
-                || Box::pin(async {}),
-                |_| std::future::ready(true),
-            )
+            .turn_with("原始指令", &mut ui, &mut interrupt, |_| {
+                std::future::ready(true)
+            })
             .await
             .unwrap();
         assert_eq!(agent.session.messages.len(), 1);
@@ -536,21 +577,15 @@ mod tests {
         let mut agent = test_agent(&server, &dir);
         let mut ui = Renderer::new();
         // 取消点队列：pump 处永不触发（让流正常完成）；首个工具处立即触发
-        let mut steps: std::collections::VecDeque<std::pin::Pin<Box<dyn Future<Output = ()>>>> =
+        let mut queue: std::collections::VecDeque<Pin<Box<dyn Future<Output = ()>>>> =
             Default::default();
-        steps.push_back(Box::pin(std::future::pending::<()>()));
-        steps.push_back(Box::pin(async {}));
+        queue.push_back(Box::pin(std::future::pending::<()>()));
+        queue.push_back(Box::pin(async {}));
+        let mut interrupt = Steps(queue);
         agent
-            .turn_with(
-                "跑两个慢命令",
-                &mut ui,
-                move || {
-                    steps
-                        .pop_front()
-                        .unwrap_or_else(|| Box::pin(std::future::pending()))
-                },
-                |_| std::future::ready(true),
-            )
+            .turn_with("跑两个慢命令", &mut ui, &mut interrupt, |_| {
+                std::future::ready(true)
+            })
             .await
             .unwrap();
 
@@ -568,6 +603,51 @@ mod tests {
         assert!(machine::is_request_valid(msgs));
         assert_eq!(machine::next_action(msgs), Some(machine::Action::CallModel));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 信号丢失窗口的回归钉：wait 与 wait 之间到达的信号必须在下一次
+    /// wait 立即可见。真实 SIGINT 靠 tokio watch 的同一语义——监听者
+    /// 整回合唯一、构造即订阅；若退化为每个 select 现建监听者，
+    /// 两个 select 之间的空窗会吞掉恰好到达的信号（pty 冒烟实测）。
+    #[tokio::test]
+    async fn signal_between_waits_is_not_lost() {
+        // 用同一 watch 语义的替身模拟真实监听者的状态机
+        struct Gate(tokio::sync::watch::Receiver<bool>);
+        impl Interrupt for Gate {
+            fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+                let rx = &mut self.0;
+                Box::pin(async move {
+                    while !*rx.borrow_and_update() {
+                        if rx.changed().await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                })
+            }
+        }
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let mut gate = Gate(rx);
+
+        // 第一次 wait：未触发，poll 一次后丢弃（对应 pump select 结束）
+        let w = gate.wait();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), w)
+                .await
+                .is_err(),
+            "未触发时不应就绪"
+        );
+
+        // 信号在两个 select 之间到达
+        tx.send(true).unwrap();
+
+        // 下一次 wait 必须立即就绪——这就是被修掉的丢失窗口
+        let w = gate.wait();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), w)
+                .await
+                .is_ok(),
+            "信号不得丢失"
+        );
     }
 
     /// 审批门拒绝：DENIED_RESULT 闭合该调用，窗口合法，下一拍继续消化。
@@ -596,7 +676,7 @@ mod tests {
             .turn_with(
                 "执行被禁止的命令",
                 &mut ui,
-                || Box::pin(std::future::pending::<()>()),
+                &mut Steps(Default::default()),
                 |_| std::future::ready(false),
             )
             .await
@@ -637,21 +717,15 @@ mod tests {
         agent.confirm_tools = true;
         let mut ui = Renderer::new();
         // 取消点队列：pump 处不触发；审批等待处立即触发
-        let mut steps: std::collections::VecDeque<std::pin::Pin<Box<dyn Future<Output = ()>>>> =
+        let mut queue: std::collections::VecDeque<Pin<Box<dyn Future<Output = ()>>>> =
             Default::default();
-        steps.push_back(Box::pin(std::future::pending::<()>()));
-        steps.push_back(Box::pin(async {}));
+        queue.push_back(Box::pin(std::future::pending::<()>()));
+        queue.push_back(Box::pin(async {}));
+        let mut interrupt = Steps(queue);
         agent
-            .turn_with(
-                "执行它",
-                &mut ui,
-                move || {
-                    steps
-                        .pop_front()
-                        .unwrap_or_else(|| Box::pin(std::future::pending()))
-                },
-                |_| std::future::pending(),
-            )
+            .turn_with("执行它", &mut ui, &mut interrupt, |_| {
+                std::future::pending()
+            })
             .await
             .unwrap();
         let msgs = &agent.session.messages;
@@ -688,7 +762,7 @@ mod tests {
             .turn_with(
                 "跑三个命令",
                 &mut ui,
-                || Box::pin(std::future::pending::<()>()),
+                &mut Steps(Default::default()),
                 |_| std::future::ready(true),
             )
             .await
