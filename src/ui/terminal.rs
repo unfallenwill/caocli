@@ -8,7 +8,7 @@
 //! could reach. Here they are behind one trait, so the decisions built on them
 //! can be tested against a stand-in and only these leaves need a real terminal.
 //!
-//! Same shape as the machine's `Interrupt` and `Approve`: the front end supplies
+//! Same shape as the machine's `Cancel` and `Approve`: the front end supplies
 //! the process-global thing, and a double supplies it in a test.
 //!
 //! **What a unit test cannot reach**: `RealTerminal` is the leaves themselves --

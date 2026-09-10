@@ -13,7 +13,7 @@ use anyhow::Result;
 
 use crate::types::ToolCall;
 
-use super::contract::{Approve, Interrupt};
+use super::contract::{Approve, Cancel, Verdict};
 
 /// The real SIGINT listener. It subscribes to tokio's watch at construction time
 /// (no poll needed), so a signal arriving at any moment from the start of the
@@ -37,7 +37,7 @@ impl Sigint {
     }
 }
 
-impl Interrupt for Sigint {
+impl Cancel for Sigint {
     fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
         Box::pin(async {
             self.0.recv().await;
@@ -50,21 +50,26 @@ impl Interrupt for Sigint {
 pub struct StdinApproval;
 
 impl Approve for StdinApproval {
-    fn ask(&mut self, _call: &ToolCall) -> Pin<Box<dyn Future<Output = bool> + '_>> {
+    fn approve(&mut self, _call: &ToolCall) -> Pin<Box<dyn Future<Output = Verdict> + '_>> {
         Box::pin(async {
             // The blocking read is wrapped in spawn_blocking: the global stdin
             // buffer is shared across calls, so surplus type-ahead is not lost.
             // (Cost: on cancellation a blocked thread lingers and swallows the
             // first line typed afterwards -- a known trade-off.)
-            tokio::task::spawn_blocking(|| {
+            let yes = tokio::task::spawn_blocking(|| {
                 let mut line = String::new();
-                let read = std::io::stdin().read_line(&mut line);
+                let bytes_read = std::io::stdin().read_line(&mut line);
                 let line = line.trim();
-                read.map(|n| n > 0).unwrap_or(false)
+                bytes_read.map(|count| count > 0).unwrap_or(false)
                     && (line.eq_ignore_ascii_case("y") || line.starts_with('y'))
             })
             .await
-            .unwrap_or(false)
+            .unwrap_or(false);
+            if yes {
+                Verdict::Allowed
+            } else {
+                Verdict::Denied
+            }
         })
     }
 }

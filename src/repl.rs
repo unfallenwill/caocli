@@ -14,7 +14,7 @@ use crate::provider;
 use crate::session::{self, Session};
 use crate::ui::Front;
 use crate::ui::text::{padded, width};
-use crate::ui::{Approve, Interrupt};
+use crate::ui::{Approve, Cancel};
 
 /// What a submitted line asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +35,7 @@ pub async fn handle(
     ui: &mut dyn Front,
     sdir: &Path,
     line: &str,
-    interrupt: &mut dyn Interrupt,
+    cancel: &mut dyn Cancel,
     approve: &mut dyn Approve,
 ) -> Result<Outcome> {
     match line {
@@ -103,7 +103,7 @@ pub async fn handle(
             ui.info("unknown command; /help lists the available commands")
         }
         _ => {
-            if let Err(e) = agent.turn(line, ui, interrupt, approve).await {
+            if let Err(e) = agent.turn(line, ui, cancel, approve).await {
                 ui.error(&format!("{e:#}"));
             }
         }
@@ -379,6 +379,7 @@ mod tests {
     use crate::session::SessionMeta;
     use crate::types::{Message, ToolCall, Usage};
     use crate::ui::Renderer;
+    use crate::ui::Verdict;
 
     /// A front end that records what it was told, so the line handling can be
     /// tested without a terminal.
@@ -440,7 +441,7 @@ mod tests {
 
     /// Never cancels: no command path below needs a cancel.
     struct Silent;
-    impl Interrupt for Silent {
+    impl Cancel for Silent {
         fn wait(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
             Box::pin(std::future::pending())
         }
@@ -449,11 +450,11 @@ mod tests {
     /// Never answers: only reached if a tool call gets that far.
     struct Deny;
     impl Approve for Deny {
-        fn ask(
+        fn approve(
             &mut self,
             _call: &ToolCall,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + '_>> {
-            Box::pin(async { false })
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Verdict> + '_>> {
+            Box::pin(async { Verdict::Denied })
         }
     }
 

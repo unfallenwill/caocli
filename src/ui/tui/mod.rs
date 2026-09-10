@@ -31,7 +31,7 @@ use crate::history;
 use crate::repl;
 use crate::session;
 use crate::types::{Message, ToolCall};
-use crate::ui::{Approve, Interrupt};
+use crate::ui::{Approve, Cancel, Verdict};
 
 use super::cell::{self, Cell};
 
@@ -63,7 +63,7 @@ use picker::{Choosing, choice_rows};
 /// there is no SIGINT to subscribe to, so a key event is the only source there is.
 struct CtrlC(watch::Receiver<bool>);
 
-impl Interrupt for CtrlC {
+impl Cancel for CtrlC {
     fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
         let rx = &mut self.0;
         Box::pin(async move {
@@ -85,17 +85,18 @@ impl Interrupt for CtrlC {
 /// submits is the answer. Denial is the default, including when the front end has
 /// gone away mid-ask.
 struct Ask {
-    tx: mpsc::UnboundedSender<oneshot::Sender<bool>>,
+    tx: mpsc::UnboundedSender<oneshot::Sender<Verdict>>,
 }
 
 impl Approve for Ask {
-    fn ask(&mut self, _call: &ToolCall) -> Pin<Box<dyn Future<Output = bool> + '_>> {
+    fn approve(&mut self, _call: &ToolCall) -> Pin<Box<dyn Future<Output = Verdict> + '_>> {
         Box::pin(async move {
             let (reply, answer) = oneshot::channel();
             if self.tx.send(reply).is_err() {
-                return false;
+                // The front end is gone: denying is the answer that runs nothing.
+                return Verdict::Denied;
             }
-            answer.await.unwrap_or(false)
+            answer.await.unwrap_or(Verdict::Denied)
         })
     }
 }
@@ -278,8 +279,8 @@ fn offer_menu(
 /// another, and the sender of the second is what the machine holds.
 struct Channels {
     notices: mpsc::UnboundedReceiver<Notice>,
-    asked: mpsc::UnboundedReceiver<oneshot::Sender<bool>>,
-    ask_tx: mpsc::UnboundedSender<oneshot::Sender<bool>>,
+    asked: mpsc::UnboundedReceiver<oneshot::Sender<Verdict>>,
+    ask_tx: mpsc::UnboundedSender<oneshot::Sender<Verdict>>,
 }
 
 /// Draw and wait at the prompt until the user submits a line. `None` says they

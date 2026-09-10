@@ -15,7 +15,7 @@ use crate::session::Session;
 use crate::tools;
 use crate::types::{ChatRequest, Message};
 use crate::ui::Ui;
-use crate::ui::{Approve, Interrupt};
+use crate::ui::{Approve, Cancel, Verdict};
 
 mod request;
 mod stream;
@@ -32,12 +32,35 @@ pub struct Agent {
     /// Ceiling on one answer, in tokens: the provider preset's value, sent as
     /// `max_tokens` on every request.
     max_tokens: u32,
-    /// Approval gate: when on, Bash/Edit/Write ask the user before running
-    /// (Read is always allowed).
-    pub confirm_tools: bool,
+    /// Whether the approval gate is on: with it, Bash/Edit/Write ask the user
+    /// before running (Read is always allowed).
+    pub approval: Approval,
     /// Per-turn tool step cap (product-level termination guarantee).
     pub max_tool_steps: usize,
     tool_steps: usize,
+}
+
+/// Whether a tool call that changes something runs or is asked about first.
+///
+/// An enum rather than the command-line flag itself: the loop reads it as a
+/// policy, and a reader should not have to remember which way a `bool` pointed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    /// Execution is trusted; every call runs.
+    Trusted,
+    /// Bash/Edit/Write ask the user first (Read never does).
+    Ask,
+}
+
+impl Approval {
+    /// The one place the command-line flag becomes a policy.
+    pub fn from_flag(ask: bool) -> Self {
+        if ask {
+            Approval::Ask
+        } else {
+            Approval::Trusted
+        }
+    }
 }
 
 impl Agent {
@@ -47,7 +70,7 @@ impl Agent {
             session,
             provider,
             max_tokens: provider.max_tokens,
-            confirm_tools: false,
+            approval: Approval::Trusted,
             max_tool_steps: machine::MAX_TOOL_STEPS,
             tool_steps: 0,
         }
@@ -104,7 +127,7 @@ impl Agent {
     /// the cache stats recorded by `usage()` never reach the instance that
     /// already drew the bar.
     ///
-    /// Exactly one interrupt listener is subscribed per turn, and the caller
+    /// Exactly one cancel source is subscribed per turn, and the caller
     /// subscribes it before calling this: tokio's signal notifications ride on a
     /// watch, so if a listener were created inside each `select`, a SIGINT
     /// arriving in the gap between two `select`s would be broadcast away before
@@ -113,7 +136,7 @@ impl Agent {
     /// subscription also keeps the interpreter independent of how a cancel
     /// arrives: `Sigint` is only one possible source.
     ///
-    /// `interrupt` is the source of an out-of-band Command (Ctrl-C): every await
+    /// `cancel` is the source of an out-of-band Command (Ctrl-C): every await
     /// point races against it (biased: if the effect finishes first its result is
     /// kept).
     /// When it fires, the current effect is dropped — the stream disconnects and
@@ -132,7 +155,7 @@ impl Agent {
         &mut self,
         input: &str,
         ui: &mut dyn Ui,
-        interrupt: &mut dyn Interrupt,
+        cancel: &mut dyn Cancel,
         approve: &mut dyn Approve,
     ) -> Result<()> {
         self.session.append_message(&Message::user(input))?;
@@ -149,7 +172,7 @@ impl Agent {
                     let done = tokio::select! {
                         biased;
                         reply = self.stream_reply(&request, ui) => Some(reply?),
-                        _ = interrupt.wait() => None,
+                        _ = cancel.wait() => None,
                     };
                     match done {
                         Some(reply) => {
@@ -180,17 +203,17 @@ impl Agent {
                     // Approval gate: Bash/Edit/Write ask first; a denial closes
                     // that call with DENIED_RESULT
                     let mut denied = false;
-                    if self.confirm_tools && call.function.name != tools::READ_NAME {
+                    if self.approval == Approval::Ask && call.function.name != tools::READ_NAME {
                         ui.approval_requested(&call.function.name, &call.function.arguments);
-                        let approved = tokio::select! {
+                        let verdict = tokio::select! {
                             biased;
-                            ok = approve.ask(&call) => ok,
-                            _ = interrupt.wait() => { cancelled = true; false }
+                            verdict = approve.approve(&call) => verdict,
+                            _ = cancel.wait() => { cancelled = true; Verdict::Denied }
                         };
                         if cancelled {
                             break;
                         }
-                        if !approved {
+                        if verdict == Verdict::Denied {
                             denied = true;
                             ui.tool_result(machine::DENIED_RESULT);
                             self.session.append_message(&Message::tool(
@@ -203,7 +226,7 @@ impl Agent {
                         let out = tokio::select! {
                             biased;
                             out = tools::execute(&call.function.name, &call.function.arguments) => out,
-                            _ = interrupt.wait() => machine::CANCELLED_RESULT.to_string(),
+                            _ = cancel.wait() => machine::CANCELLED_RESULT.to_string(),
                         };
                         let cancelled_call = out == machine::CANCELLED_RESULT;
                         ui.tool_result(&out);
@@ -244,7 +267,7 @@ mod tests {
     /// Test double: fires immediately at the first wait point (simulating a
     /// signal that already arrived).
     struct Immediate;
-    impl Interrupt for Immediate {
+    impl Cancel for Immediate {
         fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
             Box::pin(async {})
         }
@@ -253,7 +276,7 @@ mod tests {
     /// Test double: pops cancellation points in order; once exhausted it never
     /// fires again.
     struct Steps(std::collections::VecDeque<Pin<Box<dyn Future<Output = ()>>>>);
-    impl Interrupt for Steps {
+    impl Cancel for Steps {
         fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
             self.0
                 .pop_front()
@@ -263,16 +286,16 @@ mod tests {
 
     /// Test double: never cancels. For tests that are not about cancellation.
     struct Silent;
-    impl Interrupt for Silent {
+    impl Cancel for Silent {
         fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
             Box::pin(std::future::pending())
         }
     }
 
     /// Test double: answers every approval the same way.
-    struct Answer(bool);
+    struct Answer(Verdict);
     impl Approve for Answer {
-        fn ask(&mut self, _call: &ToolCall) -> Pin<Box<dyn Future<Output = bool> + '_>> {
+        fn approve(&mut self, _call: &ToolCall) -> Pin<Box<dyn Future<Output = Verdict> + '_>> {
             let verdict = self.0;
             Box::pin(async move { verdict })
         }
@@ -282,7 +305,7 @@ mod tests {
     /// cancellation has something to race against.
     struct NoAnswer;
     impl Approve for NoAnswer {
-        fn ask(&mut self, _call: &ToolCall) -> Pin<Box<dyn Future<Output = bool> + '_>> {
+        fn approve(&mut self, _call: &ToolCall) -> Pin<Box<dyn Future<Output = Verdict> + '_>> {
             Box::pin(std::future::pending())
         }
     }
@@ -461,7 +484,7 @@ mod tests {
                 "use a tool to leave a marker",
                 &mut ui,
                 &mut Silent,
-                &mut Answer(false),
+                &mut Answer(Verdict::Denied),
             )
             .await
             .unwrap();
@@ -557,7 +580,12 @@ mod tests {
         let mut agent = test_agent(&server, &dir);
         let mut ui = Renderer::new();
         agent
-            .turn("run two commands", &mut ui, &mut Silent, &mut Answer(false))
+            .turn(
+                "run two commands",
+                &mut ui,
+                &mut Silent,
+                &mut Answer(Verdict::Denied),
+            )
             .await
             .unwrap();
 
@@ -602,13 +630,13 @@ mod tests {
         let mut agent = test_agent(&server, &dir);
         let mut ui = Renderer::new();
         // the first cancellation point (the pump select) fires immediately
-        let mut interrupt = Immediate;
+        let mut cancel = Immediate;
         agent
             .turn(
                 "original instruction",
                 &mut ui,
-                &mut interrupt,
-                &mut Answer(true),
+                &mut cancel,
+                &mut Answer(Verdict::Allowed),
             )
             .await
             .unwrap();
@@ -645,13 +673,13 @@ mod tests {
             Default::default();
         queue.push_back(Box::pin(std::future::pending::<()>()));
         queue.push_back(Box::pin(async {}));
-        let mut interrupt = Steps(queue);
+        let mut cancel = Steps(queue);
         agent
             .turn(
                 "run two slow commands",
                 &mut ui,
-                &mut interrupt,
-                &mut Answer(true),
+                &mut cancel,
+                &mut Answer(Verdict::Allowed),
             )
             .await
             .unwrap();
@@ -688,7 +716,7 @@ mod tests {
         // A double using the same watch semantics to mimic the real listener's
         // state machine
         struct Gate(tokio::sync::watch::Receiver<bool>);
-        impl Interrupt for Gate {
+        impl Cancel for Gate {
             fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
                 let rx = &mut self.0;
                 Box::pin(async move {
@@ -748,14 +776,14 @@ mod tests {
         mount_chat(&server, turn2, None).await;
         let dir = tmpdir();
         let mut agent = test_agent(&server, &dir);
-        agent.confirm_tools = true;
+        agent.approval = Approval::Ask;
         let mut ui = Renderer::new();
         agent
             .turn(
                 "run the forbidden command",
                 &mut ui,
                 &mut Steps(Default::default()),
-                &mut Answer(false),
+                &mut Answer(Verdict::Denied),
             )
             .await
             .unwrap();
@@ -794,16 +822,16 @@ mod tests {
         mount_chat(&server, turn1, Some(1)).await;
         let dir = tmpdir();
         let mut agent = test_agent(&server, &dir);
-        agent.confirm_tools = true;
+        agent.approval = Approval::Ask;
         let mut ui = Renderer::new();
         // cancellation point queue: no fire at pump; immediate fire at the approval wait
         let mut queue: std::collections::VecDeque<Pin<Box<dyn Future<Output = ()>>>> =
             Default::default();
         queue.push_back(Box::pin(std::future::pending::<()>()));
         queue.push_back(Box::pin(async {}));
-        let mut interrupt = Steps(queue);
+        let mut cancel = Steps(queue);
         agent
-            .turn("run it", &mut ui, &mut interrupt, &mut NoAnswer)
+            .turn("run it", &mut ui, &mut cancel, &mut NoAnswer)
             .await
             .unwrap();
         let msgs = &agent.session.messages;
@@ -842,7 +870,7 @@ mod tests {
                 "run three commands",
                 &mut ui,
                 &mut Steps(Default::default()),
-                &mut Answer(true),
+                &mut Answer(Verdict::Allowed),
             )
             .await
             .unwrap();
@@ -885,7 +913,12 @@ mod tests {
         let mut agent = test_agent(&server, &dir);
         let mut ui = Renderer::new();
         agent
-            .turn("write a file", &mut ui, &mut Silent, &mut Answer(false))
+            .turn(
+                "write a file",
+                &mut ui,
+                &mut Silent,
+                &mut Answer(Verdict::Denied),
+            )
             .await
             .unwrap();
 
@@ -922,7 +955,7 @@ mod tests {
         let mut agent = test_agent(&server, &dir);
         let mut ui = Renderer::new();
         let err = agent
-            .turn("hi", &mut ui, &mut Silent, &mut Answer(false))
+            .turn("hi", &mut ui, &mut Silent, &mut Answer(Verdict::Denied))
             .await
             .unwrap_err();
         let s = format!("{err:#}");
@@ -950,7 +983,7 @@ mod tests {
         let mut agent = test_agent(&server, &dir);
         let mut ui = Renderer::new();
         let err = agent
-            .turn("hi", &mut ui, &mut Silent, &mut Answer(false))
+            .turn("hi", &mut ui, &mut Silent, &mut Answer(Verdict::Denied))
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("failed to parse SSE chunk"));

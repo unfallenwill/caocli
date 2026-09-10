@@ -25,6 +25,7 @@ use crate::session;
 use crate::types::Message;
 use crate::types::Usage;
 use crate::ui::Renderer;
+use crate::ui::Verdict;
 use crate::ui::cell::Span;
 use crate::ui::cell::Style;
 use crate::ui::cell::{self, Cell};
@@ -2138,7 +2139,7 @@ fn the_gate_is_answered_by_typing_at_it_while_the_turn_runs() {
     state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Char('y'))), &cancel);
     assert_eq!(state.textarea.lines(), ["y"], "it went into the box");
     state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Enter)), &cancel);
-    assert_eq!(answer.blocking_recv(), Ok(true));
+    assert_eq!(answer.blocking_recv(), Ok(Verdict::Allowed));
     assert!(state.reply.is_none(), "the gate is closed again");
 }
 
@@ -2149,7 +2150,7 @@ fn a_blank_answer_to_the_gate_denies() {
     let (reply, answer) = oneshot::channel();
     state.open_question(reply);
     state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Enter)), &cancel);
-    assert_eq!(answer.blocking_recv(), Ok(false));
+    assert_eq!(answer.blocking_recv(), Ok(Verdict::Denied));
 }
 
 /// Type into the box the way the event loop delivers a key while a turn runs.
@@ -2266,7 +2267,11 @@ fn a_line_being_typed_is_held_aside_while_the_gate_is_open() {
 
     state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Char('y'))), &cancel);
     state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Enter)), &cancel);
-    assert_eq!(answer.blocking_recv(), Ok(true), "the gate got its answer");
+    assert_eq!(
+        answer.blocking_recv(),
+        Ok(Verdict::Allowed),
+        "the gate got its answer"
+    );
     assert_eq!(
         state.textarea.lines(),
         ["and then refactor"],
@@ -2283,7 +2288,7 @@ fn a_question_is_answered_by_what_the_user_submits() {
     assert!(screen.reply.is_some(), "the answer has somewhere to go");
     screen.textarea.insert_str("yes");
     screen.close_question();
-    assert_eq!(answer.blocking_recv(), Ok(true));
+    assert_eq!(answer.blocking_recv(), Ok(Verdict::Allowed));
     assert!(screen.question.is_none());
     assert!(screen.textarea.is_empty());
 }
@@ -2475,7 +2480,11 @@ fn anything_that_is_not_yes_denies() {
         screen.open_question(reply);
         screen.textarea.insert_str(typed);
         screen.close_question();
-        assert_eq!(answer.blocking_recv(), Ok(false), "typed {typed:?}");
+        assert_eq!(
+            answer.blocking_recv(),
+            Ok(Verdict::Denied),
+            "typed {typed:?}"
+        );
     }
 }
 

@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers};
 
-use crate::agent::Agent;
+use crate::agent::{Agent, Approval};
 use crate::api::Client;
 use crate::cli::Cli;
 use crate::session::{Session, SessionMeta};
@@ -191,7 +191,7 @@ async fn run(cli: Cli) -> Result<()> {
     };
 
     let mut agent = Agent::new(api, session, provider);
-    agent.confirm_tools = cli.ask;
+    agent.approval = Approval::from_flag(cli.ask);
     ui.set_model(&agent.model_label());
     ui.set_effort(agent.effort_label());
 

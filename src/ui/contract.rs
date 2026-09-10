@@ -1,6 +1,6 @@
 //! The channels between the machine and a front end, and nothing else.
 //!
-//! [`Ui`] is the vocabulary the machine notifies with; [`Interrupt`] and
+//! [`Ui`] is the vocabulary the machine notifies with; [`Cancel`] and
 //! [`Approve`] are the two it asks its questions on; [`Front`] is what handling a
 //! submitted line asks of whichever front end is running. Keeping all of them
 //! apart from any implementation is what lets a front end be written against them
@@ -89,7 +89,7 @@ pub trait Front: Ui {
 /// cancel-safe: dropping the future does not lose the signal (the state lives in
 /// the listener), and an unconsumed signal makes the next `wait()` ready
 /// immediately.
-pub trait Interrupt {
+pub trait Cancel {
     fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>>;
 }
 
@@ -97,9 +97,22 @@ pub trait Interrupt {
 /// Notice a `Ui` sends when it asks. A Notice never returns data, so the answer
 /// comes back through a channel of its own -- this is that channel.
 ///
-/// Like `Interrupt` it is a trait rather than a closure so that a front end
+/// Like `Cancel` it is a trait rather than a closure so that a front end
 /// owning the terminal can take the answer from its own event loop, and so the
 /// output lifetime can be bound to `&mut self`.
 pub trait Approve {
-    fn ask(&mut self, call: &ToolCall) -> Pin<Box<dyn Future<Output = bool> + '_>>;
+    fn approve(&mut self, call: &ToolCall) -> Pin<Box<dyn Future<Output = Verdict> + '_>>;
+}
+
+/// The approval gate's answer.
+///
+/// An enum rather than a `bool` because the question is "run this or not", and a
+/// bare `true` says nothing at a call site about which way it points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Run the call.
+    Allowed,
+    /// Do not run it. The call is closed with a denial marker, so the model can
+    /// see what happened instead of guessing why nothing did.
+    Denied,
 }

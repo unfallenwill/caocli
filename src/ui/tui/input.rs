@@ -14,6 +14,7 @@ use tokio::sync::{oneshot, watch};
 
 use super::picker::Choosing;
 use crate::history;
+use crate::ui::Verdict;
 use crate::ui::cell::{Cell, Span, Style};
 use crate::ui::tui::layout::box_rows;
 use crate::ui::tui::paint::measure;
@@ -58,7 +59,7 @@ pub(super) const SECRET_MASK: char = '•';
 pub(super) enum Answer {
     /// The approval gate: a line starting with `y` allows and anything else
     /// denies, which is the rule the plain front end applies to a line of stdin.
-    YesNo(oneshot::Sender<bool>),
+    YesNo(oneshot::Sender<Verdict>),
     /// A secret (an API key): whatever was typed, with the text hidden while it
     /// is typed, and an empty line for a cancellation. Nothing of it is echoed
     /// into the transcript, and nothing of it is remembered.
@@ -526,7 +527,7 @@ impl State {
     }
 
     /// The approval gate is asking: remember who to answer.
-    pub(super) fn open_question(&mut self, reply: oneshot::Sender<bool>) {
+    pub(super) fn open_question(&mut self, reply: oneshot::Sender<Verdict>) {
         self.open_answer(Answer::YesNo(reply));
     }
 
@@ -558,7 +559,12 @@ impl State {
             let answer = self.textarea.lines().join("\n").trim().to_owned();
             match reply {
                 Answer::YesNo(reply) => {
-                    let _ = reply.send(answer.to_lowercase().starts_with('y'));
+                    let verdict = if answer.to_lowercase().starts_with('y') {
+                        Verdict::Allowed
+                    } else {
+                        Verdict::Denied
+                    };
+                    let _ = reply.send(verdict);
                 }
                 Answer::Secret(reply) => {
                     let _ = reply.send((!answer.is_empty()).then_some(answer));

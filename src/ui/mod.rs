@@ -31,7 +31,7 @@ pub mod tui;
 
 pub use answers::{Sigint, StdinApproval};
 pub(crate) use banner::banner;
-pub use contract::{Approve, Front, Interrupt, Ui};
+pub use contract::{Approve, Cancel, Front, Ui, Verdict};
 pub use renderer::Renderer;
 
 #[cfg(test)]
