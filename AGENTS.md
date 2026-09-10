@@ -51,9 +51,12 @@ that talks to a network API and drives an interactive terminal.
   Use `script -qec "..." /dev/null` to get a pseudo-terminal for smoke runs.
 - **The interactive front end needs a pty**; that is the only place it exists at
   all. `scripts/tui_smoke.py` is that pty, and its live section (`SMOKE_LIVE=1`) is
-  the only automated route to a real turn, the running status line and the approval
-  gate. What a tool call did is asserted on disk rather than on screen: a model's own
-  account of having run something reads the same as the thing itself.
+  the only automated route to a real turn, the running status line, the approval
+  gate and the queue a line typed during a turn goes into. What a tool call did is
+  asserted on disk rather than on screen: a model's own account of having run
+  something reads the same as the thing itself. A *queued* line is asserted on the
+  front end's own answer (a command, whose reply only the front end can write),
+  for the same reason.
 - **A screen drawn by difference does not write what is on it**, only what changed
   from the frame before: any assertion made on the byte stream is an assertion about
   the diff, and a character that happened to be in the same column already never
@@ -122,11 +125,15 @@ that talks to a network API and drives an interactive terminal.
   nothing to draw on. Starting the session must survive that by falling back to the
   plain front end, and an attempt that fails halfway must undo what it did — including
   the alternate screen, which would otherwise hide everything the user had on it.
-- **While a turn runs a front end accepts exactly two things**: the cancel key, and
-  the answer to an open approval question. Everything else is dropped, because a turn
-  is not the place to compose the next line. The second one is easy to lose: an
-  approval gate whose answer never arrives is indistinguishable, from the user's side,
-  from a model that has hung.
+- **While a turn runs a front end accepts exactly three things**: the cancel key,
+  the answer to an open approval question, and the next line. The third is a queue,
+  not a second turn: Enter takes the line out of the box and it runs when the turn
+  in flight ends — from the head, interrupted or not. Everything else is dropped.
+  The approval answer is the one that is easy to lose: a gate whose answer never
+  arrives is indistinguishable, from the user's side, from a model that has hung
+  — so while a gate is open the box is the answer's and nothing else is typed
+  into it, and a line being composed when the question arrives is held aside and
+  given back.
 - **Anything that moves on its own must be derived from the clock, never from the
   number of redraws**, and that clock must be part of whatever decides whether to
   redraw at all. A front end that skips an unchanged screen otherwise freezes its own

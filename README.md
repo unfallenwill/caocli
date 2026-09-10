@@ -84,10 +84,12 @@ for it — and the transcript takes those rows back when the line is submitted.
 ▸ Read Cargo.toml
 ok: package.name = caocli (312 bytes)
 
+› run the tests and fix what fails
+› and bump the version
 ✻ Julienning… (1m 5s · ↓ 259 tokens · running Bash)
  ⎿  Tip: PageUp and PageDown read back through the session
 ┌──────────────────────────────────────────────────────────────────────────┐
-│ ›  type a message · /help for commands                                   │
+│ ›  the turn is running · Enter queues this line                          │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -95,6 +97,16 @@ ok: package.name = caocli (312 bytes)
   the turn has been going, the output tokens the provider has reported for it
   (the segment is absent until there is something real to put there), and what
   the turn is doing — `thinking`, `responding`, or `running <tool>`.
+- **A line typed while a turn runs is queued, not dropped.** The box takes the
+  next line as usual — Enter puts it after the current turn, drawn dimmed above
+  the status line while it waits, and the box's placeholder says so. When the
+  turn ends the head of the queue runs next, so stopping a turn with `Ctrl-C`
+  redirects to what was queued rather than throwing it away; a `Ctrl-C` during a
+  queued turn stops that one and moves on to the next, which is how a queue is
+  abandoned from the front. Commands queue too — a queued `/exit` leaves when it
+  reaches the head — and a queued `/resume` with no id opens its picker when it
+  runs, with the rest of the queue waiting behind the choice, since the choice is
+  what is typed next.
 - **The tip line** comes round on a clock of its own, whether or not a turn is
   running. When nothing is running the line above it is the session summary
   (`model · cache …`).
@@ -108,7 +120,8 @@ ok: package.name = caocli (312 bytes)
   the box reads as its own history. What that costs is the terminal's own
   selection: hold `Shift` to select text, as with any full-screen program that
   takes the mouse.
-- **Ctrl-C** stops a running turn; the model is told it was stopped.
+- **Ctrl-C** stops a running turn; the model is told it was stopped. What was
+  queued behind it runs next rather than being lost.
 
 `--no-tui` keeps the plain prompt instead (it is used anyway when stdout is not
 a terminal), which is the front end the status bar below belongs to.
@@ -200,7 +213,9 @@ Limits: 10 KiB of output per tool result, 10 MB per file read/write.
   (`kill_on_drop`), unfinished tool calls get deterministic cancellation
   markers committed to the log, and history stays request-valid — so the
   next prompt simply continues from a clean, honest state instead of a
-  400-ing one.
+  400-ing one. In the screen front end the next prompt may already be
+  written: lines typed while a turn runs are queued and the head runs when
+  the turn ends, interrupted or not.
 - **Approval gate and step cap.** With `--ask`, Bash/Edit/Write wait for an
   explicit y/N (Read never blocks); a denial is committed as a tool result
   the model reads and adapts to. Every turn is also capped at
