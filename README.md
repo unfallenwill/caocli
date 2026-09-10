@@ -63,7 +63,8 @@ newlines also works (bracketed paste).
 | `--resume <ID>` | Resume a specific session by id |
 | `--list` | List sessions and exit |
 | `--ask` | Approval gate: ask y/N before Bash/Edit/Write (Read always allowed). Denials are recorded as deterministic markers the model can see and adapt to. |
-| `--no-status-bar` | Disable the REPL status bar |
+| `--no-tui` | Keep the plain prompt instead of the full-screen front end |
+| `--no-status-bar` | Disable the plain prompt's status bar |
 | `-h, --help` / `-V, --version` | Print help / version |
 
 With no `-p`, caocli starts a REPL. CLI flags override the settings stored
@@ -71,6 +72,40 @@ in a resumed session only when explicitly provided. Resuming a session
 (`-c`, `--resume`, `/resume`) replays the stored history to the screen: user
 messages with a `›` prefix, assistant reasoning dimmed, tool calls and tool
 result summaries as they were rendered live (full tool output is not replayed).
+
+### The screen front end
+
+By default caocli takes the whole screen. The transcript fills it, and the last
+four rows are the pinned region: what the current turn is doing, a tip, and the
+input box.
+
+```
+▸ Read Cargo.toml
+ok: package.name = caocli (312 bytes)
+
+✻ Julienning… (1m 5s · ↓ 259 tokens · running Bash)
+⎿  Tip: PageUp and PageDown read back through the session
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ›  type a message · /help for commands                                   │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+- **The working line** appears while a turn runs: a spinner, a word, how long
+  the turn has been going, the output tokens the provider has reported for it
+  (the segment is absent until there is something real to put there), and what
+  the turn is doing — `thinking`, `responding`, or `running <tool>`.
+- **The tip line** comes round on a clock of its own, whether or not a turn is
+  running. When nothing is running the line above it is the session summary
+  (`model · cache …`).
+- **The transcript is the application's**, not the terminal's scrollback: the
+  alternate screen is entered on startup, so nothing drawn here reaches the
+  terminal's own history. `PageUp`/`PageDown` move through the session; a new
+  prompt returns to the end. When a draft spans several lines, the same two
+  keys scroll the box instead.
+- **Ctrl-C** stops a running turn; the model is told it was stopped.
+
+`--no-tui` keeps the plain prompt instead (it is used anyway when stdout is not
+a terminal), which is the front end the status bar below belongs to.
 
 ### Status bar
 
@@ -181,7 +216,7 @@ Limits: 10 KiB of output per tool result, 10 MB per file read/write.
 - **Token usage** is attached to the final content chunk of the stream, not
   to a separate SSE event.
 - **Two levels of cache visibility.** Every sub-request prints a `tokens:`
-  line (`in/total`, `hit/miss`, `out`); the status bar aggregates `hit`/`miss`
+  line (`in/total`, `hit/miss`, `out`); the status line aggregates `hit`/`miss`
   across the whole session.
 
 ## Session storage

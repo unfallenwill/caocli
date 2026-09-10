@@ -43,9 +43,9 @@ use super::Ui;
 use super::cell::{self, Cell, Span, Style};
 use super::status::Status;
 
-/// Rows the pinned region needs: the status line, then the input box (border,
-/// text, border).
-const PINNED_ROWS: u16 = 1 + 3;
+/// Rows the pinned region needs: the status line, the tip line, then the input box
+/// (border, text, border).
+const PINNED_ROWS: u16 = 1 + 1 + 3;
 
 /// How many rows of the transcript a terminal `height` rows tall shows.
 ///
@@ -56,8 +56,8 @@ fn transcript_rows(height: u16) -> u16 {
 }
 
 /// The spinner, advanced while work is in progress. One column each, so it can
-/// sit on the status line without moving it.
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// sit on the working line without moving it.
+const SPINNER: [&str; 6] = ["·", "✢", "✳", "✶", "✽", "✻"];
 
 /// How long each spinner frame is shown. Long enough to read, short enough that
 /// the line looks alive.
@@ -67,7 +67,7 @@ const SPINNER_FRAME: Duration = Duration::from_millis(100);
 ///
 /// Derived from the elapsed time rather than counted, so a redraw that was
 /// skipped cannot leave the spinner behind: the frame is a function of *when*,
-/// not of how many times anything ran. Everything on the status line that moves
+/// not of how many times anything ran. Everything on the working line that moves
 /// on its own -- the frame, the timer -- moves on this tick, so one number
 /// answers both "which frame" and "has anything changed".
 fn spinner_step(elapsed: Duration) -> u64 {
@@ -79,14 +79,54 @@ fn spinner_frame(elapsed: Duration) -> &'static str {
     SPINNER[spinner_step(elapsed) as usize % SPINNER.len()]
 }
 
-/// A duration as the status line shows it: tenths of a second.
+/// The words a turn is introduced by, one per turn. The machine underneath is the
+/// same every time; the point of the word is that a long wait has something in it
+/// to read.
+const VERBS: [&str; 14] = [
+    "Pondering",
+    "Noodling",
+    "Julienning",
+    "Percolating",
+    "Ruminating",
+    "Simmering",
+    "Whittling",
+    "Mulling",
+    "Sifting",
+    "Tinkering",
+    "Brewing",
+    "Sketching",
+    "Untangling",
+    "Kneading",
+];
+
+/// The word a turn that began at `seed` is introduced by.
 ///
-/// Formatted from integer milliseconds so that it changes on exactly the tick
-/// [`spinner_step`] counts. A float would round at boundaries of its own, and a
-/// redraw is skipped by comparing the tick.
-fn seconds(elapsed: Duration) -> String {
-    let tenths = elapsed.as_millis() as u64 / 100;
-    format!("{}.{}s", tenths / 10, tenths % 10)
+/// The seed is a clock reading rather than a counter, so two turns in a row are
+/// unlikely to be the same word without anything having to remember the last one.
+fn verb_for(seed: u128) -> &'static str {
+    VERBS[(seed as usize) % VERBS.len()]
+}
+
+/// A clock reading that can seed anything wanting one. Nanoseconds, because the
+/// seconds a session runs for are few enough that a coarser reading would repeat.
+fn seed() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default()
+}
+
+/// How long a turn has been running, as the working line shows it: `12m 10s`.
+///
+/// Rounded to the second, because that is the scale a turn is watched at, and
+/// because a division that lands exactly on the spinner's tick is what keeps the
+/// redraw and the text in step.
+fn duration_label(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    match (secs / 60, secs % 60) {
+        (0, s) => format!("{s}s"),
+        (m, s) => format!("{m}m {s}s"),
+    }
 }
 
 /// The thinking block's ground and foreground, by their numbers in ANSI's
@@ -95,9 +135,31 @@ fn seconds(elapsed: Duration) -> String {
 const REASONING_GROUND: u8 = 236;
 const REASONING_FOREGROUND: u8 = 245;
 
-/// The least room the session summary is worth showing in. Below this it is
-/// dropped rather than clipped to a stub.
-const MIN_STATUS_COLUMNS: usize = 12;
+/// The colour the word on the working line is painted in: a warm amber, which is
+/// what separates "something is happening" from the dim text around it.
+const WORKING_FOREGROUND: u8 = 209;
+
+/// The gutter the tip line starts with: the same mark the transcript uses for the
+/// lines that belong to something else, so a tip reads as an aside rather than as
+/// part of the session.
+const TIP_GUTTER: &str = "⎿  ";
+
+/// How long one tip is shown before the next replaces it. Long enough to read
+/// without reading it twice, which is what makes the row worth its space.
+const TIP_PERIOD: Duration = Duration::from_secs(20);
+
+/// The tips, in the order they come round. One line each, short enough to read at
+/// a glance, and every one of them true: a tip about a key that does nothing is
+/// worse than no tip at all.
+const TIPS: [&str; 7] = [
+    "Tab completes · Up and Down browse what you typed",
+    "Ctrl-J adds a line · Enter sends it",
+    "PageUp and PageDown read back through the session",
+    "Ctrl-C stops a turn, and the model is told",
+    "/resume switches session · /new starts one",
+    "Start with --ask to approve a tool before it runs",
+    "/help lists every command",
+];
 
 /// How many command rows the picker shows at once. It draws over the bottom of
 /// the live area, so it has to leave the transcript somewhere to live.
@@ -294,6 +356,10 @@ struct State {
     /// need them, and both are the terminal's to say rather than the state's.
     drawn_lines: usize,
     drawn_rows: usize,
+    /// When the front end started, which is the clock the tip line runs on. Its
+    /// own clock rather than the turn's: the tips keep coming round whether or not
+    /// anything is happening.
+    started: Instant,
     /// The text block being streamed, with the style it is drawn in. The style is
     /// the block's identity, so a fragment in the other style opens a new block.
     live: Option<(Style, String)>,
@@ -317,11 +383,31 @@ struct State {
     /// both "is a turn running" and "how long has it been", which are the same
     /// question asked twice otherwise.
     turn_started: Option<Instant>,
-    /// The tool being executed, while one is.
-    tool: Option<String>,
+    /// What the running turn is doing at this moment.
+    phase: Phase,
+    /// The word the running turn is introduced by, picked when it began.
+    verb: &'static str,
+    /// Output tokens the provider has reported for the running turn, or `None`
+    /// while it has reported none.
+    turn_tokens: Option<u64>,
     /// Bumped by everything that changes what the screen should show, so a draw
     /// can be skipped when nothing has.
     revision: u64,
+}
+
+/// What a running turn is doing, as far as the working line is concerned.
+///
+/// One field rather than two, because "is a tool running" and "which one" are only
+/// ever asked together, and a turn is in exactly one of these states at a time.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+enum Phase {
+    /// Thinking, or between things: the state a turn opens in.
+    #[default]
+    Thinking,
+    /// The answer itself is being written.
+    Responding,
+    /// A tool is executing.
+    Running(String),
 }
 
 /// The picker: what it is offering, and which row is highlighted.
@@ -357,6 +443,7 @@ impl Default for State {
             scroll: Scroll::default(),
             drawn_lines: 0,
             drawn_rows: 0,
+            started: Instant::now(),
             live: None,
             question: None,
             reply: None,
@@ -366,7 +453,9 @@ impl Default for State {
             browsing: None,
             draft: String::new(),
             turn_started: None,
-            tool: None,
+            phase: Phase::default(),
+            verb: VERBS[0],
+            turn_tokens: None,
             revision: 0,
         }
     }
@@ -426,40 +515,57 @@ impl State {
         self.scroll.bottom();
     }
 
-    /// The pinned status line: the session summary, and then what is running.
-    fn status_line(&self, width: usize, now: Instant) -> String {
-        // One column is left free so the write cannot trigger autowrap.
-        let width = width.saturating_sub(1);
-        let Some(progress) = self.progress(now) else {
-            return self.status.line(width);
-        };
-        // What is running is what the user is watching, so it is measured first
-        // and the session summary gives up the room; on a narrow line the summary
-        // goes entirely rather than being clipped mid-word.
-        let spent = super::text::width(&progress) + 3;
-        let room = width.saturating_sub(spent);
-        let summary = if room < MIN_STATUS_COLUMNS {
-            String::new()
-        } else {
-            self.status.line(room)
-        };
-        if summary.is_empty() {
-            progress
-        } else {
-            format!("{summary} · {progress}")
+    /// The pinned status line: what is running while a turn is, and the session
+    /// summary when nothing is.
+    ///
+    /// The two do not share the line. What a turn is doing is the thing to look at
+    /// while it does it, and the model and cache statistics are what you read when
+    /// you are about to type rather than while you wait.
+    fn status_line(&self, width: usize, now: Instant) -> Line<'static> {
+        match self.working(width, now) {
+            Some(line) => line,
+            // One column is left free so the write cannot trigger autowrap.
+            None => Line::from(self.status.line(width.saturating_sub(1))),
         }
     }
 
-    /// What is running, if anything: a spinner, what it is, and how long it has
-    /// taken.
-    fn progress(&self, now: Instant) -> Option<String> {
+    /// The working line, while a turn is running.
+    ///
+    /// The word, how long it has been going, what it has written, and which part of
+    /// the turn it is in -- in that order, because that is the order the question is
+    /// asked in: something is happening, for this long, this much of it, at this.
+    fn working(&self, width: usize, now: Instant) -> Option<Line<'static>> {
         let elapsed = self.elapsed(now)?;
         let frame = spinner_frame(elapsed);
-        let spent = seconds(elapsed);
-        Some(match &self.tool {
-            Some(tool) => format!("{frame} {tool} · {spent}"),
-            None => format!("{frame} thinking · {spent}"),
-        })
+        let spent = duration_label(elapsed);
+        let state = match &self.phase {
+            Phase::Thinking => "thinking".to_owned(),
+            Phase::Responding => "responding".to_owned(),
+            Phase::Running(tool) => format!("running {tool}"),
+        };
+        // The token count is the one segment that can be missing: it is what the
+        // provider reported, and until it reports anything there is nothing to
+        // show but a number this process made up.
+        let tokens = match self.turn_tokens {
+            Some(n) => format!(" \u{b7} \u{2193} {n} tokens"),
+            None => String::new(),
+        };
+        let head = format!("{frame} {}\u{2026}", self.verb);
+        let rest = format!(" ({spent}{tokens} \u{b7} {state})");
+        // One row, which cannot wrap: on a line too narrow for both, the detail goes
+        // and the word stays, since a word on its own still says something is
+        // happening.
+        let head_width = super::text::width(&head);
+        let rest_width = super::text::width(&rest);
+        let detail = if head_width + rest_width < width {
+            rest
+        } else {
+            String::new()
+        };
+        Some(Line::from(vec![
+            RSpan::styled(head, RStyle::new().fg(Color::Indexed(WORKING_FOREGROUND))),
+            RSpan::styled(detail, RStyle::new().add_modifier(Modifier::DIM)),
+        ]))
     }
 
     /// How long the current turn has been running, if one is.
@@ -467,45 +573,88 @@ impl State {
         Some(now.saturating_duration_since(self.turn_started?))
     }
 
-    /// The moment on the status line's own clock, if anything is moving on it.
-    fn tick(&self, now: Instant) -> Option<u64> {
-        Some(spinner_step(self.elapsed(now)?))
+    /// The tip to show at `now`, which is the one the tip clock has come round to.
+    fn tip(&self, now: Instant) -> &'static str {
+        TIPS[self.tip_step(now) as usize % TIPS.len()]
     }
 
-    /// A turn is starting: start the clock the status line reads.
+    /// How many tip periods have passed since the front end started. The clock
+    /// reading the line and the tick that decides whether to redraw are the same
+    /// number, so the tip changes exactly when the screen is repainted for it.
+    fn tip_step(&self, now: Instant) -> u64 {
+        let period = TIP_PERIOD.as_millis().max(1);
+        (now.saturating_duration_since(self.started).as_millis() / period) as u64
+    }
+
+    /// The tip line: the gutter, then the tip.
+    fn tip_line(&self, now: Instant) -> Line<'static> {
+        Line::styled(
+            format!("{TIP_GUTTER}Tip: {}", self.tip(now)),
+            RStyle::new().add_modifier(Modifier::DIM),
+        )
+    }
+
+    /// The moment on the front end's own clock: the spinner's while a turn runs,
+    /// the tip line's while nothing does.
+    ///
+    /// Either way it is one number that says whether anything has moved without
+    /// being told to, and it is part of what decides whether to redraw -- without
+    /// that, a screen left idle would keep showing the tip it opened with.
+    fn tick(&self, now: Instant) -> u64 {
+        match self.elapsed(now) {
+            Some(elapsed) => spinner_step(elapsed),
+            None => self.tip_step(now),
+        }
+    }
+
+    /// A turn is starting: start the clock the status line reads, and pick the word
+    /// it will be introduced by.
     fn begin_turn(&mut self, now: Instant) {
         self.revision += 1;
         self.turn_started = Some(now);
+        self.verb = verb_for(seed());
+        self.turn_tokens = None;
     }
 
-    /// The turn is over: stop the clock, and stop naming the tool it was running,
-    /// which a turn can end without -- an interrupted tool reports no result.
+    /// The turn is over: stop the clock, and forget what it was doing, which a turn
+    /// can end without ever saying -- an interrupted tool reports no result.
     fn end_turn(&mut self) {
         self.revision += 1;
         self.turn_started = None;
-        self.tool = None;
+        self.phase = Phase::default();
     }
 
     /// Fold one notice into the state.
     fn apply(&mut self, notice: Notice) {
         self.revision += 1;
         match notice {
-            Notice::Reasoning(text) => self.stream(Style::Reasoning, &text),
-            Notice::Content(text) => self.stream(Style::Plain, &text),
+            Notice::Reasoning(text) => {
+                self.phase = Phase::Thinking;
+                self.stream(Style::Reasoning, &text);
+            }
+            Notice::Content(text) => {
+                self.phase = Phase::Responding;
+                self.stream(Style::Plain, &text);
+            }
             Notice::FinishTurn => self.end_block(),
             Notice::ToolStart { name, args } => {
                 self.end_block();
                 self.transcript.push(Cell::tool_call(&name, &args));
-                // The status line reports the tool by name while it runs, which
-                // is the part of a turn that can take a long time.
-                self.tool = Some(name);
+                // The working line reports the tool by name while it runs, which is
+                // the part of a turn that can take a long time.
+                self.phase = Phase::Running(name);
             }
             Notice::ToolResult(result) => {
                 self.end_block();
                 self.transcript.push(Cell::ToolResult(result));
-                self.tool = None;
+                // What follows a result is the model reading it, so the turn is back
+                // to thinking until it says otherwise.
+                self.phase = Phase::Thinking;
             }
-            Notice::Usage(u) => self.status.record(&u),
+            Notice::Usage(u) => {
+                self.status.record(&u);
+                *self.turn_tokens.get_or_insert(0) += u.completion_tokens;
+            }
             Notice::Interrupted => {
                 self.end_block();
                 self.transcript.push(Cell::Interrupted);
@@ -1090,7 +1239,7 @@ impl Drop for Tty {
 #[derive(PartialEq, Eq, Clone, Copy)]
 struct ViewKey {
     revision: u64,
-    tick: Option<u64>,
+    tick: u64,
     width: u16,
     height: u16,
 }
@@ -1187,11 +1336,13 @@ impl<B: Backend> Screen<B> {
         let last = (first + rows as usize).min(lines.len());
         let transcript = Text::from(lines[first..last].to_vec());
         let status = self.state.status_line(width, now);
+        let tip = self.state.tip_line(now);
         let cursor = self.state.textarea.screen_cursor();
 
         self.terminal.draw(|frame| {
             let rows = Layout::vertical([
                 Constraint::Min(0),
+                Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Length(3),
             ])
@@ -1211,8 +1362,9 @@ impl<B: Backend> Screen<B> {
                 frame.render_widget(Paragraph::new(Text::from(picker)), area);
             }
             frame.render_widget(Paragraph::new(status), rows[1]);
-            frame.render_widget(&self.state.textarea, rows[2]);
-            place_cursor(frame, rows[2], cursor);
+            frame.render_widget(Paragraph::new(tip), rows[2]);
+            frame.render_widget(&self.state.textarea, rows[3]);
+            place_cursor(frame, rows[3], cursor);
         })?;
         Ok(())
     }
@@ -1804,12 +1956,16 @@ mod tests {
     #[test]
     fn the_pinned_rows_take_the_bottom_of_the_screen() {
         // The shape the pinned region has to keep, whatever the transcript does:
-        // the status line, then the box, on the last rows of the terminal.
-        let mut screen = screen_for_test(40, 20);
+        // the status line, the tip, then the box, on the last rows of the terminal.
+        let mut screen = screen_for_test(60, 20);
         screen.state.status.set_model("m-1");
         screen.draw().unwrap();
         let last = screen.terminal.backend().buffer().area.height - 1;
-        assert_eq!(row(&screen, last - 3), "m-1 · cache —");
+        assert_eq!(row(&screen, last - 4), "m-1 · cache —");
+        assert_eq!(
+            row(&screen, last - 3),
+            format!("{TIP_GUTTER}Tip: {}", TIPS[0])
+        );
         assert!(row(&screen, last - 2).starts_with('┌'), "the box's top");
         assert!(row(&screen, last - 1).starts_with("│ ›"), "its text");
         assert!(row(&screen, last).starts_with('└'), "its bottom");
@@ -1817,17 +1973,32 @@ mod tests {
 
     #[test]
     fn the_status_line_says_what_the_turn_is_doing() {
-        let mut screen = screen_for_test(40, 20);
-        screen.state.status.set_model("m");
+        // The line as drawn, not as formatted: the word is painted in its own
+        // colour, and the row is the only place that can be seen.
+        let mut screen = screen_for_test(60, 20);
         let now = Instant::now();
         screen.state.begin_turn(now);
+        screen.state.verb = "Julienning";
+        screen.state.apply(Notice::Usage(Usage {
+            completion_tokens: 259,
+            ..Usage::default()
+        }));
         screen.state.apply(Notice::ToolStart {
             name: "read_file".into(),
             args: "{}".into(),
         });
         screen.draw_at(now).unwrap();
         let pinned = screen.terminal.backend().buffer().area.height - PINNED_ROWS;
-        assert_eq!(row(&screen, pinned), "m · cache — · ⠋ read_file · 0.0s");
+        assert_eq!(
+            row(&screen, pinned),
+            "· Julienning… (0s · ↓ 259 tokens · running read_file)"
+        );
+        let buf = screen.terminal.backend().buffer();
+        assert_eq!(
+            buf[(0, pinned)].fg,
+            Color::Indexed(WORKING_FOREGROUND),
+            "the word is the one thing on the line that is not dim"
+        );
     }
 
     #[test]
@@ -2351,75 +2522,182 @@ mod tests {
         assert_eq!(spinner_frame(at(0)), SPINNER[0]);
         assert_eq!(spinner_frame(at(99)), SPINNER[0], "still the first frame");
         assert_eq!(spinner_frame(at(100)), SPINNER[1]);
-        assert_eq!(spinner_frame(at(1_000)), SPINNER[0], "it comes round");
+        assert_eq!(spinner_frame(at(600)), SPINNER[0], "it comes round");
         // The same moment is always the same frame, so a redraw that was skipped
         // cannot leave the spinner behind.
         assert_eq!(spinner_frame(at(1_234)), spinner_frame(at(1_234)));
     }
 
+    /// The working line as the screen would read it, styling and all.
+    fn working_line(state: &State, now: Instant) -> String {
+        state
+            .working(80, now)
+            .expect("a turn is running")
+            .to_string()
+    }
+
     #[test]
-    fn the_status_line_shows_what_the_turn_is_doing_and_for_how_long() {
+    fn the_working_line_says_what_the_turn_is_doing_and_for_how_long() {
         let (mut state, now) = running_for(Duration::from_millis(12_300));
-        state.status.set_model("m");
+        state.verb = "Julienning";
+        // The frame comes from the clock, so the test reads it from there too.
+        let frame = spinner_frame(Duration::from_millis(12_300));
         assert_eq!(
-            state.status_line(80, now),
-            "m · cache — · ⠸ thinking · 12.3s"
+            working_line(&state, now),
+            format!("{frame} Julienning… (12s · thinking)"),
+            "the minutes only appear once there are any"
         );
         state.apply(Notice::ToolStart {
             name: "read_file".into(),
             args: "{}".into(),
         });
         assert_eq!(
-            state.status_line(80, now),
-            "m · cache — · ⠸ read_file · 12.3s"
+            working_line(&state, now),
+            format!("{frame} Julienning… (12s · running read_file)")
         );
+        // What follows a result is the model reading it.
         state.apply(Notice::ToolResult("ok".into()));
         assert_eq!(
-            state.status_line(80, now),
-            "m · cache — · ⠸ thinking · 12.3s"
+            working_line(&state, now),
+            format!("{frame} Julienning… (12s · thinking)")
         );
+        // An answer being written is the third thing a turn can be doing.
+        state.apply(Notice::Content("here it is".into()));
+        assert_eq!(
+            working_line(&state, now),
+            format!("{frame} Julienning… (12s · responding)")
+        );
+    }
+
+    #[test]
+    fn the_working_line_reports_the_tokens_the_provider_counted() {
+        let (mut state, now) = running_for(Duration::from_millis(65_400));
+        state.verb = "Julienning";
+        let frame = spinner_frame(Duration::from_millis(65_400));
+        // Nothing reported yet: no number, rather than one this side made up.
+        assert_eq!(
+            working_line(&state, now),
+            format!("{frame} Julienning… (1m 5s · thinking)")
+        );
+        state.apply(Notice::Usage(Usage {
+            completion_tokens: 259,
+            ..Usage::default()
+        }));
+        assert_eq!(
+            working_line(&state, now),
+            format!("{frame} Julienning… (1m 5s · ↓ 259 tokens · thinking)")
+        );
+        // Every sub-request of the turn goes into the same count.
+        state.apply(Notice::Usage(Usage {
+            completion_tokens: 41,
+            ..Usage::default()
+        }));
+        assert_eq!(
+            working_line(&state, now),
+            format!("{frame} Julienning… (1m 5s · ↓ 300 tokens · thinking)")
+        );
+    }
+
+    #[test]
+    fn a_narrow_working_line_keeps_the_word_and_drops_the_detail() {
+        let (mut state, now) = running_for(Duration::from_millis(1_500));
+        state.verb = "Julienning";
+        state.apply(Notice::Usage(Usage {
+            completion_tokens: 259,
+            ..Usage::default()
+        }));
+        let frame = spinner_frame(Duration::from_millis(1_500));
+        let full = format!("{frame} Julienning… (1s · ↓ 259 tokens · thinking)");
+        assert_eq!(working_line(&state, now), full);
+        assert_eq!(
+            state
+                .working(super::super::text::width(&full), now)
+                .unwrap()
+                .to_string(),
+            format!("{frame} Julienning…"),
+            "a line with no room for both keeps the word, whole"
+        );
+        assert_eq!(
+            state.working(12, now).unwrap().to_string(),
+            format!("{frame} Julienning…"),
+            "and what is left still says something is happening"
+        );
+    }
+
+    #[test]
+    fn the_word_is_picked_when_the_turn_begins() {
+        // One word per turn, out of the clock: the machine underneath is the same
+        // every time, and the word is what makes a long wait readable.
+        let mut state = State::default();
+        state.begin_turn(Instant::now());
+        let picked = state.verb;
+        assert!(VERBS.contains(&picked), "{picked:?} is not one of them");
+        assert_eq!(state.turn_tokens, None, "and the count starts empty");
+        for seed in [0u128, 1, 13, 999_999_999_999, u128::MAX] {
+            assert!(VERBS.contains(&verb_for(seed)));
+        }
     }
 
     #[test]
     fn an_idle_line_is_the_summary_and_nothing_else() {
-        let (mut state, now) = running_for(Duration::from_millis(50));
-        state.status.set_model("m");
+        let (state, now) = running_for(Duration::from_millis(50));
         assert_eq!(
-            state.status_line(40, now),
-            "m · cache — · ⠋ thinking · 0.0s"
+            state.status_line(40, now).to_string(),
+            format!(
+                "{} {}… (0s · thinking)",
+                spinner_frame(Duration::from_millis(50)),
+                state.verb
+            )
         );
-        let idle = State::default();
-        assert_eq!(idle.status_line(40, now), "cache —");
-        // Narrow enough that the summary would be clipped to a stub: with nothing
-        // running there is no reason to drop it.
-        assert_eq!(idle.status_line(9, now), "cache —");
+        let mut idle = State::default();
+        idle.status.set_model("m");
+        assert_eq!(idle.status_line(40, now).to_string(), "m · cache —");
+        // Narrow enough that the summary loses a segment of its own: with nothing
+        // running, the line is the summary and nothing competes with it.
+        assert_eq!(idle.status_line(9, now).to_string(), "m");
     }
 
     #[test]
-    fn a_narrow_line_drops_the_summary_rather_than_clipping_it() {
-        let (state, now) = running_for(Duration::from_millis(1_500));
-        let progress = "⠴ thinking · 1.5s";
-        assert_eq!(super::super::text::width(progress), 17);
-        // One column short of room for a summary worth reading, so the summary
-        // goes whole rather than being clipped mid-word.
-        assert_eq!(state.status_line(32, now), progress);
-        // One column more, and it fits with its separator.
-        assert_eq!(state.status_line(33, now), "cache — · ⠴ thinking · 1.5s");
-    }
-
-    #[test]
-    fn the_view_key_moves_with_the_clock_while_a_turn_runs() {
+    fn the_tick_moves_with_the_spinner_while_a_turn_runs() {
         let mut state = State::default();
         let now = Instant::now();
-        assert_eq!(state.tick(now), None, "nothing is running, nothing to draw");
         state.begin_turn(now);
-        let first = state.tick(now);
-        assert_eq!(first, Some(0));
-        assert_eq!(state.tick(now + SPINNER_FRAME), Some(1), "a frame later");
-        assert_eq!(state.tick(now + SPINNER_FRAME), first.map(|_| 1));
+        assert_eq!(state.tick(now), 0);
+        assert_eq!(state.tick(now + SPINNER_FRAME), 1, "a frame later");
+        // The same moment is the same tick, which is what lets a redraw be skipped.
+        assert_eq!(state.tick(now + SPINNER_FRAME), 1);
         state.end_turn();
-        assert_eq!(state.tick(now), None, "the clock stops with the turn");
-        assert!(state.tool.is_none(), "and stops naming a tool");
+        assert_eq!(state.phase, Phase::Thinking, "and stops naming a tool");
+    }
+
+    #[test]
+    fn an_idle_screen_still_has_a_clock_because_the_tip_changes_on_one() {
+        // The tip line comes round on a period of its own, which is what moves the
+        // tick while nothing else does: without it, the screen would keep the tip
+        // it opened with for as long as the session lasted.
+        let state = State::default();
+        let started = state.started;
+        assert_eq!(state.tick(started), 0);
+        assert_eq!(state.tick(started + TIP_PERIOD), 1);
+        assert_eq!(
+            state.tick(started + TIP_PERIOD - Duration::from_millis(1)),
+            0
+        );
+    }
+
+    #[test]
+    fn the_tip_comes_round_on_its_own_clock() {
+        let state = State::default();
+        let started = state.started;
+        assert_eq!(state.tip(started), TIPS[0]);
+        assert_eq!(state.tip(started + TIP_PERIOD), TIPS[1]);
+        // Round the whole list, and back to the first: a session that runs long
+        // enough does not run out of tips.
+        assert_eq!(state.tip(started + TIP_PERIOD * TIPS.len() as u32), TIPS[0]);
+        assert_eq!(
+            state.tip(started + TIP_PERIOD * 3 + Duration::from_secs(5)),
+            TIPS[3]
+        );
     }
 
     #[test]
@@ -2433,9 +2711,9 @@ mod tests {
             name: "run_command".into(),
             args: "{}".into(),
         });
-        assert!(state.progress(now).unwrap().contains("run_command"));
+        assert!(working_line(&state, now).contains("running run_command"));
         state.end_turn();
-        assert_eq!(state.progress(now), None);
+        assert!(state.working(80, now).is_none(), "nothing is running");
     }
 
     #[test]

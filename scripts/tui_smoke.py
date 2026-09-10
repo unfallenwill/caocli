@@ -58,10 +58,10 @@ STATUS = "cache"
 PICKER = "show this"  # the /help row of the command picker
 HELP = "Commands:"  # the first line of what /help commits
 
-# Live marks: the spinner the status line moves on its own, and the gate that
-# stands between a tool call and its execution.
+# Live marks: the state word the working line carries, the frames it moves through
+# on its own, and the gate that stands between a tool call and its execution.
 SPINNER = "thinking"
-SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+SPINNER_FRAMES = "·✢✳✶✽✻"
 GATE = "run it? [y/N]"
 
 # A session with an edit already in it. Resuming it draws the change, which is the
@@ -323,13 +323,24 @@ class Terminal:
                 next_note = time.time() + 15
             self.pump(0.5)
 
+    def working_row(self) -> str:
+        """The working line: the row above the tip line, which is the row above the
+        input box."""
+        rows = self.screen.lines()
+        for y in range(len(rows) - 1, 1, -1):
+            if rows[y].startswith("┌"):
+                return rows[y - 2]
+        return ""
+
     def spinner_moved(self, timeout: float) -> bool:
-        """Watch the status line: a spinner that only ever shows one frame is not
-        a spinner, and this is the only path that runs it."""
+        """Watch the working line's first column: a spinner that only ever shows
+        one frame is not a spinner, and this is the only path that runs one."""
         seen = set()
         end = time.time() + timeout
         while time.time() < end and len(seen) < 3:
-            seen |= {c for c in self.text() if c in SPINNER_FRAMES}
+            head = self.working_row()[:1]
+            if head in SPINNER_FRAMES:
+                seen.add(head)
             self.pump(0.2)
         if len(seen) < 3:
             print(f"  ✗ the spinner never advanced: {sorted(seen)}")
@@ -442,6 +453,7 @@ def main() -> int:
             # own scrollback.
             ok &= term.expect(VIEWPORT, 30)
             ok &= term.expect(STATUS, 15)
+            ok &= term.expect("⎿  Tip:", 15)
             if b"\x1b[?1049h" not in term.raw:
                 print("  ✗ the alternate screen was never entered")
                 ok = False
