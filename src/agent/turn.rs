@@ -180,7 +180,7 @@ impl Turn<'_> {
         self.ui
             .tool_start(&call.function.name, &call.function.arguments);
         if self.steps_left == 0 {
-            return self.spend_nothing(call);
+            return self.out_of_budget(call);
         }
         self.steps_left -= 1;
         match self.gate(call).await? {
@@ -193,7 +193,7 @@ impl Turn<'_> {
 
     /// The budget is gone: the call in hand is answered with the marker instead
     /// of running, and so is every call the turn left open. The turn ends here.
-    fn spend_nothing(&mut self, call: &ToolCall) -> Result<Step> {
+    fn out_of_budget(&mut self, call: &ToolCall) -> Result<Step> {
         self.answer_with(call, Marker::StepLimit)?;
         close_open_calls(&mut self.agent.session, self.ui, Marker::StepLimit)?;
         Ok(Step::Stop)
@@ -241,7 +241,8 @@ impl Turn<'_> {
         }
     }
 
-    /// Give one call the result it is owed and keep the turn going.
+    /// Write `marker` as the result of `call` — in the log and to the front end
+    /// — for a call that ends without a tool's own output to report.
     fn answer_with(&mut self, call: &ToolCall, marker: Marker) -> Result<()> {
         self.ui.tool_result(marker.text());
         self.agent

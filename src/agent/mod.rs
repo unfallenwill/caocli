@@ -1,10 +1,11 @@
-//! The interpreter: it asks the machine what the next beat is, executes it, and
-//! writes the result back into the log.
+//! The agent: one session, one provider, and the policies a turn runs under.
 //!
-//! The machine decides and never executes (`machine::next_action`), so this is
-//! the only place in the crate that turns a decision into IO. It owns the
-//! session — the log is the state — and the two things a turn needs from
-//! whoever is watching: an answer for the approval gate and a signal to stop.
+//! It owns the state the interpreter works on — the session (the log *is* the
+//! state), the client bound to a provider, whether the approval gate is on and
+//! how many tool steps one turn may spend — and it offers the control plane the
+//! shell drives: bind a provider, adopt another session, name the model. What it
+//! does with that state is `turn`, what it sends is `request`, and what comes
+//! back is `stream`.
 
 use crate::api::Client;
 use crate::machine;
@@ -15,8 +16,6 @@ use crate::types::ChatRequest;
 mod request;
 mod stream;
 mod turn;
-
-pub use request::build_request;
 
 pub struct Agent {
     api: Client,
@@ -109,7 +108,7 @@ impl Agent {
     }
 
     fn build_request(&self) -> ChatRequest {
-        build_request(&self.provider, &self.session.meta, &self.session.messages)
+        request::build_request(&self.provider, &self.session.meta, &self.session.messages)
     }
 }
 
