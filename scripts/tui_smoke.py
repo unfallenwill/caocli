@@ -332,6 +332,27 @@ class Terminal:
                 return rows[y - 2]
         return ""
 
+    def transcript_top(self) -> str:
+        """The first row of the transcript: what the window over it is scrolled to.
+        The pinned region is at the bottom, so row zero is the transcript's."""
+        return self.screen.lines()[0]
+
+    def until(self, wanted, timeout: float) -> bool:
+        """Wait for the screen to satisfy `wanted`.
+
+        A screen drawn by difference is a screen that has to be given the time to
+        be drawn: what is asked for here is not in the next byte, it is in the
+        frame after the key that moved it.
+        """
+        end = time.time() + timeout
+        while True:
+            if wanted():
+                return True
+            if time.time() >= end:
+                print("    screen:\n" + self.shown())
+                return False
+            self.pump(0.3)
+
     def box_rows(self) -> list[str]:
         """The input box as drawn: its border rows and what is between them, which
         is what says how tall it is."""
@@ -471,6 +492,12 @@ def main() -> int:
             if b"\x1b[?1049h" not in term.raw:
                 print("  ✗ the alternate screen was never entered")
                 ok = False
+            # The wheel is asked for by name. A terminal that has not been asked
+            # sends Up and Down in place of a notch, and those are the box's
+            # history: a wheel that recalls a line rather than reading one.
+            if b"\x1b[?1000h" not in term.raw or b"\x1b[?1006h" not in term.raw:
+                print("  ✗ the terminal was never asked for the wheel")
+                ok = False
             # The resumed turn's edit, line by line, from the log rather than from
             # anything that is running now.
             ok &= term.expect("  - one", 15)
@@ -563,6 +590,31 @@ def main() -> int:
             term.send("\x1b[5~")  # PageUp
             ok &= term.expect(BANNER, 15)
 
+            # The wheel, which is the other way back through the transcript and
+            # the one that has a terminal to argue with: while it was left to the
+            # terminal, a notch arrived as Up and Down and recalled a line into the
+            # box instead. Both halves are asserted -- the window moves, and the box
+            # does not -- because only the second one is the bug.
+            #
+            # Wheel down first, past the end: the window stops there, so where it
+            # is scrolled to is known and a notch back can be asked to return to it.
+            notches = {"up": "\x1b[<64;10;10M", "down": "\x1b[<65;10;10M"}
+            for _ in range(50):
+                term.send(notches["down"])
+            ok &= term.quiet(1.0, 30)
+            top = term.transcript_top()
+            term.send(notches["up"])
+            if not term.until(lambda: term.transcript_top() != top, 15):
+                print("  ✗ a wheel notch did not move the transcript")
+                ok = False
+            if not term.screen.find(VIEWPORT):
+                print("  ✗ the wheel put a line from the history in the box")
+                ok = False
+            term.send(notches["down"])
+            if not term.until(lambda: term.transcript_top() == top, 15):
+                print("  ✗ a notch down did not return the window")
+                ok = False
+
             if is_live:
                 ok &= live(term, home)
 
@@ -598,6 +650,11 @@ def main() -> int:
                 ok = False
             if b"\x1b[?1049l" not in term.raw:
                 print("  ✗ the alternate screen was never left")
+                ok = False
+            # The mouse as it was found, too: a terminal still reporting it hands
+            # nothing of the wheel to the shell that follows.
+            if b"\x1b[?1000l" not in term.raw:
+                print("  ✗ the mouse was never given back")
                 ok = False
         finally:
             try:

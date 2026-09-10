@@ -22,7 +22,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style as RStyle};
@@ -75,6 +75,12 @@ fn box_rows(lines: usize, height: u16) -> u16 {
 fn transcript_rows(height: u16, input: u16) -> u16 {
     height.saturating_sub(PINNED_ROWS + input).max(1)
 }
+
+/// The lines one wheel notch moves the window over the transcript: the step a
+/// terminal's own scrollback takes, so a notch here reads like a notch anywhere
+/// else. Not a page -- a notebook's worth of lines per flick of a wheel is a way
+/// of losing the place rather than of reading.
+const WHEEL_LINES: isize = 3;
 
 /// The spinner, advanced while work is in progress. One column each, so it can
 /// sit on the working line without moving it.
@@ -172,7 +178,7 @@ const TIP_PERIOD: Duration = Duration::from_secs(20);
 /// The tips, in the order they come round. One line each, short enough to read at
 /// a glance, and every one of them true: a tip about a key that does nothing is
 /// worse than no tip at all.
-const TIPS: [&str; 7] = [
+const TIPS: [&str; 8] = [
     "Tab completes · Up and Down browse what you typed",
     "Ctrl-J adds a line · Enter sends it",
     "PageUp and PageDown read back through the session",
@@ -180,6 +186,7 @@ const TIPS: [&str; 7] = [
     "/resume switches session · /new starts one",
     "Start with --ask to approve a tool before it runs",
     "/help lists every command",
+    "The wheel reads back too · Shift-drag selects text",
 ];
 
 /// How many command rows the picker shows at once. It draws over the bottom of the
@@ -528,10 +535,40 @@ impl State {
         self.transcript.push(cell);
     }
 
+    /// Move the window over the transcript by `lines`, positive being towards the
+    /// newest line. The bounds come from the last draw, which is the only thing
+    /// that knows how long the transcript is and how many rows of it there are
+    /// room for.
+    fn scroll_by(&mut self, lines: isize) {
+        let (total, rows) = (self.drawn_lines, self.drawn_rows);
+        self.scroll.by(lines, total, rows);
+    }
+
     /// Page through the transcript a screen at a time; `-1` is back, `+1` forward.
     fn page(&mut self, step: isize) {
-        let (total, rows) = (self.drawn_lines, self.drawn_rows);
-        self.scroll.by(step * rows as isize, total, rows);
+        self.scroll_by(step * self.drawn_rows as isize);
+    }
+
+    /// A wheel notch: three lines back, or three lines forward.
+    ///
+    /// The wheel has to be answered here rather than left to the terminal, which
+    /// cannot do it: the transcript is the application's, so the alternate screen
+    /// it is drawn on has no scrollback for the terminal to scroll. What a
+    /// terminal does with an unclaimed wheel is send Up and Down -- the only way it
+    /// has to say "scroll" to a program it believes cannot hear it -- and this box
+    /// reads those as the history of what was typed, so the wheel recalled lines
+    /// instead of reading them. Asked for the mouse, the terminal sends the notch
+    /// itself, and it moves the one thing scrolling back can mean here.
+    ///
+    /// A notch is not a click: a press, a drag, a shift of the wheel sideways --
+    /// everything else a mouse can say is ignored. A click that does nothing is
+    /// less surprising than one that moved a cursor nobody aimed.
+    fn wheel(&mut self, kind: MouseEventKind) {
+        match kind {
+            MouseEventKind::ScrollUp => self.scroll_by(-WHEEL_LINES),
+            MouseEventKind::ScrollDown => self.scroll_by(WHEEL_LINES),
+            _ => {}
+        }
     }
 
     /// Back to the end, which is where a new line will appear.
@@ -737,6 +774,12 @@ impl State {
         self.revision += 1;
         let key = match event {
             Event::Key(key) => key,
+            // The wheel is the reader's, not the box's: nothing that is typed
+            // here is what a notch moves.
+            Event::Mouse(mouse) => {
+                self.wheel(mouse.kind);
+                return Submitted::Nothing;
+            }
             // A paste goes to the box; the caller redraws either way.
             Event::Paste(text) => {
                 self.textarea.insert_str(text);
@@ -1129,6 +1172,14 @@ impl State {
         // arriving at all is reason enough to redraw -- and a draw that was not
         // needed costs one comparison.
         self.revision += 1;
+        // The wheel is the one thing a turn does not have to be told about:
+        // reading back is what there is to do while the model writes, and a notch
+        // is not a line being composed. Answered before the gate, which is shut for
+        // all but the moment it asks its question.
+        if let Event::Mouse(mouse) = &event {
+            self.wheel(mouse.kind);
+            return;
+        }
         if let Event::Key(key) = &event
             && key.kind == KeyEventKind::Press
             && key.code == KeyCode::Char('c')
@@ -1243,6 +1294,22 @@ struct Screen<B: Backend> {
     drawn: Option<ViewKey>,
 }
 
+/// The mouse, as far as this front end wants it: the wheel, and nothing else.
+///
+/// `?1000` is what reports a button press, and a wheel notch is one -- buttons 4
+/// and 5 -- so asking for it is asking for the wheel without the movement reports
+/// `?1003` adds: those arrive for every cell the pointer crosses, which over a
+/// whole screen is a stream of events and a repaint for each of them. `?1006` is
+/// the encoding that spells a notch out as a sequence of its own, rather than
+/// folding its coordinates into the bytes that name the button.
+///
+/// Written out rather than taken from crossterm's own `EnableMouseCapture`, which
+/// asks for `?1003` as well. What it also costs is the terminal's own selection:
+/// a terminal that has handed the mouse over keeps it, and gives it back under
+/// `Shift` -- which is why the tip line says so.
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
+const MOUSE_OFF: &str = "\x1b[?1000l\x1b[?1006l";
+
 /// The terminal, held by the screen that took it.
 ///
 /// A type of its own because a `Drop` impl cannot be written for a single
@@ -1252,7 +1319,7 @@ struct Screen<B: Backend> {
 struct Tty;
 
 impl Tty {
-    /// Take the terminal over: raw mode, then the alternate screen.
+    /// Take the terminal over: raw mode, then the alternate screen, then the wheel.
     ///
     /// Written so that a failure at any step undoes the steps before it: the value
     /// exists before the first escape sequence is written, so an error drops it and
@@ -1263,17 +1330,19 @@ impl Tty {
         crossterm::execute!(
             std::io::stdout(),
             crossterm::terminal::EnterAlternateScreen,
-            crossterm::event::EnableBracketedPaste
+            crossterm::event::EnableBracketedPaste,
+            crossterm::style::Print(MOUSE_ON)
         )?;
         Ok(taken)
     }
 }
 
-/// Give the terminal back: leave the alternate screen, so what the user had on it
-/// reappears, and put the cursor where a shell prompt expects to find it.
+/// Give the terminal back: the mouse, the alternate screen, so what the user had
+/// on it reappears, and the cursor where a shell prompt expects to find it.
 fn restore() -> io::Result<()> {
     crossterm::execute!(
         std::io::stdout(),
+        crossterm::style::Print(MOUSE_OFF),
         crossterm::event::DisableBracketedPaste,
         crossterm::terminal::LeaveAlternateScreen,
         crossterm::cursor::Show
@@ -1281,9 +1350,10 @@ fn restore() -> io::Result<()> {
 }
 
 /// Restoring the terminal does not depend on the success path running. Raw mode is
-/// process-wide and would wreck the shell if it survived an unwind, and the
-/// alternate screen would hide everything the user had on it -- so both are given
-/// back by dropping what took them, which an unwind does too.
+/// process-wide and would wreck the shell if it survived an unwind, the alternate
+/// screen would hide everything the user had on it -- so both are given back by
+/// dropping what took them, which an unwind does too. The mouse is the same
+/// bargain: a terminal left reporting it hands nothing to the shell that follows.
 impl Drop for Tty {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
@@ -1766,6 +1836,7 @@ pub async fn run(
 mod tests {
     use super::*;
     use crate::ui::Renderer;
+    use crossterm::event::{MouseButton, MouseEvent};
 
     #[test]
     fn every_notice_becomes_a_cell_or_a_status_change() {
@@ -2282,6 +2353,111 @@ mod tests {
     }
 
     #[test]
+    fn a_wheel_notch_moves_the_window_three_lines() {
+        let mut screen = screen_for_test(40, 20);
+        let rows = transcript_rows(20, BOX_ROWS) as usize;
+        for i in 0..(rows * 3) {
+            screen
+                .state
+                .transcript
+                .push(Cell::Notice(format!("line {i}")));
+        }
+        screen.draw().unwrap();
+        let last = rows * 3;
+        // Up: the window moves a notch, not a page.
+        assert!(matches!(
+            screen.state.key(mouse(MouseEventKind::ScrollUp)),
+            Submitted::Nothing
+        ));
+        screen.draw().unwrap();
+        assert_eq!(
+            row(&screen, rows as u16 - 1),
+            format!("line {}", last - 1 - WHEEL_LINES as usize)
+        );
+        // Down: back to where the writing ends, and no further, since there is
+        // nothing past the end for the window to show.
+        for _ in 0..2 {
+            screen.state.key(mouse(MouseEventKind::ScrollDown));
+        }
+        screen.draw().unwrap();
+        assert_eq!(row(&screen, rows as u16 - 1), format!("line {}", last - 1));
+        assert_eq!(screen.state.scroll.back, 0, "following the end again");
+    }
+
+    #[test]
+    fn the_wheel_does_not_browse_the_history_the_box_holds() {
+        // What this is here for: a terminal that has not been asked for the mouse
+        // sends Up and Down in place of a notch, and both of those recall a line
+        // -- which is a wheel that reads back through what was typed instead of
+        // through what was said.
+        let mut screen = screen_for_test(40, 20);
+        let rows = transcript_rows(20, BOX_ROWS) as usize;
+        for i in 0..(rows * 3) {
+            screen
+                .state
+                .transcript
+                .push(Cell::Notice(format!("line {i}")));
+        }
+        screen.draw().unwrap();
+        screen.state.history = vec!["look at src/main.rs".into()];
+        screen.state.key(mouse(MouseEventKind::ScrollUp));
+        assert!(
+            screen.state.textarea.is_empty(),
+            "the box was not the thing a notch moved"
+        );
+        assert!(screen.state.scroll.back > 0, "the transcript was");
+    }
+
+    #[test]
+    fn a_click_is_not_a_notch_and_moves_nothing() {
+        let mut screen = screen_for_test(40, 20);
+        let rows = transcript_rows(20, BOX_ROWS) as usize;
+        for i in 0..(rows * 3) {
+            screen
+                .state
+                .transcript
+                .push(Cell::Notice(format!("line {i}")));
+        }
+        screen.draw().unwrap();
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Moved,
+            MouseEventKind::ScrollLeft,
+            MouseEventKind::ScrollRight,
+        ] {
+            assert!(matches!(screen.state.key(mouse(kind)), Submitted::Nothing));
+        }
+        assert_eq!(screen.state.scroll.back, 0, "the window did not move");
+        assert!(screen.state.textarea.is_empty());
+    }
+
+    #[test]
+    fn the_wheel_reads_back_while_a_turn_runs() {
+        // A turn is when there is most to read: the window is the one thing a key
+        // pressed during one is allowed to move.
+        let mut screen = screen_for_test(40, 20);
+        let rows = transcript_rows(20, BOX_ROWS) as usize;
+        for i in 0..(rows * 3) {
+            screen
+                .state
+                .transcript
+                .push(Cell::Notice(format!("line {i}")));
+        }
+        screen.draw().unwrap();
+        let (cancel, _cancelled) = watch::channel(false);
+        screen
+            .state
+            .key_while_working(mouse(MouseEventKind::ScrollUp), &cancel);
+        assert!(screen.state.scroll.back > 0, "the window moved");
+        assert!(
+            screen.state.textarea.is_empty(),
+            "and the box stayed out of it"
+        );
+    }
+
+    #[test]
     fn lines_arriving_do_not_move_a_reader_who_scrolled_back() {
         // A turn keeps writing while the user reads what came before: the window
         // has to stay on the line they were on instead of sliding to the end
@@ -2383,6 +2559,17 @@ mod tests {
 
     fn press(state: &mut State, code: KeyCode) -> Submitted {
         state.key(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+    }
+
+    /// A mouse event of a given kind. Where the pointer is does not matter: this
+    /// front end reads the kind and nothing else.
+    fn mouse(kind: MouseEventKind) -> Event {
+        Event::Mouse(MouseEvent {
+            kind,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        })
     }
 
     fn type_in(state: &mut State, text: &str) {
