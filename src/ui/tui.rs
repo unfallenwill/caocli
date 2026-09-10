@@ -30,6 +30,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::agent::{Agent, Approve, Interrupt};
 use crate::history;
 use crate::repl;
+use crate::session;
 use crate::types::{Message, ToolCall, Usage};
 use crate::ui::Front;
 
@@ -89,6 +90,10 @@ const MIN_STATUS_COLUMNS: usize = 12;
 /// How many command rows the picker shows at once. It draws over the bottom of
 /// the live area, so it has to leave the transcript somewhere to live.
 const PICKER_ROWS: usize = 6;
+
+/// The columns the name gets before the detail starts. Wide enough for a session
+/// id, the longest name the picker shows, so both kinds of row line up.
+const PICKER_NAME_COLUMNS: usize = 17;
 
 /// How many lines one commit may push into scrollback at a time. Asking a
 /// terminal to scroll further than it has rows is not something it can do, so a
@@ -304,10 +309,29 @@ struct State {
     revision: u64,
 }
 
-/// The command picker: what matched, and which one is highlighted.
+/// The picker: what it is offering, and which row is highlighted.
 struct Picker {
-    matches: Vec<&'static repl::Command>,
+    kind: Choosing,
+    choices: Vec<Choice>,
     selected: usize,
+}
+
+/// What the picker is for, which is what choosing a row means.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Choosing {
+    /// A command name still being typed. What matches is recomputed on every
+    /// keystroke, Tab completes, and Enter runs what is in the box -- an argument
+    /// may still be wanted.
+    Command,
+    /// A session to switch to. The list is the whole message and nothing is
+    /// half-typed, so Enter takes the highlighted row.
+    Session,
+}
+
+/// One row of the picker: what it says, and what it is called.
+struct Choice {
+    name: String,
+    detail: String,
 }
 
 impl Default for State {
@@ -500,6 +524,12 @@ impl State {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
+                // A list of sessions is a list of things to do rather than a name
+                // being typed, so Enter takes the highlighted row and submits the
+                // line it stands for.
+                if self.choose_session() {
+                    return Submitted::Line;
+                }
                 if self.textarea.is_empty() {
                     Submitted::Nothing
                 } else {
@@ -557,6 +587,11 @@ impl State {
             KeyEvent {
                 code: KeyCode::Tab, ..
             } => {
+                // Completing a command leaves it in the box; choosing a session
+                // is the whole action, so it submits.
+                if self.choose_session() {
+                    return Submitted::Line;
+                }
                 self.complete();
                 Submitted::Nothing
             }
@@ -591,6 +626,15 @@ impl State {
     /// Recompute what the picker offers for what is in the box, keeping the
     /// highlight on the same command while it is still among the matches.
     fn refresh_picker(&mut self) {
+        // A session list is not a completion: it was asked for in full, and it
+        // stays until it is answered or dismissed, whatever is typed next.
+        if self
+            .picker
+            .as_ref()
+            .is_some_and(|p| p.kind == Choosing::Session)
+        {
+            return;
+        }
         let matches = repl::completions(&self.text());
         if matches.is_empty() {
             self.picker = None;
@@ -599,20 +643,73 @@ impl State {
         let previous = self
             .picker
             .as_ref()
-            .and_then(|p| p.matches.get(p.selected))
-            .map(|c| c.name);
+            .and_then(|p| p.choices.get(p.selected))
+            .map(|c| c.name.clone());
         let selected = previous
             .and_then(|name| matches.iter().position(|c| c.name == name))
             .unwrap_or(0);
-        self.picker = Some(Picker { matches, selected });
+        self.picker = Some(Picker {
+            kind: Choosing::Command,
+            choices: matches
+                .into_iter()
+                .map(|c| Choice {
+                    name: c.name.to_owned(),
+                    detail: c.description.to_owned(),
+                })
+                .collect(),
+            selected,
+        });
+    }
+
+    /// Offer the sessions in `list` to switch to, and say whether there was
+    /// anything to offer.
+    ///
+    /// The sessions are passed in rather than read here: the terminal is not where
+    /// the filesystem is read, and this is the state half of the front end.
+    fn open_sessions(&mut self, list: &[session::SessionInfo]) -> bool {
+        self.revision += 1;
+        if list.is_empty() {
+            self.picker = None;
+            return false;
+        }
+        self.picker = Some(Picker {
+            kind: Choosing::Session,
+            choices: list
+                .iter()
+                .map(|s| Choice {
+                    name: s.id.clone(),
+                    detail: format!("{} messages · {}", s.message_count, s.preview),
+                })
+                .collect(),
+            selected: 0,
+        });
+        true
+    }
+
+    /// Take the highlighted row, if the picker is offering sessions. The row
+    /// becomes the line the plain prompt would have been given, so switching has
+    /// one implementation rather than one per front end.
+    fn choose_session(&mut self) -> bool {
+        let Some(picker) = &self.picker else {
+            return false;
+        };
+        if picker.kind != Choosing::Session {
+            return false;
+        }
+        let Some(name) = picker.choices.get(picker.selected).map(|c| c.name.clone()) else {
+            return false;
+        };
+        self.picker = None;
+        self.set_text(&format!("/resume {name}"));
+        true
     }
 
     /// Up: the previous command, or the previous line typed.
     fn up(&mut self) {
         if let Some(picker) = &mut self.picker {
-            let last = picker.matches.len() - 1;
+            let len = picker.choices.len().max(1);
             picker.selected = if picker.selected == 0 {
-                last
+                len - 1
             } else {
                 picker.selected - 1
             };
@@ -624,7 +721,8 @@ impl State {
     /// Down: the next command, or the next line typed.
     fn down(&mut self) {
         if let Some(picker) = &mut self.picker {
-            picker.selected = (picker.selected + 1) % picker.matches.len();
+            let len = picker.choices.len().max(1);
+            picker.selected = (picker.selected + 1) % len;
             return;
         }
         self.browse(1);
@@ -665,10 +763,9 @@ impl State {
         let Some(picker) = self.picker.take() else {
             return;
         };
-        let Some(command) = picker.matches.get(picker.selected) else {
-            return;
-        };
-        self.set_text(command.name);
+        if let Some(choice) = picker.choices.get(picker.selected) {
+            self.set_text(&choice.name);
+        }
     }
 
     /// Record a submitted line. Repeating the previous one is not recorded
@@ -684,31 +781,31 @@ impl State {
         }
     }
 
-    /// The picker as it is drawn: one row per command, the highlighted one
+    /// The picker as it is drawn: one row per choice, the highlighted one
     /// reversed.
     fn picker_lines(&self) -> Vec<Line<'static>> {
         let Some(picker) = &self.picker else {
             return Vec::new();
         };
         picker
-            .matches
+            .choices
             .iter()
             .enumerate()
-            .map(|(i, command)| {
+            .map(|(i, choice)| {
                 let selected = i == picker.selected;
                 let name = if selected {
                     RStyle::new().add_modifier(Modifier::REVERSED)
                 } else {
                     RStyle::new()
                 };
-                let description = if selected {
+                let detail = if selected {
                     RStyle::new().add_modifier(Modifier::REVERSED)
                 } else {
                     RStyle::new().add_modifier(Modifier::DIM)
                 };
                 Line::from(vec![
-                    RSpan::styled(format!(" {:<10}", command.name), name),
-                    RSpan::styled(format!(" {}", command.description), description),
+                    RSpan::styled(format!(" {:<PICKER_NAME_COLUMNS$}", choice.name), name),
+                    RSpan::styled(format!(" {}", choice.detail), detail),
                 ])
             })
             .collect()
@@ -1194,6 +1291,14 @@ pub async fn run(
             break Ok(());
         }
         screen.state.remember(&line);
+        // `/resume` with nothing to resume is a request for the list rather than a
+        // command to run: the plain front end can only say so, and this one can
+        // offer it. The chosen row is submitted as `/resume <id>`, which is the
+        // line the plain prompt would have been given, so the switching itself is
+        // unchanged. An empty directory falls through to that same reply.
+        if line.trim() == "/resume" && screen.state.open_sessions(&session::list(sdir)?) {
+            continue;
+        }
 
         // A turn: it races against the keyboard, so Ctrl-C can reach it.
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -1632,7 +1737,11 @@ mod tests {
         type_in(&mut screen, "/res");
         let picker = screen.picker.as_ref().expect("a command is being named");
         assert_eq!(
-            picker.matches.iter().map(|c| c.name).collect::<Vec<_>>(),
+            picker
+                .choices
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["/resume"]
         );
         // A space means the rest is an argument, not part of the name.
@@ -1644,7 +1753,7 @@ mod tests {
     fn the_highlight_wraps_in_both_directions() {
         let mut screen = State::default();
         type_in(&mut screen, "/");
-        let count = screen.picker.as_ref().unwrap().matches.len();
+        let count = screen.picker.as_ref().unwrap().choices.len();
         assert!(count > 1, "the bare slash offers every command");
         assert_eq!(screen.picker.as_ref().unwrap().selected, 0);
         press(&mut screen, KeyCode::Up);
@@ -1678,6 +1787,107 @@ mod tests {
         press(&mut screen, KeyCode::Esc);
         assert!(screen.picker.is_none());
         assert_eq!(screen.text(), "/s", "what was typed is kept");
+    }
+
+    /// A session as the picker sees it. Its path is never read: the front end is
+    /// handed the list, it does not go looking for it.
+    fn session_info(id: &str, messages: usize, preview: &str) -> session::SessionInfo {
+        session::SessionInfo {
+            id: id.to_owned(),
+            path: std::path::PathBuf::from(format!("/nowhere/{id}.jsonl")),
+            modified: 0,
+            message_count: messages,
+            preview: preview.to_owned(),
+        }
+    }
+
+    #[test]
+    fn sessions_are_offered_newest_first_with_what_is_in_them() {
+        let mut screen = State::default();
+        assert!(screen.open_sessions(&[
+            session_info("20260910-120000", 12, "what does this do?"),
+            session_info("20260909-090000", 3, "hello"),
+        ]));
+        let picker = screen.picker.as_ref().unwrap();
+        assert_eq!(picker.kind, Choosing::Session);
+        let shown: Vec<_> = picker
+            .choices
+            .iter()
+            .map(|c| (c.name.as_str(), c.detail.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                ("20260910-120000", "12 messages · what does this do?"),
+                ("20260909-090000", "3 messages · hello"),
+            ],
+            "the order is the list's, and the detail is what is in the session"
+        );
+    }
+
+    #[test]
+    fn choosing_a_session_submits_the_line_that_switches_to_it() {
+        // The choice is not a completion: it is the line the plain prompt would
+        // have been given, submitted, so switching itself has one implementation.
+        let mut screen = State::default();
+        screen.open_sessions(&[
+            session_info("newest", 1, "hi"),
+            session_info("older", 2, "yo"),
+        ]);
+        press(&mut screen, KeyCode::Down);
+        assert!(matches!(
+            press(&mut screen, KeyCode::Enter),
+            Submitted::Line
+        ));
+        assert_eq!(screen.text(), "/resume older");
+        assert!(screen.picker.is_none(), "it has been chosen");
+    }
+
+    #[test]
+    fn tab_takes_the_highlighted_session_too() {
+        let mut screen = State::default();
+        screen.open_sessions(&[session_info("only", 1, "hi")]);
+        assert!(matches!(press(&mut screen, KeyCode::Tab), Submitted::Line));
+        assert_eq!(screen.text(), "/resume only");
+    }
+
+    #[test]
+    fn typing_does_not_turn_a_session_list_into_a_command_search() {
+        // It was asked for in full, and it stays until it is answered or
+        // dismissed: recomputing matches under the user's fingers would replace
+        // the list with something they did not ask for.
+        let mut screen = State::default();
+        screen.open_sessions(&[session_info("one", 1, "hi")]);
+        type_in(&mut screen, "/he");
+        let picker = screen.picker.as_ref().expect("still the session list");
+        assert_eq!(picker.kind, Choosing::Session);
+        assert_eq!(picker.choices.len(), 1);
+        press(&mut screen, KeyCode::Esc);
+        assert!(screen.picker.is_none(), "escape is how it is dismissed");
+    }
+
+    #[test]
+    fn nothing_to_offer_leaves_the_line_alone() {
+        // With no sessions on disk the command has to reach the handler, which is
+        // where both front ends say what an id is for.
+        let mut screen = State::default();
+        assert!(!screen.open_sessions(&[]));
+        assert!(screen.picker.is_none());
+    }
+
+    #[test]
+    fn the_session_list_is_drawn_like_the_command_one() {
+        let mut screen = screen_for_test(60, 20);
+        screen
+            .state
+            .open_sessions(&[session_info("20260910-124721", 3, "what is in this file?")]);
+        screen.draw().unwrap();
+        let rows = all_rows(&screen);
+        assert!(
+            rows.iter().any(|r| r.contains("20260910-124721")
+                && r.contains("3 messages · what is in this file?")),
+            "one row per session: {rows:?}"
+        );
     }
 
     #[test]

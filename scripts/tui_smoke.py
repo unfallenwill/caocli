@@ -151,7 +151,9 @@ class Terminal:
         A running turn repaints the status line on every tick, so a still
         terminal is an idle one -- and this is the signal that says a key can be
         sent: one pressed during a turn is dropped by design, because a turn is
-        not the place to start composing the next line.
+        not the place to start composing the next line. A line sent without
+        waiting therefore arrives half-eaten, and the fragment left in the box is
+        what gets submitted.
         """
         end = time.time() + timeout
         last = time.time()
@@ -245,6 +247,7 @@ def main() -> int:
             # Typing a command prefix opens the picker, which draws over the live
             # area: it is the one widget that is not part of either the
             # transcript or the box.
+            term.quiet(2.0, 30)
             term.send("/he")
             ok &= term.expect(PICKER, 15)
 
@@ -253,6 +256,24 @@ def main() -> int:
             term.send("\t")  # Tab completes without running the command
             term.send("\r")
             ok &= term.expect(HELP, 15)
+
+            # `/resume` with no id offers the sessions to choose from instead of
+            # asking for one, and the choice is submitted as the line the plain
+            # prompt would have been given.
+            #
+            # A second session is needed to switch to: the open one is the single
+            # writer of its own file and cannot be resumed, which is a constraint
+            # the front end has nothing to do with.
+            ok &= term.quiet(2.0, 30)
+            term.send("/new\r")
+            ok &= term.expect("new session", 30)
+            ok &= term.quiet(2.0, 30)
+            term.send("/resume\r")
+            ok &= term.expect("messages ·", 15)  # a picker row, not `/sessions`
+            term.send("\x1b[B")  # Down: the first row is the session just opened
+            time.sleep(0.3)
+            term.send("\r")
+            ok &= term.expect("switched to session", 30)
 
             if is_live:
                 ok &= live(term, home)

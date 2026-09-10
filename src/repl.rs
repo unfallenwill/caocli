@@ -53,6 +53,9 @@ pub async fn handle(
             }
             Err(e) => ui.error(&format!("{e:#}")),
         },
+        // The interactive front end offers the list to choose from instead; this
+        // is what both front ends say when there is nothing to offer.
+        "/resume" => ui.info("resume needs a session id; /sessions lists them"),
         _ if line.starts_with("/resume ") => {
             let id = line.trim_start_matches("/resume ").trim();
             match Session::load(&sdir.join(format!("{id}.jsonl"))) {
