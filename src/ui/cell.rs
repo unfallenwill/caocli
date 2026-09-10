@@ -426,17 +426,17 @@ fn summary(result: &str) -> String {
 /// second figure, appended when it is worth showing: a stream must have run at
 /// least a second (below that the quotient is noise the test suite would pin at
 /// absurd heights) and must have produced tokens at all.
-fn usage_line(u: &Usage, stream: Duration) -> String {
-    let cache = match u.cache() {
+fn usage_line(usage: &Usage, stream: Duration) -> String {
+    let cache = match usage.cache() {
         Some(c) => format!("hit {}/miss {}", c.hit, c.miss),
         None => "cache —".to_string(),
     };
     let mut line = format!(
         "tokens: in {}/{} ({cache}) · out {}",
-        u.prompt_tokens, u.total_tokens, u.completion_tokens
+        usage.prompt_tokens, usage.total_tokens, usage.completion_tokens
     );
-    if u.completion_tokens > 0 && stream >= Duration::from_secs(1) {
-        let per_second = u.completion_tokens as f64 / stream.as_secs_f64();
+    if usage.completion_tokens > 0 && stream >= Duration::from_secs(1) {
+        let per_second = usage.completion_tokens as f64 / stream.as_secs_f64();
         line.push_str(&format!(" · {} token/s", per_second.round() as u64));
     }
     line

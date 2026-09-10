@@ -31,7 +31,7 @@ pub trait Ui {
     /// accumulates session-level cache stats). The duration is what a
     /// tokens-per-second figure is computed from; a front end that shows none
     /// ignores it.
-    fn usage(&mut self, u: &Usage, stream: Duration);
+    fn usage(&mut self, usage: &Usage, stream: Duration);
     /// The turn was cancelled by the user (Ctrl-C): close the streaming block and
     /// print an interruption notice.
     fn interrupted(&mut self);

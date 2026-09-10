@@ -14,11 +14,11 @@ pub struct CacheStats {
 }
 
 impl CacheStats {
-    fn record(&mut self, u: &Usage) {
+    fn record(&mut self, usage: &Usage) {
         // Normalization: DeepSeek's flat fields and GLM's nested details both
         // converge in Usage::cache(). A provider that does not report caching
         // records nothing, so the line keeps the defaults it opened with.
-        if let Some(c) = u.cache() {
+        if let Some(c) = usage.cache() {
             self.hit += c.hit;
             self.miss += c.miss;
         }
@@ -70,8 +70,8 @@ impl Status {
     }
 
     /// Fold one sub-request's usage into the cache statistics.
-    pub fn record(&mut self, u: &Usage) {
-        self.stats.record(u);
+    pub fn record(&mut self, usage: &Usage) {
+        self.stats.record(usage);
     }
 
     /// Clear the cache statistics (when switching sessions). The model id stays:

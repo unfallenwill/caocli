@@ -48,7 +48,7 @@ impl Block {
 
     /// An empty cell of this kind, used to ask the spacing rule where the block
     /// belongs without having to duplicate the rule here.
-    fn cell(self) -> Cell {
+    fn spacing_cell(self) -> Cell {
         match self {
             Block::Reasoning => Cell::Reasoning(String::new()),
             Block::Content => Cell::Content(String::new()),
@@ -172,7 +172,7 @@ impl Renderer {
         }
     }
 
-    fn raw(&mut self, s: &str) {
+    fn emit(&mut self, s: &str) {
         let _ = self.out.write_all(s.as_bytes());
         let _ = self.out.flush();
     }
@@ -236,7 +236,7 @@ impl Renderer {
     /// in its gutter, its spans, then its line ending.
     fn paint_cell(&mut self, cell: &Cell) {
         if cell.gap_after(self.prev_was_block) {
-            self.raw("\n");
+            self.emit("\n");
         }
         // The marker first, then the cell's own spans: a cell is set in past its
         // gutter, and this front end is the one that writes those columns itself --
@@ -246,9 +246,9 @@ impl Renderer {
         let led = gutter.map(|g| Span::new(g.style, g.head));
         let spans: Vec<Span> = led.into_iter().chain(cell.spans()).collect();
         let painted = self.paint_spans(&spans, gutter.map_or("", |g| g.rest));
-        self.raw(&painted);
+        self.emit(&painted);
         if cell.ends_line() {
-            self.raw("\n");
+            self.emit("\n");
         }
         self.prev_was_block = cell.is_text_block();
     }
@@ -271,12 +271,12 @@ impl Renderer {
             return;
         }
         self.close_block();
-        if block.cell().gap_after(self.prev_was_block) {
-            self.raw("\n");
+        if block.spacing_cell().gap_after(self.prev_was_block) {
+            self.emit("\n");
         }
-        self.raw(self.open_style(block.style()));
-        if let Some(gutter) = block.cell().gutter() {
-            self.raw(gutter.head);
+        self.emit(self.open_style(block.style()));
+        if let Some(gutter) = block.spacing_cell().gutter() {
+            self.emit(gutter.head);
         }
         self.live = Some(block);
     }
@@ -286,8 +286,8 @@ impl Renderer {
         if self.live.take().is_none() {
             return;
         }
-        self.raw(self.close_style());
-        self.raw("\n");
+        self.emit(self.close_style());
+        self.emit("\n");
         self.prev_was_block = true;
     }
 
@@ -302,7 +302,7 @@ impl Renderer {
             self.paint_cell(&cell);
         }
         // Separate the replayed history from the prompt that follows it.
-        self.raw("\n");
+        self.emit("\n");
     }
 }
 
@@ -357,12 +357,12 @@ impl Front for Renderer {
 impl Ui for Renderer {
     fn reasoning_delta(&mut self, s: &str) {
         self.open_block(Block::Reasoning);
-        self.raw(s);
+        self.emit(s);
     }
 
     fn content_delta(&mut self, s: &str) {
         self.open_block(Block::Content);
-        self.raw(s);
+        self.emit(s);
     }
 
     fn finish_turn(&mut self) {
@@ -388,12 +388,12 @@ impl Ui for Renderer {
         self.paint_cell(&Cell::approval(name, args));
     }
 
-    fn usage(&mut self, u: &Usage, stream: Duration) {
+    fn usage(&mut self, usage: &Usage, stream: Duration) {
         self.paint_cell(&Cell::Usage {
-            usage: u.clone(),
+            usage: usage.clone(),
             stream,
         });
-        self.status.record(u);
+        self.status.record(usage);
         self.redraw_status_bar();
     }
 }
