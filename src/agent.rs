@@ -178,6 +178,17 @@ impl Agent {
         format!("{}/{}", self.provider.id, self.session.meta.model)
     }
 
+    /// The reasoning effort tier in effect: the one the session stored, or the
+    /// provider's default when it stored none — the same fallback the request is
+    /// built with. What `/effort` switches and the status line reports.
+    pub fn effort_label(&self) -> &str {
+        self.session
+            .meta
+            .reasoning_effort
+            .as_deref()
+            .unwrap_or(self.provider.default_effort)
+    }
+
     /// Point the machine at a provider: a client for its endpoint and key, and
     /// the ceiling its preset declares. The session's meta is the caller's to
     /// write -- it is a change to the log, and the interpreter writes the log.
@@ -534,6 +545,30 @@ mod tests {
         );
         let req = agent.build_request();
         assert_eq!(req.reasoning_effort.as_deref(), Some("max"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn effort_label_reads_the_stored_tier_or_the_providers_default() {
+        let dir = tmpdir();
+        let s = Session::create(&dir, test_meta()).unwrap();
+        let agent = Agent::new(
+            Client::new("k".into(), provider::DEEPSEEK.url.into()).unwrap(),
+            s,
+            provider::DEEPSEEK,
+        );
+        assert_eq!(agent.effort_label(), "high");
+
+        // A session that stored none is at the provider's default, which is the
+        // tier the request is built with.
+        let mut s = Session::create(&dir, test_meta()).unwrap();
+        s.meta.reasoning_effort = None;
+        let agent = Agent::new(
+            Client::new("k".into(), provider::ZAI_CODING_CN.url.into()).unwrap(),
+            s,
+            provider::ZAI_CODING_CN,
+        );
+        assert_eq!(agent.effort_label(), provider::ZAI_CODING_CN.default_effort);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

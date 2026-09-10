@@ -64,11 +64,15 @@ pub async fn handle(
         // the list, and this is the menu for the one that can only print.
         "/login" => ui.info(&login_menu()),
         "/model" => ui.info(&model_menu(&agent.model_label())),
+        "/effort" => ui.info(&effort_menu(&agent.provider(), agent.effort_label())),
         _ if line.starts_with("/login ") => {
             login(agent, ui, argument(line)).await;
         }
         _ if line.starts_with("/model ") => {
             choose_model(agent, ui, argument(line));
+        }
+        _ if line.starts_with("/effort ") => {
+            choose_effort(agent, ui, argument(line));
         }
         _ if line.starts_with("/resume ") => {
             let id = line.trim_start_matches("/resume ").trim();
@@ -201,6 +205,26 @@ fn choose_model(agent: &mut Agent, ui: &mut dyn Front, spec: &str) {
     ui.info(&format!("model {}", agent.model_label()));
 }
 
+/// `/effort <tier>`: switch the session's reasoning effort tier. The tier is the
+/// provider's to offer, so it is checked against the one in use before it is
+/// stored — a value out of range is one backend's 400 and another's silent
+/// misreading, and neither is worth finding out about on the next turn.
+fn choose_effort(agent: &mut Agent, ui: &mut dyn Front, tier: &str) {
+    if let Err(e) = agent.provider().validate_effort(tier) {
+        return ui.error(&format!("{e:#}"));
+    }
+    let mut meta = agent.session.meta.clone();
+    meta.reasoning_effort = Some(tier.to_owned());
+    if meta != agent.session.meta {
+        // The log first: it is the state, and a tier that is only in memory
+        // would be gone at the next resume.
+        if let Err(e) = agent.session.set_meta(meta) {
+            return ui.error(&format!("{e:#}"));
+        }
+    }
+    ui.info(&format!("effort {tier}"));
+}
+
 /// The `/login` menu as text, for the front end that cannot offer a list to pick
 /// from. Built from the preset table, so a provider cannot be logged into
 /// without being listed here.
@@ -244,6 +268,19 @@ pub fn model_menu(current: &str) -> String {
     out
 }
 
+/// The `/effort` menu as text, in the same spirit: the tiers the provider in use
+/// accepts, with the one in effect marked.
+pub fn effort_menu(provider: &provider::Provider, current: &str) -> String {
+    let rows = config::effort_menu(provider, current);
+    let tiers = rows.iter().map(|r| width(&r.label)).max().unwrap_or(0);
+    let mut out = String::from("choose a reasoning effort tier:");
+    for row in &rows {
+        out.push_str(&format!("\n  {} {}", padded(&row.label, tiers), row.detail));
+    }
+    out.push_str("\nrun /effort <tier>");
+    out
+}
+
 /// One slash command, as the picker and the help text both need it.
 pub struct Command {
     pub name: &'static str,
@@ -280,6 +317,10 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "/model",
         description: "switch model: <provider>/<modelid>",
+    },
+    Command {
+        name: "/effort",
+        description: "switch the reasoning effort tier",
     },
     Command {
         name: "/exit",
@@ -908,6 +949,66 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn effort_with_no_argument_prints_the_menu_instead_of_switching() {
+        let dir = tmpdir("effort-menu");
+        let mut agent = agent_in(&dir, "m");
+        let mut ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/effort").await;
+        assert_eq!(
+            ui.info,
+            vec![effort_menu(&agent.provider(), agent.effort_label())]
+        );
+        // Every tier the provider offers, and the one in effect marked.
+        for tier in agent.provider().efforts {
+            assert!(ui.info[0].contains(tier), "{:?}", ui.info);
+        }
+        assert!(ui.info[0].contains("current"), "{:?}", ui.info);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn effort_switches_the_session_and_is_stored_in_the_log() {
+        let dir = tmpdir("effort-switch");
+        let mut agent = agent_in(&dir, "m");
+        let mut ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/effort low").await;
+        assert!(ui.errors.is_empty(), "{:?}", ui.errors);
+        assert_eq!(agent.session.meta.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(ui.info, vec!["effort low"]);
+        // The log is the state: a resume has to find the tier there.
+        let log = std::fs::read_to_string(&agent.session.path).unwrap();
+        assert!(log.contains("\"reasoning_effort\":\"low\""), "{log}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_effort_the_provider_does_not_offer_is_refused_and_changes_nothing() {
+        let dir = tmpdir("effort-bogus");
+        let mut agent = agent_in(&dir, "m");
+        let mut ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/effort bogus").await;
+        assert!(ui.info.is_empty(), "{:?}", ui.info);
+        assert!(
+            ui.errors[0].contains("low | high | max"),
+            "it says what is available: {:?}",
+            ui.errors
+        );
+        assert!(
+            ui.errors[0].contains("DeepSeek"),
+            "and which provider refused: {:?}",
+            ui.errors
+        );
+        assert_eq!(
+            agent.session.meta.reasoning_effort, None,
+            "nothing was stored"
+        );
+        // Nothing was appended either: the header is still the whole file.
+        let log = std::fs::read_to_string(&agent.session.path).unwrap();
+        assert_eq!(log.lines().count(), 1, "{log}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn the_menus_are_built_from_the_same_tables_the_pickers_read() {
         // Structure, not text: a provider that cannot be logged into, or a model
@@ -927,6 +1028,13 @@ mod tests {
             assert!(
                 menu.contains(&row.label),
                 "{row:?} is not on the model menu"
+            );
+        }
+        let menu = effort_menu(&provider::DEEPSEEK, "high");
+        for row in crate::config::effort_menu(&provider::DEEPSEEK, "high") {
+            assert!(
+                menu.contains(&row.label),
+                "{row:?} is not on the effort menu"
             );
         }
     }

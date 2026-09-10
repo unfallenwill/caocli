@@ -68,6 +68,28 @@ pub fn model_menu(current: &str) -> Vec<Choice> {
     rows
 }
 
+/// The reasoning effort tiers the provider in use accepts, the one in effect
+/// marked. Built from the provider's own list, so a provider that offers other
+/// tiers offers those, and nothing here needs a second copy of them.
+pub fn effort_menu(provider: &Provider, current: &str) -> Vec<Choice> {
+    provider
+        .efforts
+        .iter()
+        .map(|tier| {
+            // The tier in effect wins the column when it is also the default,
+            // exactly as the model menu's current model does.
+            let detail = if *tier == current {
+                "current"
+            } else if *tier == provider.default_effort {
+                "default"
+            } else {
+                ""
+            };
+            Choice::new(*tier, *tier, detail)
+        })
+        .collect()
+}
+
 /// Whether a provider has a key behind it, for the rows of a menu. A settings
 /// file that cannot be read counts as none: it is reported where a key is
 /// actually asked for, and a menu is not the place to fail.
@@ -275,6 +297,27 @@ mod tests {
         // A model is chosen by the name it is shown by.
         assert_eq!(rows[1].argument, rows[1].label);
         std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn effort_menu_offers_the_providers_tiers_and_marks_the_current_one() {
+        let rows = effort_menu(&DEEPSEEK, "high");
+        let tiers: Vec<&str> = rows.iter().map(|row| row.label.as_str()).collect();
+        assert_eq!(tiers, vec!["low", "high", "max"], "the provider's own list");
+        assert_eq!(rows[1].detail, "current");
+        assert_eq!(rows[2].detail, "default");
+        assert_eq!(rows[0].detail, "", "a plain tier says nothing extra");
+        // A tier is chosen by the name it is shown by.
+        assert_eq!(rows[0].argument, rows[0].label);
+
+        // With the default in effect, the default row is the current one, as it
+        // is in the model menu.
+        let rows = effort_menu(&DEEPSEEK, DEEPSEEK.default_effort);
+        assert_eq!(rows[2].detail, "current");
+        // The menu is the provider's: another provider's tiers are its own list.
+        let rows = effort_menu(&ZAI_CODING_CN, "low");
+        assert_eq!(rows[0].detail, "current");
+        assert_eq!(rows.len(), ZAI_CODING_CN.efforts.len());
     }
 
     #[test]

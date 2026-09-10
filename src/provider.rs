@@ -59,16 +59,17 @@ impl Provider {
         self.models[0]
     }
 
-    /// Reject an `--effort` value this provider does not offer, before it is
-    /// ever sent. DeepSeek returns 400 for an out-of-range value while GLM
-    /// silently accepts it and degrades to its default tier — rejecting locally
-    /// is the only way to keep the two consistent.
+    /// Reject an effort tier this provider does not offer, before it is ever
+    /// sent. DeepSeek returns 400 for an out-of-range value while GLM silently
+    /// accepts it and degrades to its default tier — rejecting locally is the
+    /// only way to keep the two consistent. Serves both `--effort` at startup
+    /// and `/effort` mid-session, so the message names neither flag.
     pub fn validate_effort(&self, effort: &str) -> Result<()> {
         if self.efforts.contains(&effort) {
             return Ok(());
         }
         bail!(
-            "invalid --effort {effort:?} for {}; available: {}",
+            "invalid effort {effort:?} for {}; available: {}",
             self.name,
             self.efforts.join(" | ")
         )
