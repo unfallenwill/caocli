@@ -49,6 +49,16 @@ that talks to a network API and drives an interactive terminal.
 - **Terminal behavior must be verified under a pty**: a unit test's stdout is a pipe,
   so TTY-only branches (status bar, key bindings, escape sequences) never execute.
   Use `script -qec "..." /dev/null` to get a pseudo-terminal for smoke runs.
+- **The interactive front end needs a pty that answers its cursor query**; otherwise
+  the run only exercises the fallback and proves nothing about the viewport.
+  `scripts/tui_smoke.py` is that pty, and its live section (`SMOKE_LIVE=1`) is the
+  only automated route to a real turn, the spinner and the approval gate. What a tool
+  call did is asserted on disk rather than on screen: a model's own account of having
+  run something reads the same as the thing itself.
+- **A test that calls the handler directly does not show that the front end can reach
+  it.** The approval gate's state machine was fully covered and green while the gate
+  was unreachable from a running turn — the answer was dropped on the way in and the
+  turn waited forever.
 
 ## Design principles (do not violate)
 
@@ -107,6 +117,15 @@ that talks to a network API and drives an interactive terminal.
   viewport has to ask the terminal where the cursor is, and not every terminal answers
   (a bare pty does not — measured). Starting the session must survive that by falling
   back to the plain front end.
+- **While a turn runs a front end accepts exactly two things**: the cancel key, and
+  the answer to an open approval question. Everything else is dropped, because a turn
+  is not the place to compose the next line. The second one is easy to lose: an
+  approval gate whose answer never arrives is indistinguishable, from the user's side,
+  from a model that has hung.
+- **Anything that moves on its own must be derived from the clock, never from the
+  number of redraws**, and that clock must be part of whatever decides whether to
+  redraw at all. A front end that skips an unchanged screen otherwise freezes its own
+  animation, and a frame counter can be left behind by a redraw that never happened.
 - Truncating or clipping text must land on a UTF-8 character boundary, and any text
   measured against a terminal width must be measured in **display columns**, not
   chars: a CJK ideograph or an emoji is one char but two columns, so char-based
