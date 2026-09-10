@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
-// DeepSeek /chat/completions wire 类型。
-// 约束：本文件里的字段名 = API 字段名（serde rename 仅用于 r#type）。
-// KVCache 前缀匹配要求历史消息逐字节回放，因此 Message 的字符串字段
-// 存什么发什么，禁止在发送路径上做 trim/normalize/裁剪。
+// DeepSeek /chat/completions wire types.
+// Constraint: field names in this file = API field names (serde rename is used
+// only for r#type). KVCache prefix matching requires history messages to be
+// replayed byte-for-byte, so the string fields of Message are sent exactly as
+// stored: no trim/normalize/clipping on the send path.
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,7 +18,8 @@ pub enum Role {
     Tool,
 }
 
-/// 思维链开关。思维链恒定开启，这里只用来显式发出 `{"type":"enabled"}`。
+/// Thinking switch. Thinking is always on; this exists only to send an explicit
+/// `{"type":"enabled"}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Thinking {
     pub r#type: String,
@@ -59,8 +61,9 @@ pub struct ToolCall {
     pub function: ToolCallFunction,
 }
 
-/// 消息。字段名与 API 完全一致：
-/// - assistant: content / reasoning_content / tool_calls（带 tools 的请求必须回传 reasoning_content，缺失 => 400）
+/// Message. Field names match the API exactly:
+/// - assistant: content / reasoning_content / tool_calls (a request carrying
+///   tools must send reasoning_content back; missing it means a 400)
 /// - tool:      content / tool_call_id
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Message {
@@ -116,7 +119,7 @@ pub struct ChatRequest {
 }
 
 // ============================================================================
-// 流式响应（SSE chunk）
+// Streaming response (SSE chunk)
 // ============================================================================
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -157,22 +160,24 @@ pub struct ChunkChoice {
     pub finish_reason: Option<String>,
 }
 
-/// GLM / OpenAI 风格的缓存明细：`usage.prompt_tokens_details.cached_tokens`。
+/// GLM / OpenAI style cache detail: `usage.prompt_tokens_details.cached_tokens`.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct PromptTokensDetails {
     #[serde(default)]
     pub cached_tokens: u64,
 }
 
-/// 归一化后的缓存 token 数。供应商的 wire 形状差异在 `Usage::cache()` 里收敛。
+/// Normalized cached token counts. Provider wire-shape differences converge in
+/// `Usage::cache()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheTokens {
     pub hit: u64,
     pub miss: u64,
 }
 
-/// usage。DeepSeek 用扁平的 hit/miss 字段（prompt_tokens = hit + miss）；
-/// GLM / OpenAI 用嵌套的 prompt_tokens_details.cached_tokens。两种形状都兼容。
+/// usage. DeepSeek uses flat hit/miss fields (prompt_tokens = hit + miss) while
+/// GLM / OpenAI use nested prompt_tokens_details.cached_tokens. Both shapes are
+/// accepted.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct Usage {
     #[serde(default)]
@@ -190,17 +195,19 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// 缓存命中/未命中 token。两种 wire 形状都试；都不认识返回 None，
-    /// 调用方据此显示 `—`，而不是编造一个 0%。
+    /// Cache hit/miss tokens. Both wire shapes are tried; None when neither is
+    /// recognized, so the caller can show `—` instead of inventing a 0%.
     pub fn cache(&self) -> Option<CacheTokens> {
-        // DeepSeek 扁平字段：全 miss 的首轮也会给 hit=0/miss=N，所以看 miss。
+        // DeepSeek flat fields: an all-miss first turn still reports
+        // hit=0/miss=N, so key off miss.
         if self.prompt_cache_hit_tokens > 0 || self.prompt_cache_miss_tokens > 0 {
             return Some(CacheTokens {
                 hit: self.prompt_cache_hit_tokens,
                 miss: self.prompt_cache_miss_tokens,
             });
         }
-        // GLM / OpenAI 只给命中数，未命中由 prompt_tokens 推导。
+        // GLM / OpenAI report only the hit count; miss is derived from
+        // prompt_tokens.
         let details = self.prompt_tokens_details.as_ref()?;
         Some(CacheTokens {
             hit: details.cached_tokens,
@@ -218,8 +225,9 @@ pub struct ChatChunk {
 }
 
 // ============================================================================
-// TurnAccumulator：把一轮请求的流式 delta 聚合为完整 assistant Message。
-// tool_calls 按 index 分片到达：id/name 首片给出，arguments 逐片追加。
+// TurnAccumulator: aggregates one request's streaming deltas into a complete
+// assistant Message. tool_calls arrive sharded by index: id/name come in the
+// first shard, arguments are appended shard by shard.
 // ============================================================================
 
 #[derive(Debug, Default)]
@@ -417,26 +425,29 @@ mod tests {
                 }),
             };
         let mut acc = TurnAccumulator::default();
-        // 首片直接落在 index=2：中间的 0/1 用占位补齐（gap 分支）
+        // The first shard lands directly on index=2: 0/1 are padded with
+        // placeholders (the gap branch)
         acc.feed(&mk(vec![dtc(
             2,
             Some("call_a"),
             Some("read"),
             Some("{\"file"),
         )]));
-        // 后续分片带完整 id/name + 追加 arguments（走已有条目更新分支）
+        // A later shard carries the full id/name plus appended arguments (the
+        // update-existing-entry branch)
         acc.feed(&mk(vec![dtc(
             2,
             Some("call_a"),
             Some("read"),
             Some("_path\":\"a.txt\"}"),
         )]));
-        // 0 号占位随后补齐，且重复 id 更新不产生新条目
+        // Placeholder 0 is filled in afterwards, and repeating an id updates
+        // rather than appending a new entry
         acc.feed(&mk(vec![dtc(0, Some("call_z"), Some("Bash"), Some("{}"))]));
         let tcs = acc.finish().tool_calls.unwrap();
         assert_eq!(tcs.len(), 3);
         assert_eq!(tcs[0].id, "call_z");
-        assert_eq!(tcs[1].id, ""); // 纯占位
+        assert_eq!(tcs[1].id, ""); // pure placeholder
         assert_eq!(tcs[2].id, "call_a");
         assert_eq!(tcs[2].function.name, "read");
         assert_eq!(tcs[2].function.arguments, r#"{"file_path":"a.txt"}"#);
@@ -444,7 +455,7 @@ mod tests {
 
     #[test]
     fn parse_real_stream_chunk_with_reasoning() {
-        let line = r#"{"id":"x","choices":[{"index":0,"delta":{"reasoning_content":"嗯"},"finish_reason":null,"logprobs":null}],"created":1,"model":"deepseek-v4-flash","object":"chat.completion.chunk"}"#;
+        let line = r#"{"id":"x","choices":[{"index":0,"delta":{"reasoning_content":"thinking…"},"finish_reason":null,"logprobs":null}],"created":1,"model":"deepseek-v4-flash","object":"chat.completion.chunk"}"#;
         let chunk: ChatChunk = serde_json::from_str(line).unwrap();
         assert_eq!(
             chunk.choices[0]
@@ -453,7 +464,7 @@ mod tests {
                 .unwrap()
                 .reasoning_content
                 .as_deref(),
-            Some("嗯")
+            Some("thinking…")
         );
     }
 
@@ -479,7 +490,8 @@ mod tests {
 
     #[test]
     fn cache_reads_deepseek_all_miss() {
-        // 首轮全 miss：hit=0 但 miss>0，不能被当成"无缓存信息"。
+        // All-miss first turn: hit=0 but miss>0, which must not be mistaken for
+        // "no cache information".
         let u = Usage {
             prompt_tokens: 17,
             prompt_cache_hit_tokens: 0,
@@ -491,7 +503,7 @@ mod tests {
 
     #[test]
     fn cache_reads_glm_nested_details() {
-        // GLM 只给 cached_tokens，miss 由 prompt_tokens 推导。
+        // GLM reports only cached_tokens; miss is derived from prompt_tokens.
         let line = r#"{"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":300,"total_tokens":1500,"prompt_tokens_details":{"cached_tokens":800}}}"#;
         let chunk: ChatChunk = serde_json::from_str(line).unwrap();
         let u = chunk.usage.unwrap();

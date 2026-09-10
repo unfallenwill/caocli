@@ -10,14 +10,19 @@ use crate::types::{Message, Role};
 use std::os::fd::AsRawFd;
 
 // ============================================================================
-// 会话存储：JSONL append-only。
-// 第一行 header；每条消息一行 msg；meta 变更追加 meta 行（后行覆盖前行）。
-// 文件永不重写；读取时跳过损坏行（进程崩溃写一半只影响尾部）。
-// KVCache 依赖历史逐字节回放：Message 字段名与 API wire 格式一致，
-// load 出来的 messages 直接原样进请求，无任何转换。
-// 单写者假设：同一会话文件不允许两个进程同时追加（无文件锁）。
-// 交错写入会产生无法自愈的非法历史（野 tool 结果），构建请求时会被
-// is_request_valid tripwire 拦截（debug panic / release 由后端 400）。
+// Session storage: append-only JSONL.
+// The first line is the header; each message is one msg line; a meta change
+// appends a meta line (later lines override earlier ones).
+// The file is never rewritten; corrupt lines are skipped when reading (a crash
+// mid-write can only damage the tail).
+// KVCache depends on byte-for-byte history replay: Message field names match the
+// API wire format, so the messages returned by load go straight into the request
+// with no conversion at all.
+// Single-writer assumption: two processes must never append to the same session
+// file at once (enforced with an exclusive flock, see lock_exclusive).
+// Interleaved writes would produce invalid history that cannot be healed (stray
+// tool results); constructing a request trips the is_request_valid tripwire
+// (debug panic / release gets a 400 from the backend).
 // ============================================================================
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -51,7 +56,8 @@ enum Line {
 pub struct Session {
     pub id: String,
     pub path: PathBuf,
-    #[allow(dead_code)] // 会话创建时间（epoch 秒），未来用于列表展示与导出
+    #[allow(dead_code)]
+    // session creation time (epoch seconds), for future list display and export
     pub created_at: i64,
     pub meta: SessionMeta,
     pub messages: Vec<Message>,
@@ -65,14 +71,19 @@ fn write_line<T: Serialize>(file: &mut std::fs::File, value: &T) -> Result<()> {
     Ok(())
 }
 
-/// 单写者强制：对会话文件取独占 flock（非阻塞，持有着直到进程退出）。
-/// 两个进程同时追加同一会话会交错出无法自愈的非法历史
-/// （野 tool 结果），这里在入口处直接拒绝。
+/// Single-writer enforcement: take an exclusive flock on the session file
+/// (non-blocking, held until the process exits).
+/// Two processes appending to the same session at once would interleave into
+/// invalid history that cannot be healed (stray tool results), so this rejects
+/// it right at the entrance.
 #[cfg(unix)]
 fn lock_exclusive(file: &std::fs::File, path: &Path) -> Result<()> {
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
-        bail!("会话 {} 正在被另一个进程使用（单写者约束）", path.display());
+        bail!(
+            "session {} is already in use by another process (single-writer constraint)",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -96,7 +107,7 @@ impl Session {
             .create_new(true)
             .append(true)
             .open(&path)
-            .with_context(|| format!("创建会话文件失败: {}", path.display()))?;
+            .with_context(|| format!("failed to create session file: {}", path.display()))?;
         let created_at = Utc::now().timestamp();
         write_line(
             &mut file,
@@ -117,10 +128,11 @@ impl Session {
         })
     }
 
-    /// 读取会话并打开追加句柄。损坏行跳过（仅尾部行可能因崩溃损坏）。
+    /// Load a session and open the append handle. Corrupt lines are skipped
+    /// (only the tail line can be damaged, by a crash).
     pub fn load(path: &Path) -> Result<Self> {
-        let data =
-            std::fs::read(path).with_context(|| format!("读取会话文件失败: {}", path.display()))?;
+        let data = std::fs::read(path)
+            .with_context(|| format!("failed to read session file: {}", path.display()))?;
         let mut id = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -147,24 +159,34 @@ impl Session {
             }
         }
         let Some(meta) = meta else {
-            bail!("会话文件缺少有效 header: {}", path.display());
+            bail!("session file has no valid header: {}", path.display());
         };
         if bad_lines > 0 {
-            eprintln!("警告: {} 中有 {bad_lines} 行损坏已跳过", path.display());
+            eprintln!(
+                "warning: skipped {bad_lines} corrupt line(s) in {}",
+                path.display()
+            );
         }
-        // 崩溃自愈：为中断的工具调用合成占位结果，只改内存视图。
-        // append-only：文件永不重写，下次 load 确定性地重新合成同样内容。
+        // Crash healing: synthesize placeholder results for interrupted tool
+        // calls, in the in-memory view only.
+        // append-only: the file is never rewritten, and the next load
+        // deterministically synthesizes the same content again.
         let healed = crate::machine::heal(&mut messages);
         if healed > 0 {
             eprintln!(
-                "警告: {} 有 {healed} 个中断的工具调用，已合成占位结果",
+                "warning: synthesized placeholder results for {healed} interrupted tool call(s) in {}",
                 path.display()
             );
         }
         let file = std::fs::OpenOptions::new()
             .append(true)
             .open(path)
-            .with_context(|| format!("打开会话文件（追加模式）失败: {}", path.display()))?;
+            .with_context(|| {
+                format!(
+                    "failed to open session file in append mode: {}",
+                    path.display()
+                )
+            })?;
         lock_exclusive(&file, path)?;
         Ok(Self {
             id,
@@ -200,8 +222,8 @@ pub struct SessionInfo {
 
 pub fn list(dir: &Path) -> Result<Vec<SessionInfo>> {
     let mut out = Vec::new();
-    let entries =
-        std::fs::read_dir(dir).with_context(|| format!("读取目录失败: {}", dir.display()))?;
+    let entries = std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read directory: {}", dir.display()))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_none_or(|x| x != "jsonl") {
@@ -226,13 +248,13 @@ fn summarize(path: &Path) -> Result<SessionInfo> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     let mut count = 0usize;
-    let mut preview = String::from("(空会话)");
+    let mut preview = String::from("(empty session)");
     for raw in data.split(|&b| b == b'\n') {
         if raw.is_empty() {
             continue;
         }
         let Ok(line) = serde_json::from_str::<Line>(&String::from_utf8_lossy(raw)) else {
-            continue; // list 模式静默跳过坏行
+            continue; // list mode silently skips corrupt lines
         };
         match line {
             Line::Header(h) => id = h.id,
@@ -286,11 +308,11 @@ mod tests {
     fn create_append_load_roundtrip() {
         let dir = tmpdir();
         let mut s = Session::create(&dir, test_meta()).unwrap();
-        s.append_message(&Message::user("第一问")).unwrap();
+        s.append_message(&Message::user("first question")).unwrap();
         s.append_message(&Message {
             role: Role::Assistant,
-            content: Some("答".into()),
-            reasoning_content: Some("推理过程".into()),
+            content: Some("answer".into()),
+            reasoning_content: Some("reasoning trace".into()),
             tool_calls: Some(vec![crate::types::ToolCall {
                 id: "call_1".into(),
                 r#type: "function".into(),
@@ -307,13 +329,13 @@ mod tests {
 
         let path = s.path.clone();
         let id = s.id.clone();
-        drop(s); // flock 由存活的 Session 持有，重载前先释放
+        drop(s); // the flock is held by the live Session, so release it before reloading
         let loaded = Session::load(&path).unwrap();
         assert_eq!(loaded.id, id);
         assert_eq!(loaded.messages.len(), 3);
         assert_eq!(
             loaded.messages[1].reasoning_content.as_deref(),
-            Some("推理过程")
+            Some("reasoning trace")
         );
         assert_eq!(loaded.messages[2].tool_call_id.as_deref(), Some("call_1"));
         std::fs::remove_dir_all(&dir).unwrap();
@@ -324,7 +346,7 @@ mod tests {
         let dir = tmpdir();
         let mut s = Session::create(&dir, test_meta()).unwrap();
         s.append_message(&Message::user("ok")).unwrap();
-        // 模拟崩溃写一半
+        // simulate a crash mid-write
         let mut f = std::fs::OpenOptions::new()
             .append(true)
             .open(&s.path)
@@ -340,8 +362,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 崩溃现场：call_2 的结果因中断丢失。load 后内存视图被修复成合法历史，
-    /// 但文件保持原样（append-only），修复是确定性的读取时视图。
+    /// Crash site: call_2's result was lost to an interruption. After load the
+    /// in-memory view is repaired into valid history, but the file stays exactly
+    /// as it was (append-only) — the repair is a deterministic read-time view.
     #[test]
     fn load_heals_orphan_tool_calls_in_memory_only() {
         let dir = tmpdir();
@@ -373,22 +396,27 @@ mod tests {
         })
         .unwrap();
         s.append_message(&Message::tool("call_1", "ok")).unwrap();
-        s.append_message(&Message::user("下一问")).unwrap();
+        s.append_message(&Message::user("next question")).unwrap();
 
         let path = s.path.clone();
         drop(s);
         let loaded = Session::load(&path).unwrap();
         let msgs = &loaded.messages;
-        assert_eq!(msgs.len(), 5, "补插一条 call_2 的占位结果");
+        assert_eq!(
+            msgs.len(),
+            5,
+            "one placeholder result is inserted for call_2"
+        );
         assert_eq!(msgs[3].tool_call_id.as_deref(), Some("call_2"));
         assert_eq!(
             msgs[3].content.as_deref(),
             Some(crate::machine::INTERRUPTED_RESULT)
         );
-        // 文件没有被重写：仍是 header + 4 行消息
+        // the file was not rewritten: still header + 4 message lines
         let raw = std::fs::read_to_string(&path).unwrap();
         assert_eq!(raw.lines().count(), 5);
-        // 修复后的历史对决策函数合法：可以直接发请求
+        // the healed history is valid for the decision function: a request can
+        // be sent right away
         assert_eq!(
             crate::machine::next_action(msgs),
             Some(crate::machine::Action::CallModel)
@@ -396,22 +424,23 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 单写者强制：持锁的 Session 存活期间，第二个句柄 load 必须被拒。
+    /// Single-writer enforcement: while the locking Session is alive, a second
+    /// handle's load must be rejected.
     #[test]
     fn load_rejects_while_another_process_holds_the_lock() {
         let dir = tmpdir();
         let s = Session::create(&dir, test_meta()).unwrap();
-        // Session 未实现 Debug，用 match 取出错误
+        // Session does not implement Debug, so pull the error out with match
         let err = match Session::load(&s.path) {
             Err(e) => e,
-            Ok(_) => panic!("持锁期间 load 必须失败"),
+            Ok(_) => panic!("load must fail while the lock is held"),
         };
         assert!(
-            format!("{err:#}").contains("单写者约束"),
-            "错误信息应说明单写者约束: {err:#}"
+            format!("{err:#}").contains("single-writer"),
+            "the error should mention the single-writer constraint: {err:#}"
         );
         let path = s.path.clone();
-        drop(s); // 释放锁（进程退出时也会自动释放）
+        drop(s); // release the lock (it is also released automatically at process exit)
         assert!(Session::load(&path).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -437,17 +466,17 @@ mod tests {
     fn list_orders_by_mtime_and_previews_last_user() {
         let dir = tmpdir();
         let mut s1 = Session::create(&dir, test_meta()).unwrap();
-        s1.append_message(&Message::user("第一个会话的问题"))
+        s1.append_message(&Message::user("first session's question"))
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let mut s2 = Session::create(&dir, test_meta()).unwrap();
-        s2.append_message(&Message::user("第二个会话的问题"))
+        s2.append_message(&Message::user("second session's question"))
             .unwrap();
 
         let infos = list(&dir).unwrap();
         assert_eq!(infos.len(), 2);
-        assert_eq!(infos[0].id, s2.id); // mtime 最新在前
-        assert_eq!(infos[0].preview, "第二个会话的问题");
+        assert_eq!(infos[0].id, s2.id); // most recent mtime first
+        assert_eq!(infos[0].preview, "second session's question");
         assert_eq!(infos[0].message_count, 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -462,10 +491,10 @@ mod tests {
         )
         .unwrap();
         let err = match Session::load(&path) {
-            Ok(_) => panic!("缺少 header 应当报错"),
+            Ok(_) => panic!("a missing header must be an error"),
             Err(e) => e,
         };
-        assert!(err.to_string().contains("缺少有效 header"));
+        assert!(err.to_string().contains("no valid header"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -473,10 +502,10 @@ mod tests {
     fn list_skips_non_jsonl_and_unreadable() {
         let dir = tmpdir();
         let mut s = Session::create(&dir, test_meta()).unwrap();
-        s.append_message(&Message::user("真实会话")).unwrap();
-        // 非 jsonl：list 忽略
+        s.append_message(&Message::user("real session")).unwrap();
+        // not jsonl: list ignores it
         std::fs::write(dir.join("notes.txt"), "ignored").unwrap();
-        // 名为 .jsonl 的目录：summarize 读失败，list 静默跳过
+        // a directory named .jsonl: summarize cannot read it, list skips it silently
         std::fs::create_dir(dir.join("broken.jsonl")).unwrap();
 
         let infos = list(&dir).unwrap();
@@ -489,13 +518,13 @@ mod tests {
     fn list_tolerates_corrupt_lines_and_meta() {
         let dir = tmpdir();
         let mut s = Session::create(&dir, test_meta()).unwrap();
-        s.append_message(&Message::user("长".repeat(60))).unwrap();
+        s.append_message(&Message::user("x".repeat(60))).unwrap();
         s.set_meta(SessionMeta {
             model: "deepseek-v4-pro".into(),
             reasoning_effort: None,
         })
         .unwrap();
-        // 追加一条崩溃写一半的坏行
+        // append a corrupt half-written line from a crash
         let mut f = std::fs::OpenOptions::new()
             .append(true)
             .open(&s.path)
@@ -506,7 +535,8 @@ mod tests {
 
         let infos = list(&dir).unwrap();
         assert_eq!(infos.len(), 1);
-        assert_eq!(infos[0].preview.chars().count(), 40); // 坏行/meta 不计消息数，preview 截断
+        // corrupt lines and meta do not count as messages, and preview is truncated
+        assert_eq!(infos[0].preview.chars().count(), 40);
         assert_eq!(infos[0].message_count, 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -514,12 +544,12 @@ mod tests {
     #[test]
     fn latest_returns_most_recent_or_none() {
         let dir = tmpdir();
-        assert!(latest(dir.clone()).unwrap().is_none()); // 空目录
+        assert!(latest(dir.clone()).unwrap().is_none()); // empty directory
         let mut s1 = Session::create(&dir, test_meta()).unwrap();
-        s1.append_message(&Message::user("旧")).unwrap();
+        s1.append_message(&Message::user("old")).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let mut s2 = Session::create(&dir, test_meta()).unwrap();
-        s2.append_message(&Message::user("新")).unwrap();
+        s2.append_message(&Message::user("new")).unwrap();
         assert_eq!(latest(dir.clone()).unwrap().unwrap(), s2.path);
         std::fs::remove_dir_all(&dir).unwrap();
     }

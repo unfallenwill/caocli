@@ -1,35 +1,43 @@
-//! 机器核心：状态 = 会话日志的折叠，决策 = 纯函数，UI/IO = 无状态执行器。
+//! Machine core: state = a fold of the session log, decisions = pure functions,
+//! UI/IO = stateless executors.
 //!
-//! 架构不变量（事件词汇表逐步落地；未落地项只记录在此，不留死代码）：
+//! Architecture invariants (the event vocabulary lands incrementally; whatever
+//! has not landed is only recorded here, and no dead code is left behind):
 //!
-//! - **机器只做决定，永不执行**：[`next_action`] 读历史输出 [`Action`]，
-//!   解释器（`Agent::turn`）执行并把结果写回日志。机器永不 await IO。
-//! - **回调只收通知，不回传数据**：`ui::Ui` 是机器的 Notice 通道；
-//!   需要结果的操作（如未来的审批门）必须以事件形式回到决策函数。
-//! - **状态 = 日志的折叠**：`Session` 是唯一持久状态，任何时刻可由
-//!   `Session::load` 重建；内存里不允许存在第二个真相来源。
+//! - **The machine only decides, it never executes**: [`next_action`] reads the
+//!   history and yields an [`Action`]; the interpreter (`Agent::turn`) executes it
+//!   and writes the result back into the log. The machine never awaits IO.
+//! - **Callbacks receive notifications only, never return data**: `ui::Ui` is the
+//!   machine's Notice channel; operations that need results (such as a future
+//!   approval gate) must come back to the decision function as events.
+//! - **State = a fold of the log**: `Session` is the only persistent state and can
+//!   be rebuilt at any time via `Session::load`; a second source of truth is not
+//!   allowed to exist in memory.
 //!
-//! | 词汇 | 状态 | 成员 |
+//! | Vocabulary | Status | Members |
 //! |---|---|---|
-//! | Input | 已落地（隐式） | UserLine（`turn` 入参）、Delta（SSE 流）、ToolFinished（execute 返回值） |
-//! | Command | 部分落地 | Cancel 已落地（回合中 Ctrl-C；带外，在解释器层处理，不进 `next_action`）；New / Resume / Exit 未落地 |
-//! | Notice | 已落地 | `ui::Ui` 的七个方法 |
-//! | Effect | 未落地 | 目前由解释器直写；出现条件化效果组合（如审批门）时提为显式枚举 |
+//! | Input | landed (implicit) | UserLine (the `turn` argument), Delta (SSE stream), ToolFinished (execute return value) |
+//! | Command | partially landed | Cancel has landed (Ctrl-C during a turn; out-of-band, handled in the interpreter layer, never enters `next_action`); New / Resume / Exit have not |
+//! | Notice | landed | the seven methods of `ui::Ui` |
+//! | Effect | not landed | currently written directly by the interpreter; promote to an explicit enum once conditional effect combinations appear (e.g. the approval gate) |
 
 use std::collections::HashSet;
 
 use crate::types::{Message, Role, ToolCall};
 
 // ============================================================================
-// 历史合法性规范（可执行形式）。
-// "发给后端的请求历史必须满足什么"从此以这里为权威定义：
+// History validity specification (executable form).
+// "What the history sent to the backend must satisfy" is authoritatively
+// defined here as of now:
 //   is_request_valid = windows_complete ∧ no_stray_tools
-// 不满足的形状会被 DeepSeek/GLM 直接 400。`heal` 与请求构造都以它为
-// 目标不变量；下方测试用有界全形状族穷举钉住「崩溃点自愈必合法」。
+// Shapes that violate it are rejected with a 400 by DeepSeek/GLM. Both `heal`
+// and request construction target it as their invariant; the tests below pin
+// down "every crash point heals into something valid" by exhaustively
+// enumerating a bounded shape family.
 // ============================================================================
 
-/// 每条带 tool_calls 的 assistant：其后的 tool 结果窗口与声明一一对应
-/// （数量相等、id 集合相同）。
+/// For every assistant message carrying tool_calls: the tool result window that
+/// follows matches the declarations one for one (equal count, identical id set).
 pub fn windows_complete(messages: &[Message]) -> bool {
     for (i, m) in messages.iter().enumerate() {
         let Some(calls) = &m.tool_calls else { continue };
@@ -53,7 +61,8 @@ pub fn windows_complete(messages: &[Message]) -> bool {
     true
 }
 
-/// 所有 tool 结果都落在某个带（非空）调用的 assistant 的结果窗口内，无野结果。
+/// Every tool result falls inside the result window of some assistant with
+/// (non-empty) calls; there are no stray results.
 pub fn no_stray_tools(messages: &[Message]) -> bool {
     let mut under_calls = false;
     for m in messages {
@@ -71,47 +80,61 @@ pub fn no_stray_tools(messages: &[Message]) -> bool {
     true
 }
 
-/// 请求历史合法性。请求构造处有 debug tripwire 强制；heal 的目标不变量。
+/// Request history validity. Enforced by a debug tripwire where requests are
+/// constructed; the invariant that `heal` targets.
 pub fn is_request_valid(messages: &[Message]) -> bool {
     windows_complete(messages) && no_stray_tools(messages)
 }
 
-/// 崩溃自愈为未执行的工具调用合成的占位结果。必须是确定性常量：
-/// 同一份日志每次 load 都要合成出逐字节相同的历史（前缀缓存依赖）。
+/// Placeholder result synthesized by crash healing for a tool call that never
+/// executed. Must be a deterministic constant: the same log has to synthesize a
+/// byte-for-byte identical history on every load (prefix cache depends on it).
 pub const INTERRUPTED_RESULT: &str = "error: interrupted before execution; no result was recorded";
 
-/// 用户取消（Ctrl-C）时为未完成调用落盘的占位结果。确定性常量，理由同上。
-/// 与 INTERRUPTED_RESULT 区分：前者是崩溃后 load 时合成（只进内存视图），
-/// 后者是取消时真实落盘（进程还活着，必须写进文件）。
+/// Placeholder result persisted for unfinished calls when the user cancels
+/// (Ctrl-C). A deterministic constant, for the same reason. Distinct from
+/// INTERRUPTED_RESULT: that one is synthesized at load time after a crash (it
+/// only enters the in-memory view), whereas this one is really written to the
+/// file on cancellation (the process is still alive, so it must land in the file).
 pub const CANCELLED_RESULT: &str = "error: cancelled by user before a result was recorded";
 
-/// 审批门拒绝时为该调用落盘的结果。确定性常量；模型读到后可自行调整方案。
+/// Result persisted for a call denied by the approval gate. A deterministic
+/// constant; the model can adjust its plan after reading it.
 pub const DENIED_RESULT: &str = "error: the user declined this tool call";
 
-/// 单回合工具步上限（每个 ExecTool 动作计一步，含被拒绝的）。
-/// 终止性的产品兜底：模型抽风无限循环时最多烧到这里。
+/// Per-turn tool step cap (every ExecTool action counts as one step, including
+/// denied ones). A product-level termination guarantee: a model that goes
+/// haywire in a loop can burn at most this much.
 pub const MAX_TOOL_STEPS: usize = 500;
 
-/// 步数超限时为调用落盘的结果。确定性常量。
+/// Result persisted for calls once the step cap is exceeded. A deterministic
+/// constant.
 pub const STEP_LIMIT_RESULT: &str = "error: tool step limit reached; turn aborted";
 
-/// 下一拍该做什么。由日志折叠得出的机器决策出口。
+/// What the next beat should do. The machine's decision exit, obtained by
+/// folding the log.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    /// 历史就绪（末尾是 user，或工具结果已齐全），需要发起新的模型子请求。
+    /// History is ready (the tail is a user message, or the tool results are
+    /// complete), so a new model sub-request should be issued.
     CallModel,
-    /// 末尾 assistant 声明的 tool_calls 尚有未执行的，执行它（按声明顺序）。
+    /// The tool_calls declared by the trailing assistant still have unexecuted
+    /// ones; execute that one (in declaration order).
     ExecTool(ToolCall),
-    /// 末尾 assistant 已给出最终回答，本回合结束。
+    /// The trailing assistant has given its final answer; the turn is over.
     Done,
 }
 
-/// 决策函数：读历史，输出下一拍。无 IO、无时钟，表驱动可测。
+/// Decision function: read the history, produce the next beat. No IO, no clock,
+/// table-driven and testable.
 ///
-/// 多工具调用的关键：assistant 一次声明 c1、c2 时，历史会以
-/// `Assistant(calls) → Tool(c1) → Tool(c2)` 逐条增长。只看末尾消息会把
-/// 「末尾是 Tool」误判成结果齐全，漏执行 c2 就发请求（API 400）。
-/// 因此必须定位最后一条 assistant，比对它的全部声明与紧随的结果串。
+/// The multi-tool-call subtlety: when an assistant declares c1 and c2 at once,
+/// the history grows one message at a time as
+/// `Assistant(calls) → Tool(c1) → Tool(c2)`. Looking only at the trailing
+/// message would misread "the tail is a Tool" as "the results are complete",
+/// skip c2 and send the request (API 400). So we must locate the last assistant
+/// message and compare all of its declarations against the run of results that
+/// follows it.
 pub fn next_action(messages: &[Message]) -> Option<Action> {
     let last = messages.last()?;
     match last.role {
@@ -120,9 +143,10 @@ pub fn next_action(messages: &[Message]) -> Option<Action> {
             let ai = messages.iter().rposition(|m| m.role == Role::Assistant)?;
             let calls = messages[ai].tool_calls.as_deref().unwrap_or_default();
             if calls.is_empty() {
-                // 末尾 assistant 无调用 → 回答完毕。（末尾 Tool 却找不到
-                // 带调用的 assistant 属于非法历史：与"错误即文本"一致，
-                // 停下而不是 panic，让用户看到并处置。）
+                // The trailing assistant has no calls → the answer is complete.
+                // (A trailing Tool with no assistant carrying calls in front of
+                // it is invalid history: consistent with "errors are text", we
+                // stop instead of panicking so the user can see and handle it.)
                 return Some(Action::Done);
             }
             let answered: HashSet<&str> = messages[ai + 1..]
@@ -139,9 +163,11 @@ pub fn next_action(messages: &[Message]) -> Option<Action> {
     }
 }
 
-/// 已声明但结果窗口内未应答的调用 id（按声明顺序）。
-/// 取消收尾的依据：这些调用需要补 CANCELLED_RESULT 才能闭合窗口，
-/// 否则下一回合会复活僵尸调用（或构造请求时 400）。
+/// Ids of calls that were declared but not answered inside their result window
+/// (in declaration order).
+/// The basis for cancellation cleanup: these calls need a CANCELLED_RESULT to
+/// close the window, otherwise the next turn resurrects zombie calls (or
+/// constructing the request gets a 400).
 pub fn open_call_ids(messages: &[Message]) -> Vec<String> {
     let mut open = Vec::new();
     let mut i = 0;
@@ -169,11 +195,13 @@ pub fn open_call_ids(messages: &[Message]) -> Vec<String> {
     open
 }
 
-/// 崩溃自愈：为「声明了 tool_calls 但结果不全」的 assistant 补上占位结果，
-/// 使历史重新满足 API 约束（每个 call 恰好一个紧随的 tool 结果）。
-/// 只修改传入的内存视图，**不写文件**——日志 append-only 永不重写，
-/// 下次 load 会确定性地重新合成同样的内容。
-/// 返回补插的消息数。
+/// Crash healing: for an assistant that "declared tool_calls but whose results
+/// are incomplete", pad in placeholder results so the history satisfies the API
+/// constraint again (exactly one immediately following tool result per call).
+/// This only modifies the in-memory view passed in and **does not write the
+/// file** — the log is append-only and never rewritten; the next load
+/// deterministically synthesizes the same content.
+/// Returns the number of inserted messages.
 pub fn heal(messages: &mut Vec<Message>) -> usize {
     let mut inserted = 0;
     let mut i = 0;
@@ -182,7 +210,8 @@ pub fn heal(messages: &mut Vec<Message>) -> usize {
             i += 1;
             continue;
         }
-        // 定位该 assistant 紧随的 tool 结果串的终点
+        // Find the end of the run of tool results immediately following this
+        // assistant message
         let mut j = i + 1;
         while j < messages.len() && messages[j].role == Role::Tool {
             j += 1;
@@ -200,12 +229,14 @@ pub fn heal(messages: &mut Vec<Message>) -> usize {
             .map(|c| c.id.clone())
             .collect();
         for (n, id) in missing.iter().enumerate() {
-            // j 已是当前向量的坐标：同一窗口内逐个追加只需 + n。
-            // 不得混入跨窗口的累计插入数——那会让第二个窗口越界。
+            // j is already a coordinate in the current vector: appending one by
+            // one inside the same window only needs + n. A cumulative
+            // insertion count carried across windows must not be mixed in —
+            // that would send the second window out of bounds.
             messages.insert(j + n, Message::tool(id, INTERRUPTED_RESULT));
         }
         inserted += missing.len();
-        // 跳过整个窗口（含新插入的占位结果）
+        // Skip the whole window (including the placeholder results just inserted)
         i = j + missing.len();
     }
     inserted
@@ -244,48 +275,49 @@ mod tests {
 
     #[test]
     fn user_tail_requests_model() {
-        let msgs = vec![Message::user("问")];
+        let msgs = vec![Message::user("q")];
         assert_eq!(next_action(&msgs), Some(Action::CallModel));
     }
 
     #[test]
     fn plain_assistant_tail_ends_turn() {
         let mut m = assistant(vec![]);
-        m.content = Some("答案".into());
-        let msgs = vec![Message::user("问"), m];
+        m.content = Some("answer".into());
+        let msgs = vec![Message::user("q"), m];
         assert_eq!(next_action(&msgs), Some(Action::Done));
     }
 
     #[test]
     fn declared_calls_execute_in_declaration_order() {
-        let msgs = vec![Message::user("问"), assistant(vec![call("a"), call("b")])];
+        let msgs = vec![Message::user("q"), assistant(vec![call("a"), call("b")])];
         assert_eq!(
             next_action(&msgs),
             Some(Action::ExecTool(call("a"))),
-            "先执行先声明的调用"
+            "the earlier declared call runs first"
         );
     }
 
     #[test]
     fn partial_results_run_remaining_call_before_requesting() {
-        // 关键回归：Assistant(a,b) → Tool(a) 之后必须继续执行 b，
-        // 而不是拿着缺 b 结果的历史去发请求（API 400）。
+        // Key regression: after Assistant(a,b) → Tool(a) we must keep executing
+        // b rather than sending a request with a history that is missing b's
+        // result (API 400).
         let msgs = vec![
-            Message::user("问"),
+            Message::user("q"),
             assistant(vec![call("a"), call("b")]),
             Message::tool("a", "ok"),
         ];
         assert_eq!(
             next_action(&msgs),
             Some(Action::ExecTool(call("b"))),
-            "b 的结果未落盘，必须先执行"
+            "b has no result on disk yet, so it must run first"
         );
     }
 
     #[test]
     fn complete_results_request_model() {
         let msgs = vec![
-            Message::user("问"),
+            Message::user("q"),
             assistant(vec![call("a"), call("b")]),
             Message::tool("a", "ok"),
             Message::tool("b", "ok"),
@@ -296,10 +328,10 @@ mod tests {
     #[test]
     fn healthy_history_is_not_healed() {
         let mut msgs = vec![
-            Message::user("问"),
+            Message::user("q"),
             assistant(vec![call("a")]),
             Message::tool("a", "ok"),
-            Message::user("再问"),
+            Message::user("again"),
         ];
         assert_eq!(heal(&mut msgs), 0);
         assert_eq!(msgs.len(), 4);
@@ -307,8 +339,8 @@ mod tests {
 
     #[test]
     fn orphan_calls_get_synthetic_results() {
-        // 崩溃现场：两个调用都没执行就断了
-        let mut msgs = vec![Message::user("问"), assistant(vec![call("a"), call("b")])];
+        // Crash site: both calls were cut off before executing
+        let mut msgs = vec![Message::user("q"), assistant(vec![call("a"), call("b")])];
         assert_eq!(heal(&mut msgs), 2);
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[2].tool_call_id.as_deref(), Some("a"));
@@ -316,18 +348,19 @@ mod tests {
         assert_eq!(
             msgs[2].content.as_deref(),
             Some(INTERRUPTED_RESULT),
-            "合成文本必须逐字节确定（前缀缓存依赖）"
+            "the synthesized text must be byte-for-byte deterministic (prefix cache depends on it)"
         );
     }
 
     #[test]
     fn partial_run_is_completed_in_place() {
-        // 崩溃现场：c1 已落盘、c2 丢失 → c2 的占位结果插在结果串末尾
+        // Crash site: c1 is on disk, c2 was lost → c2's placeholder goes at the
+        // end of the result run
         let mut msgs = vec![
-            Message::user("问"),
+            Message::user("q"),
             assistant(vec![call("a"), call("b")]),
             Message::tool("a", "ok"),
-            Message::user("下一问"),
+            Message::user("next"),
         ];
         assert_eq!(heal(&mut msgs), 1);
         assert_eq!(msgs.len(), 5);
@@ -335,15 +368,18 @@ mod tests {
         assert_eq!(
             msgs[3].tool_call_id.as_deref(),
             Some("b"),
-            "补在既有结果之后"
+            "appended after the existing results"
         );
-        assert_eq!(msgs[4].role, Role::User, "原有消息不被挪动");
+        assert_eq!(msgs[4].role, Role::User, "existing messages are not moved");
     }
 
-    /// 转移函数的穷举论证：assistant 声明 n 个调用后，紧随结果串是 2^n 个
-    /// 子集之一。对 n ≤ 3 全枚举，检查每种情况的决策恰好是"按声明顺序的
-    /// 第一个未执行调用"，全部执行完才转 CallModel。
-    /// 这是对可达抽象状态的完备性检查，不是抽样覆盖。
+    /// Exhaustive argument for the transition function: after an assistant
+    /// declares n calls, the run of results that follows is one of 2^n subsets.
+    /// Fully enumerate n ≤ 3 and check that each case decides exactly "the first
+    /// unexecuted call in declaration order", switching to CallModel only once
+    /// all of them have run.
+    /// This is a completeness check over the reachable abstract states, not
+    /// sampled coverage.
     #[test]
     fn exhaustive_answer_subsets_yield_first_unanswered_call() {
         for n in 1..=3usize {
@@ -363,36 +399,44 @@ mod tests {
                 assert_eq!(
                     next_action(&msgs),
                     Some(expected),
-                    "n={n}, 已落盘结果掩码={mask:#b}"
+                    "n={n}, persisted-result mask={mask:#b}"
                 );
             }
         }
     }
 
-    /// heal 幂等：自愈过的历史再次自愈必须零插入、零改动。
-    /// 这是"同一份日志每次 load 得到同一视图"的必要条件（前缀缓存依赖）。
+    /// heal is idempotent: healing an already-healed history must insert nothing
+    /// and change nothing.
+    /// This is a necessary condition for "the same log yields the same view on
+    /// every load" (prefix cache depends on it).
     #[test]
     fn heal_is_idempotent() {
         let mut msgs = vec![
-            Message::user("问"),
+            Message::user("q"),
             assistant(vec![call("a"), call("b")]),
             Message::tool("a", "ok"),
-            Message::user("下一问"),
+            Message::user("next"),
         ];
         assert_eq!(heal(&mut msgs), 1);
         let once = msgs.clone();
-        assert_eq!(heal(&mut msgs), 0, "第二次自愈不得再插入");
-        assert_eq!(msgs, once, "第二次自愈不得改动任何消息");
+        assert_eq!(heal(&mut msgs), 0, "a second heal must not insert again");
+        assert_eq!(msgs, once, "a second heal must not change any message");
     }
 
-    /// 可执行规范自身的定向用例：接受健康形状，拒绝已知会被 400 的形状。
+    /// Directed cases for the executable specification itself: accept healthy
+    /// shapes, reject the shapes known to produce a 400.
     #[test]
     fn spec_predicate_directed_cases() {
-        let ok = |msgs: &[Message]| assert!(is_request_valid(msgs), "应为合法: {msgs:?}");
-        let bad = |msgs: &[Message]| assert!(!is_request_valid(msgs), "应非法: {msgs:?}");
+        let ok = |msgs: &[Message]| assert!(is_request_valid(msgs), "should be valid: {msgs:?}");
+        let bad =
+            |msgs: &[Message]| assert!(!is_request_valid(msgs), "should be invalid: {msgs:?}");
 
         ok(&[]);
-        ok(&[Message::user("q"), assistant(vec![]), Message::user("再问")]);
+        ok(&[
+            Message::user("q"),
+            assistant(vec![]),
+            Message::user("again"),
+        ]);
         ok(&[
             Message::user("q"),
             assistant(vec![call("a"), call("b")]),
@@ -402,24 +446,24 @@ mod tests {
         ok(&[
             assistant(vec![call("a")]),
             Message::tool("a", "1"),
-            Message::user("下一轮"),
+            Message::user("next round"),
             assistant(vec![call("b")]),
             Message::tool("b", "2"),
         ]);
-        // 孤儿声明（崩溃形态）：结果缺失
+        // orphan declaration (crash shape): the result is missing
         bad(&[Message::user("q"), assistant(vec![call("a")])]);
-        // 野结果：前面没有带调用的 assistant
+        // stray result: no assistant carrying calls in front of it
         bad(&[Message::user("q"), Message::tool("a", "1")]);
         bad(&[assistant(vec![]), Message::tool("a", "1")]);
-        // 重复结果
+        // duplicate result
         bad(&[
             assistant(vec![call("a")]),
             Message::tool("a", "1"),
             Message::tool("a", "2"),
         ]);
-        // id 对不上
+        // id does not match
         bad(&[assistant(vec![call("a")]), Message::tool("b", "1")]);
-        // 窗口已被非 tool 消息关闭，结果迟到
+        // the window was already closed by a non-tool message, so the result is late
         bad(&[
             assistant(vec![call("a")]),
             Message::user("x"),
@@ -427,8 +471,9 @@ mod tests {
         ]);
     }
 
-    /// 有界穷举族：长度 ≤ 5、字母表 7 种消息（User；Assistant ∅/{a}/{b}/{a,b}；
-    /// Tool(a)/Tool(b)）的全部 7^0+…+7^5 = 19608 个序列。
+    /// Bounded exhaustive family: all 7^0+…+7^5 = 19608 sequences of length ≤ 5
+    /// over a 7-symbol message alphabet (User; Assistant ∅/{a}/{b}/{a,b};
+    /// Tool(a)/Tool(b)).
     fn bounded_family() -> Vec<Vec<Message>> {
         fn kind(d: u32) -> Message {
             match d {
@@ -456,10 +501,12 @@ mod tests {
         out
     }
 
-    /// 定理 A（有界穷举 · 全族 19608 形状）：任意历史经 heal 后，每个声明
-    /// 的调用都在其结果窗口内得到应答（declared ⊆ answered）。
-    /// 注意 heal 只补缺、不去重：完整合法性属于定理 B 的崩溃可达族——
-    /// 这个定理边界本身就是规范的一部分。
+    /// Theorem A (bounded exhaustive · all 19608 shapes): after heal, every
+    /// declared call is answered inside its result window
+    /// (declared ⊆ answered).
+    /// Note that heal only pads missing results and never de-duplicates: full
+    /// validity belongs to theorem B's crash-reachable family — that boundary
+    /// is itself part of the specification.
     #[test]
     fn theorem_a_heal_answers_every_declared_call_exhaustive() {
         for mut seq in bounded_family() {
@@ -477,16 +524,18 @@ mod tests {
                 for c in calls {
                     assert!(
                         answered.contains(c.id.as_str()),
-                        "heal 后仍有未应答调用 {c:?}，形状: {seq:?}"
+                        "an unanswered call {c:?} survived heal; shape: {seq:?}"
                     );
                 }
             }
         }
     }
 
-    /// 定理 B（有界穷举 · 崩溃可达族）：合法历史的每个前缀 = 进程可停在
-    /// 的每个崩溃点。全部前缀经 heal 后必须满足可执行规范。
-    /// 这把「六个崩溃点各有恢复路径」的人工枚举升级为机械检查。
+    /// Theorem B (bounded exhaustive · crash-reachable family): every prefix of
+    /// a valid history = every crash point the process can stop at. All prefixes
+    /// must satisfy the executable specification after heal.
+    /// This upgrades the manual enumeration of "each of the six crash points has
+    /// a recovery path" into a mechanical check.
     #[test]
     fn theorem_b_every_crash_prefix_of_valid_history_recovers() {
         let mut checked = 0usize;
@@ -499,18 +548,22 @@ mod tests {
                 heal(&mut prefix);
                 assert!(
                     is_request_valid(&prefix),
-                    "截断点 {cut}/{} 自愈后仍非法: {prefix:?}（原序列 {seq:?}）",
+                    "cut point {cut}/{} still invalid after healing: {prefix:?} (original {seq:?})",
                     seq.len()
                 );
                 checked += 1;
             }
         }
-        assert!(checked > 1000, "穷举族意外缩水：仅 {checked} 个前缀");
+        assert!(
+            checked > 1000,
+            "the exhaustive family shrank unexpectedly: only {checked} prefixes"
+        );
     }
 
-    /// 回归：多个窗口同时缺结果时，插入坐标必须逐窗口局部。
-    /// 此形状曾使 heal 越界 panic（insertion index out of bounds）——
-    /// 由定理 A 的穷举率先暴露。
+    /// Regression: when several windows are missing results at once, the
+    /// insertion coordinate must stay local to each window.
+    /// This shape used to make heal panic out of bounds (insertion index out of
+    /// bounds) — first exposed by theorem A's exhaustive sweep.
     #[test]
     fn heal_two_deficient_windows_inserts_locally() {
         let mut msgs = vec![
@@ -543,7 +596,7 @@ mod tests {
 
     #[test]
     fn healed_history_yields_callmodel() {
-        let mut msgs = vec![Message::user("问"), assistant(vec![call("a")])];
+        let mut msgs = vec![Message::user("q"), assistant(vec![call("a")])];
         heal(&mut msgs);
         assert_eq!(next_action(&msgs), Some(Action::CallModel));
     }

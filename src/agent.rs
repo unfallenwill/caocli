@@ -11,30 +11,36 @@ use crate::tools;
 use crate::types::{ChatRequest, Message, Thinking, ToolCall, TurnAccumulator, Usage};
 use crate::ui::Ui;
 
-/// 参与请求前缀（KVCache）。禁止注入时间、cwd、随机 id 等任何动态内容，
-/// 否则每个请求的前缀都不同，缓存全 miss。
+/// Participates in the request prefix (KVCache). Injecting time, cwd, a random
+/// id or any other dynamic content is forbidden, or every request would have a
+/// different prefix and the cache would miss entirely.
 pub const SYSTEM_PROMPT: &str = "You are caocli, a terminal coding agent. Prefer running commands to gather facts before answering. Keep answers concise. Tool routing: use Read to read a file, Edit to modify an existing file, Write to create or fully rewrite a file, and Bash for everything else (running programs, builds, tests, git, directories, bulk text processing). Prefer absolute paths: each Bash call starts a fresh shell, so cd does not persist.";
 
 pub struct Agent {
     api: Client,
     pub session: Session,
-    /// 审批门：开启后 Bash/Edit/Write 执行前询问用户（Read 永远放行）。
+    /// Approval gate: when on, Bash/Edit/Write ask the user before running
+    /// (Read is always allowed).
     pub confirm_tools: bool,
-    /// 单回合工具步上限（终止性的产品兜底）。
+    /// Per-turn tool step cap (product-level termination guarantee).
     pub max_tool_steps: usize,
     tool_steps: usize,
 }
 
-/// 带外取消（Ctrl-C）源：整回合持有一个长生命周期监听者，按需借出
-/// 可丢弃的等待 future。等待是 cancel-safe 的：future 被丢弃不丢信号
-/// （状态在监听者里），未消费的信号让下一次 `wait()` 立即就绪。
-/// 输出生命周期绑 `&mut self`——`Fn` 家族表达不了「返回值借用接收者」。
+/// Out-of-band cancellation (Ctrl-C) source: one long-lived listener is held for
+/// the whole turn and lends out a droppable wait future on demand. Waiting is
+/// cancel-safe: dropping the future does not lose the signal (the state lives in
+/// the listener), and an unconsumed signal makes the next `wait()` ready
+/// immediately.
+/// The output lifetime is bound to `&mut self` — the `Fn` family cannot express
+/// "the return value borrows the receiver".
 trait Interrupt {
     fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>>;
 }
 
-/// 真实 SIGINT 监听者。构造即向 tokio 的 watch 订阅（无需 poll），
-/// 因此从 turn 开始到结束的任何时刻，信号都不会因「无监听空窗」而丢失。
+/// The real SIGINT listener. It subscribes to tokio's watch at construction time
+/// (no poll needed), so a signal arriving at any moment from the start of the
+/// turn to its end cannot be lost to a "no listener" gap.
 struct Sigint(
     #[cfg(unix)] tokio::signal::unix::Signal,
     #[cfg(not(unix))] tokio::signal::windows::CtrlC,
@@ -59,9 +65,11 @@ impl Agent {
         }
     }
 
-    /// 控制面唯一入口：`/new`、`/resume` 等 shell 命令经此替换机器的持久
-    /// 状态（机器 = 日志，换会话即整体替换）。会话级渲染状态（统计清零、
-    /// 状态栏模型）由调用方（shell）同步刷新。
+    /// The only control-plane entrance: shell commands such as `/new` and
+    /// `/resume` replace the machine's persistent state through here (the machine
+    /// = the log, so switching sessions replaces it wholesale). Session-level
+    /// rendering state (clearing stats, the status bar's model) is refreshed by
+    /// the caller (the shell).
     pub fn adopt(&mut self, session: Session) {
         self.session = session;
     }
@@ -70,11 +78,13 @@ impl Agent {
         let mut messages = Vec::with_capacity(self.session.messages.len() + 1);
         messages.push(Message::system(SYSTEM_PROMPT));
         messages.extend(self.session.messages.iter().cloned());
-        // 规范 tripwire（仅 debug 构建）：发出去的历史必须满足可执行规范，
-        // 违反即后端 400 的形状——开发期拦住，而不是等线上。
+        // Specification tripwire (debug builds only): the history being sent must
+        // satisfy the executable specification. A violation is a shape the
+        // backend answers with a 400 — catch it during development rather than in
+        // production.
         debug_assert!(
             machine::is_request_valid(&messages),
-            "请求历史违反 tool_calls 窗口规范: {messages:?}"
+            "request history violates the tool_calls window specification: {messages:?}"
         );
         ChatRequest {
             model: self.session.meta.model.clone(),
@@ -83,7 +93,8 @@ impl Agent {
             tool_choice: Some("auto".into()),
             stream: true,
             thinking: Some(Thinking::enabled()),
-            // 后端默认档不一致（DeepSeek high / GLM max），未存值时钉成 DEFAULT_EFFORT。
+            // The backends' defaults differ (DeepSeek high / GLM max), so pin it
+            // to DEFAULT_EFFORT when no value is stored.
             reasoning_effort: Some(
                 self.session
                     .meta
@@ -94,13 +105,18 @@ impl Agent {
         }
     }
 
-    /// 一轮对话：可能包含多个子请求（模型调用工具后继续，直到 finish_reason=stop）。
-    /// 渲染器由调用方持有并传入：状态栏与流式输出必须走同一个 `Ui` 实现，
-    /// 否则 `usage()` 记录到的缓存统计不会反映到已建栏的实例上。
+    /// One conversational turn: may contain several sub-requests (the model keeps
+    /// going after calling tools, until finish_reason=stop).
+    /// The renderer is held by the caller and passed in: the status bar and the
+    /// streaming output must go through the same `Ui` implementation, otherwise
+    /// the cache stats recorded by `usage()` never reach the instance that
+    /// already drew the bar.
     ///
-    /// SIGINT 监听者整回合只建一个：tokio 的信号通知挂在 watch 上，若每个
-    /// select 现建监听者，两个 select 之间的空窗里到达的 SIGINT 会在新监听者
-    /// 订阅前被 broadcast 掉，永远丢失（pty 冒烟实测，毫秒级窗口）。
+    /// Exactly one SIGINT listener is created per turn: tokio's signal
+    /// notifications ride on a watch, so if a listener were created inside each
+    /// `select`, a SIGINT arriving in the gap between two `select`s would be
+    /// broadcast away before the new listener subscribed and would be lost
+    /// forever (measured in the pty smoke test, a millisecond-scale window).
     pub async fn turn(&mut self, input: &str, ui: &mut impl Ui) -> Result<()> {
         #[cfg(unix)]
         let mut sigint = Sigint(tokio::signal::unix::signal(
@@ -109,10 +125,12 @@ impl Agent {
         #[cfg(not(unix))]
         let mut sigint = Sigint(tokio::signal::windows::ctrl_c()?);
         self.turn_with(input, ui, &mut sigint, |_call| async {
-            // 审批应答（Input 事件）：一行 stdin，默认拒绝。
-            // 用阻塞读包进 spawn_blocking：全局 stdin 缓冲跨调用共享，
-            // 多余的预输入不会丢。（代价：取消时残留一个阻塞线程，
-            // 之后的第一行输入会被它吞掉——已知取舍。）
+            // Approval answer (an Input event): one line of stdin, denial by
+            // default.
+            // The blocking read is wrapped in spawn_blocking: the global stdin
+            // buffer is shared across calls, so surplus type-ahead is not lost.
+            // (Cost: on cancellation a blocked thread lingers and swallows the
+            // first line typed afterwards — a known trade-off.)
             tokio::task::spawn_blocking(|| {
                 let mut line = String::new();
                 let read = std::io::stdin().read_line(&mut line);
@@ -126,12 +144,16 @@ impl Agent {
         .await
     }
 
-    /// 一轮对话的解释器循环，`interrupt` 是带外 Command（Ctrl-C）的来源：
-    /// 每个 await 点与之竞争（biased：效果先完成则保留结果）。
-    /// 触发时当前 effect 被丢弃——流断开、Bash 子进程被 kill_on_drop 杀死；
-    /// 已声明未应答的调用以 CANCELLED_RESULT 落盘闭合窗口，
-    /// 历史保持 is_request_valid，下一回合从合法前缀继续。
-    /// 取消在解释器层处理，不进 `next_action`（带外，任何状态可达）。
+    /// The interpreter loop for one turn; `interrupt` is the source of an
+    /// out-of-band Command (Ctrl-C): every await point races against it (biased:
+    /// if the effect finishes first its result is kept).
+    /// When it fires, the current effect is dropped — the stream disconnects and
+    /// the Bash child process is killed by kill_on_drop; the calls that were
+    /// declared but not answered are persisted with CANCELLED_RESULT to close the
+    /// window, the history stays is_request_valid, and the next turn continues
+    /// from a valid prefix.
+    /// Cancellation is handled in the interpreter layer and never enters
+    /// `next_action` (it is out-of-band and every state is reachable).
     async fn turn_with<A, FutA>(
         &mut self,
         input: &str,
@@ -145,13 +167,15 @@ impl Agent {
     {
         self.session.append_message(&Message::user(input))?;
         let mut cancelled = false;
-        // 解释器循环：每拍向机器要决策（日志折叠出的 Action），执行后把
-        // 结果写回日志，直到 Done。循环本身不携带状态——历史只有日志一处。
+        // Interpreter loop: each beat asks the machine for a decision (an Action
+        // folded out of the log) and writes the result back into the log, until
+        // Done. The loop itself carries no state — the log is the only history.
         loop {
             match machine::next_action(&self.session.messages) {
                 Some(Action::CallModel) => {
                     let req = self.build_request();
-                    // select 表达式结束即弃未来，self 的借用随之结束
+                    // The future is dropped when the select expression ends, which
+                    // ends the borrow of self
                     let done = tokio::select! {
                         biased;
                         r = self.pump(&req, ui) => Some(r?),
@@ -169,8 +193,10 @@ impl Agent {
                 }
                 Some(Action::ExecTool(call)) => {
                     ui.tool_start(&call.function.name, &call.function.arguments);
-                    // 步数上限：每个 ExecTool 动作计一步（含被拒绝的），
-                    // 超限即以确定性标记收尾，防模型抽风无限循环。
+                    // Step cap: every ExecTool action counts as a step (including
+                    // denied ones); exceeding it ends the turn with a
+                    // deterministic marker, so a model that goes haywire in a loop
+                    // cannot run forever.
                     if self.tool_steps >= self.max_tool_steps {
                         ui.tool_result(machine::STEP_LIMIT_RESULT);
                         self.session.append_message(&Message::tool(
@@ -181,7 +207,8 @@ impl Agent {
                         break;
                     }
                     self.tool_steps += 1;
-                    // 审批门：Bash/Edit/Write 先询问，拒绝以 DENIED_RESULT 闭合该调用
+                    // Approval gate: Bash/Edit/Write ask first; a denial closes
+                    // that call with DENIED_RESULT
                     let mut denied = false;
                     if self.confirm_tools && call.function.name != tools::READ_NAME {
                         ui.approval_requested(&call.function.name, &call.function.arguments);
@@ -229,8 +256,10 @@ impl Agent {
         Ok(())
     }
 
-    /// 中断/超限收尾：把已声明但未应答的调用以给定标记落盘，闭合窗口。
-    /// 落盘而非仅内存视图——进程还活着，文件必须如实记录。
+    /// Interruption/step-limit cleanup: persist the given marker for calls that
+    /// were declared but not answered, closing the window.
+    /// Persisted rather than kept in the in-memory view only — the process is
+    /// still alive, so the file has to record it faithfully.
     fn close_open_calls(&mut self, ui: &mut impl Ui, marker: &str) -> Result<()> {
         for id in machine::open_call_ids(&self.session.messages) {
             self.session.append_message(&Message::tool(&id, marker))?;
@@ -239,8 +268,10 @@ impl Agent {
         Ok(())
     }
 
-    /// 执行一次子请求：消费 SSE 流（逐 delta 通知 UI），聚合出完整 assistant 消息。
-    /// 错误向上抛，此时 assistant 消息未落盘，会话停留在合法前缀。
+    /// Run one sub-request: consume the SSE stream (notifying the UI delta by
+    /// delta) and aggregate a complete assistant message.
+    /// Errors propagate upward; at that point the assistant message has not been
+    /// persisted, so the session stays at a valid prefix.
     async fn pump(&self, req: &ChatRequest, ui: &mut impl Ui) -> Result<(Message, Option<Usage>)> {
         let mut stream = self.api.stream_chat(req).await?;
         let mut acc = TurnAccumulator::default();
@@ -267,7 +298,8 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
-    /// 测试替身：第一个等待点立即触发（模拟信号早已到达）。
+    /// Test double: fires immediately at the first wait point (simulating a
+    /// signal that already arrived).
     struct Immediate;
     impl Interrupt for Immediate {
         fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
@@ -275,7 +307,8 @@ mod tests {
         }
     }
 
-    /// 测试替身：按序弹出游走的取消点；耗尽后永不触发。
+    /// Test double: pops cancellation points in order; once exhausted it never
+    /// fires again.
     struct Steps(std::collections::VecDeque<Pin<Box<dyn Future<Output = ()>>>>);
     impl Interrupt for Steps {
         fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
@@ -311,7 +344,7 @@ mod tests {
         }
     }
 
-    /// 构造一个 SSE chunk 行（含空行分隔）。
+    /// Build one SSE chunk line (including the blank-line separator).
     fn sse(
         delta: serde_json::Value,
         finish: Option<&str>,
@@ -351,7 +384,8 @@ mod tests {
 
     #[test]
     fn system_prompt_is_stable_constant() {
-        // 防止未来有人把动态内容塞进 system prompt 破坏 KVCache
+        // Guard against someone injecting dynamic content into the system prompt
+        // and breaking KVCache in the future
         assert!(!SYSTEM_PROMPT.contains("now"));
         assert!(!SYSTEM_PROMPT.contains("cwd"));
     }
@@ -377,7 +411,8 @@ mod tests {
 
     #[test]
     fn build_request_defaults_missing_effort_to_max() {
-        // 老会话 meta 里没有 effort 时，也要钉成 max 而不是留给后端各自默认。
+        // Even when an older session's meta has no effort, it must be pinned to
+        // max rather than left to each backend's default.
         let dir = tmpdir();
         let mut s = Session::create(&dir, test_meta()).unwrap();
         s.meta.reasoning_effort = None;
@@ -391,14 +426,15 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 端到端：tool_calls（arguments 分片）→ 真实执行 Bash → 第二轮带
-    /// reasoning_content 回传 → 最终回答。钉住 DeepSeek "带 tools 必须回传
-    /// reasoning_content" 硬约束与历史逐字节回放。
+    /// End to end: tool_calls (with sharded arguments) → really execute Bash →
+    /// second round passes reasoning_content back → final answer. This pins the
+    /// DeepSeek hard constraint "with tools, reasoning_content must be passed
+    /// back" and byte-for-byte history replay.
     #[tokio::test]
     async fn mock_full_tool_loop_replays_reasoning_content() {
         let server = MockServer::start().await;
         let turn1 = [
-            sse(json!({"role":"assistant","reasoning_content":"我需要执行命令。"}), None, None),
+            sse(json!({"role":"assistant","reasoning_content":"I need to run a command."}), None, None),
             sse(json!({"tool_calls":[{"index":0,"id":"call_mock_1","type":"function","function":{"name":"Bash","arguments":"{\"comm"}}]}), None, None),
             sse(json!({"tool_calls":[{"index":0,"function":{"arguments":"and\":\"echo caocli-mock-marker\"}"}}]}), None, None),
             sse(json!({"content":""}), Some("tool_calls"), Some(json!({"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":10}))),
@@ -406,7 +442,7 @@ mod tests {
         ]
         .concat();
         let turn2 = [
-            sse(json!({"content":"已执行完毕。"}), None, None),
+            sse(json!({"content":"Done executing."}), None, None),
             sse(json!({"content":""}), Some("stop"), Some(json!({"prompt_tokens":20,"completion_tokens":8,"total_tokens":28,"prompt_cache_hit_tokens":12,"prompt_cache_miss_tokens":8}))),
             "data: [DONE]\n\n".to_string(),
         ]
@@ -417,21 +453,25 @@ mod tests {
         let dir = tmpdir();
         let mut agent = test_agent(&server, &dir);
         let mut ui = Renderer::new();
-        agent.turn("用工具打个标记", &mut ui).await.unwrap();
+        agent
+            .turn("use a tool to leave a marker", &mut ui)
+            .await
+            .unwrap();
 
-        // usage 必须喂给调用方持有的渲染器，否则状态栏缓存统计永远不更新
+        // usage must reach the renderer held by the caller, otherwise the status
+        // bar's cache stats never update
         assert_eq!(
             ui.stats(),
             crate::ui::CacheStats { hit: 12, miss: 18 },
-            "两个子请求的 hit/miss 应累计到同一渲染器"
+            "hit/miss from both sub-requests should accumulate into the same renderer"
         );
 
-        // 会话历史：user / assistant(思维链+tool_calls) / tool(执行结果) / assistant
+        // session history: user / assistant(thinking + tool_calls) / tool(result) / assistant
         assert_eq!(agent.session.messages.len(), 4);
         let assistant1 = &agent.session.messages[1];
         assert_eq!(
             assistant1.reasoning_content.as_deref(),
-            Some("我需要执行命令。")
+            Some("I need to run a command.")
         );
         let calls = assistant1.tool_calls.as_ref().unwrap();
         assert_eq!(calls[0].id, "call_mock_1");
@@ -443,7 +483,7 @@ mod tests {
         let tool_msg = &agent.session.messages[2];
         assert_eq!(tool_msg.role, Role::Tool);
         assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call_mock_1"));
-        // Bash 真的执行了
+        // Bash really ran
         assert!(
             tool_msg
                 .content
@@ -453,10 +493,11 @@ mod tests {
         );
         assert_eq!(
             agent.session.messages[3].content.as_deref(),
-            Some("已执行完毕。")
+            Some("Done executing.")
         );
 
-        // 第二轮请求体：核心硬约束 —— reasoning_content 原样回传
+        // second round's request body: the core hard constraint — reasoning_content
+        // is passed back verbatim
         let reqs = server.received_requests().await.unwrap();
         assert_eq!(reqs.len(), 2);
         let body: serde_json::Value = serde_json::from_slice(&reqs[1].body).unwrap();
@@ -464,11 +505,11 @@ mod tests {
         assert_eq!(msgs.len(), 4); // system + user + assistant + tool
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[2]["role"], "assistant");
-        assert_eq!(msgs[2]["reasoning_content"], "我需要执行命令。");
+        assert_eq!(msgs[2]["reasoning_content"], "I need to run a command.");
         assert_eq!(msgs[2]["tool_calls"][0]["id"], "call_mock_1");
         assert_eq!(msgs[3]["role"], "tool");
         assert_eq!(msgs[3]["tool_call_id"], "call_mock_1");
-        // 请求参数形状
+        // request parameter shape
         assert_eq!(body["model"], "deepseek-v4-flash");
         assert_eq!(body["stream"], true);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -477,8 +518,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 端到端：一次声明两个工具调用。解释器必须按声明顺序把两个都执行完
-    /// 才发第二个子请求——若只执行一个就发请求，历史缺 tool 结果（API 400）。
+    /// End to end: two tool calls declared at once. The interpreter must finish
+    /// executing both, in declaration order, before sending the second
+    /// sub-request — sending after only one would leave the history missing a
+    /// tool result (API 400).
     #[tokio::test]
     async fn mock_multi_call_loop_executes_all_before_next_request() {
         let server = MockServer::start().await;
@@ -492,7 +535,7 @@ mod tests {
         ]
         .concat();
         let turn2 = [
-            sse(json!({"content":"都执行完了。"}), None, None),
+            sse(json!({"content":"Both executed."}), None, None),
             sse(json!({"content":""}), Some("stop"), None),
             "data: [DONE]\n\n".to_string(),
         ]
@@ -503,7 +546,7 @@ mod tests {
         let dir = tmpdir();
         let mut agent = test_agent(&server, &dir);
         let mut ui = Renderer::new();
-        agent.turn("跑两个命令", &mut ui).await.unwrap();
+        agent.turn("run two commands", &mut ui).await.unwrap();
 
         let msgs = &agent.session.messages;
         assert_eq!(
@@ -516,7 +559,7 @@ mod tests {
         assert!(msgs[2].content.as_deref().unwrap().contains("one"));
         assert!(msgs[3].content.as_deref().unwrap().contains("two"));
 
-        // 第二个子请求的历史里，两个结果必须都已就位
+        // In the second sub-request's history both results must already be present
         let reqs = server.received_requests().await.unwrap();
         assert_eq!(reqs.len(), 2);
         let body: serde_json::Value = serde_json::from_slice(&reqs[1].body).unwrap();
@@ -530,23 +573,25 @@ mod tests {
         assert_eq!(
             results,
             vec!["call_m1", "call_m2"],
-            "第二个请求必须携带全部工具结果"
+            "the second request must carry every tool result"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Ctrl-C 在首轮流式中到达：assistant 未提交，历史停在 user。
-    /// 取消 = 活着的中断，最轻形态：无需任何标记，历史本就合法。
+    /// Ctrl-C arrives during the first stream: the assistant is not committed, so
+    /// the history stops at the user message.
+    /// Cancellation = a live interruption in its lightest form: no marker is
+    /// needed because the history was already valid.
     #[tokio::test]
     async fn cancel_during_first_stream_keeps_history_at_user() {
-        let server = MockServer::start().await; // 不挂 mock：pump 必然 pending
+        let server = MockServer::start().await; // no mock mounted: pump stays pending
         let dir = tmpdir();
         let mut agent = test_agent(&server, &dir);
         let mut ui = Renderer::new();
-        // 第一个取消点（pump select）立即触发
+        // the first cancellation point (the pump select) fires immediately
         let mut interrupt = Immediate;
         agent
-            .turn_with("原始指令", &mut ui, &mut interrupt, |_| {
+            .turn_with("original instruction", &mut ui, &mut interrupt, |_| {
                 std::future::ready(true)
             })
             .await
@@ -557,8 +602,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Ctrl-C 在工具执行中到达：被中断的调用与其后未执行的调用都以
-    /// 取消标记落盘，窗口闭合、历史合法——下一回合不会复活僵尸调用。
+    /// Ctrl-C arrives while a tool is executing: the interrupted call and every
+    /// call after it that never ran are persisted with the cancellation marker,
+    /// closing the window and keeping the history valid — the next turn does not
+    /// resurrect zombie calls.
     #[tokio::test]
     async fn cancel_during_tool_marks_remaining_calls_cancelled() {
         let server = MockServer::start().await;
@@ -576,42 +623,51 @@ mod tests {
         let dir = tmpdir();
         let mut agent = test_agent(&server, &dir);
         let mut ui = Renderer::new();
-        // 取消点队列：pump 处永不触发（让流正常完成）；首个工具处立即触发
+        // cancellation point queue: never fires at pump (let the stream finish);
+        // fires immediately at the first tool
         let mut queue: std::collections::VecDeque<Pin<Box<dyn Future<Output = ()>>>> =
             Default::default();
         queue.push_back(Box::pin(std::future::pending::<()>()));
         queue.push_back(Box::pin(async {}));
         let mut interrupt = Steps(queue);
         agent
-            .turn_with("跑两个慢命令", &mut ui, &mut interrupt, |_| {
+            .turn_with("run two slow commands", &mut ui, &mut interrupt, |_| {
                 std::future::ready(true)
             })
             .await
             .unwrap();
 
         let msgs = &agent.session.messages;
-        assert_eq!(msgs.len(), 4, "user / assistant(2 calls) / 取消标记×2");
+        assert_eq!(
+            msgs.len(),
+            4,
+            "user / assistant(2 calls) / cancellation marker ×2"
+        );
         assert_eq!(msgs[2].tool_call_id.as_deref(), Some("call_c1"));
         assert_eq!(msgs[3].tool_call_id.as_deref(), Some("call_c2"));
         assert_eq!(
             msgs[2].content.as_deref(),
             Some(machine::CANCELLED_RESULT),
-            "被执行中被中断的调用也标记取消"
+            "a call interrupted while executing is marked cancelled too"
         );
         assert_eq!(msgs[3].content.as_deref(), Some(machine::CANCELLED_RESULT));
-        // 窗口闭合：历史合法，下一回合的决策是发请求而不是复活僵尸调用
+        // the window is closed: the history is valid, so the next turn's decision
+        // is to send a request rather than resurrect zombie calls
         assert!(machine::is_request_valid(msgs));
         assert_eq!(machine::next_action(msgs), Some(machine::Action::CallModel));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 信号丢失窗口的回归钉：wait 与 wait 之间到达的信号必须在下一次
-    /// wait 立即可见。真实 SIGINT 靠 tokio watch 的同一语义——监听者
-    /// 整回合唯一、构造即订阅；若退化为每个 select 现建监听者，
-    /// 两个 select 之间的空窗会吞掉恰好到达的信号（pty 冒烟实测）。
+    /// Regression pin for the lost-signal window: a signal arriving between two
+    /// waits must be visible to the next wait immediately. The real SIGINT relies
+    /// on the same tokio watch semantics — one listener per turn, subscribed at
+    /// construction; if it degenerated into a listener created per select, the gap
+    /// between two selects would swallow a signal arriving exactly then (measured
+    /// in the pty smoke test).
     #[tokio::test]
     async fn signal_between_waits_is_not_lost() {
-        // 用同一 watch 语义的替身模拟真实监听者的状态机
+        // A double using the same watch semantics to mimic the real listener's
+        // state machine
         struct Gate(tokio::sync::watch::Receiver<bool>);
         impl Interrupt for Gate {
             fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
@@ -628,29 +684,32 @@ mod tests {
         let (tx, rx) = tokio::sync::watch::channel(false);
         let mut gate = Gate(rx);
 
-        // 第一次 wait：未触发，poll 一次后丢弃（对应 pump select 结束）
+        // first wait: not fired, polled once and dropped (matching the end of the
+        // pump select)
         let w = gate.wait();
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(1), w)
                 .await
                 .is_err(),
-            "未触发时不应就绪"
+            "it should not be ready before firing"
         );
 
-        // 信号在两个 select 之间到达
+        // the signal arrives between the two selects
         tx.send(true).unwrap();
 
-        // 下一次 wait 必须立即就绪——这就是被修掉的丢失窗口
+        // the next wait must be ready immediately — this is the lost window that
+        // was fixed
         let w = gate.wait();
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(1), w)
                 .await
                 .is_ok(),
-            "信号不得丢失"
+            "the signal must not be lost"
         );
     }
 
-    /// 审批门拒绝：DENIED_RESULT 闭合该调用，窗口合法，下一拍继续消化。
+    /// Approval denied: DENIED_RESULT closes that call, the window is valid, and
+    /// the next beat keeps going.
     #[tokio::test]
     async fn approval_denied_commits_denial_marker() {
         let server = MockServer::start().await;
@@ -662,7 +721,7 @@ mod tests {
         .concat();
         mount_chat(&server, turn1, Some(1)).await;
         let turn2 = [
-            sse(json!({"content":"已跳过该命令。"}), None, None),
+            sse(json!({"content":"Skipped that command."}), None, None),
             sse(json!({"content":""}), Some("stop"), None),
             "data: [DONE]\n\n".to_string(),
         ]
@@ -674,7 +733,7 @@ mod tests {
         let mut ui = Renderer::new();
         agent
             .turn_with(
-                "执行被禁止的命令",
+                "run the forbidden command",
                 &mut ui,
                 &mut Steps(Default::default()),
                 |_| std::future::ready(false),
@@ -685,23 +744,25 @@ mod tests {
         assert_eq!(
             msgs.len(),
             4,
-            "user / assistant / 拒绝标记 / 收尾 assistant"
+            "user / assistant / denial marker / closing assistant"
         );
         assert_eq!(msgs[2].content.as_deref(), Some(machine::DENIED_RESULT));
         assert!(machine::is_request_valid(msgs));
-        // 窗口已闭合且拒绝结果回传模型：收尾 assistant 证明模型消化了拒绝
+        // the window is closed and the denial went back to the model: the closing
+        // assistant proves the model digested the denial
         assert_eq!(msgs[3].role, Role::Assistant);
         assert!(
             msgs[3]
                 .content
                 .as_deref()
                 .unwrap_or_default()
-                .contains("跳过")
+                .contains("Skipped")
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 审批等待中 Ctrl-C：未应答调用以取消标记落盘（与拒绝标记区分）。
+    /// Ctrl-C during the approval wait: unanswered calls are persisted with the
+    /// cancellation marker (distinct from the denial marker).
     #[tokio::test]
     async fn cancel_during_approval_wait_commits_cancelled() {
         let server = MockServer::start().await;
@@ -716,14 +777,14 @@ mod tests {
         let mut agent = test_agent(&server, &dir);
         agent.confirm_tools = true;
         let mut ui = Renderer::new();
-        // 取消点队列：pump 处不触发；审批等待处立即触发
+        // cancellation point queue: no fire at pump; immediate fire at the approval wait
         let mut queue: std::collections::VecDeque<Pin<Box<dyn Future<Output = ()>>>> =
             Default::default();
         queue.push_back(Box::pin(std::future::pending::<()>()));
         queue.push_back(Box::pin(async {}));
         let mut interrupt = Steps(queue);
         agent
-            .turn_with("执行它", &mut ui, &mut interrupt, |_| {
+            .turn_with("run it", &mut ui, &mut interrupt, |_| {
                 std::future::pending()
             })
             .await
@@ -735,7 +796,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 步数上限：达到上限后不再执行新工具，剩余调用以上限标记闭合。
+    /// Step cap: once the cap is reached no new tool runs, and the remaining calls
+    /// are closed with the cap marker.
     #[tokio::test]
     async fn step_limit_aborts_with_deterministic_markers() {
         let server = MockServer::start().await;
@@ -760,7 +822,7 @@ mod tests {
         let mut ui = Renderer::new();
         agent
             .turn_with(
-                "跑三个命令",
+                "run three commands",
                 &mut ui,
                 &mut Steps(Default::default()),
                 |_| std::future::ready(true),
@@ -772,14 +834,14 @@ mod tests {
         assert_eq!(
             msgs[4].content.as_deref(),
             Some(machine::STEP_LIMIT_RESULT),
-            "第 3 个调用因超限收到标记而非执行"
+            "the third call gets the marker instead of executing because the cap is reached"
         );
         assert!(machine::is_request_valid(msgs));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 端到端：Write 工具分派 —— 模型调用 Write，文件真的被创建，且
-    /// 第二轮请求携带全部四个工具定义。
+    /// End to end: Write tool dispatch — the model calls Write, the file really is
+    /// created, and the second request carries all four tool definitions.
     #[tokio::test]
     async fn mock_write_tool_creates_file() {
         let server = MockServer::start().await;
@@ -794,7 +856,7 @@ mod tests {
         ]
         .concat();
         let turn2 = [
-            sse(json!({"content":"文件已创建。"}), None, None),
+            sse(json!({"content":"File created."}), None, None),
             sse(json!({"content":""}), Some("stop"), None),
             "data: [DONE]\n\n".to_string(),
         ]
@@ -805,7 +867,7 @@ mod tests {
         let dir = tmpdir();
         let mut agent = test_agent(&server, &dir);
         let mut ui = Renderer::new();
-        agent.turn("写个文件", &mut ui).await.unwrap();
+        agent.turn("write a file", &mut ui).await.unwrap();
 
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "written by mock");
         let tool_msg = &agent.session.messages[2];
@@ -824,7 +886,8 @@ mod tests {
         std::fs::remove_dir_all(&file_dir).unwrap();
     }
 
-    /// HTTP 错误必须带状态码和响应体，且不破坏已落盘的会话。
+    /// An HTTP error must carry the status code and the response body, and must
+    /// not damage the already-persisted session.
     #[tokio::test]
     async fn mock_http_error_includes_status_and_body() {
         let server = MockServer::start().await;
@@ -840,18 +903,21 @@ mod tests {
         let mut ui = Renderer::new();
         let err = agent.turn("hi", &mut ui).await.unwrap_err();
         let s = format!("{err:#}");
-        assert!(s.contains("400"), "错误信息应含状态码: {s}");
+        assert!(
+            s.contains("400"),
+            "the error should include the status code: {s}"
+        );
         assert!(
             s.contains("reasoning_content must be passed back"),
-            "错误信息应含响应体: {s}"
+            "the error should include the response body: {s}"
         );
-        // user 消息已落盘，assistant 未落盘
+        // the user message is persisted, the assistant one is not
         assert_eq!(agent.session.messages.len(), 1);
         assert_eq!(agent.session.messages[0].role, Role::User);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 坏 SSE chunk 报错并带上下文。
+    /// A broken SSE chunk errors out with context.
     #[tokio::test]
     async fn mock_broken_sse_chunk_fails_with_context() {
         let server = MockServer::start().await;
