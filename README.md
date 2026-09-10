@@ -6,8 +6,8 @@
 A minimal terminal coding agent in Rust, backed by an OpenAI-compatible
 `/chat/completions` API: DeepSeek by default, Z.AI's GLM coding endpoint via
 `--provider zai-coding-cn`. It streams the model's thinking (`reasoning_content`) in
-dim gray, then runs a tool loop over four tools: `Bash`, `Read`, `Edit`,
-and `Write`. Both backends see images, which are attached with `/image` or
+dim gray, then runs a tool loop over five tools: `Bash`, `Read`, `Edit`,
+`Write`, and `AskUserQuestion` (which asks you rather than the filesystem). Both backends see images, which are attached with `/image` or
 `--image` and travel inside the message itself. Sessions are append-only JSONL
 logs under `~/.caocli/sessions/`, resumable across runs and replayed
 byte-for-byte so the backend's prefix cache keeps hitting.
@@ -93,7 +93,7 @@ newlines also works (bracketed paste).
 | `-c, --cont` | Continue the most recent session |
 | `--resume <ID>` | Resume a specific session by id |
 | `--list` | List sessions and exit |
-| `--ask` | Approval gate: ask y/N before Bash/Edit/Write (Read always allowed). Denials are recorded as deterministic markers the model can see and adapt to. |
+| `--ask` | Approval gate: ask y/N before Bash/Edit/Write (Read always allowed, and a question reaches you either way). Denials are recorded as deterministic markers the model can see and adapt to. |
 | `--no-tui` | Keep the plain prompt instead of the full-screen front end |
 | `--no-status-bar` | Disable the plain prompt's status bar |
 | `-h, --help` / `-V, --version` | Print help / version |
@@ -161,6 +161,9 @@ zai-coding-cn/glm-5.3 · effort max · cache 95.3% · hit 846912 · miss 41538
   takes the mouse.
 - **Ctrl-C** stops a running turn; the model is told it was stopped. What was
   queued behind it runs next rather than being lost.
+- **A question is answered from the panel it puts up**, or by typing in the box;
+  see [Answering a question](#answering-a-question). While one is open the box
+  belongs to the answer, exactly as it does while the approval gate asks.
 
 `--no-tui` keeps the plain prompt instead (it is used anyway when stdout is not
 a terminal), which is the front end the status bar below belongs to.
@@ -276,7 +279,7 @@ There are no API key variables: a key is only ever what `/login` stored.
 
 ## Tools
 
-The model can call four tools. Tool results are always plain text: failures
+The model can call five tools. Tool results are always plain text: failures
 are returned to the model as text so it can recover, never as a hard error.
 
 | Tool | Behavior |
@@ -285,8 +288,26 @@ are returned to the model as text so it can recover, never as a hard error.
 | `Read` | Read a UTF-8 text file. Output truncated to 10 KiB. |
 | `Edit` | Replace `old_string` with `new_string`; `old_string` must match exactly once. Written atomically via tmp + rename. |
 | `Write` | Create or fully overwrite a file; parent directories are created automatically. |
+| `AskUserQuestion` | Ask you to choose: up to four questions, each with up to four options. The answer comes back as the call's result (`<id>: <chosen label>`), so the model continues with what you picked. |
 
 Limits: 10 KiB of output per tool result, 10 MB per file read/write.
+
+### Answering a question
+
+`AskUserQuestion` is the one call whose result is yours, and it is answered
+wherever the answer is typed:
+
+- **The screen front end** puts a panel over the transcript: `↑`/`↓` (or the
+  digits) move the cursor, `Space` toggles an option for a question that takes
+  several, `Enter` confirms and moves to the next question, and `Esc` dismisses
+  the whole call — which the model is told, so it can ask again or go on without
+  an answer. Typing in the box answers in your own words instead, which is the
+  only way to answer a question that offers no options.
+- **The plain prompt** (`--no-tui`, or when stdout is not a terminal) prints the
+  questions and reads one line per question: a number, an option's label, or a
+  comma-separated list of them for a question that takes several. An empty line
+  leaves that question blank, and an end of input leaves the call unanswered
+  rather than hanging.
 
 ## Design notes
 

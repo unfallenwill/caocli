@@ -522,6 +522,43 @@ def live(term: "Terminal", home: str) -> bool:
         return False
     ok &= gated
 
+    # The question tool: the panel and the keys that answer it exist only on a
+    # terminal, so this is the one place the answer path runs at all. The run is
+    # under `--ask`, which is also what shows that a question is never put to the
+    # gate: a gated call would be waiting for a y/N instead of drawing a panel.
+    #
+    # What is asked for is spelled out -- one question, its id, two labels --
+    # because the rows are the panel's but the answer is the model's, and what is
+    # being asserted is that the answer comes back as the call's result.
+    term.idle(2.0, 120)
+    term.send(
+        'Use the AskUserQuestion tool exactly once: one question with id "fruit", '
+        'the question "Which fruit?", and two options labelled "apple" and "pear". '
+        "Then say what I chose and nothing else.\r"
+    )
+    # The footer is what says the panel is up: a question the model headed or
+    # asked two of draws a heading line too, and the keys are there either way.
+    if term.expect("↑/↓ move", 180):
+        ok &= term.expect("❯ 1.", 30)  # the cursor opens on the first option
+        term.send("\x1b[B")  # the arrow key: the second option
+        ok &= term.expect("❯ 2.", 30)
+        term.send("\r")
+        if term.until(
+            lambda: any(
+                "fruit:" in line.lower() and "pear" in line.lower()
+                for line in term.screen.lines()
+            ),
+            180,
+        ):
+            print("  ✓ the question was answered from the panel")
+        else:
+            print("  ✗ the answer never reached the call's result")
+            ok = False
+    else:
+        print("  ✗ the question tool never put a panel up")
+        term.send("\x1b")  # leave nothing waiting for an answer
+        ok = False
+
     # Ctrl-C with a line queued behind the turn: the turn stops and the head of
     # the queue runs. The turn asked for is one that would take a while, and the
     # cancel key is sent right behind the line -- the model call is in flight, so

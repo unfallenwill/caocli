@@ -73,7 +73,7 @@ that talks to a network API and drives an interactive terminal.
   table — no dynamic registration, plugin systems, or other indirect layers; write it
   directly when you can. The traits a front end implements (`ui::contract`) are the only
   exception — they are not an abstraction layer but the machine's own vocabulary: what it
-  notifies with, and the two questions it asks. There is one implementation per front end
+  notifies with, and the three questions it asks. There is one implementation per front end
   and the front ends are mutually exclusive (the plain prompt when stdout is not a
   terminal, or `--no-tui`, or a terminal that will not take raw mode; the interactive one
   otherwise), so the machine never chooses between them.
@@ -131,8 +131,21 @@ that talks to a network API and drives an interactive terminal.
   also passed back to the model so it can correct itself.
 - **Approval gate**: execution is trusted by default; with `--ask`, Bash/Edit/Write
   require a user y/N before running (Read is always allowed). Denial, cancellation,
-  and the step cap all persist deterministic text markers that are passed back to the
-  model so it can adjust on its own; the command echo is unchanged.
+  an unanswered question, and the step cap all persist deterministic text markers that
+  are passed back to the model so it can adjust on its own; the command echo is
+  unchanged.
+- **A question is answered, not executed**: `AskUserQuestion` is the one tool whose
+  result is a person's. The interpreter reads its arguments, asks through the front
+  end's `Ask` channel (`ui::contract`) and writes what was chosen back as the call's
+  tool result — the same shape as the approval gate, with a value for a decision. It
+  never passes the gate (asking permission to ask is asking twice about one thing),
+  and its questions are the call's own arguments, so the transcript replays them
+  exactly as they were asked. Dismissing it is not a hard error: the marker text is
+  the result, and the turn carries on.
+- **A front end that cannot take an answer declines rather than blocking**: a question
+  asked where nobody is listening (an end of input, a front end that has gone away)
+  is answered `None`, which the interpreter writes down as the unanswered marker —
+  never a wait with no one to end it.
 - **Session logs are append-only and never rewritten**: a crash loses at most a
   trailing partial line, and corrupt lines are skipped when reading; interrupted tool
   calls are healed **deterministically** at load time (in-memory view only — the
@@ -155,15 +168,20 @@ that talks to a network API and drives an interactive terminal.
   nothing to draw on. Starting the session must survive that by falling back to the
   plain front end, and an attempt that fails halfway must undo what it did — including
   the alternate screen, which would otherwise hide everything the user had on it.
-- **While a turn runs a front end accepts exactly three things**: the cancel key,
-  the answer to an open approval question, and the next line. The third is a queue,
-  not a second turn: Enter takes the line out of the box and it runs when the turn
-  in flight ends — from the head, interrupted or not. Everything else is dropped.
-  The approval answer is the one that is easy to lose: a gate whose answer never
-  arrives is indistinguishable, from the user's side, from a model that has hung
-  — so while a gate is open the box is the answer's and nothing else is typed
-  into it, and a line being composed when the question arrives is held aside and
-  given back.
+- **While a turn runs a front end accepts exactly four things**: the cancel key,
+  the answer to an open approval question, the answer to an open question tool call,
+  and the next line. The last is a queue, not a second turn: Enter takes the line out
+  of the box and it runs when the turn in flight ends — from the head, interrupted or
+  not. Everything else is dropped.
+  The two answers are the ones that are easy to lose: a gate or a panel whose answer
+  never arrives is indistinguishable, from the user's side, from a model that has hung
+  — so while either is open the box is the answer's and nothing else is typed into it,
+  and a line being composed when one arrives is held aside and given back.
+  A question with options is answered with the arrow keys (or the digits, or space for
+  a question that takes several) and Enter; Esc dismisses the call, which is not the
+  same as answering it with the option the cursor happened to be on. The box stays the
+  place an answer is typed: a panel that could only answer with the options it was
+  given is a panel that cannot ask an open question.
 - **Anything that moves on its own must be derived from the clock, never from the
   number of redraws**, and that clock must be part of whatever decides whether to
   redraw at all. A front end that skips an unchanged screen otherwise freezes its own
