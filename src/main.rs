@@ -136,7 +136,7 @@ async fn run(cli: Cli) -> Result<()> {
         session.set_meta(session.meta.clone())?;
     }
 
-    let mut agent = Agent::new(api, session);
+    let mut agent = Agent::new(api, session, provider.max_tokens);
     agent.confirm_tools = cli.ask;
     ui.set_model(&agent.session.meta.model);
 

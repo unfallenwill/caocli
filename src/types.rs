@@ -106,6 +106,10 @@ impl Message {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatRequest {
     pub model: String,
+    /// Ceiling on a single answer, taken from the provider preset. Always sent:
+    /// the backends' own default is far below what these models can emit, and a
+    /// long `Write` cut off mid-file is a failure the model cannot see.
+    pub max_tokens: u32,
     pub messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDef>>,
@@ -347,6 +351,7 @@ mod tests {
     fn request_serializes_thinking_and_effort() {
         let req = ChatRequest {
             model: "deepseek-v4-flash".into(),
+            max_tokens: 384_000,
             messages: vec![Message::user("hi")],
             tools: None,
             tool_choice: None,

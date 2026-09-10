@@ -248,7 +248,7 @@ mod tests {
             },
         )
         .unwrap();
-        Agent::new(api, session)
+        Agent::new(api, session, crate::config::DEEPSEEK.max_tokens)
     }
 
     async fn submit(

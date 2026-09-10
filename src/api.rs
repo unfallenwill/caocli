@@ -226,6 +226,7 @@ mod tests {
     fn request_body_shape() {
         let req = ChatRequest {
             model: "deepseek-v4-flash".into(),
+            max_tokens: 384_000,
             messages: vec![Message::system("sys"), Message::user("hi")],
             tools: None,
             tool_choice: None,
@@ -235,6 +236,7 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::to_value(&req).unwrap();
         assert_eq!(v["model"], "deepseek-v4-flash");
+        assert_eq!(v["max_tokens"], 384_000);
         assert_eq!(v["stream"], true);
         assert_eq!(v["thinking"]["type"], "enabled");
         assert_eq!(v["reasoning_effort"], "max");

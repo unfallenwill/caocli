@@ -138,13 +138,19 @@ restored on exit.
 It is a per-run choice and is not stored in the session, so resume a GLM
 session with `--provider glm` again (e.g. `caocli -c --provider glm`).
 
-| Provider | Endpoint | Default model |
-|---|---|---|
-| `deepseek` | `api.deepseek.com` | `deepseek-flash` |
-| `glm` | `open.bigmodel.cn` (coding) | `GLM-5.3-Flash` |
+| Provider | Endpoint | Default model | Max answer |
+|---|---|---|---|
+| `deepseek` | `api.deepseek.com` | `deepseek-flash` | 384k tokens |
+| `glm` | `open.bigmodel.cn` (coding) | `GLM-5.3-Flash` | 128k tokens |
 
 Both speak the same `thinking` / `reasoning_content` protocol, so the request
 builder and stream parser are shared. Thinking is always on.
+
+Both models take 1M tokens of context, so nothing here trims history. The
+"max answer" column is `max_tokens`, which is sent on every request: it bounds
+a *single* completion, not the conversation, and the backends' own default is
+far below what these models emit — a long `Write` would otherwise be cut off
+mid-file, which the model cannot see and the next `Edit` cannot repair.
 
 ### Environment
 
@@ -208,6 +214,11 @@ Limits: 10 KiB of output per tool result, 10 MB per file read/write.
   validity spec itself is executable (`machine::is_request_valid`), and
   bounded-exhaustive checks pin that every prefix of a valid history heals
   back to a valid one.
+- **One answer is capped, the conversation is not.** `max_tokens` comes from the
+  provider preset and is sent on every request; a short answer is unaffected
+  (it is a ceiling, not a reservation). History is never trimmed: both backends
+  take 1M tokens of context, and the prefix cache depends on replaying it
+  byte-for-byte.
 - **Prefix-cache friendly.** `SYSTEM_PROMPT` is a compile-time constant and
   history is replayed byte-for-byte — no trimming, reordering, or
   compaction. Injecting volatile data (time, cwd) or changing the tool set

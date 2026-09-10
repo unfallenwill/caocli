@@ -12,6 +12,16 @@ pub struct Provider {
     pub url: &'static str,
     /// Default model when `--model` is not given.
     pub default_model: &'static str,
+    /// Largest answer the backend will produce, sent as `max_tokens`. Omitting
+    /// it leaves the backend's own default cap in force, which is far below what
+    /// these models can emit — a long `Write` would be cut off mid-file and the
+    /// next `Edit` would then fail to match. The cap is a ceiling, not a
+    /// reservation: a short answer costs nothing extra.
+    ///
+    /// This bounds a single completion, not the conversation: both backends take
+    /// 1M tokens of context and history is replayed whole (never trimmed), so
+    /// there is nothing else here for a context window to do.
+    pub max_tokens: u32,
     /// API key environment variables, first non-empty one wins, in order.
     pub key_envs: &'static [&'static str],
 }
@@ -20,6 +30,7 @@ pub const DEEPSEEK: Provider = Provider {
     id: "deepseek",
     url: "https://api.deepseek.com/chat/completions",
     default_model: "deepseek-flash",
+    max_tokens: 384_000,
     key_envs: &["DEEPSEEK_API_KEY"],
 };
 
@@ -30,6 +41,7 @@ pub const GLM: Provider = Provider {
     id: "glm",
     url: "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
     default_model: "GLM-5.3-Flash",
+    max_tokens: 128_000,
     key_envs: &["ZAI_API_KEY", "GLM_API_KEY"],
 };
 
@@ -152,6 +164,10 @@ mod tests {
         assert_eq!(DEFAULT_PROVIDER, "deepseek");
         assert_eq!(DEEPSEEK.default_model, "deepseek-flash");
         assert_eq!(GLM.default_model, "GLM-5.3-Flash");
+        // The two backends cap a single answer differently; both are ceilings
+        // well above the defaults they replace.
+        assert_eq!(DEEPSEEK.max_tokens, 384_000);
+        assert_eq!(GLM.max_tokens, 128_000);
         assert!(GLM.url.contains("open.bigmodel.cn"));
     }
 

@@ -19,6 +19,9 @@ pub const SYSTEM_PROMPT: &str = "You are caocli, a terminal coding agent. Prefer
 pub struct Agent {
     api: Client,
     pub session: Session,
+    /// Ceiling on one answer, in tokens: the provider preset's value, sent as
+    /// `max_tokens` on every request.
+    max_tokens: u32,
     /// Approval gate: when on, Bash/Edit/Write ask the user before running
     /// (Read is always allowed).
     pub confirm_tools: bool,
@@ -104,10 +107,11 @@ impl Approve for StdinApproval {
 }
 
 impl Agent {
-    pub fn new(api: Client, session: Session) -> Self {
+    pub fn new(api: Client, session: Session, max_tokens: u32) -> Self {
         Self {
             api,
             session,
+            max_tokens,
             confirm_tools: false,
             max_tool_steps: machine::MAX_TOOL_STEPS,
             tool_steps: 0,
@@ -137,6 +141,7 @@ impl Agent {
         );
         ChatRequest {
             model: self.session.meta.model.clone(),
+            max_tokens: self.max_tokens,
             messages,
             tools: Some(tools::definitions()),
             tool_choice: Some("auto".into()),
@@ -432,7 +437,7 @@ mod tests {
         )
         .unwrap();
         let session = Session::create(dir, test_meta()).unwrap();
-        Agent::new(api, session)
+        Agent::new(api, session, crate::config::DEEPSEEK.max_tokens)
     }
 
     #[test]
@@ -451,6 +456,7 @@ mod tests {
         let agent = Agent::new(
             Client::new("k".into(), crate::config::DEEPSEEK.url.into()).unwrap(),
             s,
+            crate::config::DEEPSEEK.max_tokens,
         );
         let req = agent.build_request();
         assert_eq!(req.messages.len(), 2);
@@ -473,6 +479,7 @@ mod tests {
         let agent = Agent::new(
             Client::new("k".into(), crate::config::DEEPSEEK.url.into()).unwrap(),
             s,
+            crate::config::DEEPSEEK.max_tokens,
         );
         let req = agent.build_request();
         assert_eq!(req.reasoning_effort.as_deref(), Some("max"));
@@ -570,6 +577,7 @@ mod tests {
         assert_eq!(msgs[3]["tool_call_id"], "call_mock_1");
         // request parameter shape
         assert_eq!(body["model"], "deepseek-v4-flash");
+        assert_eq!(body["max_tokens"], 384_000);
         assert_eq!(body["stream"], true);
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["reasoning_effort"], "high");
