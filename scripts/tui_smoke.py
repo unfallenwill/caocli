@@ -88,7 +88,7 @@ def seed_session(home: str) -> str:
                 "t": "header",
                 "id": SEED,
                 "created_at": 1_789_000_000,
-                "model": "deepseek-v4.1-flash-expires-on-0910",
+                "model": "deepseek-flash",
                 "reasoning_effort": "max",
             }
         ),

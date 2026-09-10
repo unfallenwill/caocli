@@ -19,7 +19,7 @@ pub struct Provider {
 pub const DEEPSEEK: Provider = Provider {
     id: "deepseek",
     url: "https://api.deepseek.com/chat/completions",
-    default_model: "deepseek-v4.1-flash-expires-on-0910",
+    default_model: "deepseek-flash",
     key_envs: &["DEEPSEEK_API_KEY"],
 };
 
@@ -150,6 +150,7 @@ mod tests {
         assert_eq!(provider("glm").unwrap(), GLM);
         assert!(provider("nope").unwrap_err().to_string().contains("glm"));
         assert_eq!(DEFAULT_PROVIDER, "deepseek");
+        assert_eq!(DEEPSEEK.default_model, "deepseek-flash");
         assert_eq!(GLM.default_model, "GLM-5.3-Flash");
         assert!(GLM.url.contains("open.bigmodel.cn"));
     }

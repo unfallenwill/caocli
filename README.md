@@ -119,7 +119,7 @@ In the plain REPL (`--no-tui`), a status bar pinned to the bottom line shows the
 and the session's cumulative cache hit rate, right-aligned:
 
 ```
-deepseek-v4.1-flash-expires-on-0910 · cache 98.6% · hit 32384 · miss 461
+deepseek-flash · cache 98.6% · hit 32384 · miss 461
 ```
 
 The model segment mirrors the active session's meta and is refreshed on
@@ -140,7 +140,7 @@ session with `--provider glm` again (e.g. `caocli -c --provider glm`).
 
 | Provider | Endpoint | Default model |
 |---|---|---|
-| `deepseek` | `api.deepseek.com` | `deepseek-v4.1-flash-expires-on-0910` |
+| `deepseek` | `api.deepseek.com` | `deepseek-flash` |
 | `glm` | `open.bigmodel.cn` (coding) | `GLM-5.3-Flash` |
 
 Both speak the same `thinking` / `reasoning_content` protocol, so the request
@@ -231,7 +231,7 @@ Sessions live in `~/.caocli/sessions/<YYYYMMDD-HHMMSS>.jsonl`. Each line is
 one JSON object tagged by `t`; `meta` lines override earlier ones on load.
 
 ```jsonl
-{"t":"header","id":"20250101-120000","created_at":1735704000,"model":"deepseek-v4.1-flash-expires-on-0910","reasoning_effort":"high"}
+{"t":"header","id":"20250101-120000","created_at":1735704000,"model":"deepseek-flash","reasoning_effort":"high"}
 {"t":"msg","message":{"role":"user","content":"check disk usage"}}
 {"t":"meta","model":"deepseek-v4-pro","reasoning_effort":"max"}
 ```
