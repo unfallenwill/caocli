@@ -17,7 +17,7 @@
 //! loop. Nothing on the machine's side ever touches the terminal.
 
 use std::future::Future;
-use std::io;
+use std::io::{self, Stdout};
 use std::path::Path;
 use std::pin::Pin;
 use std::time::Duration;
@@ -39,13 +39,14 @@ mod layout;
 mod notice;
 mod screen;
 
+use ratatui::backend::CrosstermBackend;
 use screen::Screen;
 mod paint;
 mod picker;
 mod state;
 
 use input::Submitted;
-use notice::{Notifier, drain};
+use notice::{Notice, Notifier, drain};
 use picker::{Choosing, choice_rows};
 
 // ------------------------------------------------------------- activity ---
@@ -148,121 +149,43 @@ pub async fn run(
     screen.state.show(Cell::Notice(banner.to_owned()));
     screen.state.transcript.extend(cell::from_messages(history));
 
-    let (tx, mut notices) = mpsc::unbounded_channel();
-    let (ask_tx, mut asked) = mpsc::unbounded_channel();
+    let (tx, notices) = mpsc::unbounded_channel();
+    let (ask_tx, asked) = mpsc::unbounded_channel();
     let mut handle = Notifier { tx };
+    let mut channels = Channels {
+        notices,
+        asked,
+        ask_tx,
+    };
 
     let result: anyhow::Result<()> = 'session: loop {
         // Idle: draw, then wait for something to submit.
-        if let Err(e) = screen.draw_if_changed() {
-            break 'session Err(e.into());
-        }
-        let mut line = loop {
-            for notice in drain(&mut notices) {
-                screen.state.apply(notice);
-            }
-            screen.draw_if_changed()?;
-            match poll_key(TICK)? {
-                Some(event) => match screen.state.key(event) {
-                    Submitted::Line => break screen.state.take_line(),
-                    Submitted::Exit => break String::new(),
-                    Submitted::Nothing => {}
-                },
-                None => continue,
-            }
+        let line = match idle_line(&mut screen, &mut channels)? {
+            Some(line) => line,
+            None => break 'session Ok(()),
         };
         // Everything from here runs without returning to the keyboard in between,
         // and the next line is the head of the queue: what was asked for while the
         // last one ran is what comes after it. That is the whole point of the
         // queue -- an interruption ends the turn, not the sequence.
+        let mut line = line;
         loop {
             if line.is_empty() {
                 break 'session Ok(());
             }
             screen.state.submit(&line);
-            // `/resume` with nothing to resume is a request for the list rather
-            // than a command to run: the plain front end can only say so, and this
-            // one can offer it. The chosen row is submitted as `/resume <id>`,
-            // which is the line the plain prompt would have been given, so the
-            // switching itself is unchanged. An empty directory falls through to
-            // that same reply.
-            // The choice is typed, so the queue waits behind it: a picker answered
-            // by a line that is still in the queue would answer itself.
-            if line.trim() == "/resume" && screen.state.open_sessions(&session::list(sdir)?) {
-                break;
-            }
-            // The other two menus work the same way: the command still needs an
-            // argument, and the front end that can offer the possibilities does.
-            if line.trim() == "/login"
-                && screen
-                    .state
-                    .open_choices(Choosing::Provider, choice_rows(config::provider_choices()))
+            // A menu stands between the line and the turn: the command still
+            // needs an argument, and the front end that can offer the
+            // possibilities does. The choice is typed, so the queue waits behind
+            // it -- a picker answered by a line that is still in the queue would
+            // answer itself.
+            if let Some(menu) = menu_for(&line)
+                && offer_menu(&mut screen, menu, agent, sdir)?
             {
                 break;
             }
-            if line.trim() == "/model"
-                && screen.state.open_choices(
-                    Choosing::Model,
-                    choice_rows(config::model_menu(&agent.model_label())),
-                )
-            {
-                break;
-            }
-
-            // A turn: it races against the keyboard, so Ctrl-C can reach it.
-            // The block is what bounds the borrow of `line`: it ends with the
-            // turn, and the queue then hands the same variable the next line.
-            let outcome = {
-                let (cancel_tx, cancel_rx) = watch::channel(false);
-                let mut interrupt = CtrlC(cancel_rx);
-                let mut approve = Ask { tx: ask_tx.clone() };
-                let turn = repl::handle(
-                    agent,
-                    &mut handle,
-                    sdir,
-                    &line,
-                    &mut interrupt,
-                    &mut approve,
-                );
-                tokio::pin!(turn);
-                screen.state.begin_turn();
-                let outcome = loop {
-                    // Keys are read here, never on another thread: see `poll_key`.
-                    if let Some(event) = poll_key(TICK)? {
-                        screen.state.key_while_working(event, &cancel_tx);
-                    }
-                    for notice in drain(&mut notices) {
-                        screen.state.apply(notice);
-                    }
-                    for reply in drain(&mut asked) {
-                        screen.state.open_question(reply);
-                    }
-                    screen.state.tick_activity();
-                    screen.draw_if_changed()?;
-                    tokio::select! {
-                        outcome = &mut turn => break outcome,
-                        // Nothing else to wait on: the tick above paces the loop,
-                        // and this branch only gives the turn a real waker so that
-                        // it is driven by readiness rather than by the tick.
-                        _ = tokio::time::sleep(TICK) => {}
-                    }
-                };
-                // Drain once more before closing the turn. The turn is polled
-                // *inside* the select above, so its last notifications are sent
-                // after the loop's last drain and are still queued when it
-                // resolves; closing the block without them would leave the tail of
-                // the turn to open one of its own.
-                for notice in drain(&mut notices) {
-                    screen.state.apply(notice);
-                }
-                for reply in drain(&mut asked) {
-                    screen.state.open_question(reply);
-                }
-                outcome
-            };
-            screen.state.end_turn();
-            screen.state.close_question();
-            screen.commit();
+            let outcome =
+                run_turn(agent, &mut handle, &mut screen, &mut channels, sdir, &line).await?;
             match outcome {
                 Ok(repl::Outcome::Exit) => break 'session Ok(()),
                 Ok(repl::Outcome::Continue) => {}
@@ -291,6 +214,147 @@ pub async fn run(
     }
     result?;
     Ok(true)
+}
+
+/// The menus the front end can offer where the plain front end can only print.
+///
+/// `/resume` with nothing to resume is a request for the list rather than a
+/// command to run; `/login` and `/model` are commands whose argument is a row
+/// of a menu. The chosen row is submitted as the very line the plain prompt
+/// would have been given, so the switching itself is unchanged.
+#[derive(Debug, Clone, Copy)]
+enum Menu {
+    /// The sessions there are to switch to.
+    Sessions,
+    /// The providers a key can be stored for.
+    Login,
+    /// The models the session can switch to.
+    Model,
+}
+
+/// The command a line names whose answer is a menu rather than a turn.
+fn menu_for(line: &str) -> Option<Menu> {
+    match line.trim() {
+        "/resume" => Some(Menu::Sessions),
+        "/login" => Some(Menu::Login),
+        "/model" => Some(Menu::Model),
+        _ => None,
+    }
+}
+
+/// Open the menu a command asked for. `Ok(true)` says the menu is up and the
+/// answer comes from the keyboard; `Ok(false)` says there was nothing to offer
+/// -- an empty session directory -- and the line runs as it would have.
+fn offer_menu(
+    screen: &mut Screen<CrosstermBackend<Stdout>>,
+    menu: Menu,
+    agent: &Agent,
+    sdir: &Path,
+) -> anyhow::Result<bool> {
+    match menu {
+        Menu::Sessions => Ok(screen.state.open_sessions(&session::list(sdir)?)),
+        Menu::Login => Ok(screen
+            .state
+            .open_choices(Choosing::Provider, choice_rows(config::provider_choices()))),
+        Menu::Model => Ok(screen.state.open_choices(
+            Choosing::Model,
+            choice_rows(config::model_menu(&agent.model_label())),
+        )),
+    }
+}
+
+/// The channels the event loop reads and answers while it runs.
+///
+/// The machine's notifications arrive on one, the approval questions on
+/// another, and the sender of the second is what the machine holds.
+struct Channels {
+    notices: mpsc::UnboundedReceiver<Notice>,
+    asked: mpsc::UnboundedReceiver<oneshot::Sender<bool>>,
+    ask_tx: mpsc::UnboundedSender<oneshot::Sender<bool>>,
+}
+
+/// Draw and wait at the prompt until the user submits a line. `None` says they
+/// asked to leave.
+fn idle_line(
+    screen: &mut Screen<CrosstermBackend<Stdout>>,
+    channels: &mut Channels,
+) -> anyhow::Result<Option<String>> {
+    if let Err(e) = screen.draw_if_changed() {
+        return Err(e.into());
+    }
+    loop {
+        for notice in drain(&mut channels.notices) {
+            screen.state.apply(notice);
+        }
+        screen.draw_if_changed()?;
+        match poll_key(TICK)? {
+            Some(event) => match screen.state.key(event) {
+                Submitted::Line => return Ok(Some(screen.state.take_line())),
+                Submitted::Exit => return Ok(None),
+                Submitted::Nothing => {}
+            },
+            None => continue,
+        }
+    }
+}
+
+/// Run one line through the machine while the keyboard keeps working: Ctrl-C
+/// can reach it, a next line can be queued behind it, and an approval question
+/// is answered from the box.
+///
+/// The outer result is the session's -- a screen or a keyboard that has gone
+/// away; the inner one is the turn's, which the session survives. The turn is
+/// polled *inside* the select below, so its last notifications are sent after
+/// the loop's last drain and are still queued when it resolves; returning
+/// without draining again would leave the tail of the turn to open one of its
+/// own.
+async fn run_turn(
+    agent: &mut Agent,
+    handle: &mut Notifier,
+    screen: &mut Screen<CrosstermBackend<Stdout>>,
+    channels: &mut Channels,
+    sdir: &Path,
+    line: &str,
+) -> anyhow::Result<anyhow::Result<repl::Outcome>> {
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let mut interrupt = CtrlC(cancel_rx);
+    let mut approve = Ask {
+        tx: channels.ask_tx.clone(),
+    };
+    let turn = repl::handle(agent, handle, sdir, line, &mut interrupt, &mut approve);
+    tokio::pin!(turn);
+    screen.state.begin_turn();
+    let outcome = loop {
+        // Keys are read here, never on another thread: see `poll_key`.
+        if let Some(event) = poll_key(TICK)? {
+            screen.state.key_while_working(event, &cancel_tx);
+        }
+        for notice in drain(&mut channels.notices) {
+            screen.state.apply(notice);
+        }
+        for reply in drain(&mut channels.asked) {
+            screen.state.open_question(reply);
+        }
+        screen.state.tick_activity();
+        screen.draw_if_changed()?;
+        tokio::select! {
+            outcome = &mut turn => break outcome,
+            // Nothing else to wait on: the tick above paces the loop, and this
+            // branch only gives the turn a real waker so that it is driven by
+            // readiness rather than by the tick.
+            _ = tokio::time::sleep(TICK) => {}
+        }
+    };
+    for notice in drain(&mut channels.notices) {
+        screen.state.apply(notice);
+    }
+    for reply in drain(&mut channels.asked) {
+        screen.state.open_question(reply);
+    }
+    screen.state.end_turn();
+    screen.state.close_question();
+    screen.commit();
+    Ok(outcome)
 }
 
 #[cfg(test)]
