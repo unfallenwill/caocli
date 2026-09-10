@@ -37,6 +37,9 @@ pub struct Agent {
     pub approval: Approval,
     /// Per-turn tool step cap (product-level termination guarantee).
     pub max_tool_steps: usize,
+    /// Steps taken by the turn in flight. Counted per turn, not per process: a
+    /// long session may spend this much again on its next question, and only a
+    /// turn that cannot finish inside one budget is stopped.
     tool_steps: usize,
 }
 
@@ -141,9 +144,9 @@ impl Agent {
     /// kept).
     /// When it fires, the current effect is dropped — the stream disconnects and
     /// the Bash child process is killed by kill_on_drop; the calls that were
-    /// declared but not answered are persisted with a cancellation marker to close the
-    /// window, the history stays is_request_valid, and the next turn continues
-    /// from a valid prefix.
+    /// declared but not answered are persisted with a cancellation marker to
+    /// close the window, the history stays is_request_valid, and the next turn
+    /// continues from a valid prefix.
     /// Cancellation is handled in the interpreter layer and never enters
     /// `next_action` (it is out-of-band and every state is reachable).
     ///
@@ -159,6 +162,7 @@ impl Agent {
         approve: &mut dyn Approve,
     ) -> Result<()> {
         self.session.append_message(&Message::user(input))?;
+        self.tool_steps = 0;
         let mut cancelled = false;
         // Interpreter loop: each beat asks the machine for a decision (an Action
         // folded out of the log) and writes the result back into the log, until
@@ -756,6 +760,75 @@ mod tests {
                 .is_ok(),
             "the signal must not be lost"
         );
+    }
+
+    /// The step budget is the turn's, not the process's: a session that has spent
+    /// it once may spend it again on the next question. A cumulative counter would
+    /// stop the second turn before its first call.
+    #[tokio::test]
+    async fn the_step_budget_is_spent_again_by_the_next_turn() {
+        let server = MockServer::start().await;
+        let call = |word: &str| {
+            json!({"tool_calls": [{"index": 0, "id": format!("call_{word}"), "type": "function",
+                   "function": {"name": "Bash", "arguments": format!("{{\"command\":\"echo {word}\"}}")}}]})
+        };
+        let tool_turn = |word: &str| {
+            [
+                sse(call(word), None, None),
+                sse(json!({"content": ""}), Some("tool_calls"), None),
+                "data: [DONE]\n\n".to_string(),
+            ]
+            .concat()
+        };
+        let answer = |text: &str| {
+            [
+                sse(json!({"content": text}), None, None),
+                sse(json!({"content": ""}), Some("stop"), None),
+                "data: [DONE]\n\n".to_string(),
+            ]
+            .concat()
+        };
+        // Each turn costs two sub-requests: the call, then the answer.
+        mount_chat(&server, tool_turn("budget-one"), Some(1)).await;
+        mount_chat(&server, answer("first done"), Some(1)).await;
+        mount_chat(&server, tool_turn("budget-two"), Some(1)).await;
+        mount_chat(&server, answer("second done"), None).await;
+
+        let dir = tmpdir();
+        let mut agent = test_agent(&server, &dir);
+        agent.max_tool_steps = 1;
+        let mut ui = Renderer::new();
+        for question in ["run one command", "run another"] {
+            agent
+                .turn(
+                    question,
+                    &mut ui,
+                    &mut Silent,
+                    &mut Answer(Verdict::Allowed),
+                )
+                .await
+                .unwrap();
+        }
+
+        let msgs = &agent.session.messages;
+        let results: Vec<&str> = msgs
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+        assert_eq!(results.len(), 2, "each turn ran exactly one call");
+        assert!(
+            results.iter().all(|r| !r.contains("step limit")),
+            "the second turn must get a budget of its own: {results:?}"
+        );
+        assert!(results[0].contains("budget-one") && results[1].contains("budget-two"));
+        assert_eq!(
+            msgs.last().and_then(|m| m.content.as_deref()),
+            Some("second done"),
+            "the second turn ran to the model's answer"
+        );
+        assert!(machine::is_request_valid(msgs));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Approval denied: the denial marker closes that call, the window is valid, and
