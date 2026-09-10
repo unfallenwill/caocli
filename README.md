@@ -6,8 +6,9 @@
 A minimal terminal coding agent in Rust, backed by an OpenAI-compatible
 `/chat/completions` API: DeepSeek by default, Z.AI's GLM coding endpoint via
 `--provider zai-coding-cn`. It streams the model's thinking (`reasoning_content`) in
-dim gray, then runs a tool loop over five tools: `Bash`, `Read`, `Edit`,
-`Write`, and `AskUserQuestion` (which asks you rather than the filesystem). Both backends see images, which are attached with `/image` or
+dim gray, then runs a tool loop over six tools: `Bash`, `Read`, `Edit`,
+`Write`, `AskUserQuestion` (which asks you rather than the filesystem) and
+`TodoWrite` (which writes the plan where you can see it while it works). Both backends see images, which are attached with `/image` or
 `--image` and travel inside the message itself. Sessions are append-only JSONL
 logs under `~/.caocli/sessions/`, resumable across runs and replayed
 byte-for-byte so the backend's prefix cache keeps hitting.
@@ -93,7 +94,7 @@ newlines also works (bracketed paste).
 | `-c, --cont` | Continue the most recent session |
 | `--resume <ID>` | Resume a specific session by id |
 | `--list` | List sessions and exit |
-| `--ask` | Approval gate: ask y/N before Bash/Edit/Write (Read always allowed, and a question reaches you either way). Denials are recorded as deterministic markers the model can see and adapt to. |
+| `--ask` | Approval gate: ask y/N before Bash/Edit/Write (Read always allowed, as is `TodoWrite`, which changes nothing; a question reaches you either way). Denials are recorded as deterministic markers the model can see and adapt to. |
 | `--no-tui` | Keep the plain prompt instead of the full-screen front end |
 | `--no-status-bar` | Disable the plain prompt's status bar |
 | `-h, --help` / `-V, --version` | Print help / version |
@@ -107,7 +108,8 @@ result summaries as they were rendered live (full tool output is not replayed).
 ### The screen front end
 
 By default caocli takes the whole screen. The transcript fills it, and the last
-rows are the pinned region: the input box, and under it the status line.
+rows are the pinned region: the standing task list when there is one, the queue,
+the input box, and under it the status line.
 The box is as tall as what is in it — `Ctrl-J` adds a line and room for it — and
 the transcript takes those rows back when the line is submitted. It is ruled off
 above and below rather than boxed in, so a line of the session and a line being
@@ -119,6 +121,11 @@ ok: package.name = caocli (312 bytes)
 
 › run the tests and fix what fails
 › and bump the version
+
+· todos · 1/3 done
+✔ Read the failing test
+▸ Fix the parser
+☐ Bump the version
 ─────────────────────────────────────────⠸ 12s · ~38 token/s
 ›  the turn is running · Enter queues · Ctrl-C stops
 ──────────────────────────────────────────────────────────────────────────
@@ -164,6 +171,9 @@ zai-coding-cn/glm-5.3 · effort max · cache 95.3% · hit 846912 · miss 41538
 - **A question is answered from the panel it puts up**, or by typing in the box;
   see [Answering a question](#answering-a-question). While one is open the box
   belongs to the answer, exactly as it does while the approval gate asks.
+- **The task list stands above the box** for as long as the model keeps one, so a
+  long piece of work can be watched without scrolling: what it planned, and which
+  part it is on. See [The task list](#the-task-list).
 
 `--no-tui` keeps the plain prompt instead (it is used anyway when stdout is not
 a terminal), which is the front end the status bar below belongs to.
@@ -279,7 +289,7 @@ There are no API key variables: a key is only ever what `/login` stored.
 
 ## Tools
 
-The model can call five tools. Tool results are always plain text: failures
+The model can call six tools. Tool results are always plain text: failures
 are returned to the model as text so it can recover, never as a hard error.
 
 | Tool | Behavior |
@@ -289,8 +299,27 @@ are returned to the model as text so it can recover, never as a hard error.
 | `Edit` | Replace `old_string` with `new_string`; `old_string` must match exactly once. Written atomically via tmp + rename. |
 | `Write` | Create or fully overwrite a file; parent directories are created automatically. |
 | `AskUserQuestion` | Ask you to choose: up to four questions, each with up to four options. The answer comes back as the call's result (`<id>: <chosen label>`), so the model continues with what you picked. |
+| `TodoWrite` | Record the plan as a list of tasks, up to 20. The whole list is sent every call and replaces the one before it, so each call is the state of the work rather than a change to it. |
 
 Limits: 10 KiB of output per tool result, 10 MB per file read/write.
+
+### The task list
+
+`TodoWrite` changes nothing on disk and needs nobody to answer it — writing the
+list down *is* the result — so it never passes the approval gate.
+
+The list is a fold of the session log rather than state of its own: what is
+standing at any moment is the arguments of the last call, which is why a resumed
+session shows exactly the list the live one did. It is drawn in two places, out
+of those same arguments:
+
+- **In the transcript**, as the call's own cell: a head line saying how far the
+  list has got, then one line per task — `☐` not started, `▸` in hand, `✔` done.
+- **Above the input box**, in the screen front end, for as long as the list
+  stands: the transcript gives up the rows, and the box gives up rows to it when
+  the screen is short. A list too long for the block follows the task in hand and
+  counts what it left out at each end, so the one row you are waiting on is never
+  the one that was cut. Sending an empty list clears it, and the block goes.
 
 ### Answering a question
 
@@ -338,7 +367,9 @@ wherever the answer is typed:
   written: lines typed while a turn runs are queued and the head runs when
   the turn ends, interrupted or not.
 - **Approval gate and step cap.** With `--ask`, Bash/Edit/Write wait for an
-  explicit y/N (Read never blocks); a denial is committed as a tool result
+  explicit y/N (Read never blocks, and neither does `TodoWrite`: a question in
+  front of a call that cannot go wrong is a question that teaches you to answer
+  without reading); a denial is committed as a tool result
   the model reads and adapts to. Every turn is also capped at
   `machine::MAX_TOOL_STEPS` (500) tool-call steps so a looping model cannot
   burn tokens forever — the cap closes the turn with deterministic markers.

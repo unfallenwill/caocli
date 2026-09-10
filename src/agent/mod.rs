@@ -24,8 +24,8 @@ pub struct Agent {
     /// answer ceiling all come from it, and the model is named by it: the
     /// status line reads `<provider>/<modelid>` from here.
     provider: provider::Provider,
-    /// Whether the approval gate is on: with it, Bash/Edit/Write ask the user
-    /// before running (Read is always allowed).
+    /// Whether the approval gate is on: with it, the calls that change something
+    /// on disk ask the user before running, and the ones that do not never do.
     pub approval: Approval,
     /// Per-turn tool step cap (product-level termination guarantee). The turn in
     /// flight counts against it (`turn::Turn`), and the next turn gets it whole.

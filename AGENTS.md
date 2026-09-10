@@ -112,6 +112,15 @@ that talks to a network API and drives an interactive terminal.
   a placeholder string instead. The box's rules are drawn by the front end for the same
   reason: a block on the editor would be inset with it and the rules would stop short of
   the edges the transcript is read against.
+- **Anything pinned to the bottom is paid for out of the transcript, and the box is the
+  last to shrink.** A pinned region (the standing task list, the queue, the status line)
+  takes rows the transcript does not get, and a box that is short by a row can still be
+  typed in where a transcript with no rows left is a session you cannot read. A pinned
+  region is measured off the lines it actually laid out, not off its item count: a task
+  is as many rows as its words take, and a block whose height was guessed from the
+  number of items is a block that either leaves a row blank or is silently clipped.
+  What a cut list leaves out is counted, and the row a reader is waiting on — for a task
+  list, the task in hand — is the one row that cannot be the one that gives way.
 - **Ctrl-C during a turn is an out-of-band Command (graceful cancel), not a process
   kill**: the current effect is dropped (stream disconnected, child process
   `kill_on_drop`), unanswered calls are persisted with a deterministic cancellation
@@ -130,10 +139,12 @@ that talks to a network API and drives an interactive terminal.
 - **Tool results are always text and are never raised as hard errors**: failures are
   also passed back to the model so it can correct itself.
 - **Approval gate**: execution is trusted by default; with `--ask`, Bash/Edit/Write
-  require a user y/N before running (Read is always allowed). Denial, cancellation,
+  require a user y/N before running (a call that changes nothing on disk is always
+  allowed: reading, and writing the todo list). Denial, cancellation,
   an unanswered question, and the step cap all persist deterministic text markers that
   are passed back to the model so it can adjust on its own; the command echo is
-  unchanged.
+  unchanged. The set of calls that are asked about is a blacklist, so a tool added
+  later is asked about until somebody decides otherwise.
 - **A question is answered, not executed**: `AskUserQuestion` is the one tool whose
   result is a person's. The interpreter reads its arguments, asks through the front
   end's `Ask` channel (`ui::contract`) and writes what was chosen back as the call's
@@ -146,6 +157,13 @@ that talks to a network API and drives an interactive terminal.
   asked where nobody is listening (an end of input, a front end that has gone away)
   is answered `None`, which the interpreter writes down as the unanswered marker —
   never a wait with no one to end it.
+- **The todo list is a fold of the log, not state**: the tool writes the whole list
+  every call, so what is standing is the arguments of the last such call and nothing
+  has to be kept in step — a resumed session pins exactly the list the watched one
+  did. It is executed like any other tool (nothing about its answer needs a person),
+  it never passes the gate (asking permission to write down a note is asking about
+  nothing), and both surfaces that show it go through the same marks and the same
+  summary line, so they cannot say different things about one list.
 - **Session logs are append-only and never rewritten**: a crash loses at most a
   trailing partial line, and corrupt lines are skipped when reading; interrupted tool
   calls are healed **deterministically** at load time (in-memory view only — the
