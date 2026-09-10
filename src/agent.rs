@@ -5,7 +5,6 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use crate::api::Client;
-use crate::config::DEFAULT_EFFORT;
 use crate::machine::{self, Action};
 use crate::provider;
 use crate::session::Session;
@@ -173,15 +172,16 @@ impl Agent {
             tools: Some(tools::definitions()),
             tool_choice: Some("auto".into()),
             stream: true,
-            thinking: Some(Thinking::enabled()),
-            // The backends' defaults differ (DeepSeek high / GLM max), so pin it
-            // to DEFAULT_EFFORT when no value is stored.
+            // The thinking switch and the effort fallback are the provider's:
+            // a preset that omits one or defaults differently says so in the
+            // table, and nothing here needs to know which.
+            thinking: self.provider.send_thinking.then(Thinking::enabled),
             reasoning_effort: Some(
                 self.session
                     .meta
                     .reasoning_effort
                     .clone()
-                    .unwrap_or_else(|| DEFAULT_EFFORT.to_string()),
+                    .unwrap_or_else(|| self.provider.default_effort.to_string()),
             ),
         }
     }

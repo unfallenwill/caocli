@@ -6,17 +6,6 @@ use std::path::{Path, PathBuf};
 
 use crate::provider::{PROVIDERS, Provider};
 
-/// Valid tiers for reasoning_effort. Both backends support only these three:
-/// GLM's low produces no reasoning_content, DeepSeek's low still thinks.
-/// Invalid values must be rejected locally — DeepSeek returns 400 and GLM
-/// silently falls back to its default tier.
-pub const EFFORTS: &[&str] = &["low", "high", "max"];
-
-/// Tier used when `--effort` is not given. The backends' own defaults differ
-/// (DeepSeek high, GLM max), so pinning it explicitly is the only way to make the
-/// two behave the same.
-pub const DEFAULT_EFFORT: &str = "max";
-
 /// One row of a menu: what it shows, what choosing it means, and what it says
 /// about itself. The two front ends render these their own way — a picker row, a
 /// line of text — but neither invents its own list.

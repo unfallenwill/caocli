@@ -13,7 +13,7 @@ mod ui;
 
 use std::io::IsTerminal;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Parser;
 use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers};
 
@@ -40,13 +40,18 @@ fn fresh_meta(cli: &Cli, start: provider::Provider) -> Result<SessionMeta> {
         Some(spec) => provider::model_spec(spec, start.id)?,
         None => (start, start.default_model().to_string()),
     };
+    // Checked against the provider the session will run on — which `--model`
+    // may name, independently of the run's own choice.
+    if let Some(e) = &cli.effort {
+        provider.validate_effort(e)?;
+    }
     Ok(SessionMeta {
         provider: Some(provider.id.to_string()),
         model,
         reasoning_effort: cli
             .effort
             .clone()
-            .or_else(|| Some(config::DEFAULT_EFFORT.to_string())),
+            .or_else(|| Some(provider.default_effort.to_string())),
     })
 }
 
@@ -93,6 +98,16 @@ fn apply_overrides(
         }
         (None, None) => {}
     }
+    // The effort, when given, is checked against the provider the session ends
+    // up on — the one `--model`/`--provider` chose above, or the session's own
+    // when neither was given.
+    if let Some(e) = &cli.effort {
+        let on = match meta.provider.as_deref() {
+            Some(id) => provider::provider(id)?,
+            None => current,
+        };
+        on.validate_effort(e)?;
+    }
     if let Some(e) = &cli.effort
         && meta.reasoning_effort.as_deref() != Some(e.as_str())
     {
@@ -110,24 +125,7 @@ fn enable_multiline(rl: &mut rustyline::DefaultEditor) {
     let _ = rl.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
 }
 
-/// `--effort` accepts only `low|high|max`. DeepSeek returns 400 for an
-/// out-of-range value while GLM silently accepts it and degrades to its default
-/// tier — so reject it locally first, which is the only way to keep the two
-/// consistent.
-fn validate_effort(cli: &Cli) -> Result<()> {
-    if let Some(e) = &cli.effort
-        && !config::EFFORTS.contains(&e.as_str())
-    {
-        bail!(
-            "invalid --effort {e:?}; available: {}",
-            config::EFFORTS.join(" | ")
-        );
-    }
-    Ok(())
-}
-
 async fn run(cli: Cli) -> Result<()> {
-    validate_effort(&cli)?;
     let mut ui = Renderer::new();
     let sdir = config::sessions_dir()?;
 
@@ -493,7 +491,7 @@ mod tests {
         assert_eq!(meta.model, provider::DEEPSEEK.default_model());
         assert_eq!(
             meta.reasoning_effort.as_deref(),
-            Some(config::DEFAULT_EFFORT)
+            Some(provider::DEEPSEEK.default_effort)
         );
     }
 
@@ -536,17 +534,27 @@ mod tests {
     }
 
     #[test]
-    fn validate_effort_accepts_known_tiers_and_rejects_others() {
-        for ok in ["low", "high", "max"] {
-            assert!(validate_effort(&cli(&["--effort", ok])).is_ok(), "{ok}");
-        }
-        assert!(validate_effort(&cli(&[])).is_ok()); // not passed = the backend default tier
-        for bad in ["none", "minimal", "medium", "xhigh", "HIGH", "bogus", ""] {
-            let err = validate_effort(&cli(&["--effort", bad]))
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("low | high | max"), "{bad}: {err}");
-        }
+    fn an_effort_the_provider_does_not_offer_is_rejected_where_it_lands() {
+        // A new session is checked against the provider it will run on — the one
+        // `--model` names, when it names one.
+        let err = fresh_meta(&cli(&["--effort", "bogus"]), provider::DEEPSEEK)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("low | high | max"), "{err}");
+        let err = fresh_meta(
+            &cli(&["--model", "zai-coding-cn/glm-5.3", "--effort", "bogus"]),
+            provider::DEEPSEEK,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Z.AI Coding CN"), "{err}");
+        // A resumed session is checked against the provider its meta names,
+        // not against this run's choice.
+        let mut meta = meta_of("zai-coding-cn", "glm-5.3");
+        let err = apply_overrides(&mut meta, &cli(&["--effort", "bogus"]), provider::DEEPSEEK)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Z.AI Coding CN"), "{err}");
     }
 
     #[test]

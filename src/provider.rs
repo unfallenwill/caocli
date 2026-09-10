@@ -38,6 +38,18 @@ pub struct Provider {
     /// 1M tokens of context and history is replayed whole (never trimmed), so
     /// there is nothing else here for a context window to do.
     pub max_tokens: u32,
+    /// Whether the request carries the DeepSeek-style `thinking` switch. Both
+    /// backends today take `{"type":"enabled"}`; a backend that rejects fields
+    /// it does not know sets this to false, and nothing else changes.
+    pub send_thinking: bool,
+    /// Valid `reasoning_effort` tiers this backend accepts. The tiers are the
+    /// backend's answer, not the program's, so they live in the preset: a
+    /// provider with other tiers declares them here and nothing else changes.
+    pub efforts: &'static [&'static str],
+    /// Tier sent when no effort is stored. The backends' own defaults differ
+    /// (DeepSeek high, GLM max), so the preset pins one explicitly — the only
+    /// way to make them behave the same.
+    pub default_effort: &'static str,
 }
 
 impl Provider {
@@ -45,6 +57,21 @@ impl Provider {
     /// own meta all override it.
     pub fn default_model(&self) -> &'static str {
         self.models[0]
+    }
+
+    /// Reject an `--effort` value this provider does not offer, before it is
+    /// ever sent. DeepSeek returns 400 for an out-of-range value while GLM
+    /// silently accepts it and degrades to its default tier — rejecting locally
+    /// is the only way to keep the two consistent.
+    pub fn validate_effort(&self, effort: &str) -> Result<()> {
+        if self.efforts.contains(&effort) {
+            return Ok(());
+        }
+        bail!(
+            "invalid --effort {effort:?} for {}; available: {}",
+            self.name,
+            self.efforts.join(" | ")
+        )
     }
 }
 
@@ -55,6 +82,10 @@ pub const DEEPSEEK: Provider = Provider {
     // What GET /models returns for this endpoint.
     models: &["deepseek-flash", "deepseek-v4-pro"],
     max_tokens: 384_000,
+    send_thinking: true,
+    // DeepSeek's low still emits reasoning_content, unlike GLM's.
+    efforts: &["low", "high", "max"],
+    default_effort: "max",
 };
 
 /// Z.AI's coding endpoint for mainland China: OpenAI-compatible plus
@@ -68,6 +99,10 @@ pub const ZAI_CODING_CN: Provider = Provider {
     // spells them.
     models: &["glm-5.3-flash", "glm-5.3"],
     max_tokens: 128_000,
+    send_thinking: true,
+    // GLM's low answers without emitting reasoning_content.
+    efforts: &["low", "high", "max"],
+    default_effort: "max",
 };
 
 pub const PROVIDERS: &[Provider] = &[DEEPSEEK, ZAI_CODING_CN];
@@ -138,6 +173,33 @@ mod tests {
         assert_eq!(DEEPSEEK.max_tokens, 384_000);
         assert_eq!(ZAI_CODING_CN.max_tokens, 128_000);
         assert!(ZAI_CODING_CN.url.contains("open.bigmodel.cn"));
+    }
+
+    #[test]
+    fn every_preset_declares_a_usable_effort_profile() {
+        for p in PROVIDERS {
+            assert!(!p.efforts.is_empty(), "{} offers no effort tier", p.id);
+            // The default must be one of the offered tiers, or a session that
+            // never names an effort sends a value the backend rejects (or worse,
+            // silently degrades from).
+            assert!(
+                p.efforts.contains(&p.default_effort),
+                "{} defaults to a tier it does not offer",
+                p.id
+            );
+        }
+    }
+
+    #[test]
+    fn validate_effort_names_the_provider_and_its_tiers() {
+        for ok in ["low", "high", "max"] {
+            assert!(DEEPSEEK.validate_effort(ok).is_ok(), "{ok}");
+        }
+        for bad in ["none", "medium", "HIGH", "bogus", ""] {
+            let err = DEEPSEEK.validate_effort(bad).unwrap_err().to_string();
+            assert!(err.contains("low | high | max"), "{bad}: {err}");
+            assert!(err.contains("DeepSeek"), "{bad}: {err}");
+        }
     }
 
     #[test]
