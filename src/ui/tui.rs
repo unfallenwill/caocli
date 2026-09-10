@@ -15,6 +15,7 @@ use std::future::Future;
 use std::io::{self, Stdout};
 use std::path::Path;
 use std::pin::Pin;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::backend::{Backend, CrosstermBackend};
@@ -46,6 +47,44 @@ const PINNED_ROWS: u16 = 1 + 3;
 
 /// The whole inline viewport.
 const VIEWPORT_ROWS: u16 = LIVE_ROWS + PINNED_ROWS;
+
+/// The spinner, advanced while work is in progress. One column each, so it can
+/// sit on the status line without moving it.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// How long each spinner frame is shown. Long enough to read, short enough that
+/// the line looks alive.
+const SPINNER_FRAME: Duration = Duration::from_millis(100);
+
+/// How many spinner frames fit in `elapsed`: the tick a moment belongs to.
+///
+/// Derived from the elapsed time rather than counted, so a redraw that was
+/// skipped cannot leave the spinner behind: the frame is a function of *when*,
+/// not of how many times anything ran. Everything on the status line that moves
+/// on its own -- the frame, the timer -- moves on this tick, so one number
+/// answers both "which frame" and "has anything changed".
+fn spinner_step(elapsed: Duration) -> u64 {
+    elapsed.as_millis() as u64 / SPINNER_FRAME.as_millis().max(1) as u64
+}
+
+/// Which spinner frame belongs to a moment in time.
+fn spinner_frame(elapsed: Duration) -> &'static str {
+    SPINNER[spinner_step(elapsed) as usize % SPINNER.len()]
+}
+
+/// A duration as the status line shows it: tenths of a second.
+///
+/// Formatted from integer milliseconds so that it changes on exactly the tick
+/// [`spinner_step`] counts. A float would round at boundaries of its own, and a
+/// redraw is skipped by comparing the tick.
+fn seconds(elapsed: Duration) -> String {
+    let tenths = elapsed.as_millis() as u64 / 100;
+    format!("{}.{}s", tenths / 10, tenths % 10)
+}
+
+/// The least room the session summary is worth showing in. Below this it is
+/// dropped rather than clipped to a stub.
+const MIN_STATUS_COLUMNS: usize = 12;
 
 /// How many command rows the picker shows at once. It draws over the bottom of
 /// the live area, so it has to leave the transcript somewhere to live.
@@ -198,7 +237,7 @@ impl Approve for Ask {
 /// How long the loop will wait for a key before looking at everything else.
 ///
 /// Short enough to feel immediate, long enough not to spin.
-const TICK: std::time::Duration = std::time::Duration::from_millis(8);
+const TICK: Duration = Duration::from_millis(8);
 
 /// Read a key if one is waiting, without blocking for longer than a tick.
 ///
@@ -208,7 +247,7 @@ const TICK: std::time::Duration = std::time::Duration::from_millis(8);
 /// same handle. A background reader parked in `event::read` steals the answer, and
 /// the query then times out -- measured, and intermittent, which is exactly what a
 /// stolen read looks like.
-fn poll_key(timeout: std::time::Duration) -> io::Result<Option<Event>> {
+fn poll_key(timeout: Duration) -> io::Result<Option<Event>> {
     if crossterm::event::poll(timeout)? {
         Ok(Some(crossterm::event::read()?))
     } else {
@@ -244,8 +283,6 @@ struct State {
     reply: Option<oneshot::Sender<bool>>,
     /// The answer being typed.
     textarea: TextArea<'static>,
-    /// Whether a turn is running, which the status line reports.
-    working: bool,
     /// The command picker, while what is in the box is a command still being
     /// named.
     picker: Option<Picker>,
@@ -256,6 +293,15 @@ struct State {
     /// What was in the box before browsing started, so that stepping past the
     /// newest entry gives it back.
     draft: String,
+    /// When the current turn started, while one is running. One field answers
+    /// both "is a turn running" and "how long has it been", which are the same
+    /// question asked twice otherwise.
+    turn_started: Option<Instant>,
+    /// The tool being executed, while one is.
+    tool: Option<String>,
+    /// Bumped by everything that changes what the screen should show, so a draw
+    /// can be skipped when nothing has.
+    revision: u64,
 }
 
 /// The command picker: what matched, and which one is highlighted.
@@ -273,11 +319,13 @@ impl Default for State {
             question: None,
             reply: None,
             textarea: input_box(),
-            working: false,
             picker: None,
             history: Vec::new(),
             browsing: None,
             draft: String::new(),
+            turn_started: None,
+            tool: None,
+            revision: 0,
         }
     }
 }
@@ -299,19 +347,69 @@ impl State {
         lines
     }
 
-    /// The pinned status line, plus whether a turn is running.
-    fn status_line(&self, width: usize) -> String {
+    /// The pinned status line: the session summary, and then what is running.
+    fn status_line(&self, width: usize, now: Instant) -> String {
         // One column is left free so the write cannot trigger autowrap.
-        let label = self.status.line(width.saturating_sub(1));
-        if self.working {
-            format!("{label} · working…")
+        let width = width.saturating_sub(1);
+        let Some(progress) = self.progress(now) else {
+            return self.status.line(width);
+        };
+        // What is running is what the user is watching, so it is measured first
+        // and the session summary gives up the room; on a narrow line the summary
+        // goes entirely rather than being clipped mid-word.
+        let spent = super::text::width(&progress) + 3;
+        let room = width.saturating_sub(spent);
+        let summary = if room < MIN_STATUS_COLUMNS {
+            String::new()
         } else {
-            label
+            self.status.line(room)
+        };
+        if summary.is_empty() {
+            progress
+        } else {
+            format!("{summary} · {progress}")
         }
+    }
+
+    /// What is running, if anything: a spinner, what it is, and how long it has
+    /// taken.
+    fn progress(&self, now: Instant) -> Option<String> {
+        let elapsed = self.elapsed(now)?;
+        let frame = spinner_frame(elapsed);
+        let spent = seconds(elapsed);
+        Some(match &self.tool {
+            Some(tool) => format!("{frame} {tool} · {spent}"),
+            None => format!("{frame} thinking · {spent}"),
+        })
+    }
+
+    /// How long the current turn has been running, if one is.
+    fn elapsed(&self, now: Instant) -> Option<Duration> {
+        Some(now.saturating_duration_since(self.turn_started?))
+    }
+
+    /// The moment on the status line's own clock, if anything is moving on it.
+    fn tick(&self, now: Instant) -> Option<u64> {
+        Some(spinner_step(self.elapsed(now)?))
+    }
+
+    /// A turn is starting: start the clock the status line reads.
+    fn begin_turn(&mut self, now: Instant) {
+        self.revision += 1;
+        self.turn_started = Some(now);
+    }
+
+    /// The turn is over: stop the clock, and stop naming the tool it was running,
+    /// which a turn can end without -- an interrupted tool reports no result.
+    fn end_turn(&mut self) {
+        self.revision += 1;
+        self.turn_started = None;
+        self.tool = None;
     }
 
     /// Fold one notice into the state.
     fn apply(&mut self, notice: Notice) {
+        self.revision += 1;
         match notice {
             Notice::Reasoning(text) => self.stream(Style::Dim, &text),
             Notice::Content(text) => self.stream(Style::Plain, &text),
@@ -319,10 +417,14 @@ impl State {
             Notice::ToolStart { name, args } => {
                 self.end_block();
                 self.pending.push(Cell::tool_call(&name, &args));
+                // The status line reports the tool by name while it runs, which
+                // is the part of a turn that can take a long time.
+                self.tool = Some(name);
             }
             Notice::ToolResult(result) => {
                 self.end_block();
                 self.pending.push(Cell::ToolResult(result));
+                self.tool = None;
             }
             Notice::Usage(u) => self.status.record(&u),
             Notice::Interrupted => {
@@ -376,6 +478,7 @@ impl State {
 
     /// Handle a key at the prompt.
     fn key(&mut self, event: Event) -> Submitted {
+        self.revision += 1;
         let key = match event {
             Event::Key(key) => key,
             // A paste goes to the box; the caller redraws either way.
@@ -617,6 +720,10 @@ impl State {
     /// approval question, while the gate is waiting for one. Everything else is
     /// dropped, because a turn is not the place to start composing the next line.
     fn key_while_working(&mut self, event: Event, cancel: &watch::Sender<bool>) {
+        // A resize arrives here too, and it changes the layout, so anything
+        // arriving at all is reason enough to redraw -- and a draw that was not
+        // needed costs one comparison.
+        self.revision += 1;
         if let Event::Key(key) = &event
             && key.kind == KeyEventKind::Press
             && key.code == KeyCode::Char('c')
@@ -659,8 +766,8 @@ impl State {
 
     /// The approval gate is asking: remember who to answer.
     fn open_question(&mut self, reply: oneshot::Sender<bool>) {
+        self.revision += 1;
         self.reply = Some(reply);
-        self.working = true;
         // The box is where the answer goes, so it says so rather than inviting
         // the next message: nothing else can be typed while a turn runs.
         self.textarea
@@ -671,13 +778,13 @@ impl State {
     /// starting with `y` allows and anything else denies, which is the rule the
     /// plain front end applies to a line of stdin.
     fn close_question(&mut self) {
+        self.revision += 1;
         if let Some(reply) = self.reply.take() {
             let answer = self.textarea.lines().join("\n").trim().to_lowercase();
             let _ = reply.send(answer.starts_with('y'));
             self.textarea = input_box();
         }
         self.question = None;
-        self.working = false;
     }
 }
 
@@ -690,6 +797,26 @@ impl State {
 struct Screen<B: Backend> {
     terminal: Terminal<B>,
     state: State,
+    /// The view key of the last draw, or `None` when the screen has to be
+    /// repainted whatever the key says: nothing has been drawn yet, or something
+    /// outside this screen (`insert_before`) has moved it.
+    drawn: Option<ViewKey>,
+}
+
+/// What the viewport would show, as a value that can be compared.
+///
+/// Equal keys mean a redraw cannot change a pixel, so it is skipped. The
+/// revision covers everything the state knows about itself; the tick covers what
+/// moves without the state changing, which is the turn's own clock; the size is
+/// there because the viewport is laid out from it. Reading the size is an
+/// `ioctl`, not a round trip to the terminal, so it is cheap enough to be part
+/// of a check that runs on every tick of the loop.
+#[derive(PartialEq, Eq, Clone, Copy)]
+struct ViewKey {
+    revision: u64,
+    tick: Option<u64>,
+    width: u16,
+    height: u16,
 }
 
 /// An inline viewport on `backend`: the last [`VIEWPORT_ROWS`] rows of the
@@ -732,6 +859,7 @@ impl Screen<CrosstermBackend<Stdout>> {
         Ok(Self {
             terminal,
             state: State::default(),
+            drawn: None,
         })
     }
 
@@ -750,9 +878,44 @@ impl Screen<CrosstermBackend<Stdout>> {
 }
 
 impl<B: Backend> Screen<B> {
+    /// What the viewport would show right now.
+    fn view_key(&self, now: Instant) -> Result<ViewKey, B::Error> {
+        let size = self.terminal.size()?;
+        Ok(ViewKey {
+            revision: self.state.revision,
+            tick: self.state.tick(now),
+            width: size.width,
+            height: size.height,
+        })
+    }
+
+    /// Repaint, unless the viewport already shows this.
+    ///
+    /// The loop wakes on a tick to stay responsive to the keyboard, and most of
+    /// those ticks have nothing new to show: a turn spends its time waiting, and
+    /// repainting an unchanged viewport would be a full-screen write every tick.
+    fn draw_if_changed(&mut self) -> Result<(), B::Error> {
+        let now = Instant::now();
+        let key = self.view_key(now)?;
+        if self.drawn == Some(key) {
+            return Ok(());
+        }
+        self.draw_at(now)?;
+        // Only after the draw succeeded: a failed one leaves the screen showing
+        // something else, so the next call has to try again.
+        self.drawn = Some(key);
+        Ok(())
+    }
+
+    /// Draw the viewport as of now, for tests that do not care about the clock.
+    #[cfg(test)]
+    fn draw(&mut self) -> Result<(), B::Error> {
+        self.draw_at(Instant::now())
+    }
+
     /// Draw the viewport: the tail of the live area, the pinned status line, the
     /// input box.
-    fn draw(&mut self) -> Result<(), B::Error> {
+    fn draw_at(&mut self, now: Instant) -> Result<(), B::Error> {
         let size = self.terminal.size()?;
         let width = size.width as usize;
         let lines = self.state.lines(width);
@@ -760,7 +923,7 @@ impl<B: Backend> Screen<B> {
         // rather than a head.
         let scroll = lines.len().saturating_sub(LIVE_ROWS as usize) as u16;
         let live = Text::from(lines);
-        let status = self.state.status_line(width);
+        let status = self.state.status_line(width, now);
         let cursor = self.state.textarea.screen_cursor();
         // The picker draws over the bottom of the live area rather than beside
         // it: it belongs to the line being typed, which is what it sits above.
@@ -819,6 +982,9 @@ impl<B: Backend> Screen<B> {
                 Paragraph::new(Text::from(chunk.clone())).render(buf.area, buf);
             })?;
         }
+        // The insertion moved everything the viewport shows, so what was drawn
+        // last is not what is on the screen any more.
+        self.drawn = None;
         Ok(())
     }
 }
@@ -1007,14 +1173,14 @@ pub async fn run(
 
     let result: anyhow::Result<()> = loop {
         // Idle: draw, then wait for something to submit.
-        if let Err(e) = screen.draw() {
+        if let Err(e) = screen.draw_if_changed() {
             break Err(e.into());
         }
         let line = loop {
             for notice in drain(&mut notices) {
                 screen.state.apply(notice);
             }
-            screen.draw()?;
+            screen.draw_if_changed()?;
             match poll_key(TICK)? {
                 Some(event) => match screen.state.key(event) {
                     Submitted::Line => break screen.state.take_line(),
@@ -1042,7 +1208,9 @@ pub async fn run(
             &mut approve,
         );
         tokio::pin!(turn);
-        screen.state.working = true;
+        // The clock starts here rather than when the line was submitted: what the
+        // status line reports is the turn, and a turn is what is being waited for.
+        screen.state.begin_turn(Instant::now());
         let outcome = loop {
             // Keys are read here, never on another thread: see `poll_key`.
             if let Some(event) = poll_key(TICK)? {
@@ -1054,7 +1222,7 @@ pub async fn run(
             for reply in drain(&mut asked) {
                 screen.state.open_question(reply);
             }
-            screen.draw()?;
+            screen.draw_if_changed()?;
             tokio::select! {
                 outcome = &mut turn => break outcome,
                 // Nothing else to wait on: the tick above paces the loop, and
@@ -1074,7 +1242,7 @@ pub async fn run(
         for reply in drain(&mut asked) {
             screen.state.open_question(reply);
         }
-        screen.state.working = false;
+        screen.state.end_turn();
         screen.state.close_question();
         if let Err(e) = screen.commit() {
             break Err(e.into());
@@ -1310,7 +1478,18 @@ mod tests {
         Screen {
             terminal: viewport(backend).unwrap(),
             state: State::default(),
+            drawn: None,
         }
+    }
+
+    /// A state with a turn that has been running for `elapsed`, and the moment it
+    /// is asked about. The clock is the test's to decide, so what the status line
+    /// shows is asserted rather than waited for.
+    fn running_for(elapsed: Duration) -> (State, Instant) {
+        let mut state = State::default();
+        let now = Instant::now();
+        state.begin_turn(now - elapsed);
+        (state, now)
     }
 
     /// One row of what was drawn, without the padding.
@@ -1360,13 +1539,21 @@ mod tests {
     }
 
     #[test]
-    fn the_status_line_says_when_a_turn_is_running() {
+    fn the_status_line_says_what_the_turn_is_doing() {
         let mut screen = screen_for_test(40, 20);
         screen.state.status.set_model("m");
-        screen.state.working = true;
-        screen.draw().unwrap();
+        let now = Instant::now();
+        screen.state.begin_turn(now);
+        screen.state.apply(Notice::ToolStart {
+            name: "read_file".into(),
+            args: "{}".into(),
+        });
+        screen.draw_at(now).unwrap();
         let top = origin(&mut screen).y;
-        assert_eq!(row(&screen, top + LIVE_ROWS), "m · cache — · working…");
+        assert_eq!(
+            row(&screen, top + LIVE_ROWS),
+            "m · cache — · ⠋ read_file · 0.0s"
+        );
     }
 
     #[test]
@@ -1612,12 +1799,221 @@ mod tests {
     }
 
     #[test]
-    fn the_status_line_reports_whether_a_turn_is_running() {
-        let mut screen = State::default();
-        screen.status.set_model("m");
-        assert_eq!(screen.status_line(40), "m · cache —");
-        screen.working = true;
-        assert_eq!(screen.status_line(40), "m · cache — · working…");
+    fn the_spinner_frame_comes_from_the_clock_not_from_a_counter() {
+        let at = Duration::from_millis;
+        assert_eq!(spinner_frame(at(0)), SPINNER[0]);
+        assert_eq!(spinner_frame(at(99)), SPINNER[0], "still the first frame");
+        assert_eq!(spinner_frame(at(100)), SPINNER[1]);
+        assert_eq!(spinner_frame(at(1_000)), SPINNER[0], "it comes round");
+        // The same moment is always the same frame, so a redraw that was skipped
+        // cannot leave the spinner behind.
+        assert_eq!(spinner_frame(at(1_234)), spinner_frame(at(1_234)));
+    }
+
+    #[test]
+    fn the_status_line_shows_what_the_turn_is_doing_and_for_how_long() {
+        let (mut state, now) = running_for(Duration::from_millis(12_300));
+        state.status.set_model("m");
+        assert_eq!(
+            state.status_line(80, now),
+            "m · cache — · ⠸ thinking · 12.3s"
+        );
+        state.apply(Notice::ToolStart {
+            name: "read_file".into(),
+            args: "{}".into(),
+        });
+        assert_eq!(
+            state.status_line(80, now),
+            "m · cache — · ⠸ read_file · 12.3s"
+        );
+        state.apply(Notice::ToolResult("ok".into()));
+        assert_eq!(
+            state.status_line(80, now),
+            "m · cache — · ⠸ thinking · 12.3s"
+        );
+    }
+
+    #[test]
+    fn an_idle_line_is_the_summary_and_nothing_else() {
+        let (mut state, now) = running_for(Duration::from_millis(50));
+        state.status.set_model("m");
+        assert_eq!(
+            state.status_line(40, now),
+            "m · cache — · ⠋ thinking · 0.0s"
+        );
+        let idle = State::default();
+        assert_eq!(idle.status_line(40, now), "cache —");
+        // Narrow enough that the summary would be clipped to a stub: with nothing
+        // running there is no reason to drop it.
+        assert_eq!(idle.status_line(9, now), "cache —");
+    }
+
+    #[test]
+    fn a_narrow_line_drops_the_summary_rather_than_clipping_it() {
+        let (state, now) = running_for(Duration::from_millis(1_500));
+        let progress = "⠴ thinking · 1.5s";
+        assert_eq!(super::super::text::width(progress), 17);
+        // One column short of room for a summary worth reading, so the summary
+        // goes whole rather than being clipped mid-word.
+        assert_eq!(state.status_line(32, now), progress);
+        // One column more, and it fits with its separator.
+        assert_eq!(state.status_line(33, now), "cache — · ⠴ thinking · 1.5s");
+    }
+
+    #[test]
+    fn the_view_key_moves_with_the_clock_while_a_turn_runs() {
+        let mut state = State::default();
+        let now = Instant::now();
+        assert_eq!(state.tick(now), None, "nothing is running, nothing to draw");
+        state.begin_turn(now);
+        let first = state.tick(now);
+        assert_eq!(first, Some(0));
+        assert_eq!(state.tick(now + SPINNER_FRAME), Some(1), "a frame later");
+        assert_eq!(state.tick(now + SPINNER_FRAME), first.map(|_| 1));
+        state.end_turn();
+        assert_eq!(state.tick(now), None, "the clock stops with the turn");
+        assert!(state.tool.is_none(), "and stops naming a tool");
+    }
+
+    #[test]
+    fn a_turn_that_ends_forgets_the_tool_it_was_running() {
+        // A tool whose turn was interrupted never reports a result, so the name
+        // has to be dropped by the turn ending rather than by the result.
+        let mut state = State::default();
+        let now = Instant::now();
+        state.begin_turn(now);
+        state.apply(Notice::ToolStart {
+            name: "run_command".into(),
+            args: "{}".into(),
+        });
+        assert!(state.progress(now).unwrap().contains("run_command"));
+        state.end_turn();
+        assert_eq!(state.progress(now), None);
+    }
+
+    #[test]
+    fn everything_that_changes_the_screen_moves_the_revision() {
+        let mut state = State::default();
+        let mut moved = Vec::new();
+        let mut step = |state: &State| moved.push(state.revision);
+        step(&state);
+        state.apply(Notice::Content("hello".into()));
+        step(&state);
+        state.key(Event::Key(KeyEvent::from(KeyCode::Char('h'))));
+        step(&state);
+        let (reply, _answer) = oneshot::channel();
+        state.open_question(reply);
+        step(&state);
+        state.close_question();
+        step(&state);
+        let mut sorted = moved.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, moved, "every step moved it: {moved:?}");
+    }
+
+    /// A backend that counts the frames it is asked to paint, so that a draw the
+    /// screen decided to skip is something a test can observe rather than infer.
+    struct Counting {
+        inner: ratatui::backend::TestBackend,
+        frames: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Backend for Counting {
+        type Error = std::convert::Infallible;
+
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), std::convert::Infallible>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.frames.set(self.frames.get() + 1);
+            self.inner.draw(content)
+        }
+
+        fn hide_cursor(&mut self) -> Result<(), std::convert::Infallible> {
+            self.inner.hide_cursor()
+        }
+
+        fn show_cursor(&mut self) -> Result<(), std::convert::Infallible> {
+            self.inner.show_cursor()
+        }
+
+        fn get_cursor_position(
+            &mut self,
+        ) -> Result<ratatui::layout::Position, std::convert::Infallible> {
+            self.inner.get_cursor_position()
+        }
+
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), std::convert::Infallible> {
+            self.inner.set_cursor_position(position)
+        }
+
+        fn clear(&mut self) -> Result<(), std::convert::Infallible> {
+            self.inner.clear()
+        }
+
+        fn clear_region(
+            &mut self,
+            clear_type: ratatui::backend::ClearType,
+        ) -> Result<(), std::convert::Infallible> {
+            self.inner.clear_region(clear_type)
+        }
+
+        fn size(&self) -> Result<ratatui::layout::Size, std::convert::Infallible> {
+            self.inner.size()
+        }
+
+        fn window_size(
+            &mut self,
+        ) -> Result<ratatui::backend::WindowSize, std::convert::Infallible> {
+            self.inner.window_size()
+        }
+
+        fn flush(&mut self) -> Result<(), std::convert::Infallible> {
+            self.inner.flush()
+        }
+    }
+
+    #[test]
+    fn an_unchanged_viewport_is_not_drawn_again() {
+        let frames = std::rc::Rc::new(std::cell::Cell::new(0));
+        let backend = Counting {
+            inner: ratatui::backend::TestBackend::new(40, 20),
+            frames: frames.clone(),
+        };
+        let mut screen = Screen {
+            terminal: viewport(backend).unwrap(),
+            state: State::default(),
+            drawn: None,
+        };
+        screen.draw_if_changed().unwrap();
+        assert_eq!(frames.get(), 1);
+        screen.draw_if_changed().unwrap();
+        assert_eq!(frames.get(), 1, "nothing changed, so nothing was drawn");
+        // A keystroke changes what the box holds, so the next draw happens.
+        screen
+            .state
+            .key(Event::Key(KeyEvent::from(KeyCode::Char('h'))));
+        screen.draw_if_changed().unwrap();
+        assert_eq!(frames.get(), 2);
+        // So does a running turn: the spinner has to keep moving.
+        screen.state.begin_turn(Instant::now());
+        screen.draw_if_changed().unwrap();
+        assert_eq!(frames.get(), 3);
+    }
+
+    #[test]
+    fn committing_forces_the_next_draw() {
+        // `insert_before` moves everything the viewport shows, so what was drawn
+        // last is stale whatever the revision says.
+        let mut screen = screen_for_test(40, 20);
+        screen.draw_if_changed().unwrap();
+        screen.state.pending.push(Cell::Notice("done".into()));
+        screen.commit().unwrap();
+        assert!(screen.drawn.is_none(), "the next draw cannot be skipped");
     }
 
     #[test]
@@ -1683,7 +2079,7 @@ mod tests {
         let mut screen = State::default();
         let (reply, answer) = oneshot::channel();
         screen.open_question(reply);
-        assert!(screen.working, "the status line shows the gate is open");
+        assert!(screen.reply.is_some(), "the answer has somewhere to go");
         screen.textarea.insert_str("yes");
         screen.close_question();
         assert_eq!(answer.blocking_recv(), Ok(true));
