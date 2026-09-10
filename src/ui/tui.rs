@@ -141,8 +141,8 @@ const WORKING_FOREGROUND: u8 = 209;
 
 /// The gutter the tip line starts with: the same mark the transcript uses for the
 /// lines that belong to something else, so a tip reads as an aside rather than as
-/// part of the session.
-const TIP_GUTTER: &str = "⎿  ";
+/// part of the session. Indented by a column, so that it hangs off nothing.
+const TIP_GUTTER: &str = " ⎿  ";
 
 /// How long one tip is shown before the next replaces it. Long enough to read
 /// without reading it twice, which is what makes the row worth its space.

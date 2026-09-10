@@ -84,7 +84,7 @@ input box.
 ok: package.name = caocli (312 bytes)
 
 ✻ Julienning… (1m 5s · ↓ 259 tokens · running Bash)
-⎿  Tip: PageUp and PageDown read back through the session
+ ⎿  Tip: PageUp and PageDown read back through the session
 ┌──────────────────────────────────────────────────────────────────────────┐
 │ ›  type a message · /help for commands                                   │
 └──────────────────────────────────────────────────────────────────────────┘
