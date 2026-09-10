@@ -180,9 +180,9 @@ async fn run(cli: Cli) -> Result<()> {
 
     // Interactive front end: it owns the terminal, so nothing may have been
     // printed before it and nothing may be printed after it while it runs.
-    // It declines rather than fails when the terminal cannot host it -- an
-    // inline viewport has to ask where the cursor is, and a terminal that does
-    // not answer leaves no way to place it.
+    // It declines rather than fails when the terminal cannot host it: the
+    // alternate screen and raw mode are process-wide, and a terminal that cannot
+    // take them leaves the plain prompt as the only one there is.
     if !cli.no_tui && std::io::stdout().is_terminal() {
         // Cloned because the front end borrows the agent mutably for the whole
         // session; this is once, at startup.

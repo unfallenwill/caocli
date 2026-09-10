@@ -40,8 +40,8 @@ pub struct Cli {
     pub no_status_bar: bool,
 
     /// Keep the plain prompt instead of the full-screen front end. The plain
-    /// prompt is used anyway on a terminal that cannot host the viewport, or
-    /// when stdout is not a terminal.
+    /// prompt is used anyway when stdout is not a terminal, or when the terminal
+    /// will not take raw mode.
     #[arg(long)]
     pub no_tui: bool,
 

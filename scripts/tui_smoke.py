@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-"""Interactive front-end smoke test: run caocli inside a pseudo-terminal that
-answers the cursor query an inline viewport needs.
+"""Interactive front-end smoke test: run caocli inside a pseudo-terminal, which is
+the only place the front end that owns the screen exists at all.
 
-`pty_smoke.py` deliberately does not answer it, so it covers the fallback to the
-plain prompt. This one does, which is the only way to exercise the viewport
-itself: the input box, the pinned status line, committing a finished line into
-scrollback, and leaving the terminal as it was found.
+It covers what only a terminal can show: the alternate screen being entered and
+given back, the input box, the pinned status line, the transcript being drawn and
+paged, and the terminal handed back as it was found. Nothing has to answer a
+cursor query any more -- that was the inline viewport's -- so this is a pty with a
+size and nothing else.
 
 Only local commands are sent -- no provider is called -- so a placeholder API key
 is enough and the test stays offline. Exit code 0 = pass.
 
 With `SMOKE_LIVE=1` and a real key, it goes on to a live turn, which is the only
-way to see the parts that need a model to move: the spinner that runs while the
-turn does, and the approval gate that asks before a tool runs.
+way to see the parts that need a model to move: the status line running a clock of
+its own, and the approval gate that asks before a tool runs.
 """
 
+import codecs
 import fcntl
 import json
 import os
@@ -27,19 +29,31 @@ import sys
 import tempfile
 import termios
 import time
+import unicodedata
 
 BIN = os.path.join(os.path.dirname(__file__), "..", "target", "debug", "caocli")
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 ROWS, COLS = 24, 80
 
-# ANSI escapes, stripped before matching: a line of text is written with a cursor
-# move and a style change around it, so a needle would otherwise be split across
-# escape sequences.
+# ANSI escapes, stripped for the diagnostics: a line of text is written with a
+# cursor move and a style change around it, so a needle would otherwise be split
+# across escape sequences.
 ESCAPES = re.compile(rb"\x1b\[[0-9;?]*[a-zA-Z]|\x1b[=>]|\x1b\][^\x07]*\x07")
+
+# A control sequence, split into its parameters (with the private prefix some of
+# them carry) and its final byte, which is what says what it does.
+CSI = re.compile(r"\[([?]?[0-9;]*)([a-zA-Z])")
+
+
+def cell_width(ch: str) -> int:
+    """The columns a character takes -- the same rule the terminal applies, and
+    the reason a wide character is worth a test of its own."""
+    return 2 if unicodedata.east_asian_width(ch) in "WF" else 1
 
 # Rendered by the interactive front end and by nothing else: the plain prompt has
 # no box, no placeholder and no pinned line.
 VIEWPORT = "type a message"
+BANNER = "caocli · session"
 STATUS = "cache"
 PICKER = "show this"  # the /help row of the command picker
 HELP = "Commands:"  # the first line of what /help commits
@@ -146,16 +160,133 @@ def spawn(home: str, extra: list[str]):
     return pid, master
 
 
-class Terminal:
-    """The other end of the pty: it reads, and answers what a terminal answers."""
+class Screen:
+    """What the terminal is showing.
 
-    def __init__(self, master: int):
+    A full-screen front end is drawn by difference: a cell that did not change is
+    never written, so the byte stream is not what the screen says -- it is the
+    difference between one frame and the next. Reading it back therefore means
+    putting the frames together, which is what this does: cursor moves, erases and
+    text, with a wide character taking the two columns it takes.
+    """
+
+    def __init__(self, rows: int, cols: int):
+        self.rows, self.cols = rows, cols
+        self.grid = [[" "] * cols for _ in range(rows)]
+        self.row = self.col = 0
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self.pending = ""
+
+    def lines(self) -> list[str]:
+        return ["".join(row).rstrip() for row in self.grid]
+
+    def find(self, needle: str) -> bool:
+        return any(needle in line for line in self.lines())
+
+    def feed(self, chunk: bytes):
+        self.pending += self.decoder.decode(chunk)
+        while self.pending:
+            if self.pending[0] == "\x1b":
+                eaten = self.escape(self.pending[1:])
+                if eaten is None:
+                    return  # a sequence split across two reads: wait for the rest
+                self.pending = self.pending[1 + eaten :]
+                continue
+            ch, self.pending = self.pending[0], self.pending[1:]
+            self.put(ch)
+
+    def escape(self, rest: str) -> int | None:
+        """Consume one escape sequence, or say how much of it is still missing."""
+        if not rest:
+            return None
+        if rest[0] == "[":
+            m = CSI.match(rest)
+            if m is None:
+                return None
+            self.csi(m.group(1) + m.group(2))
+            return m.end()
+        return 1  # ESC 7 / ESC 8 / ESC = / ESC >: nothing this reads depends on them
+
+    def csi(self, params: str):
+        final, body = params[-1], params[:-1]
+        if body.startswith("?"):
+            # The alternate screen coming and going: both leave a blank screen.
+            if body[1:] == "1049":
+                self.grid = [[" "] * self.cols for _ in range(self.rows)]
+                self.row = self.col = 0
+            return
+        args = [int(a) if a else 0 for a in body.split(";") if a != ""] or [0]
+        match final:
+            case "H" | "f":  # position
+                self.row = min(max((args[0] or 1) - 1, 0), self.rows - 1)
+                col = args[1] if len(args) > 1 else 0
+                self.col = min(max((col or 1) - 1, 0), self.cols - 1)
+            case "A":
+                self.row = max(self.row - (args[0] or 1), 0)
+            case "B":
+                self.row = min(self.row + (args[0] or 1), self.rows - 1)
+            case "C":
+                self.col = min(self.col + (args[0] or 1), self.cols - 1)
+            case "D":
+                self.col = max(self.col - (args[0] or 1), 0)
+            case "G":
+                self.col = min(max((args[0] or 1) - 1, 0), self.cols - 1)
+            case "d":
+                self.row = min(max((args[0] or 1) - 1, 0), self.rows - 1)
+            case "J":  # erase in the screen
+                if args[0] == 2:
+                    self.grid = [[" "] * self.cols for _ in range(self.rows)]
+                else:
+                    self.erase(self.row, self.col, self.row + 1, self.cols)
+            case "K":  # erase in the line
+                if args[0] == 2:
+                    self.erase(self.row, 0, self.row + 1, self.cols)
+                elif args[0] == 1:
+                    self.erase(self.row, 0, self.row + 1, self.col + 1)
+                else:
+                    self.erase(self.row, self.col, self.row + 1, self.cols)
+            case "X":
+                self.erase(self.row, self.col, self.row + 1, self.col + (args[0] or 1))
+            case "m":  # style: what is on the screen does not depend on it
+                pass
+
+    def erase(self, y0: int, x0: int, y1: int, x1: int):
+        for y in range(y0, min(y1, self.rows)):
+            for x in range(x0, min(x1, self.cols)):
+                self.grid[y][x] = " "
+
+    def put(self, ch: str):
+        if ch == "\n":
+            return  # nothing here writes a newline: rows move by escape
+        if ch == "\r":
+            self.col = 0
+            return
+        if ch < " ":
+            return
+        width = cell_width(ch)
+        if self.col + width > self.cols:
+            return  # past the edge: a wide character in the last column is dropped
+        self.grid[self.row][self.col] = ch
+        for dx in range(1, width):
+            self.grid[self.row][self.col + dx] = ""
+        self.col += width
+
+
+class Terminal:
+    """The other end of the pty: it reads, and holds what is on the screen."""
+
+    def __init__(self, master: int, rows: int = ROWS, cols: int = COLS):
         self.master = master
         self.raw = b""
-        self.queries = 0
+        self.screen = Screen(rows, cols)
 
     def text(self) -> str:
+        """Everything written, escapes stripped. For diagnostics only: the front
+        end writes what changed, not what is there."""
         return ESCAPES.sub(b"", self.raw).decode("utf-8", "replace")
+
+    def shown(self) -> str:
+        return "\n".join(f"    | {line}" for line in self.screen.lines())
 
     def pump(self, timeout: float) -> bool:
         r, _, _ = select.select([self.master], [], [], timeout)
@@ -168,33 +299,27 @@ class Terminal:
         if not chunk:
             return False
         self.raw += chunk
-        # `\x1b[6n` is the terminal being asked where the cursor is. The viewport
-        # cannot place itself without an answer, so it is answered with a row
-        # that leaves it room to lay out above the current line. Answering is the
-        # whole point of this harness: without it the front end declines and the
-        # plain prompt runs instead.
-        for _ in range(chunk.count(b"\x1b[6n")):
-            os.write(self.master, f"\x1b[{ROWS - 4};1R".encode())
-            self.queries += 1
+        self.screen.feed(chunk)
         return True
 
     def expect(self, needle: str, timeout: float, quiet: bool = False) -> bool:
+        """Wait for `needle` to be on the screen."""
         end = time.time() + timeout
         next_note = time.time() + 15
         while True:
-            if needle in self.text():
+            if self.screen.find(needle):
                 if not quiet:
-                    print(f"  ✓ {needle!r}")
+                    print(f"  \u2713 {needle!r}")
                 return True
             if time.time() >= end:
                 if not quiet:
-                    print(f"  ✗ timed out waiting for {needle!r}")
-                    print(f"    tail seen: {self.text()[-400:]!r}")
+                    print(f"  \u2717 timed out waiting for {needle!r}")
+                    print("    screen:\n" + self.shown())
                 return False
             if time.time() >= next_note:
                 # A live turn spends a long time waiting on a model, so silence
                 # would be indistinguishable from a hang.
-                print(f"  · still waiting for {needle!r}")
+                print(f"  \u00b7 still waiting for {needle!r}")
                 next_note = time.time() + 15
             self.pump(0.5)
 
@@ -260,12 +385,12 @@ def live(term: "Terminal", home: str) -> bool:
     ok = True
     # The status line reports the turn while it runs, on a clock of its own: it
     # moves without anything else about the screen changing.
-    # Note: what the user said is in here, but it is not asserted on screen. The
-    # live area is ten rows, and a turn that fails or answers quickly fills them
-    # before the first frame is painted -- and the screen is written
-    # incrementally, so a line that was never painted never appears in the byte
-    # stream either. The cell a submitted line produces is covered by unit tests
-    # and by the resumed turn above, which draws one out of the log.
+    # Note: what the user said is in here, but it is not asserted on screen. A
+    # turn that fails or answers quickly writes more than the window shows before
+    # the first frame is painted -- and the screen is written incrementally, so a
+    # line that was never painted never appears in the byte stream either. The
+    # cell a submitted line produces is covered by unit tests and by the resumed
+    # turn above, which draws one out of the log.
     term.send(f"use the Read tool to read {ROOT}/Cargo.toml\r")
     ok &= term.expect(SPINNER, 15)
     ok &= term.spinner_moved(5)
@@ -312,9 +437,14 @@ def main() -> int:
         term = Terminal(master)
         try:
             # Startup: the box, the pinned line. Both are drawn before the first
-            # key, so seeing them is seeing that the viewport was entered.
+            # key, so seeing them is seeing that the screen was entered -- and the
+            # alternate screen is the whole reason none of it reaches the terminal's
+            # own scrollback.
             ok &= term.expect(VIEWPORT, 30)
             ok &= term.expect(STATUS, 15)
+            if b"\x1b[?1049h" not in term.raw:
+                print("  ✗ the alternate screen was never entered")
+                ok = False
             # The resumed turn's edit, line by line, from the log rather than from
             # anything that is running now.
             ok &= term.expect("  - one", 15)
@@ -325,15 +455,11 @@ def main() -> int:
             if b"48;5;236" not in term.raw:
                 print("  ✗ the thinking block has no ground")
                 ok = False
-            # Those characters have to arrive with nothing between them: a space in
-            # that column is the bug this is here to keep out.
-            if "中文宽度测试".encode() not in term.raw:
+            # Those characters have to sit together on the screen: a space in the
+            # column a wide character covers is what the bug looks like.
+            if not term.screen.find("中文宽度测试"):
                 print("  ✗ wide characters are drawn with a gap after each one")
                 ok = False
-            if term.queries == 0:
-                print("  ✗ the viewport never asked where the cursor was")
-                ok = False
-
             # Typing a command prefix opens the picker, which draws over the live
             # area: it is the one widget that is not part of either the
             # transcript or the box.
@@ -341,8 +467,8 @@ def main() -> int:
             term.send("/he")
             ok &= term.expect(PICKER, 15)
 
-            # Completing and submitting it: the answer is committed into
-            # scrollback, above the viewport, in the terminal's own history.
+            # Completing and submitting it: the answer becomes part of the
+            # transcript, which the application holds and draws.
             term.send("\t")  # Tab completes without running the command
             term.send("\r")
             ok &= term.expect(HELP, 15)
@@ -365,24 +491,27 @@ def main() -> int:
             term.send("\r")
             ok &= term.expect("switched to session", 30)
 
-            # The transcript, full screen: what the session holds is readable in the
-            # application, not only in the terminal's own scrollback. The resumed
-            # turn is in there, which is what makes this the whole session rather
-            # than what happens to fit above the box.
+            # The transcript is a window that pages in place. `/help` wrote more
+            # lines than the screen has rows, so the first line of the session has
+            # been pushed off the top of it -- and paging back is the only way to
+            # see it again, since nothing writes that banner twice.
             ok &= term.quiet(2.0, 30)
-            term.send("\x0f")  # Ctrl-O
-            ok &= term.expect("esc closes", 15)
-            ok &= term.expect("change a.txt", 15)
-            term.send("\x1b")  # esc
-            ok &= term.expect(VIEWPORT, 15)  # and the box is back
+            if not term.screen.find("Startup flags"):
+                print("  ✗ /help did not reach the screen")
+                ok = False
+            if term.screen.find(BANNER):
+                print("  ✗ the transcript did not scroll: the banner is still up")
+                ok = False
+            term.send("\x1b[5~")  # PageUp
+            ok &= term.expect(BANNER, 15)
 
             if is_live:
                 ok &= live(term, home)
 
-            # Leaving: the process ends, and the terminal is handed back (raw mode
-            # off) rather than left in the state the viewport put it in. Sent again
-            # while it is not taken, because a key that arrives during a turn is
-            # dropped rather than queued.
+            # Leaving: the process ends, and the terminal is handed back -- raw mode
+            # off and the alternate screen gone -- rather than left in the state the
+            # front end put it in. Sent again while it is not taken, because a key
+            # that arrives during a turn is dropped rather than queued.
             term.quiet(2.0, 120)
             status = None
             deadline = time.time() + 90
@@ -403,18 +532,21 @@ def main() -> int:
                 print(f"  ✗ exit code {status}")
                 ok = False
             # Raw mode is process-wide, so a front end that forgets to give it
-            # back leaves the shell without echo. The child is gone; what can be
-            # checked here is that it said it was leaving, which it does by
-            # showing the cursor again.
+            # back leaves the shell without echo; the alternate screen would hide
+            # everything the user had on it. The child is gone, so what can be
+            # checked here is that it said both, on the way out.
             if b"\x1b[?25h" not in term.raw:
                 print("  ✗ the cursor was never shown again on the way out")
+                ok = False
+            if b"\x1b[?1049l" not in term.raw:
+                print("  ✗ the alternate screen was never left")
                 ok = False
         finally:
             try:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-    print(f"tui smoke: {'✅ pass' if ok else '❌ fail'} ({term.queries} cursor queries answered)")
+    print(f"tui smoke: {'✅ pass' if ok else '❌ fail'}")
     return 0 if ok else 1
 
 

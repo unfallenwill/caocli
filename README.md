@@ -74,7 +74,7 @@ result summaries as they were rendered live (full tool output is not replayed).
 
 ### Status bar
 
-In the REPL, a status bar pinned to the bottom line shows the active model
+In the plain REPL (`--no-tui`), a status bar pinned to the bottom line shows the active model
 and the session's cumulative cache hit rate, right-aligned:
 
 ```

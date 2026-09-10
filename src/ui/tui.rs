@@ -1,5 +1,10 @@
-//! The interactive front end: an inline viewport pinned to the bottom of the
-//! terminal, with finished turns flowing into the terminal's own scrollback.
+//! The interactive front end: the whole screen, with the session held in the
+//! application rather than in the terminal.
+//!
+//! The alternate screen is what makes the layout the application's to decide, and
+//! it is also what costs the terminal's own scrollback: nothing drawn here reaches
+//! it, so the transcript is kept as cells and read back by moving a window over
+//! them. The session log is the durable copy either way.
 //!
 //! It owns the terminal, so it also owns the two channels the machine needs: raw
 //! mode clears `ISIG`, which means Ctrl-C arrives as a key event and there is no
@@ -19,11 +24,10 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::backend::{Backend, CrosstermBackend};
-use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style as RStyle};
 use ratatui::text::{Line, Span as RSpan, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use ratatui_textarea::{ScreenCursor, TextArea};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -39,16 +43,17 @@ use super::Ui;
 use super::cell::{self, Cell, Span, Style};
 use super::status::Status;
 
-/// Rows the live area occupies above the pinned region. It shows the tail of what
-/// the current turn is producing; a finished turn moves up into scrollback.
-const LIVE_ROWS: u16 = 10;
-
 /// Rows the pinned region needs: the status line, then the input box (border,
 /// text, border).
 const PINNED_ROWS: u16 = 1 + 3;
 
-/// The whole inline viewport.
-const VIEWPORT_ROWS: u16 = LIVE_ROWS + PINNED_ROWS;
+/// How many rows of the transcript a terminal `height` rows tall shows.
+///
+/// Never zero, even on a terminal too short for the pinned region: the box is
+/// worth a cramped transcript, where an empty screen is worth nothing.
+fn transcript_rows(height: u16) -> u16 {
+    height.saturating_sub(PINNED_ROWS).max(1)
+}
 
 /// The spinner, advanced while work is in progress. One column each, so it can
 /// sit on the status line without moving it.
@@ -101,13 +106,6 @@ const PICKER_ROWS: usize = 6;
 /// The columns the name gets before the detail starts. Wide enough for a session
 /// id, the longest name the picker shows, so both kinds of row line up.
 const PICKER_NAME_COLUMNS: usize = 17;
-
-/// How many lines one commit may push into scrollback at a time. Asking a
-/// terminal to scroll further than it has rows is not something it can do, so a
-/// long turn is committed in batches.
-fn commit_batch(terminal_height: u16) -> usize {
-    terminal_height.saturating_sub(VIEWPORT_ROWS).max(1) as usize
-}
 
 // ---------------------------------------------------------------- notices ---
 
@@ -284,8 +282,18 @@ fn drain<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> Vec<T> {
 /// does to it can be tested without one.
 struct State {
     status: Status,
-    /// Cells produced since the last commit: the turn in flight.
-    pending: Vec<Cell>,
+    /// Everything the session has produced, in draw order: replayed history, the
+    /// turn in flight, and the lines the user submitted. The whole session, not
+    /// an increment of it -- with the alternate screen there is no scrollback to
+    /// hand finished lines to, and the terminal keeps no copy of its own.
+    transcript: Vec<Cell>,
+    /// Which part of the transcript is on screen.
+    scroll: Scroll,
+    /// What the last draw saw: how long the transcript was, and how many rows of
+    /// it there were room for. Paging and staying put while lines arrive both
+    /// need them, and both are the terminal's to say rather than the state's.
+    drawn_lines: usize,
+    drawn_rows: usize,
     /// The text block being streamed, with the style it is drawn in. The style is
     /// the block's identity, so a fragment in the other style opens a new block.
     live: Option<(Style, String)>,
@@ -345,7 +353,10 @@ impl Default for State {
     fn default() -> Self {
         Self {
             status: Status::default(),
-            pending: Vec::new(),
+            transcript: Vec::new(),
+            scroll: Scroll::default(),
+            drawn_lines: 0,
+            drawn_rows: 0,
             live: None,
             question: None,
             reply: None,
@@ -362,10 +373,10 @@ impl Default for State {
 }
 
 impl State {
-    /// Everything not yet committed to scrollback, in draw order: the turn's
-    /// finished cells, then the block still streaming, then a pending question.
+    /// The whole transcript as lines, in draw order: the session's finished
+    /// cells, then the block still streaming, then a pending question.
     fn lines(&self, width: usize) -> Vec<Line<'static>> {
-        let mut lines = cell_lines(&self.pending, width);
+        let mut lines = cell_lines(&self.transcript, width);
         if let Some((style, text)) = &self.live {
             lines.extend(wrapped_lines(&[Span::new(*style, text.clone())], width));
         }
@@ -376,6 +387,43 @@ impl State {
             lines.extend(wrapped_lines(&question.spans(), width));
         }
         lines
+    }
+
+    /// The first transcript line to draw: a window on the end, or the one the
+    /// reader scrolled back to.
+    ///
+    /// Lines that arrive between two draws take the window with them rather than
+    /// sliding under it, so a reader who scrolled back stays on the line they were
+    /// reading instead of being carried to the end. Everything is clamped, because
+    /// a resize re-wraps the transcript and the line count is not the one this was
+    /// scrolled against.
+    fn window(&mut self, total: usize, rows: usize) -> usize {
+        if self.scroll.back > 0 {
+            let grew = total.saturating_sub(self.drawn_lines);
+            self.scroll.by(-(grew as isize), total, rows);
+        }
+        self.drawn_lines = total;
+        self.drawn_rows = rows;
+        self.scroll.first(total, rows)
+    }
+
+    /// Put a cell in the transcript that the machine did not send -- the banner,
+    /// a session-level failure. It still moves the revision, or the draw that
+    /// should show it would be skipped.
+    fn show(&mut self, cell: Cell) {
+        self.revision += 1;
+        self.transcript.push(cell);
+    }
+
+    /// Page through the transcript a screen at a time; `-1` is back, `+1` forward.
+    fn page(&mut self, step: isize) {
+        let (total, rows) = (self.drawn_lines, self.drawn_rows);
+        self.scroll.by(step * rows as isize, total, rows);
+    }
+
+    /// Back to the end, which is where a new line will appear.
+    fn follow(&mut self) {
+        self.scroll.bottom();
     }
 
     /// The pinned status line: the session summary, and then what is running.
@@ -447,20 +495,20 @@ impl State {
             Notice::FinishTurn => self.end_block(),
             Notice::ToolStart { name, args } => {
                 self.end_block();
-                self.pending.push(Cell::tool_call(&name, &args));
+                self.transcript.push(Cell::tool_call(&name, &args));
                 // The status line reports the tool by name while it runs, which
                 // is the part of a turn that can take a long time.
                 self.tool = Some(name);
             }
             Notice::ToolResult(result) => {
                 self.end_block();
-                self.pending.push(Cell::ToolResult(result));
+                self.transcript.push(Cell::ToolResult(result));
                 self.tool = None;
             }
             Notice::Usage(u) => self.status.record(&u),
             Notice::Interrupted => {
                 self.end_block();
-                self.pending.push(Cell::Interrupted);
+                self.transcript.push(Cell::Interrupted);
             }
             Notice::Approval { name, args } => {
                 self.end_block();
@@ -468,15 +516,15 @@ impl State {
             }
             Notice::Replay(messages) => {
                 self.end_block();
-                self.pending.extend(cell::from_messages(&messages));
+                self.transcript.extend(cell::from_messages(&messages));
             }
             Notice::Info(text) => {
                 self.end_block();
-                self.pending.push(Cell::Notice(text));
+                self.transcript.push(Cell::Notice(text));
             }
             Notice::Error(text) => {
                 self.end_block();
-                self.pending.push(Cell::Failure(text));
+                self.transcript.push(Cell::Failure(text));
             }
             Notice::SetModel(model) => self.status.set_model(&model),
             Notice::ResetStats => self.status.reset_stats(),
@@ -497,13 +545,17 @@ impl State {
     }
 
     /// Close the block being streamed, if any, so it becomes a finished cell.
+    ///
+    /// Bumps the revision: this is called from the turn's end as well as from a
+    /// notice, and in the first case it is the only thing that has changed.
     fn end_block(&mut self) {
         if let Some((style, text)) = self.live.take() {
             let cell = match style {
                 Style::Reasoning => Cell::Reasoning(text),
                 _ => Cell::Content(text),
             };
-            self.pending.push(cell);
+            self.revision += 1;
+            self.transcript.push(cell);
         }
     }
 
@@ -575,13 +627,25 @@ impl State {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } if self.textarea.is_empty() => Submitted::Exit,
-            // Ctrl-O shows the transcript full screen. The keys that scroll it
-            // belong to that view, so this one only opens it.
+            // Paging through the transcript. The box scrolls itself with the same
+            // two keys, so a draft with more lines than it has rows keeps them --
+            // which is the only case where the box has anything to page.
             KeyEvent {
-                code: KeyCode::Char('o'),
-                modifiers: KeyModifiers::CONTROL,
+                code: KeyCode::PageUp,
+                modifiers: KeyModifiers::NONE,
                 ..
-            } => Submitted::Scroll,
+            } if !self.text().contains('\n') => {
+                self.page(-1);
+                Submitted::Nothing
+            }
+            KeyEvent {
+                code: KeyCode::PageDown,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } if !self.text().contains('\n') => {
+                self.page(1);
+                Submitted::Nothing
+            }
             // Up and Down mean the picker while it is open and the history
             // otherwise: the picker is only open while a command is being named,
             // so the two never compete for the same keystroke.
@@ -806,8 +870,11 @@ impl State {
         self.remember(line);
         if !line.starts_with('/') {
             self.revision += 1;
-            self.pending.push(Cell::User(line.to_owned()));
+            self.transcript.push(Cell::User(line.to_owned()));
         }
+        // What was just asked is what the user wants to watch, so the transcript
+        // goes back to its end whether or not that line becomes a cell.
+        self.follow();
     }
 
     /// The picker as it is drawn: one row per choice, the highlighted one
@@ -916,10 +983,10 @@ impl State {
 
 // ------------------------------------------------------------ scroll view ---
 
-/// Where the full-screen transcript is scrolled to.
+/// Where the window over the transcript sits.
 ///
-/// Held as lines back from the newest one, because that is where it opens: the
-/// tail is what the reader was already looking at.
+/// Held as lines back from the newest one, because that is where it opens: the end
+/// is what the reader is watching.
 #[derive(Debug, Default, Clone, Copy)]
 struct Scroll {
     back: usize,
@@ -936,11 +1003,6 @@ impl Scroll {
         self.back = (self.back as isize - step).clamp(0, most) as usize;
     }
 
-    /// Go to the beginning of the transcript.
-    fn top(&mut self, total: usize, height: usize) {
-        self.back = total.saturating_sub(height);
-    }
-
     /// Go back to the end, which is where it starts.
     fn bottom(&mut self) {
         self.back = 0;
@@ -952,46 +1014,6 @@ impl Scroll {
     }
 }
 
-/// Draw one frame of the scroll view: a header saying where the view sits, then
-/// the transcript from there down.
-///
-/// Generic over the backend, and a function of the lines rather than of the cells,
-/// so that what it draws can be asserted on in memory -- the terminal-touching
-/// half of a view is exactly the half that is otherwise never checked.
-fn draw_scroll<B: Backend>(
-    terminal: &mut Terminal<B>,
-    view: &Scroll,
-    lines: &[Line<'static>],
-) -> Result<(), B::Error> {
-    terminal.draw(|frame| {
-        let rows =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(frame.area());
-        let body = rows[1].height as usize;
-        let first = view.first(lines.len(), body);
-        let last = (first + body).min(lines.len());
-        // Which lines are on screen, and how many there are: enough to know both
-        // where the view is and whether there is more of it.
-        let where_ = if lines.is_empty() {
-            "nothing to show".to_owned()
-        } else {
-            format!("lines {}–{} of {}", first + 1, last, lines.len())
-        };
-        let header = format!("transcript · {where_} · ↑↓ PgUp/PgDn Home/End · esc closes");
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                header,
-                RStyle::new().add_modifier(Modifier::DIM),
-            )),
-            rows[0],
-        );
-        frame.render_widget(
-            Paragraph::new(Text::from(lines[first..last].to_vec())),
-            rows[1],
-        );
-    })?;
-    Ok(())
-}
-
 /// The viewport: a terminal, and the state it shows.
 ///
 /// Generic over the backend so that what it draws can be asserted on. The
@@ -1001,10 +1023,60 @@ fn draw_scroll<B: Backend>(
 struct Screen<B: Backend> {
     terminal: Terminal<B>,
     state: State,
+    /// The terminal this screen took, for as long as it holds it. `None` in a test,
+    /// which draws into memory and has nothing to give back.
+    tty: Option<Tty>,
     /// The view key of the last draw, or `None` when the screen has to be
-    /// repainted whatever the key says: nothing has been drawn yet, or something
-    /// outside this screen (`insert_before`) has moved it.
+    /// repainted whatever the key says: nothing has been drawn yet.
     drawn: Option<ViewKey>,
+}
+
+/// The terminal, held by the screen that took it.
+///
+/// A type of its own because a `Drop` impl cannot be written for a single
+/// instantiation of a generic one: the screen is generic over its backend so that a
+/// test can draw into memory, and the terminal that has to be given back is not
+/// generic at all.
+struct Tty;
+
+impl Tty {
+    /// Take the terminal over: raw mode, then the alternate screen.
+    ///
+    /// Written so that a failure at any step undoes the steps before it: the value
+    /// exists before the first escape sequence is written, so an error drops it and
+    /// the drop is what gives the terminal back.
+    fn take() -> io::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        let taken = Self;
+        crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::event::EnableBracketedPaste
+        )?;
+        Ok(taken)
+    }
+}
+
+/// Give the terminal back: leave the alternate screen, so what the user had on it
+/// reappears, and put the cursor where a shell prompt expects to find it.
+fn restore() -> io::Result<()> {
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableBracketedPaste,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show
+    )
+}
+
+/// Restoring the terminal does not depend on the success path running. Raw mode is
+/// process-wide and would wreck the shell if it survived an unwind, and the
+/// alternate screen would hide everything the user had on it -- so both are given
+/// back by dropping what took them, which an unwind does too.
+impl Drop for Tty {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = restore();
+    }
 }
 
 /// What the viewport would show, as a value that can be compared.
@@ -1023,147 +1095,39 @@ struct ViewKey {
     height: u16,
 }
 
-/// An inline viewport on `backend`: the last [`VIEWPORT_ROWS`] rows of the
-/// terminal, with everything above it left to the terminal's own scrolling.
-fn viewport<B: Backend>(backend: B) -> Result<Terminal<B>, B::Error> {
+/// A terminal that draws over the whole screen.
+///
+/// Nothing here has to ask the terminal where its cursor is -- that question is
+/// what an inline viewport lives by -- so the only way this fails is a terminal
+/// that cannot be put into raw mode at all.
+fn fullscreen<B: Backend>(backend: B) -> Result<Terminal<B>, B::Error> {
     Terminal::with_options(
         backend,
         TerminalOptions {
-            viewport: Viewport::Inline(VIEWPORT_ROWS),
+            viewport: Viewport::Fullscreen,
         },
     )
 }
 
 impl Screen<CrosstermBackend<Stdout>> {
-    /// Enter the viewport.
+    /// Enter the screen.
     ///
-    /// Fallible on purpose. An inline viewport has to ask the terminal where its
-    /// cursor is, and a terminal that does not answer leaves ratatui no way to
-    /// place itself; the caller falls back to the plain front end rather than
-    /// failing to start. Raw mode is restored before the error is returned, so a
-    /// failed attempt leaves no trace.
+    /// Fallible on purpose: raw mode is process-wide and the alternate screen hides
+    /// everything the user had on it, so an attempt that cannot be finished has to
+    /// leave the terminal as it was found. An error here is the caller's signal to
+    /// fall back to the plain front end rather than to fail to start.
     fn enter() -> io::Result<Self> {
-        crossterm::terminal::enable_raw_mode()?;
-        match Self::try_enter() {
-            Ok(screen) => Ok(screen),
-            Err(e) => {
-                let _ = crossterm::terminal::disable_raw_mode();
-                Err(e)
-            }
-        }
-    }
-
-    fn try_enter() -> io::Result<Self> {
-        // The viewport is placed first: it is the step that can fail, and it asks
-        // the terminal where its cursor is. Anything that changes terminal state
-        // waits until that has succeeded, so a declined attempt emits nothing but
-        // the query itself.
-        let terminal = viewport(CrosstermBackend::new(std::io::stdout()))?;
-        crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
         Ok(Self {
-            terminal,
+            tty: Some(Tty::take()?),
+            terminal: fullscreen(CrosstermBackend::new(std::io::stdout()))?,
             state: State::default(),
             drawn: None,
         })
     }
 
-    /// Leave the viewport. No alternate screen was entered, so this only undoes
-    /// raw mode and parks the cursor where a shell prompt can follow.
-    fn leave(&mut self) -> io::Result<()> {
-        crossterm::execute!(
-            self.terminal.backend_mut(),
-            crossterm::event::DisableBracketedPaste,
-            crossterm::cursor::Show
-        )?;
-        self.terminal.show_cursor()?;
-        println!();
-        Ok(())
-    }
-
-    /// Show the transcript full screen, and give the viewport back untouched.
-    ///
-    /// The alternate screen is what makes this cost nothing: it covers the inline
-    /// viewport for the duration and restores it on the way out, so no cells have
-    /// to be committed, re-committed or scrolled out of the way to make room -- and
-    /// the batching that committing uses is not involved at all.
-    ///
-    /// `cells` is the whole session, folded from its log by the same call replay
-    /// uses, plus whatever the current turn has not committed yet. Nothing is
-    /// written while the view is open, so there is nothing that could disagree with
-    /// the scrollback underneath it.
-    fn scroll(&mut self, cells: &[Cell]) -> io::Result<()> {
-        crossterm::execute!(
-            self.terminal.backend_mut(),
-            crossterm::terminal::EnterAlternateScreen,
-            crossterm::cursor::Hide
-        )?;
-        // A terminal of its own: a viewport cannot be changed on a live one, and
-        // the inline viewport is still in place underneath this one, waiting to be
-        // shown again.
-        let backend = CrosstermBackend::new(std::io::stdout());
-        let mut full = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Fullscreen,
-            },
-        )?;
-        let result = self.scroll_loop(&mut full, cells);
-        crossterm::execute!(
-            full.backend_mut(),
-            crossterm::terminal::LeaveAlternateScreen,
-            crossterm::cursor::Show
-        )?;
-        // The inline viewport shows what the terminal held before the alternate
-        // screen covered it, which is not what this screen drew last.
-        self.drawn = None;
-        result
-    }
-
-    /// The scroll view's own loop, which owns the keyboard until it is closed.
-    ///
-    /// The turn is not polled here, and that is why Ctrl-O is only read at the
-    /// prompt: a turn's notifications arrive on a channel that only the event loop
-    /// drains, and its future is only driven by the loop that races the keyboard,
-    /// so opening this from inside a turn would stall the turn for as long as the
-    /// view stayed open.
-    fn scroll_loop(
-        &self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-        cells: &[Cell],
-    ) -> io::Result<()> {
-        let mut view = Scroll::default();
-        loop {
-            let size = terminal.size()?;
-            let lines = cell_lines(cells, size.width as usize);
-            // A row is the header, so the transcript gets the rest.
-            let height = size.height.saturating_sub(1) as usize;
-            draw_scroll(terminal, &view, &lines)?;
-            let Some(event) = poll_key(TICK)? else {
-                continue;
-            };
-            let Event::Key(key) = event else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            match key.code {
-                // Both hands on the same keys: a reader reaching for the arrows and
-                // one reaching for the vi keys are both served, and neither has to
-                // be told which this is.
-                KeyCode::Up | KeyCode::Char('k') => view.by(-1, lines.len(), height),
-                KeyCode::Down | KeyCode::Char('j') => view.by(1, lines.len(), height),
-                KeyCode::PageUp => view.by(-(height as isize), lines.len(), height),
-                KeyCode::PageDown => view.by(height as isize, lines.len(), height),
-                KeyCode::Home | KeyCode::Char('g') => view.top(lines.len(), height),
-                KeyCode::End | KeyCode::Char('G') => view.bottom(),
-                KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
-                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Ok(());
-                }
-                _ => {}
-            }
-        }
+    /// Leave the screen: giving the terminal back is the whole of it.
+    fn leave(&mut self) {
+        drop(self.tty.take());
     }
 }
 
@@ -1203,30 +1167,36 @@ impl<B: Backend> Screen<B> {
         self.draw_at(Instant::now())
     }
 
-    /// Draw the viewport: the tail of the live area, the pinned status line, the
-    /// input box.
+    /// Draw the screen: the window on the transcript, the status line, the input
+    /// box.
     fn draw_at(&mut self, now: Instant) -> Result<(), B::Error> {
         let size = self.terminal.size()?;
         let width = size.width as usize;
         let lines = self.state.lines(width);
-        // Only the tail of the turn fits; scrolling is what makes it a tail
-        // rather than a head.
-        let scroll = lines.len().saturating_sub(LIVE_ROWS as usize) as u16;
-        let live = Text::from(lines);
+        let rows = transcript_rows(size.height);
+        // The window over the transcript: its end unless the reader scrolled back.
+        // The picker belongs to the line being typed, so it takes the box's end of
+        // the transcript with it.
+        let picker = self.state.picker_lines();
+        let first = if picker.is_empty() {
+            self.state.window(lines.len(), rows as usize)
+        } else {
+            self.state.follow();
+            lines.len().saturating_sub(rows as usize)
+        };
+        let last = (first + rows as usize).min(lines.len());
+        let transcript = Text::from(lines[first..last].to_vec());
         let status = self.state.status_line(width, now);
         let cursor = self.state.textarea.screen_cursor();
-        // The picker draws over the bottom of the live area rather than beside
-        // it: it belongs to the line being typed, which is what it sits above.
-        let picker = self.state.picker_lines();
 
         self.terminal.draw(|frame| {
             let rows = Layout::vertical([
-                Constraint::Length(LIVE_ROWS),
+                Constraint::Min(0),
                 Constraint::Length(1),
                 Constraint::Length(3),
             ])
             .split(frame.area());
-            frame.render_widget(Paragraph::new(live).scroll((scroll, 0)), rows[0]);
+            frame.render_widget(Paragraph::new(transcript), rows[0]);
             if !picker.is_empty() {
                 let height = picker.len().min(PICKER_ROWS) as u16;
                 let area = Rect {
@@ -1247,41 +1217,13 @@ impl<B: Backend> Screen<B> {
         Ok(())
     }
 
-    /// Push the finished cells into the terminal's own scrollback.
+    /// A turn is over: close the block that was still being streamed.
     ///
-    /// Batched: each insert costs a cursor-position round trip to the terminal
-    /// (measured), so a turn is committed in as few passes as the screen height
-    /// allows rather than a line at a time.
-    fn commit(&mut self) -> Result<(), B::Error> {
+    /// Nothing leaves the screen. The transcript is the state's, and a turn is part
+    /// of it from the moment it arrives; this only closes the block, so that the
+    /// next turn's first fragment opens one of its own.
+    fn commit(&mut self) {
         self.state.end_block();
-        if self.state.pending.is_empty() {
-            return Ok(());
-        }
-        let size = self.terminal.size()?;
-        let width = size.width as usize;
-        let batch = commit_batch(size.height);
-        let cells = std::mem::take(&mut self.state.pending);
-        // Each cell wraps on its own: a cell boundary is always a line boundary.
-        let lines = cell_lines(&cells, width);
-        for chunk in lines.chunks(batch) {
-            let chunk = chunk.to_vec();
-            self.terminal.insert_before(chunk.len() as u16, |buf| {
-                Paragraph::new(Text::from(chunk.clone())).render(buf.area, buf);
-                blank_wide_continuations(buf);
-            })?;
-        }
-        // The insertion moved everything the viewport shows, so what was drawn
-        // last is not what is on the screen any more.
-        self.drawn = None;
-        Ok(())
-    }
-}
-
-/// Raw mode is process-wide and would wreck the shell if it survived an unwind,
-/// so restoring it does not depend on the success path running.
-impl<B: Backend> Drop for Screen<B> {
-    fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
     }
 }
 
@@ -1297,35 +1239,6 @@ fn input_box() -> TextArea<'static> {
     textarea.set_placeholder_text("›  type a message · /help for commands");
     textarea.set_cursor_line_style(RStyle::new());
     textarea
-}
-
-/// Leave the columns a wide symbol covers empty.
-///
-/// A terminal draws a two-column character and moves two columns: the second
-/// column belongs to the character, and it advances past it itself. ratatui leaves
-/// the column after a wide grapheme as an ordinary blank cell, which is invisible
-/// as long as only changed cells are written -- but the insertion path that puts a
-/// finished turn into scrollback writes every cell it was handed, so a wide
-/// character came out followed by a space. A line of CJK text therefore reached the
-/// terminal with a gap between every character.
-fn blank_wide_continuations(buf: &mut Buffer) {
-    let area = buf.area;
-    for y in area.top()..area.bottom() {
-        let mut x = area.left();
-        while x < area.right() {
-            // Graphemes are one or two columns wide; the cast is the same one
-            // ratatui makes when it places them.
-            let width = super::text::width(buf[(x, y)].symbol()) as u16;
-            for dx in 1..width {
-                let at = x.saturating_add(dx);
-                if at < area.right() {
-                    buf[(at, y)].set_symbol("");
-                }
-            }
-            // A symbol of no width would otherwise stand still.
-            x += width.max(1);
-        }
-    }
 }
 
 /// The lines cells occupy at `width`.
@@ -1492,8 +1405,6 @@ enum Submitted {
     Line,
     /// The user asked to leave.
     Exit,
-    /// The user asked for the transcript, full screen.
-    Scroll,
     /// Nothing to run; keep waiting.
     Nothing,
 }
@@ -1520,9 +1431,8 @@ pub async fn run(
     let history_path = crate::config::history_file()?;
     screen.state.history = history::load(&history_path);
     screen.state.status.set_model(&agent.session.meta.model);
-    screen.state.pending.push(Cell::Notice(banner.to_owned()));
-    screen.state.pending.extend(cell::from_messages(history));
-    screen.commit()?;
+    screen.state.show(Cell::Notice(banner.to_owned()));
+    screen.state.transcript.extend(cell::from_messages(history));
 
     let (tx, mut notices) = mpsc::unbounded_channel();
     let (ask_tx, mut asked) = mpsc::unbounded_channel();
@@ -1542,17 +1452,6 @@ pub async fn run(
                 Some(event) => match screen.state.key(event) {
                     Submitted::Line => break screen.state.take_line(),
                     Submitted::Exit => break String::new(),
-                    Submitted::Scroll => {
-                        // The whole session, as the cells replay would fold it out
-                        // of the log, and then whatever this process has produced
-                        // that has not been committed yet.
-                        let mut cells = cell::from_messages(&agent.session.messages);
-                        cells.extend(screen.state.pending.iter().cloned());
-                        screen.scroll(&cells)?;
-                        // The viewport it comes back to is the one it left, and
-                        // what that shows is decided by the draw at the top of the
-                        // loop.
-                    }
                     Submitted::Nothing => {}
                 },
                 None => continue,
@@ -1607,11 +1506,10 @@ pub async fn run(
                 _ = tokio::time::sleep(TICK) => {}
             }
         };
-        // Drain once more before committing. The turn is polled *inside* the
-        // select above, so its last notifications are sent after the loop's last
-        // drain and are still queued when it resolves; committing without them
-        // would push a half-finished turn into scrollback and leave the rest to
-        // surface during the next idle wait.
+        // Drain once more before closing the turn. The turn is polled *inside*
+        // the select above, so its last notifications are sent after the loop's
+        // last drain and are still queued when it resolves; closing the block
+        // without them would leave the tail of the turn to open one of its own.
         for notice in drain(&mut notices) {
             screen.state.apply(notice);
         }
@@ -1620,26 +1518,26 @@ pub async fn run(
         }
         screen.state.end_turn();
         screen.state.close_question();
-        if let Err(e) = screen.commit() {
-            break Err(e.into());
-        }
+        screen.commit();
         match outcome {
             Ok(repl::Outcome::Exit) => break Ok(()),
             Ok(repl::Outcome::Continue) => {}
             Err(e) => {
                 // `repl::handle` reports turn failures itself; anything escaping
                 // it is a session-level problem worth showing.
-                screen.state.pending.push(Cell::Failure(format!("{e:#}")));
-                let _ = screen.commit();
+                screen.state.show(Cell::Failure(format!("{e:#}")));
             }
         }
     };
 
-    screen.leave()?;
+    screen.leave();
     // Written on the way out rather than per line: the file is small, and a
     // rewrite per keystroke would be work for nothing.
     if let Err(e) = history::save(&history_path, &screen.state.history) {
-        screen.state.pending.push(Cell::Failure(format!("{e:#}")));
+        screen
+            .state
+            .transcript
+            .push(Cell::Failure(format!("{e:#}")));
     }
     result?;
     Ok(true)
@@ -1667,7 +1565,7 @@ mod tests {
         screen.apply(Notice::Error("boom".into()));
         screen.apply(Notice::Interrupted);
         assert_eq!(
-            screen.pending,
+            screen.transcript,
             vec![
                 Cell::Reasoning("think".into()),
                 Cell::Content("answer".into()),
@@ -1688,12 +1586,12 @@ mod tests {
         assert!(screen.live.is_some(), "still one open block");
         screen.apply(Notice::Content("x".into()));
         assert_eq!(
-            screen.pending,
+            screen.transcript,
             vec![Cell::Reasoning("ab".into())],
             "the reasoning block closed when the style changed"
         );
         screen.apply(Notice::FinishTurn);
-        assert_eq!(screen.pending[1], Cell::Content("x".into()));
+        assert_eq!(screen.transcript[1], Cell::Content("x".into()));
         assert!(screen.live.is_none());
     }
 
@@ -1733,7 +1631,7 @@ mod tests {
             Message::tool("call_1", "exit_code: 0\n--- stdout ---\nbody"),
         ]));
         assert_eq!(
-            screen.pending,
+            screen.transcript,
             vec![
                 Cell::Reasoning("let me think".into()),
                 Cell::Content("running it".into()),
@@ -1852,8 +1750,9 @@ mod tests {
     fn screen_for_test(width: u16, height: u16) -> Screen<ratatui::backend::TestBackend> {
         let backend = ratatui::backend::TestBackend::new(width, height);
         Screen {
-            terminal: viewport(backend).unwrap(),
+            terminal: fullscreen(backend).unwrap(),
             state: State::default(),
+            tty: None,
             drawn: None,
         }
     }
@@ -1868,80 +1767,14 @@ mod tests {
         (state, now)
     }
 
-    /// One row of what a terminal holds, without the padding.
-    fn term_row(terminal: &Terminal<ratatui::backend::TestBackend>, y: u16) -> String {
-        let buf = terminal.backend().buffer();
-        (0..buf.area.width)
-            .map(|x| buf[(x, y)].symbol())
-            .collect::<String>()
-            .trim_end()
-            .to_owned()
-    }
-
     #[test]
-    fn the_scroll_view_opens_at_the_end_and_stops_there() {
-        let mut view = Scroll::default();
-        let (total, height) = (30, 10);
-        assert_eq!(view.first(total, height), 20, "it opens on the tail");
-        view.by(1, total, height);
-        assert_eq!(view.first(total, height), 20, "nothing lies past the end");
-        view.by(-5, total, height);
-        assert_eq!(view.first(total, height), 15);
-        view.by(-100, total, height);
-        assert_eq!(view.first(total, height), 0, "nor before the start");
-        view.by(100, total, height);
-        assert_eq!(view.first(total, height), 20);
-    }
-
-    #[test]
-    fn a_transcript_that_fits_does_not_scroll() {
-        let mut view = Scroll::default();
-        let (total, height) = (5, 10);
-        view.by(-3, total, height);
-        assert_eq!(view.first(total, height), 0);
-        assert_eq!(view.back, 0, "there is nowhere to go");
-    }
-
-    #[test]
-    fn home_and_end_reach_the_ends_of_the_transcript() {
+    fn paging_to_either_end_stops_there() {
         let mut view = Scroll::default();
         let (total, height) = (100, 10);
-        view.top(total, height);
-        assert_eq!(view.first(total, height), 0);
+        view.by(-1000, total, height);
+        assert_eq!(view.first(total, height), 0, "the beginning of it");
         view.bottom();
-        assert_eq!(view.first(total, height), 90);
-    }
-
-    #[test]
-    fn the_scroll_view_draws_a_header_and_the_lines_it_is_at() {
-        let lines: Vec<Line<'static>> = (0..30).map(|i| Line::from(format!("line {i}"))).collect();
-        // Eight rows: one of header, seven of transcript.
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
-        let mut view = Scroll::default();
-        draw_scroll(&mut terminal, &view, &lines).unwrap();
-        assert!(
-            term_row(&terminal, 0).starts_with("transcript · lines 24–30 of 30"),
-            "{:?}",
-            term_row(&terminal, 0)
-        );
-        assert_eq!(term_row(&terminal, 1), "line 23");
-        assert_eq!(term_row(&terminal, 7), "line 29");
-
-        view.top(30, 7);
-        draw_scroll(&mut terminal, &view, &lines).unwrap();
-        assert_eq!(term_row(&terminal, 1), "line 0");
-        assert!(
-            term_row(&terminal, 0).starts_with("transcript · lines 1–7 of 30"),
-            "{:?}",
-            term_row(&terminal, 0)
-        );
-    }
-
-    #[test]
-    fn a_session_with_nothing_in_it_says_so() {
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
-        draw_scroll(&mut terminal, &Scroll::default(), &[]).unwrap();
-        assert!(term_row(&terminal, 0).contains("nothing to show"));
+        assert_eq!(view.first(total, height), 90, "and its end");
     }
 
     /// One row of what was drawn, without the padding.
@@ -1969,25 +1802,17 @@ mod tests {
     }
 
     #[test]
-    fn the_viewport_pins_the_status_line_above_the_input_box() {
-        // The shape the pinned region has to keep, whatever the live area does.
+    fn the_pinned_rows_take_the_bottom_of_the_screen() {
+        // The shape the pinned region has to keep, whatever the transcript does:
+        // the status line, then the box, on the last rows of the terminal.
         let mut screen = screen_for_test(40, 20);
         screen.state.status.set_model("m-1");
         screen.draw().unwrap();
-        let top = origin(&mut screen).y;
-        assert_eq!(row(&screen, top + LIVE_ROWS), "m-1 · cache —");
-        assert!(
-            row(&screen, top + LIVE_ROWS + 1).starts_with('┌'),
-            "the box's top"
-        );
-        assert!(
-            row(&screen, top + LIVE_ROWS + 2).starts_with("│ ›"),
-            "its text"
-        );
-        assert!(
-            row(&screen, top + LIVE_ROWS + 3).starts_with('└'),
-            "its bottom"
-        );
+        let last = screen.terminal.backend().buffer().area.height - 1;
+        assert_eq!(row(&screen, last - 3), "m-1 · cache —");
+        assert!(row(&screen, last - 2).starts_with('┌'), "the box's top");
+        assert!(row(&screen, last - 1).starts_with("│ ›"), "its text");
+        assert!(row(&screen, last).starts_with('└'), "its bottom");
     }
 
     #[test]
@@ -2001,17 +1826,14 @@ mod tests {
             args: "{}".into(),
         });
         screen.draw_at(now).unwrap();
-        let top = origin(&mut screen).y;
-        assert_eq!(
-            row(&screen, top + LIVE_ROWS),
-            "m · cache — · ⠋ read_file · 0.0s"
-        );
+        let pinned = screen.terminal.backend().buffer().area.height - PINNED_ROWS;
+        assert_eq!(row(&screen, pinned), "m · cache — · ⠋ read_file · 0.0s");
     }
 
     #[test]
     fn a_tool_call_that_changes_a_file_is_drawn_across_its_lines() {
         let mut screen = screen_for_test(40, 20);
-        screen.state.pending.push(Cell::tool_call(
+        screen.state.transcript.push(Cell::tool_call(
             "Edit",
             r#"{"file_path":"a.rs","old_string":"one\ntwo","new_string":"three"}"#,
         ));
@@ -2029,7 +1851,7 @@ mod tests {
         // wrap it, or the tail of the line is lost.
         let mut screen = screen_for_test(20, 20);
         let long = "x".repeat(30);
-        screen.state.pending.push(Cell::tool_call(
+        screen.state.transcript.push(Cell::tool_call(
             "Write",
             &format!(r#"{{"file_path":"a.txt","content":"{long}"}}"#),
         ));
@@ -2040,34 +1862,13 @@ mod tests {
     }
 
     #[test]
-    fn the_columns_a_wide_symbol_covers_are_left_empty() {
-        // A terminal puts a wide character in its two columns and moves past both.
-        // Anything written into the second one arrives on screen as a space after
-        // the character -- which is what a line of CJK text looked like.
-        let mut buf = Buffer::empty(Rect::new(0, 0, 8, 1));
-        buf.set_string(0, 0, "看一下ab", RStyle::new());
-        blank_wide_continuations(&mut buf);
-        let symbols: Vec<&str> = (0..8).map(|x| buf[(x, 0)].symbol()).collect();
-        assert_eq!(symbols, vec!["看", "", "一", "", "下", "", "a", "b"]);
-    }
-
-    #[test]
-    fn leaving_those_columns_empty_does_not_disturb_the_rest() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 5, 1));
-        buf.set_string(0, 0, "abcde", RStyle::new());
-        blank_wide_continuations(&mut buf);
-        let symbols: Vec<&str> = (0..5).map(|x| buf[(x, 0)].symbol()).collect();
-        assert_eq!(symbols, vec!["a", "b", "c", "d", "e"]);
-    }
-
-    #[test]
     fn thinking_is_drawn_as_a_block_that_reaches_the_edge() {
         // Its own ground, painted across the whole row rather than under the
         // characters only: a block that stops where the text stops does not read as
         // a block, and the answer below it must not be caught by it.
         let mut screen = screen_for_test(40, 20);
-        screen.state.pending.push(Cell::Reasoning("hmm".into()));
-        screen.state.pending.push(Cell::Content("answer".into()));
+        screen.state.transcript.push(Cell::Reasoning("hmm".into()));
+        screen.state.transcript.push(Cell::Content("answer".into()));
         screen.draw().unwrap();
         let top = origin(&mut screen).y;
         let buf = screen.terminal.backend().buffer();
@@ -2112,62 +1913,150 @@ mod tests {
     }
 
     #[test]
-    fn the_live_area_shows_the_tail_of_a_long_turn() {
-        // The area is a fixed height: what does not fit scrolls off the top of it
-        // rather than pushing the pinned rows away.
+    fn the_transcript_fills_the_screen_and_shows_its_end() {
+        // The whole screen is the transcript, less the pinned rows -- and what
+        // does not fit is off the top, because the end is what was just written.
         let mut screen = screen_for_test(40, 20);
-        for i in 0..(LIVE_ROWS + 5) {
-            screen.state.pending.push(Cell::Notice(format!("line {i}")));
+        let rows = transcript_rows(20) as usize;
+        for i in 0..(rows + 5) {
+            screen
+                .state
+                .transcript
+                .push(Cell::Notice(format!("line {i}")));
         }
         screen.draw().unwrap();
-        let top = origin(&mut screen).y;
-        assert_eq!(row(&screen, top), "line 5", "the first five scrolled off");
-        assert_eq!(row(&screen, top + LIVE_ROWS - 1), "line 14");
+        assert_eq!(row(&screen, 0), "line 5", "the first five are off the top");
+        assert_eq!(row(&screen, rows as u16 - 1), format!("line {}", rows + 4));
     }
 
     #[test]
-    fn committing_moves_the_turn_into_scrollback_and_empties_it() {
+    fn paging_back_moves_the_window_and_paging_forward_returns_it() {
         let mut screen = screen_for_test(40, 20);
-        screen.state.pending.push(Cell::Notice("first".into()));
-        screen.state.pending.push(Cell::Notice("second".into()));
-        screen.commit().unwrap();
-        assert!(screen.state.pending.is_empty(), "nothing is left to redraw");
-        let rows = all_rows(&screen);
-        let first = rows.iter().position(|r| r == "first").expect("committed");
-        assert_eq!(rows[first + 1], "second", "in order, on the next row");
-        assert!(
-            !screen
+        let rows = transcript_rows(20) as usize;
+        for i in 0..(rows * 3) {
+            screen
                 .state
-                .lines(40)
-                .iter()
-                .any(|l| format!("{l:?}").contains("first")),
-            "and gone from the live area"
+                .transcript
+                .push(Cell::Notice(format!("line {i}")));
+        }
+        screen.draw().unwrap();
+        let last = rows * 3;
+        // A screen back: the window is the one above the end.
+        press(&mut screen.state, KeyCode::PageUp);
+        screen.draw().unwrap();
+        assert_eq!(row(&screen, 0), format!("line {}", last - rows * 2));
+        assert_eq!(
+            row(&screen, rows as u16 - 1),
+            format!("line {}", last - rows - 1)
         );
+        // Forward again, one page at a time.
+        press(&mut screen.state, KeyCode::PageDown);
+        screen.draw().unwrap();
+        assert_eq!(row(&screen, rows as u16 - 1), format!("line {}", last - 1));
+        // And no further: there is nothing past the end.
+        press(&mut screen.state, KeyCode::PageDown);
+        screen.draw().unwrap();
+        assert_eq!(row(&screen, rows as u16 - 1), format!("line {}", last - 1));
     }
 
     #[test]
-    fn what_is_committed_is_wrapped_not_clipped() {
-        // The regression this guards: `insert_before` renders into a fixed-width
-        // buffer, where an over-long line is silently cut off.
+    fn lines_arriving_do_not_move_a_reader_who_scrolled_back() {
+        // A turn keeps writing while the user reads what came before: the window
+        // has to stay on the line they were on instead of sliding to the end
+        // under them.
+        let mut screen = screen_for_test(40, 20);
+        let rows = transcript_rows(20) as usize;
+        for i in 0..(rows * 3) {
+            screen
+                .state
+                .transcript
+                .push(Cell::Notice(format!("line {i}")));
+        }
+        screen.draw().unwrap();
+        press(&mut screen.state, KeyCode::PageUp);
+        screen.draw().unwrap();
+        let was = row(&screen, 0);
+        for i in 0..5 {
+            screen
+                .state
+                .transcript
+                .push(Cell::Notice(format!("more {i}")));
+        }
+        screen.draw().unwrap();
+        assert_eq!(row(&screen, 0), was, "still looking at the same line");
+    }
+
+    #[test]
+    fn submitting_a_line_returns_to_the_end_of_the_transcript() {
+        let mut screen = screen_for_test(40, 20);
+        for i in 0..(transcript_rows(20) as usize * 2) {
+            screen
+                .state
+                .transcript
+                .push(Cell::Notice(format!("line {i}")));
+        }
+        screen.draw().unwrap();
+        press(&mut screen.state, KeyCode::PageUp);
+        assert!(screen.state.scroll.back > 0, "scrolled back");
+        screen.state.submit("look at this");
+        assert_eq!(screen.state.scroll.back, 0, "back to where it is written");
+    }
+
+    #[test]
+    fn a_long_line_is_wrapped_into_the_window_not_clipped() {
+        // The transcript is drawn into a region of a fixed width, where an
+        // over-long line would otherwise be cut off at the edge.
         let mut screen = screen_for_test(10, 30);
         let long = "abcdefghijklmnopqrstuvwxyz"; // 26 columns at width 10
-        screen.state.pending.push(Cell::Notice(long.into()));
-        screen.commit().unwrap();
+        screen.state.transcript.push(Cell::Notice(long.into()));
+        screen.draw().unwrap();
         let rows = all_rows(&screen);
-        let joined: String = rows
-            .iter()
-            .filter(|r| !r.is_empty() && !r.starts_with(['┌', '│', '└']))
-            .cloned()
-            .collect();
+        let joined: String = rows[..transcript_rows(30) as usize].concat();
         assert_eq!(joined, long, "every column survived, in order");
+    }
+
+    #[test]
+    fn a_turn_stays_on_screen_when_it_ends() {
+        // Nothing is handed to the terminal's scrollback any more, so what is
+        // drawn has to outlive the turn that produced it.
+        let mut screen = screen_for_test(40, 20);
+        screen.state.transcript.push(Cell::Notice("first".into()));
+        screen.state.transcript.push(Cell::Notice("second".into()));
+        screen.commit();
+        screen.draw().unwrap();
+        let rows = all_rows(&screen);
+        let first = rows.iter().position(|r| r == "first").expect("still there");
+        assert_eq!(rows[first + 1], "second", "in order, on the next row");
     }
 
     #[test]
     fn an_empty_turn_commits_nothing() {
         let mut screen = screen_for_test(40, 20);
+        screen.draw().unwrap();
         let before = all_rows(&screen);
-        screen.commit().unwrap();
+        screen.commit();
+        screen.draw().unwrap();
         assert_eq!(all_rows(&screen), before);
+    }
+
+    #[test]
+    fn committing_closes_the_block_that_was_still_streaming() {
+        // `commit` ends the turn, so the block open at that moment becomes a
+        // finished cell: the next turn's first fragment must open one of its own.
+        let mut screen = screen_for_test(40, 20);
+        screen.state.stream(Style::Plain, "half a line");
+        screen.commit();
+        assert!(screen.state.live.is_none(), "nothing left open");
+        screen.state.stream(Style::Plain, " and the rest");
+        screen.commit();
+        assert_eq!(
+            screen.state.transcript,
+            vec![
+                Cell::Content("half a line".into()),
+                Cell::Content(" and the rest".into()),
+            ],
+            "one cell per turn, not one for the two of them"
+        );
     }
 
     fn press(state: &mut State, code: KeyCode) -> Submitted {
@@ -2450,12 +2339,10 @@ mod tests {
     }
 
     #[test]
-    fn the_commit_batch_leaves_room_for_the_viewport() {
-        // Scrolling further than the screen has rows is not something a terminal
-        // can do, so the batch is capped by the rows above the viewport.
-        assert_eq!(commit_batch(24), 24 - VIEWPORT_ROWS as usize);
-        assert_eq!(commit_batch(1), 1, "never zero, even on a tiny terminal");
-        assert_eq!(commit_batch(0), 1);
+    fn the_transcript_gets_the_rows_the_pinned_region_leaves() {
+        assert_eq!(transcript_rows(24), 24 - PINNED_ROWS);
+        assert_eq!(transcript_rows(1), 1, "never zero, even on a tiny terminal");
+        assert_eq!(transcript_rows(0), 1);
     }
 
     #[test]
@@ -2645,8 +2532,9 @@ mod tests {
             frames: frames.clone(),
         };
         let mut screen = Screen {
-            terminal: viewport(backend).unwrap(),
+            terminal: fullscreen(backend).unwrap(),
             state: State::default(),
+            tty: None,
             drawn: None,
         };
         screen.draw_if_changed().unwrap();
@@ -2666,14 +2554,15 @@ mod tests {
     }
 
     #[test]
-    fn committing_forces_the_next_draw() {
-        // `insert_before` moves everything the viewport shows, so what was drawn
-        // last is stale whatever the revision says.
+    fn closing_a_turn_is_worth_a_draw() {
+        // The turn's end is the one thing that changes the screen without a
+        // notice arriving, so it has to move the revision itself.
         let mut screen = screen_for_test(40, 20);
+        screen.state.stream(Style::Plain, "half a line");
         screen.draw_if_changed().unwrap();
-        screen.state.pending.push(Cell::Notice("done".into()));
-        screen.commit().unwrap();
-        assert!(screen.drawn.is_none(), "the next draw cannot be skipped");
+        let drawn = screen.state.revision;
+        screen.commit();
+        assert_ne!(screen.state.revision, drawn, "the draw cannot be skipped");
     }
 
     #[test]
@@ -2703,7 +2592,7 @@ mod tests {
         let mut state = State::default();
         state.submit("look at src/main.rs");
         assert_eq!(
-            state.pending,
+            state.transcript,
             vec![Cell::User("look at src/main.rs".into())]
         );
         assert_eq!(state.history, vec!["look at src/main.rs"]);
@@ -2715,7 +2604,7 @@ mod tests {
         // session does not have them either.
         let mut state = State::default();
         state.submit("/help");
-        assert!(state.pending.is_empty(), "nothing to replay");
+        assert!(state.transcript.is_empty(), "nothing to replay");
         assert_eq!(state.history, vec!["/help"], "but it is worth recalling");
     }
 
@@ -2723,7 +2612,7 @@ mod tests {
     fn a_submitted_line_is_drawn_above_what_the_turn_says() {
         let mut screen = screen_for_test(40, 20);
         screen.state.submit("look at src/main.rs");
-        screen.state.pending.push(Cell::Content("on it".into()));
+        screen.state.transcript.push(Cell::Content("on it".into()));
         screen.draw().unwrap();
         let top = origin(&mut screen).y;
         assert_eq!(row(&screen, top), "› look at src/main.rs");

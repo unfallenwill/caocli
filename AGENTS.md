@@ -49,12 +49,16 @@ that talks to a network API and drives an interactive terminal.
 - **Terminal behavior must be verified under a pty**: a unit test's stdout is a pipe,
   so TTY-only branches (status bar, key bindings, escape sequences) never execute.
   Use `script -qec "..." /dev/null` to get a pseudo-terminal for smoke runs.
-- **The interactive front end needs a pty that answers its cursor query**; otherwise
-  the run only exercises the fallback and proves nothing about the viewport.
-  `scripts/tui_smoke.py` is that pty, and its live section (`SMOKE_LIVE=1`) is the
-  only automated route to a real turn, the spinner and the approval gate. What a tool
-  call did is asserted on disk rather than on screen: a model's own account of having
-  run something reads the same as the thing itself.
+- **The interactive front end needs a pty**; that is the only place it exists at
+  all. `scripts/tui_smoke.py` is that pty, and its live section (`SMOKE_LIVE=1`) is
+  the only automated route to a real turn, the running status line and the approval
+  gate. What a tool call did is asserted on disk rather than on screen: a model's own
+  account of having run something reads the same as the thing itself.
+- **A screen drawn by difference does not write what is on it**, only what changed
+  from the frame before: any assertion made on the byte stream is an assertion about
+  the diff, and a character that happened to be in the same column already never
+  appears in it at all. Read the screen back instead -- the smoke harness keeps a
+  grid and applies cursor moves, erases and text to it.
 - **A test that calls the handler directly does not show that the front end can reach
   it.** The approval gate's state machine was fully covered and green while the gate
   was unreachable from a running turn — the answer was dropped on the way in and the
@@ -67,8 +71,8 @@ that talks to a network API and drives an interactive terminal.
   directly when you can. `trait Ui` is the only exception — it is not an abstraction
   layer but the machine's notification vocabulary. There is one implementation per
   front end and the front ends are mutually exclusive (the plain prompt when stdout is
-  not a terminal or the terminal declines the viewport; the interactive one otherwise),
-  so the machine never chooses between them.
+  not a terminal, or `--no-tui`, or a terminal that will not take raw mode; the
+  interactive one otherwise), so the machine never chooses between them.
 - **The machine decides, never executes**: turn flow is determined by
   `machine::next_action` (a pure fold over the persisted history); the interpreter
   executes and writes back. To add behavior to the loop, extend the vocabulary first
@@ -113,10 +117,11 @@ that talks to a network API and drives an interactive terminal.
   synthesized text must be a constant, otherwise the prefix cache becomes unstable).
 - **Exactly one renderer per process**: streaming output and usage accounting must go
   through the same instance, otherwise counts are lost.
-- **A front end that cannot take the terminal declines; it does not fail.** An inline
-  viewport has to ask the terminal where the cursor is, and not every terminal answers
-  (a bare pty does not — measured). Starting the session must survive that by falling
-  back to the plain front end.
+- **A front end that cannot take the terminal declines; it does not fail.** Raw mode
+  and the alternate screen are process-wide, and a terminal that refuses either leaves
+  nothing to draw on. Starting the session must survive that by falling back to the
+  plain front end, and an attempt that fails halfway must undo what it did — including
+  the alternate screen, which would otherwise hide everything the user had on it.
 - **While a turn runs a front end accepts exactly two things**: the cancel key, and
   the answer to an open approval question. Everything else is dropped, because a turn
   is not the place to compose the next line. The second one is easy to lose: an

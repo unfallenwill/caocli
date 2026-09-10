@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""pty interactive smoke test: run the REPL inside a pseudo-terminal to exercise
-the branches that only execute on a TTY.
+"""pty interactive smoke test: run the plain front end inside a pseudo-terminal to
+exercise the branches that only execute on a TTY.
 
 Covers: the status bar (scroll region + cache label), the prompt round trip, and
 graceful Ctrl-C cancellation during a turn (cooked-mode SIGINT -> cancellation
-marker -> back to the prompt).
+marker -> back to the prompt). The front end that owns the screen is
+`tui_smoke.py`'s subject, so `--no-tui` picks this one out.
 Exit code 0 = pass. Requires DEEPSEEK_API_KEY (real API).
 """
 
@@ -46,7 +47,7 @@ def spawn():
         for fd in (master, slave):
             if fd > 2:
                 os.close(fd)
-        os.execvp(BIN, ["caocli"])
+        os.execvp(BIN, ["caocli", "--no-tui"])
     os.close(slave)
     return pid, master
 
