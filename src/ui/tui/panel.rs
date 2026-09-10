@@ -19,14 +19,8 @@ use tokio::sync::oneshot;
 use crate::tools::ask::{Answer, Question};
 use crate::ui::cell::{Span, Style};
 
-use super::layout::picker_window;
-use super::paint::{measure, more_line, wrapped_lines};
+use super::paint::{measure, wrapped_lines};
 use super::state::State;
-
-/// How many option rows the panel shows at once. Like the picker's cap, this is
-/// what the panel may cost the transcript it stands over; what the window keeps
-/// is the option the cursor is on, and what it cuts is counted.
-pub(super) const PANEL_ROWS: usize = 8;
 
 /// What the box says while a question is open: the panel is what offers the
 /// choices, so the box says what it is for -- the answer in the user's own words.
@@ -274,36 +268,17 @@ impl State {
             ask.push(Span::new(Style::Dim, " · choose any"));
         }
         lines.extend(wrapped_lines(&ask, width));
-        let count = question.options.len();
-        if count > 0 {
-            let window = picker_window(count, panel.cursor, PANEL_ROWS);
-            let blank = " ".repeat(lead_columns(question));
-            if window.above > 0 {
-                lines.push(more_line(&blank, window.above));
-            }
-            for at in window.first..window.last {
-                lines.extend(option_lines(panel, at, width));
-            }
-            if window.below > 0 {
-                lines.push(more_line(&blank, window.below));
-            }
+        // Every option is drawn: the call allows four of them, so there is
+        // nothing here to window -- and an option nobody can see is an option
+        // nobody can choose.
+        for at in 0..question.options.len() {
+            lines.extend(option_lines(panel, at, width));
         }
         lines.extend(wrapped_lines(
             &[Span::new(Style::Dim, footer(question))],
             width,
         ));
         lines
-    }
-}
-
-/// The columns a question's rows open in: the cursor, and for a question that
-/// takes several, the mark of what has been chosen. Also the indent the counts of
-/// a cut option list are written at, so that they line up with what they count.
-fn lead_columns(question: &Question) -> usize {
-    if question.multi_select {
-        2 * CURSOR.chars().count()
-    } else {
-        CURSOR.chars().count()
     }
 }
 
