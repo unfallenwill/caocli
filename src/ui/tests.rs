@@ -12,7 +12,78 @@ impl Write for SharedBuf {
     }
 }
 
+use super::terminal::{Echo, Terminal};
 use super::*;
+
+/// A terminal that answers what a test tells it to rather than what the
+/// process's own does.
+///
+/// The facts are the terminal's; the decisions built on them -- is the bar
+/// enabled, is the size usable, does the echo go off before the question is
+/// asked -- are this front end's, and these are what let a unit test make them.
+pub(super) struct StandIn {
+    size: Option<(u16, u16)>,
+    tty: bool,
+    dumb: bool,
+}
+
+impl StandIn {
+    /// A 24x80 terminal that can host the bar.
+    pub(super) fn new() -> Self {
+        Self {
+            size: Some((24, 80)),
+            tty: true,
+            dumb: false,
+        }
+    }
+
+    pub(super) fn tty(mut self, tty: bool) -> Self {
+        self.tty = tty;
+        self
+    }
+
+    pub(super) fn dumb(mut self, dumb: bool) -> Self {
+        self.dumb = dumb;
+        self
+    }
+
+    pub(super) fn sized(mut self, rows: u16, cols: u16) -> Self {
+        self.size = Some((rows, cols));
+        self
+    }
+
+    /// A terminal that cannot be measured at all.
+    pub(super) fn unmeasurable(mut self) -> Self {
+        self.size = None;
+        self
+    }
+}
+
+impl Terminal for StandIn {
+    fn size(&self) -> Option<(u16, u16)> {
+        self.size
+    }
+
+    fn is_tty(&self) -> bool {
+        self.tty
+    }
+
+    fn is_dumb(&self) -> bool {
+        self.dumb
+    }
+
+    /// Nothing to silence, which is the answer a terminal that is not there
+    /// gives: the answer is still read, it is just not hidden.
+    fn echo_off(&self) -> Option<Box<dyn Echo>> {
+        None
+    }
+
+    fn read_line(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + '_>> {
+        Box::pin(async { None })
+    }
+}
 use crate::types::Role;
 use status::CacheStats;
 
@@ -550,8 +621,16 @@ fn status_bar_from_size_guards() {
 }
 
 #[test]
-fn status_bar_detect_rejects_non_tty() {
-    assert_eq!(StatusBar::detect(false), None);
+fn status_bar_detect_rejects_a_terminal_that_cannot_host_it() {
+    assert_eq!(StatusBar::detect(&StandIn::new().tty(false)), None);
+    assert_eq!(StatusBar::detect(&StandIn::new().dumb(true)), None);
+    assert_eq!(StatusBar::detect(&StandIn::new().unmeasurable()), None);
+    assert_eq!(StatusBar::detect(&StandIn::new().sized(2, 80)), None);
+    assert_eq!(StatusBar::detect(&StandIn::new().sized(24, 1)), None);
+    assert_eq!(
+        StatusBar::detect(&StandIn::new().sized(24, 80)),
+        Some(StatusBar { rows: 24, cols: 80 })
+    );
 }
 
 /// Regression: the bar used to measure its label in chars, so every wide

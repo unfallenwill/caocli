@@ -1,13 +1,14 @@
 mod cell;
 mod contract;
 mod status;
+mod terminal;
 pub(crate) mod text;
 pub mod tui;
 
 pub use contract::{Front, Ui};
 
 use std::future::Future;
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -15,23 +16,9 @@ use crate::types::{Message, Usage};
 
 use cell::{Cell, Span, Style};
 use status::Status;
+use terminal::{RealTerminal, Terminal};
 
 const RESET: &str = "\x1b[0m";
-
-/// Terminal size (rows, cols). None on non-unix or when the ioctl fails.
-#[cfg(unix)]
-fn terminal_size() -> Option<(u16, u16)> {
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    // SAFETY: STDOUT_FILENO is a valid fd, and ws has the winsize layout that
-    // TIOCGWINSZ requires
-    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
-    (rc == 0 && ws.ws_row > 0 && ws.ws_col > 0).then_some((ws.ws_row, ws.ws_col))
-}
-
-#[cfg(not(unix))]
-fn terminal_size() -> Option<(u16, u16)> {
-    None
-}
 
 /// The line a session opens with: what this is, which session it is, how much is
 /// in it, and the model it is talking to.
@@ -92,7 +79,9 @@ fn banner_at(id: &str, messages: usize, model: &str, columns: Option<usize>) -> 
 /// The columns a transcript line has to write in: the terminal's width, less the
 /// columns every line that is not an answer is set in from the left edge.
 fn available_columns() -> Option<usize> {
-    terminal_size().map(|(_, cols)| (cols as usize).saturating_sub(cell::MARKER_COLUMNS))
+    RealTerminal
+        .size()
+        .map(|(_, cols)| (cols as usize).saturating_sub(cell::MARKER_COLUMNS))
 }
 
 /// Fixed status bar at the bottom: it occupies the terminal's last line and the
@@ -112,12 +101,13 @@ impl StatusBar {
     /// of output area + one row of slack.
     const MIN_ROWS: u16 = 3;
 
-    /// Give up immediately when `tty=false` or TERM=dumb, without issuing ioctl.
-    fn detect(tty: bool) -> Option<Self> {
-        if !tty || std::env::var("TERM").is_ok_and(|t| t == "dumb") {
+    /// Give up immediately when stdout is not a terminal or the terminal says it
+    /// cannot address the screen (`TERM=dumb`), without asking for a size.
+    fn detect(term: &dyn Terminal) -> Option<Self> {
+        if !term.is_tty() || term.is_dumb() {
             return None;
         }
-        Self::from_size(terminal_size())
+        Self::from_size(term.size())
     }
 
     fn from_size(size: Option<(u16, u16)>) -> Option<Self> {
@@ -202,76 +192,6 @@ impl Block {
     }
 }
 
-/// One line of stdin, read on a blocking task: the terminal's own line editing is
-/// what ends the line, and a runtime worker is not what should be waiting on it.
-/// `None` is an end of input.
-async fn read_answer_line() -> Option<String> {
-    tokio::task::spawn_blocking(|| {
-        let mut line = String::new();
-        match std::io::stdin().read_line(&mut line) {
-            Ok(n) if n > 0 => Some(line.trim_end_matches(['\n', '\r']).to_owned()),
-            _ => None,
-        }
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-/// Echo off for as long as this value lives, and back on when it is dropped —
-/// including on the early returns, which is the whole reason it is a value and
-/// not a pair of calls. A terminal that will not take the setting (stdin is a
-/// pipe, or there is no terminal at all) leaves nothing to silence, and reading
-/// it is not a failure.
-#[cfg(unix)]
-struct EchoOff {
-    saved: libc::termios,
-}
-
-#[cfg(unix)]
-impl EchoOff {
-    fn new() -> Option<Self> {
-        let fd = libc::STDIN_FILENO;
-        // SAFETY: fd is a valid descriptor and `saved` has the termios layout
-        // the call fills in; a failure leaves both untouched, and it is only
-        // used when a touch is wanted.
-        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
-            return None;
-        }
-        let mut quiet = saved;
-        quiet.c_lflag &= !libc::ECHO;
-        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
-            return None;
-        }
-        Some(Self { saved })
-    }
-}
-
-#[cfg(unix)]
-impl Drop for EchoOff {
-    fn drop(&mut self) {
-        // SAFETY: `saved` came from tcgetattr on this same descriptor.
-        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved) };
-    }
-}
-
-/// Where termios does not exist there is nothing to silence and nothing to
-/// restore. The value still exists, so the asker stays one code on every
-/// platform: the answer is read the same way, and what the terminal keeps
-/// showing while it is typed is the price of a key on a machine without a
-/// termios -- the same decline-and-still-work the plain front end accepts
-/// everywhere else it cannot take the terminal's full cooperation.
-#[cfg(not(unix))]
-struct EchoOff;
-
-#[cfg(not(unix))]
-impl EchoOff {
-    fn new() -> Option<Self> {
-        Some(Self)
-    }
-}
-
 /// Streaming renderer. Thinking and body text are two independent render blocks:
 /// - thinking is dim, body text is the normal color
 /// - blocks are separated by a newline; switching from thinking to body adds an
@@ -286,6 +206,10 @@ impl EchoOff {
 /// last was a text block (all the spacing rule needs).
 pub struct Renderer {
     out: Box<dyn Write>,
+    /// The terminal this front end is attached to: everything it knows about the
+    /// process's own terminal -- its width, whether it can take escape
+    /// sequences, how to silence its echo -- comes from here.
+    term: Box<dyn Terminal>,
     color: bool,
     /// The text block currently being streamed, if any.
     live: Option<Block>,
@@ -301,9 +225,18 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new() -> Self {
-        let color = std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal();
+        let term = RealTerminal;
+        let color = term.wants_color();
+        Self::on(Box::new(std::io::stdout()), color, Box::new(term))
+    }
+
+    /// The same, with the writer, the palette and the terminal handed in rather
+    /// than taken from the process: what a test drives, and the reason nothing
+    /// below this line reads a global.
+    pub(crate) fn on(out: Box<dyn Write>, color: bool, term: Box<dyn Terminal>) -> Self {
         Self {
-            out: Box::new(std::io::stdout()),
+            out,
+            term,
             color,
             live: None,
             prev_was_block: false,
@@ -315,14 +248,11 @@ impl Renderer {
     #[cfg(test)]
     fn with_buffer(color: bool) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let r = Self {
-            out: Box::new(tests::SharedBuf(buf.clone())),
+        let r = Self::on(
+            Box::new(tests::SharedBuf(buf.clone())),
             color,
-            live: None,
-            prev_was_block: false,
-            status: Status::default(),
-            bar: None,
-        };
+            Box::new(RealTerminal),
+        );
         (r, buf)
     }
 
@@ -330,7 +260,7 @@ impl Renderer {
     /// starts and before each input, which also handles window resizes (if the
     /// size changed, the bar is torn down and rebuilt).
     pub fn refresh_status_bar(&mut self) {
-        let current = StatusBar::detect(std::io::stdout().is_terminal());
+        let current = StatusBar::detect(self.term.as_ref());
         self.apply_status_bar(current);
     }
 
@@ -560,11 +490,11 @@ impl Front for Renderer {
         // written now rather than awaited -- an answer nobody knows is being
         // asked for is not an answer -- and the read waits in the future, where
         // the caller awaits it.
-        let echo = EchoOff::new();
+        let echo = self.term.echo_off();
         let _ = writeln!(self.out, "{}", self.paint(Style::Dim, prompt));
         let _ = self.out.flush();
         Box::pin(async move {
-            let answer = read_answer_line().await;
+            let answer = self.term.read_line().await;
             drop(echo);
             answer
         })
