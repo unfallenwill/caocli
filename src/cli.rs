@@ -4,42 +4,42 @@ use clap::Parser;
 #[command(
     name = "caocli",
     version,
-    about = "终端 agent · DeepSeek / GLM 后端 · 思维链 + Bash"
+    about = "Terminal coding agent · DeepSeek / GLM backends · thinking + Bash"
 )]
 pub struct Cli {
-    /// 单次执行模式：执行该 prompt（含工具循环）后退出
+    /// One-shot mode: run this prompt (including the tool loop), then exit
     #[arg(short = 'p')]
     pub prompt: Option<String>,
 
-    /// 供应商: deepseek（默认）| glm
+    /// Provider: deepseek (default) | glm
     #[arg(long)]
     pub provider: Option<String>,
 
-    /// 模型 id（默认取供应商的默认模型）
+    /// Model id (defaults to the provider's default model)
     #[arg(long)]
     pub model: Option<String>,
 
-    /// 思考强度: low|high|max（默认 max）
+    /// Thinking effort: low|high|max (default max)
     #[arg(long)]
     pub effort: Option<String>,
 
-    /// 继续最近一次会话
+    /// Continue the most recent session
     #[arg(short = 'c', long)]
     pub cont: bool,
 
-    /// 按 id 恢复指定会话
+    /// Resume a specific session by id
     #[arg(long)]
     pub resume: Option<String>,
 
-    /// 列出会话后退出
+    /// List sessions and exit
     #[arg(long)]
     pub list: bool,
 
-    /// 关闭 REPL 底部状态栏（缓存命中率）
+    /// Disable the REPL status bar (cache hit rate)
     #[arg(long)]
     pub no_status_bar: bool,
 
-    /// 审批门：Bash/Edit/Write 执行前询问 y/N（Read 永远放行）
+    /// Approval gate: ask y/N before Bash/Edit/Write executes (Read is always allowed)
     #[arg(long)]
     pub ask: bool,
 }

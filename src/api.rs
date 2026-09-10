@@ -6,10 +6,12 @@ use std::time::Duration;
 use crate::types::ChatChunk;
 
 // ============================================================================
-// HTTP 客户端 + SSE 流式解析。
-// parse_sse_line / take_line 是纯函数，可单测；SseStream::next_chunk 逐块返回。
-// 流式约定：delta.reasoning_content 先于 delta.content；data: [DONE] 结束；
-// usage 附在最后一个内容块上（不存在独立 usage 块）。
+// HTTP client + SSE streaming parsing.
+// parse_sse_line / take_line are pure functions and unit-testable;
+// SseStream::next_chunk yields one chunk at a time.
+// Streaming contract: delta.reasoning_content precedes delta.content;
+// `data: [DONE]` ends the stream; usage rides on the last content block
+// (there is no standalone usage block).
 // ============================================================================
 
 type ByteStream = Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>;
@@ -25,7 +27,7 @@ impl Client {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .build()
-            .context("构建 HTTP 客户端失败")?;
+            .context("failed to build HTTP client")?;
         Ok(Self { http, api_key, url })
     }
 
@@ -37,11 +39,11 @@ impl Client {
             .json(req)
             .send()
             .await
-            .context("请求发送失败（网络错误）")?;
+            .context("request failed (network error)")?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            bail!("API 返回 HTTP {status}\n响应体: {body}");
+            bail!("API returned HTTP {status}\nresponse body: {body}");
         }
         Ok(SseStream {
             inner: Box::pin(resp.bytes_stream()),
@@ -58,7 +60,7 @@ pub struct SseStream {
 }
 
 impl SseStream {
-    /// 返回 None 表示流结束（收到 [DONE] 或连接关闭）。
+    /// None means the stream is over ([DONE] received or connection closed).
     pub async fn next_chunk(&mut self) -> Result<Option<ChatChunk>> {
         loop {
             if let Some(line) = take_line(&mut self.buf) {
@@ -76,14 +78,15 @@ impl SseStream {
             }
             match self.inner.next().await {
                 Some(Ok(bytes)) => self.buf.extend_from_slice(&bytes),
-                Some(Err(e)) => bail!("流读取错误: {e}"),
+                Some(Err(e)) => bail!("stream read error: {e}"),
                 None => self.done = true,
             }
         }
     }
 }
 
-/// 从缓冲区取出一行（含 \n 即返回），处理 \r\n。无完整行返回 None。
+/// Pull one line out of the buffer (returns as soon as \n is seen), handling
+/// \r\n. Returns None while there is no complete line.
 fn take_line(buf: &mut Vec<u8>) -> Option<String> {
     let pos = buf.iter().position(|&b| b == b'\n')?;
     let line: Vec<u8> = buf.drain(..=pos).collect();
@@ -100,7 +103,8 @@ pub enum SseLine {
     Ignored,
 }
 
-/// 解析单行 SSE。只处理 "data:" 行；[DONE] 结束；其余（空行/注释/event: 字段）忽略。
+/// Parse a single SSE line. Only "data:" lines are handled; [DONE] ends the
+/// stream; everything else (blank lines, comments, event: fields) is ignored.
 fn parse_sse_line(line: &str) -> Result<SseLine> {
     let Some(data) = line.strip_prefix("data:") else {
         return Ok(SseLine::Ignored);
@@ -113,7 +117,7 @@ fn parse_sse_line(line: &str) -> Result<SseLine> {
         return Ok(SseLine::Ignored);
     }
     let chunk: ChatChunk =
-        serde_json::from_str(data).with_context(|| format!("解析 SSE chunk 失败: {data}"))?;
+        serde_json::from_str(data).with_context(|| format!("failed to parse SSE chunk: {data}"))?;
     Ok(SseLine::Chunk(chunk))
 }
 
@@ -138,7 +142,7 @@ mod tests {
                     Some("hi")
                 );
             }
-            _ => panic!("应为 Chunk"),
+            _ => panic!("expected Chunk"),
         }
     }
 
@@ -179,20 +183,20 @@ mod tests {
         assert_eq!(l1, "data: {\"a\":1}");
         let l2 = take_line(&mut buf).unwrap();
         assert_eq!(l2, "data: [DONE]");
-        assert!(take_line(&mut buf).is_none()); // residual 无换行，不取出
+        assert!(take_line(&mut buf).is_none()); // no newline yet, stays buffered
         assert_eq!(buf, b"residual");
     }
 
     #[tokio::test]
     async fn stream_consumes_multiple_chunks_across_buffer_boundaries() {
-        // 模拟两个网络包：第一个包切断第二行的 JSON
+        // Simulate two network packets: the first one cuts the second line's JSON
         let body = format!(
             "data: {}\n\ndata: {}\n\ndata: [DONE]\n",
             chunk_with_content("a"),
             chunk_with_content("b")
         );
         let bytes = body.as_bytes();
-        let split_at = body.find("data: {").unwrap() + 12; // 第二行 JSON 中间切开
+        let split_at = body.find("data: {").unwrap() + 12; // cut inside the 2nd line's JSON
         let (p1, p2) = bytes.split_at(split_at);
         let stream = futures_util::stream::iter(vec![
             Ok(bytes::Bytes::from(p1.to_vec())),

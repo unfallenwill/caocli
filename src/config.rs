@@ -1,17 +1,18 @@
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
-/// 后端供应商预设。刻意用静态表而非 trait/动态注册：
-/// 加一个供应商 = 加一行常量，保持“一个后端、一个循环”的极简。
+/// Backend provider presets. Deliberately a static table instead of a trait or
+/// dynamic registration: adding a provider = adding one const line, which keeps
+/// the "one backend, one loop" minimalism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Provider {
-    /// `--provider` 使用的 id。
+    /// Id used by `--provider`.
     pub id: &'static str,
-    /// 完整的 chat/completions 端点。
+    /// Full chat/completions endpoint.
     pub url: &'static str,
-    /// 未指定 `--model` 时的默认模型。
+    /// Default model when `--model` is not given.
     pub default_model: &'static str,
-    /// API key 环境变量，按顺序取第一个非空的。
+    /// API key environment variables, first non-empty one wins, in order.
     pub key_envs: &'static [&'static str],
 }
 
@@ -22,8 +23,9 @@ pub const DEEPSEEK: Provider = Provider {
     key_envs: &["DEEPSEEK_API_KEY"],
 };
 
-/// 智谱 BigModel（GLM）coding 端点：OpenAI 兼容 + DeepSeek 风格的
-/// `thinking` / `reasoning_content`，因此复用同一套请求与流式解析。
+/// Zhipu BigModel (GLM) coding endpoint: OpenAI-compatible plus DeepSeek-style
+/// `thinking` / `reasoning_content`, so it reuses the same request and streaming
+/// parsing.
 pub const GLM: Provider = Provider {
     id: "glm",
     url: "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
@@ -32,21 +34,23 @@ pub const GLM: Provider = Provider {
 };
 
 pub const PROVIDERS: &[Provider] = &[DEEPSEEK, GLM];
-/// 未指定 `--provider` 时的供应商。
+/// Provider used when `--provider` is not given.
 pub const DEFAULT_PROVIDER: &str = "deepseek";
-/// 通用 API key 覆盖，优先级高于供应商专用变量。
+/// Universal API key override, takes precedence over provider-specific variables.
 const UNIVERSAL_KEY_ENV: &str = "CAOCLI_API_KEY";
 
-/// reasoning_effort 的合法档位。两家后端都只支持这三档：
-/// GLM 的 low 不产出 reasoning_content，DeepSeek 的 low 仍会思考。
-/// 非法值必须本地拒绝——DeepSeek 会 400，GLM 会静默按默认档处理。
+/// Valid tiers for reasoning_effort. Both backends support only these three:
+/// GLM's low produces no reasoning_content, DeepSeek's low still thinks.
+/// Invalid values must be rejected locally — DeepSeek returns 400 and GLM
+/// silently falls back to its default tier.
 pub const EFFORTS: &[&str] = &["low", "high", "max"];
 
-/// 未指定 `--effort` 时使用的档位。后端各自的默认不同（DeepSeek high、
-/// GLM max），显式钉成 max 才能让两家行为一致。
+/// Tier used when `--effort` is not given. The backends' own defaults differ
+/// (DeepSeek high, GLM max), so pinning it explicitly is the only way to make the
+/// two behave the same.
 pub const DEFAULT_EFFORT: &str = "max";
 
-/// 按 id 查供应商。
+/// Look up a provider by id.
 pub fn provider(id: &str) -> Result<Provider> {
     PROVIDERS
         .iter()
@@ -58,11 +62,12 @@ pub fn provider(id: &str) -> Result<Provider> {
                 .map(|p| p.id)
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("未知供应商 {id:?}；可用: {ids}")
+            format!("unknown provider {id:?}; available: {ids}")
         })
 }
 
-/// 取该供应商的 API key：先看通用变量，再按供应商专用变量顺序。
+/// Resolve the API key for this provider: the universal variable first, then the
+/// provider-specific variables in order.
 pub fn api_key(provider: &Provider) -> Result<String> {
     let mut envs = vec![UNIVERSAL_KEY_ENV];
     envs.extend_from_slice(provider.key_envs);
@@ -74,7 +79,7 @@ pub fn api_key(provider: &Provider) -> Result<String> {
         }
     }
     bail!(
-        "未设置供应商 {} 的 API key：请 export {}=<key>（或用 {} 覆盖）",
+        "no API key set for provider {}: export {}=<key> (or set {} to override)",
         provider.id,
         provider.key_envs[0],
         UNIVERSAL_KEY_ENV
@@ -84,18 +89,20 @@ pub fn api_key(provider: &Provider) -> Result<String> {
 fn home_dir() -> Result<PathBuf> {
     std::env::var("HOME")
         .map(PathBuf::from)
-        .context("无法确定 HOME 目录")
+        .context("cannot determine HOME directory")
 }
 
 pub fn caocli_dir() -> Result<PathBuf> {
     let dir = home_dir()?.join(".caocli");
-    std::fs::create_dir_all(&dir).with_context(|| format!("创建目录失败: {}", dir.display()))?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create directory: {}", dir.display()))?;
     Ok(dir)
 }
 
 pub fn sessions_dir() -> Result<PathBuf> {
     let dir = caocli_dir()?.join("sessions");
-    std::fs::create_dir_all(&dir).with_context(|| format!("创建目录失败: {}", dir.display()))?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create directory: {}", dir.display()))?;
     Ok(dir)
 }
 
@@ -108,10 +115,11 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// env 是进程级全局，测试并行跑会互相踩；串行化所有读写 env 的用例。
+    /// The environment is process-global, so parallel tests stomp on each other;
+    /// serialize every case that reads or writes env vars.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// 返回一个已创建的空临时 HOME。
+    /// Returns a fresh, already-created temporary HOME.
     fn temp_home() -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let d = std::env::temp_dir().join(format!(
@@ -123,7 +131,8 @@ mod tests {
         d
     }
 
-    /// 清掉所有与 key 解析相关的环境变量，避免用例间互相污染。
+    /// Clear every env var involved in key resolution so cases do not pollute
+    /// each other.
     fn clear_key_envs() {
         for e in [
             UNIVERSAL_KEY_ENV,
@@ -207,7 +216,7 @@ mod tests {
             history_file().unwrap(),
             home.join(".caocli").join("history")
         );
-        assert!(caocli_dir().unwrap().is_dir()); // 幂等
+        assert!(caocli_dir().unwrap().is_dir()); // idempotent
         std::fs::remove_dir_all(&home).unwrap();
     }
 

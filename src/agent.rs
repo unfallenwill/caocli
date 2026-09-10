@@ -861,7 +861,7 @@ mod tests {
         let mut agent = test_agent(&server, &dir);
         let mut ui = Renderer::new();
         let err = agent.turn("hi", &mut ui).await.unwrap_err();
-        assert!(format!("{err:#}").contains("解析 SSE chunk 失败"));
+        assert!(format!("{err:#}").contains("failed to parse SSE chunk"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
