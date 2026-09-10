@@ -1,66 +1,136 @@
-# caocli — agent 行为指南
+# caocli — agent behavior guide
 
-本仓库由 AI agent 开发和维护。本文件面向 agent，只写**稳定、与具体实现无关、且无法从通用 Rust/git 经验推断**的约定。
+This repository is developed and maintained by AI agents. This file is written for
+agents and records only conventions that are **stable, independent of the current
+implementation, and not inferable from general Rust/git experience**.
 
-刻意**不写**代码结构、文件职责、函数名、常量、字段格式、命令行选项——这些变化很快，需要时直接读代码。本文件的目的是指导 agent 在本仓库里的行为，而不是替代代码阅读。
+It deliberately does **not** describe code structure, file responsibilities, function
+names, constants, field formats, or command-line options — those change fast, so read
+the code when you need them. The purpose of this file is to guide agent behavior in
+this repository, not to replace reading the code.
 
-## 完成定义
+## Definition of done
 
-任何改动在认为完成前必须依次通过：
+Any change must pass the following in order before you consider it done:
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo llvm-cov --fail-under-lines 90   # 行覆盖率门禁
+cargo llvm-cov --fail-under-lines 90   # line coverage gate
 ```
 
-- 推送即触发 CI，以上任一红即不许合入；CI 另跑依赖安全审计。
-- 提交信息用英文、Conventional Commits（`feat(scope): ...`、`fix(ui): ...` 等）。
-- 改动小步提交，每次提交都应能独立通过上述门禁。
+- Pushing triggers CI; any red above blocks merging. CI additionally runs a
+  dependency security audit.
+- Commit messages are English, Conventional Commits (`feat(scope): ...`,
+  `fix(ui): ...`, etc.).
+- Commit in small steps; every commit must independently pass the gates above.
 
-## 验证方式
+## Language
 
-单元测试不足以证明改动正确，因为这是一个面向网络 API、又带交互式终端的程序。
+Everything committed to this repository is **English**: code comments, doc comments,
+test names, assertion messages, panic messages, user-facing CLI text, and the text
+that is sent to the model (tool names, tool descriptions, parameter descriptions,
+tool results, synthesized markers). Documentation and commit messages too.
 
-- 改完先 `cargo test`，再用**真实 API 的单次执行模式**（`-p`）跑一次冒烟——这是 agent 自测主通道。
-- 纯逻辑（解析、流式聚合、截断）尽量单测；网络、终端、文件等带副作用的边界靠冒烟。
-- **终端行为必须在 pty 里验证**：单元测试的 stdout 是管道，TTY 分支（状态栏、按键绑定、转义序列）根本不会执行。用 `script -qec "..." /dev/null` 起伪终端来冒烟。
+Chinese (or any other non-English text) in the repo is a defect, not a style choice.
+The only place non-ASCII text is legitimate is test data whose *purpose* is
+multi-byte handling — and even then prefer accented Latin or emoji over CJK.
 
-## 设计原则（勿违背）
+## How to verify
 
-- **刻意极简**：一个主循环。供应商用静态预设表表达，不引入动态注册、插件系统等间接层；能直写就直写。`trait Ui` 是唯一例外——它不是抽象层，是机器的通知词汇表（进程内唯一实现 `Renderer`）。
-- **机器只做决定，永不执行**：回合走向由 `machine::next_action`（对已落盘历史的纯折叠）决定，解释器负责执行并回填。给循环加行为先扩词汇表（`machine.rs` 模块注释里有目标事件表），不在循环里塞隐式状态。
-- **回调只收通知，不回传数据**：`Ui` 实现不得阻塞、不得向机器返回决策；需要结果的操作（如未来的审批门）必须以事件形式回到决策函数。
-- **状态 = 日志的折叠**：`Session` 是唯一持久状态，内存里不允许第二个真相来源；任何时刻可由 `Session::load` 重建。
-- **回合中的 Ctrl-C 是带外 Command（优雅取消），不是杀进程**：当前 effect 被丢弃（流断开、子进程 kill_on_drop），未应答调用以确定性取消标记落盘，历史保持 `is_request_valid`；取消在解释器层处理，不进 `next_action`。SIGINT 监听者整回合唯一、构造即订阅——每个 select 现建监听者会在两个 select 之间留下空窗，恰好到达的信号会被永久吞掉（tokio watch 语义，pty 冒烟实测）。
-- **回合步数上限**：单回合最多 `machine::MAX_TOOL_STEPS`（500）个工具调用步，超限以确定性标记收尾——终止性的产品兜底。
-- **工具结果永远是文本，永不作为硬错误抛出**：失败也回传给模型，让模型自己纠偏。
-- **审批门**：默认信任执行；`--ask` 开启后 Bash/Edit/Write 执行前经用户 y/N（Read 永远放行）。拒绝/取消/超限都以确定性文本标记落盘回传模型，让模型自行调整；命令回显不变。
-- **会话日志只追加，永不重写**：崩溃最多损失尾部半行，读取时跳过损坏行；中断的工具调用在 load 时做**确定性**自愈（只改内存视图，合成文本必须是常量，否则前缀缓存不稳定）。
-- **全进程只有一个渲染器**：流式输出与用量统计必须经过同一实例，否则统计会丢。
-- 截断/裁剪文本时必须落在 UTF-8 字符边界。
+Unit tests are not sufficient evidence that a change is correct: this is a program
+that talks to a network API and drives an interactive terminal.
 
-## 前缀缓存（改请求或消息构造前必读）
+- After a change, run `cargo test`, then do one smoke run through **one-shot mode
+  against the real API** (`-p`) — that is the agent's primary self-test channel.
+- Pure logic (parsing, stream aggregation, truncation) should be unit tested;
+  boundaries with side effects (network, terminal, files) rely on the smoke run.
+- **Terminal behavior must be verified under a pty**: a unit test's stdout is a pipe,
+  so TTY-only branches (status bar, key bindings, escape sequences) never execute.
+  Use `script -qec "..." /dev/null` to get a pseudo-terminal for smoke runs.
 
-后端按请求前缀完整匹配缓存，命中率直接决定成本与延迟：
+## Design principles (do not violate)
 
-- 系统提示是固定常量，**禁止**注入时间、cwd、随机 id 等任何动态内容。
-- 历史消息**逐字节回放**：不 trim、不重排、不裁剪、不压缩、不规范化。
-- 改变工具集或工具顺序会改变前缀，导致缓存全量 miss——只能有意识地做。
-- 任何“优化历史”的改动都等于缓存全 miss。
-- 用每轮的 hit/miss token 计数验证，不要凭感觉。
+- **Deliberate minimalism**: one main loop. Providers are expressed as a static preset
+  table — no dynamic registration, plugin systems, or other indirect layers; write it
+  directly when you can. `trait Ui` is the only exception — it is not an abstraction
+  layer but the machine's notification vocabulary (exactly one in-process
+  implementation, `Renderer`).
+- **The machine decides, never executes**: turn flow is determined by
+  `machine::next_action` (a pure fold over the persisted history); the interpreter
+  executes and writes back. To add behavior to the loop, extend the vocabulary first
+  (the target event table lives in the `machine.rs` module comment); do not stuff
+  implicit state into the loop.
+- **Callbacks receive notifications only, never return data**: a `Ui` implementation
+  must not block and must not return decisions to the machine; operations that need
+  results (such as a future approval gate) must come back to the decision function as
+  events.
+- **State = a fold of the log**: `Session` is the only persistent state; there is no
+  second source of truth in memory, and at any moment it can be rebuilt by
+  `Session::load`.
+- **Ctrl-C during a turn is an out-of-band Command (graceful cancel), not a process
+  kill**: the current effect is dropped (stream disconnected, child process
+  `kill_on_drop`), unanswered calls are persisted with a deterministic cancellation
+  marker, and the history still satisfies `is_request_valid`; cancellation is handled
+  in the interpreter layer and never enters `next_action`. The SIGINT listener is
+  created once per turn and subscribed at construction time — constructing a listener
+  inside each `select` leaves a window between two `select`s in which a signal that
+  arrives exactly then is swallowed forever (tokio watch semantics, measured in the
+  pty smoke test).
+- **Turn step cap**: at most `machine::MAX_TOOL_STEPS` (500) tool-call steps per turn;
+  exceeding it ends the turn with a deterministic marker — a product-level
+  termination guarantee.
+- **Tool results are always text and are never raised as hard errors**: failures are
+  also passed back to the model so it can correct itself.
+- **Approval gate**: execution is trusted by default; with `--ask`, Bash/Edit/Write
+  require a user y/N before running (Read is always allowed). Denial, cancellation,
+  and the step cap all persist deterministic text markers that are passed back to the
+  model so it can adjust on its own; the command echo is unchanged.
+- **Session logs are append-only and never rewritten**: a crash loses at most a
+  trailing partial line, and corrupt lines are skipped when reading; interrupted tool
+  calls are healed **deterministically** at load time (in-memory view only — the
+  synthesized text must be a constant, otherwise the prefix cache becomes unstable).
+- **Exactly one renderer per process**: streaming output and usage accounting must go
+  through the same instance, otherwise counts are lost.
+- Truncating or clipping text must land on a UTF-8 character boundary.
 
-## 后端 API 硬约束（改请求构造前必读）
+## Prefix cache (must read before changing request or message construction)
 
-以官方文档为准（thinking_mode、kv_cache 指南）。最容易被踩的两条：
+The backend matches its cache on the exact request prefix; the hit rate directly
+determines cost and latency:
 
-- **请求带 `tools` 时，历史 assistant 消息的 `reasoning_content` 必须原样回传（DeepSeek 缺失即 400）。**
-- **历史合法性有可执行规范**：`machine::is_request_valid`（每个声明的调用在紧随窗口内恰好一个结果；无野 tool 结果）。`heal` 与请求构造都以它为目标不变量；其测试用有界全形状族（19608 形状）穷举钉住「任意崩溃前缀自愈后必合法」。改 heal/请求构造前先跑这两个定理测试。
-- 流式响应中，思考内容先于正文；token 用量附在最后一个内容块上，没有独立用量事件。
+- The system prompt is a fixed constant — it is **forbidden** to inject time, cwd,
+  random ids, or any other dynamic content.
+- History messages are **replayed byte-for-byte**: no trimming, no reordering, no
+  clipping, no compression, no normalization.
+- Changing the tool set, the tool order, or any tool schema text (names,
+  descriptions, parameter descriptions) changes the prefix and causes a full cache
+  miss — only do it deliberately.
+- Any change that "optimizes the history" equals a full cache miss.
+- Verify with the per-turn hit/miss token counts; do not go by feel.
 
-## 工作方式
+## Backend API hard constraints (must read before changing request construction)
 
-- 先读代码再改；不要依赖本文件里的实现描述（本文件刻意不写）。
-- 行为不确定时，先跑 `-p` 或 pty 冒烟确认，再下结论。
-- 不要为了“以后可能用到”而抽象；这个项目的价值在于小和直接。
+The official docs are authoritative (`thinking_mode`, the `kv_cache` guide). The two
+easiest ones to trip over:
+
+- **When a request carries `tools`, the `reasoning_content` of historical assistant
+  messages must be passed back verbatim (DeepSeek returns 400 when it is missing).**
+- **History validity has an executable specification**: `machine::is_request_valid`
+  (every declared call has exactly one result within the immediately following
+  window; no stray tool results). Both `heal` and request construction target it as
+  an invariant; its tests pin down "any crash prefix, once healed, is valid" by
+  exhaustively enumerating a bounded shape family (19608 shapes). Run those two
+  theorem tests before changing `heal` or request construction.
+- In a streaming response, thinking content precedes the body text; token usage rides
+  on the last content block and there is no separate usage event.
+
+## Working style
+
+- Read the code before changing it; do not rely on implementation descriptions in this
+  file (it deliberately omits them).
+- When behavior is uncertain, first confirm it with a `-p` or pty smoke run, then draw
+  conclusions.
+- Do not abstract for "we might need it later"; the value of this project is being
+  small and direct.
