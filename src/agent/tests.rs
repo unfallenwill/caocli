@@ -676,7 +676,14 @@ async fn mock_write_tool_creates_file() {
         .collect();
     assert_eq!(
         names,
-        vec!["Bash", "Read", "Edit", "Write", "AskUserQuestion"]
+        vec![
+            "Bash",
+            "Read",
+            "Edit",
+            "Write",
+            "AskUserQuestion",
+            "TodoWrite"
+        ]
     );
     std::fs::remove_dir_all(&dir).unwrap();
     std::fs::remove_dir_all(&file_dir).unwrap();

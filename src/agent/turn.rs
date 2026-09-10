@@ -265,9 +265,10 @@ impl Turn<'_> {
     }
 
     /// Ask before running, when the policy says to ask and the call changes
-    /// something on disk. Reading never asks.
+    /// something on disk. Reading never asks, and neither does writing the plan
+    /// down where the user can see it.
     async fn gate(&mut self, call: &ToolCall) -> Result<Gate> {
-        if self.agent.approval != Approval::Ask || call.function.name == tools::READ_NAME {
+        if self.agent.approval != Approval::Ask || !tools::changes_files(&call.function.name) {
             return Ok(Gate::Cleared);
         }
         // The question is a notification like any other; the answer comes back

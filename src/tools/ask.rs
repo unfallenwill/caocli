@@ -11,7 +11,7 @@ use std::collections::HashSet;
 
 use serde_json::{Value, json};
 
-use super::parse_args;
+use super::{checked, parse_args, required_string};
 use crate::types::{FunctionDef, ToolDef};
 
 /// The tool's name on the wire. Named for what it does rather than for the
@@ -220,16 +220,6 @@ fn one_option(option: &Value, question: usize, index: usize) -> Result<Choice, S
     Ok(Choice { label, description })
 }
 
-/// A required string that is there and not blank.
-fn required_string(v: &Value, key: &str) -> Result<String, String> {
-    match v.get(key) {
-        Some(Value::String(s)) if !s.trim().is_empty() => Ok(s.clone()),
-        Some(Value::String(_)) => Err(format!("{key} must not be empty")),
-        Some(_) => Err(format!("{key} must be a string")),
-        None => Err(format!("missing required argument {key} (string)")),
-    }
-}
-
 /// An optional string: absent, null and empty all mean "not given".
 fn optional_string(v: &Value, key: &str) -> Result<String, String> {
     match v.get(key) {
@@ -246,11 +236,6 @@ fn optional_bool(v: &Value, key: &str) -> Result<bool, String> {
         Some(Value::Bool(b)) => Ok(*b),
         Some(_) => Err(format!("{key} must be a boolean")),
     }
-}
-
-/// Prefix a failure with the path it was found at.
-fn checked<T>(value: Result<T, String>, path: &str) -> Result<T, String> {
-    value.map_err(|e| format!("error: {path}: {e}"))
 }
 
 /// The tool result for a call the user answered: one line per question, in the

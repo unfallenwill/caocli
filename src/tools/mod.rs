@@ -1,6 +1,7 @@
 pub mod ask;
 mod fs;
 mod shell;
+pub mod todo;
 
 use crate::types::ToolDef;
 
@@ -11,6 +12,10 @@ pub const READ_NAME: &str = fs::READ_NAME;
 /// Name of the one tool whose result is a person's answer rather than the
 /// machine's: the interpreter recognizes it before dispatching anything.
 pub const ASK_NAME: &str = ask::ASK_NAME;
+
+/// Name of the tool that writes the plan down where the user can see it. Like
+/// reading it changes nothing on disk, so it never passes the approval gate.
+pub const TODO_NAME: &str = todo::TODO_NAME;
 
 /// Cap on tool output sent back to the model (bytes).
 pub const MAX_OUTPUT: usize = 10 * 1024;
@@ -27,7 +32,21 @@ pub fn definitions() -> Vec<ToolDef> {
         fs::edit_definition(),
         fs::write_definition(),
         ask::definition(),
+        todo::definition(),
     ]
+}
+
+/// Whether a call changes something on disk -- which is the whole of what the
+/// approval gate asks about.
+///
+/// A blacklist and not a list of the calls that write: a tool added later is one
+/// nobody has decided about yet, and the safe reading of "nobody has decided" is
+/// to ask rather than to run. The two that are settled: reading changes nothing,
+/// and a todo list is a note to the user rather than a change to anything, so
+/// putting a y/N in front of it would only teach the reader to answer without
+/// looking.
+pub fn changes_files(name: &str) -> bool {
+    !matches!(name, READ_NAME | TODO_NAME)
 }
 
 /// Dispatch by name. Never returns Err: every failure (unknown tool, bad
@@ -45,15 +64,17 @@ pub async fn execute(name: &str, args_json: &str) -> String {
         fs::READ_NAME => fs::read(args_json),
         fs::EDIT_NAME => fs::edit(args_json),
         fs::WRITE_NAME => fs::write(args_json),
+        todo::TODO_NAME => todo::execute(args_json),
         ask::ASK_NAME => {
             format!("error: {ASK_NAME} is answered by the front end and cannot be executed here")
         }
         other => format!(
-            "error: unknown tool {other:?}. Available tools: Bash, {}, {}, {}, {}",
+            "error: unknown tool {other:?}. Available tools: Bash, {}, {}, {}, {}, {}",
             fs::READ_NAME,
             fs::EDIT_NAME,
             fs::WRITE_NAME,
-            ASK_NAME
+            ASK_NAME,
+            TODO_NAME
         ),
     }
 }
@@ -69,6 +90,26 @@ fn str_arg(v: &serde_json::Value, key: &str) -> Result<String, String> {
         .and_then(|x| x.as_str())
         .map(str::to_owned)
         .ok_or_else(|| format!("error: missing required argument {key} (string)"))
+}
+
+/// A required string argument that is there and not blank.
+///
+/// Shared by the two tools whose arguments are a structure the user reads rather
+/// than a line the machine runs: both report a bad field by the path it sits at,
+/// and a field checked two ways is a field that can be accepted in one tool and
+/// refused in the other.
+pub(super) fn required_string(v: &serde_json::Value, key: &str) -> Result<String, String> {
+    match v.get(key) {
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => Ok(s.clone()),
+        Some(serde_json::Value::String(_)) => Err(format!("{key} must not be empty")),
+        Some(_) => Err(format!("{key} must be a string")),
+        None => Err(format!("missing required argument {key} (string)")),
+    }
+}
+
+/// Prefix a failure with the path it was found at.
+pub(super) fn checked<T>(value: Result<T, String>, path: &str) -> Result<T, String> {
+    value.map_err(|e| format!("error: {path}: {e}"))
 }
 
 /// Truncate at a byte limit, backing off to a UTF-8 character boundary so a
@@ -105,8 +146,33 @@ mod tests {
         let names: Vec<String> = definitions().into_iter().map(|d| d.function.name).collect();
         assert_eq!(
             names,
-            vec!["Bash", "Read", "Edit", "Write", "AskUserQuestion"]
+            vec![
+                "Bash",
+                "Read",
+                "Edit",
+                "Write",
+                "AskUserQuestion",
+                "TodoWrite"
+            ]
         );
+    }
+
+    /// The gate's policy: the calls that change something on disk are asked
+    /// about, and the two that cannot go wrong are not.
+    #[test]
+    fn the_gate_asks_about_the_calls_that_change_disk() {
+        for name in ["Bash", "Edit", "Write"] {
+            assert!(
+                changes_files(name),
+                "{name} changes disk and is asked about"
+            );
+        }
+        for name in [READ_NAME, TODO_NAME] {
+            assert!(!changes_files(name), "{name} changes nothing to ask about");
+        }
+        // A tool nobody has decided about yet is asked about rather than run:
+        // the blacklist is the fail-safe direction.
+        assert!(changes_files("SomeToolAddedLater"));
     }
 
     #[tokio::test]
@@ -134,5 +200,18 @@ mod tests {
     async fn dispatch_reaches_shell() {
         let out = execute("Bash", r#"{"command":"echo dispatched"}"#).await;
         assert!(out.contains("dispatched"));
+    }
+
+    /// The todo tool is dispatched like the tools that touch the world, even
+    /// though it touches none: it answers with text of its own, and the front
+    /// ends read the list back out of the call it answered.
+    #[tokio::test]
+    async fn dispatch_reaches_the_todo_tool() {
+        let out = execute(
+            TODO_NAME,
+            r#"{"todos":[{"content":"Run the gates","status":"in_progress"}]}"#,
+        )
+        .await;
+        assert_eq!(out, "todo list updated (0/1 done)");
     }
 }
