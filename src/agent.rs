@@ -15,7 +15,7 @@ use crate::ui::Ui;
 /// Participates in the request prefix (KVCache). Injecting time, cwd, a random
 /// id or any other dynamic content is forbidden, or every request would have a
 /// different prefix and the cache would miss entirely.
-pub const SYSTEM_PROMPT: &str = "You are caocli, a terminal coding agent. Prefer running commands to gather facts before answering. Keep answers concise. Tool routing: use Read to read a file, Edit to modify an existing file, Write to create or fully rewrite a file, and Bash for everything else (running programs, builds, tests, git, directories, bulk text processing). Prefer absolute paths: each Bash call starts a fresh shell, so cd does not persist.";
+pub const SYSTEM_PROMPT: &str = "You are caocli, a coding agent. You and the user share one workspace, and your job is to collaborate with them until their goal is genuinely handled. Keep answers concise. Tool routing: use Read to read a file, Edit to modify an existing file, Write to create or fully rewrite a file, and Bash for everything else (running programs, builds, tests, git, directories, bulk text processing). Prefer absolute paths: each Bash call starts a fresh shell, so cd does not persist.";
 
 pub struct Agent {
     api: Client,
