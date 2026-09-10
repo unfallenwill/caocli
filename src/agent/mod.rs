@@ -1,3 +1,11 @@
+//! The interpreter: it asks the machine what the next beat is, executes it, and
+//! writes the result back into the log.
+//!
+//! The machine decides and never executes (`machine::next_action`), so this is
+//! the only place in the crate that turns a decision into IO. It owns the
+//! session — the log is the state — and the two things a turn needs from
+//! whoever is watching: an answer for the approval gate and a signal to stop.
+
 use anyhow::Result;
 
 use std::future::Future;
@@ -7,58 +15,14 @@ use std::time::{Duration, Instant};
 use crate::api::Client;
 use crate::machine::{self, Action};
 use crate::provider;
-use crate::session::{Session, SessionMeta};
+use crate::session::Session;
 use crate::tools;
-use crate::types::{ChatRequest, Message, Thinking, ToolCall, TurnAccumulator, Usage};
+use crate::types::{ChatRequest, Message, ToolCall, TurnAccumulator, Usage};
 use crate::ui::Ui;
 
-/// Participates in the request prefix (KVCache). Injecting time, cwd, a random
-/// id or any other dynamic content is forbidden, or every request would have a
-/// different prefix and the cache would miss entirely.
-pub const SYSTEM_PROMPT: &str = "You are caocli, a coding agent. You and the user share one workspace, and your job is to collaborate with them until their goal is genuinely handled. Keep answers concise. Tool routing: use Read to read a file, Edit to modify an existing file, Write to create or fully rewrite a file, and Bash for everything else (running programs, builds, tests, git, directories, bulk text processing). Prefer absolute paths: each Bash call starts a fresh shell, so cd does not persist.";
+mod request;
 
-/// Build the sub-request for a history: the system prompt, the history as
-/// stored, the tools, and the provider's wire profile.
-///
-/// A free function rather than a method so its shape is testable without an
-/// Agent behind it — no client, no session file: it is pure in
-/// `(provider, meta, history)`. That is also the cache contract made visible:
-/// the same three inputs must produce the same bytes, because the backend's
-/// prefix cache matches on them.
-pub fn build_request(
-    provider: &provider::Provider,
-    meta: &SessionMeta,
-    history: &[Message],
-) -> ChatRequest {
-    let mut messages = Vec::with_capacity(history.len() + 1);
-    messages.push(Message::system(SYSTEM_PROMPT));
-    messages.extend(history.iter().cloned());
-    // Specification tripwire (debug builds only): the history being sent must
-    // satisfy the executable specification. A violation is a shape the
-    // backend answers with a 400 — catch it during development rather than in
-    // production.
-    debug_assert!(
-        machine::is_request_valid(&messages),
-        "request history violates the tool_calls window specification: {messages:?}"
-    );
-    ChatRequest {
-        model: meta.model.clone(),
-        max_tokens: provider.max_tokens,
-        messages,
-        tools: Some(tools::definitions()),
-        tool_choice: Some("auto".into()),
-        stream: true,
-        // The thinking switch and the effort fallback are the provider's:
-        // a preset that omits one or defaults differently says so in the
-        // table, and nothing here needs to know which.
-        thinking: provider.send_thinking.then(Thinking::enabled),
-        reasoning_effort: Some(
-            meta.reasoning_effort
-                .clone()
-                .unwrap_or_else(|| provider.default_effort.to_string()),
-        ),
-    }
-}
+pub use request::build_request;
 
 pub struct Agent {
     api: Client,
@@ -438,6 +402,9 @@ mod tests {
     }
 
     use super::*;
+    // The prompt is asserted on here, but it lives with the request it belongs
+    // to; the pure request tests move next to it in the same file.
+    use super::request::SYSTEM_PROMPT;
     use crate::session::SessionMeta;
     use crate::types::Role;
     use crate::ui::Renderer;
