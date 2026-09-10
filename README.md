@@ -7,8 +7,8 @@ A minimal terminal coding agent in Rust, backed by an OpenAI-compatible
 `/chat/completions` API: DeepSeek by default, Z.AI's GLM coding endpoint via
 `--provider zai-coding-cn`. It streams the model's thinking (`reasoning_content`) in
 dim gray, then runs a tool loop over four tools: `Bash`, `Read`, `Edit`,
-and `Write`. Both backends see images, which are attached with `/image` and
-travel inside the message itself. Sessions are append-only JSONL
+and `Write`. Both backends see images, which are attached with `/image` or
+`--image` and travel inside the message itself. Sessions are append-only JSONL
 logs under `~/.caocli/sessions/`, resumable across runs and replayed
 byte-for-byte so the backend's prefix cache keeps hitting.
 
@@ -24,6 +24,7 @@ cargo run --                            # interactive REPL: /login, then chat
 cargo run -- -c -p "check disk usage"   # one-shot, continuing the latest session
 cargo run -- --effort max --model deepseek/deepseek-v4-pro -p "..."
 cargo run -- --provider zai-coding-cn -p "1+1"   # Z.AI Coding CN, glm-5.3-flash
+cargo run -- -p "what is wrong here?" --image shot.png
 cargo run -- --list                     # list sessions and exit
 ```
 
@@ -85,6 +86,7 @@ newlines also works (bracketed paste).
 | Flag | Description |
 |---|---|
 | `-p <PROMPT>` | Run one prompt (including the tool loop), then exit |
+| `--image <PATH>` | Attach an image to `-p`'s prompt; repeat for more than one. In an interactive session, `/image` is how one is attached |
 | `--provider <NAME>` | Backend provider: `deepseek` (default) or `zai-coding-cn`. Settles the endpoint of a new session; a resumed session keeps the one its meta names |
 | `--model <MODEL>` | Model id as `<provider>/<modelid>`, or bare for `--provider`; defaults to the provider's default model |
 | `--effort <EFFORT>` | Reasoning effort: `low`, `high`, or `max` (default `max`); other values are rejected locally. `/effort` switches it inside a session. On GLM, `low` answers without emitting `reasoning_content`. |
@@ -207,7 +209,9 @@ not by the file's extension, and at most 10 MiB may be attached.
 An attached image is carried in the message itself as a `data:` URL, so the
 session log is the whole of it: a resumed session replays the same bytes it sent
 the first time — the prefix cache goes on matching — and follow-up questions work
-even if the file has since been moved or changed.
+even if the file has since been moved or changed. `--image` is the one-shot
+form: `caocli -p "what is wrong here?" --image shot.png` (repeat it for several
+images).
 
 ### Providers
 

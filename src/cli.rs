@@ -11,6 +11,11 @@ pub struct Cli {
     #[arg(short = 'p')]
     pub prompt: Option<String>,
 
+    /// Attach an image to the one-shot prompt (PNG, JPEG, WebP or GIF; repeat
+    /// for more than one)
+    #[arg(long, value_name = "PATH")]
+    pub image: Vec<std::path::PathBuf>,
+
     /// Provider: deepseek (default) | zai-coding-cn
     #[arg(long)]
     pub provider: Option<String>,

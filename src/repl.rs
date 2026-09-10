@@ -422,7 +422,7 @@ pub fn completions(input: &str) -> Vec<&'static Command> {
 
 /// The keys the prompt accepts, and the startup flags. Separate from the table
 /// above because these are not commands.
-const INPUT_AND_FLAGS: &str = "Input:\n  Enter            submit\n  Ctrl-J           newline (multi-line input)\n  Tab              complete a command\n  Up / Down        pick a command, or browse history\nStartup flags:\n  -c / --continue  continue the most recent session\n  --resume <id>    resume a specific session\n  --provider deepseek|zai-coding-cn\n  --effort low|high|max --model <id>\n  -p \"prompt\"      run once and exit";
+const INPUT_AND_FLAGS: &str = "Input:\n  Enter            submit\n  Ctrl-J           newline (multi-line input)\n  Tab              complete a command\n  Up / Down        pick a command, or browse history\nStartup flags:\n  -c / --continue  continue the most recent session\n  --resume <id>    resume a specific session\n  --provider deepseek|zai-coding-cn\n  --effort low|high|max --model <id>\n  -p \"prompt\"      run once and exit\n  --image <path>   attach an image to -p's prompt";
 
 /// The `/help` text, built from the command table so the two cannot drift.
 pub fn help() -> String {
@@ -910,6 +910,7 @@ mod tests {
             "--provider deepseek|zai-coding-cn",
             "--effort low|high|max",
             "-p \"prompt\"",
+            "--image <path>",
             "Ctrl-J",
             "Tab",
         ] {

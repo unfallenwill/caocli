@@ -3,6 +3,7 @@ mod api;
 mod cli;
 mod config;
 mod history;
+mod image;
 mod machine;
 mod provider;
 mod repl;
@@ -13,7 +14,7 @@ mod ui;
 
 use std::io::IsTerminal;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers};
 
@@ -143,6 +144,15 @@ async fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    // An image has to go somewhere, and only a turn carries one: a one-shot run
+    // has `-p` to attach it to, and the interactive front ends have `/image`.
+    if !cli.image.is_empty() && cli.prompt.is_none() {
+        bail!(
+            "--image attaches an image to the one-shot prompt (-p); \
+             in the interactive front end, use /image <path> [text]"
+        );
+    }
+
     // The provider this run starts from: --provider, or the default. It settles
     // the endpoint of a new session and of one whose provider is not recorded;
     // `--model <provider>/<model>` and a resumed session's own meta name one too.
@@ -203,12 +213,24 @@ async fn run(cli: Cli) -> Result<()> {
             agent.model_label(),
             agent.effort_label()
         ));
+        let message = match image::user_message(prompt, &cli.image) {
+            Ok(message) => message,
+            Err(e) => {
+                ui.error(&format!("{e:#}"));
+                std::process::exit(1);
+            }
+        };
+        // An attached image is shown the way the session shows it, because
+        // nothing else prints it: the prompt itself was typed in the shell.
+        if !cli.image.is_empty() {
+            ui.replay(std::slice::from_ref(&message));
+        }
         // One interrupt listener per turn, subscribed before the turn's first
         // await point (see Agent::turn).
         let mut interrupt = Sigint::new()?;
         let mut approve = StdinApproval;
         if let Err(e) = agent
-            .turn(prompt, &mut ui, &mut interrupt, &mut approve)
+            .turn_message(message, &mut ui, &mut interrupt, &mut approve)
             .await
         {
             ui.error(&format!("{e:#}"));
