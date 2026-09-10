@@ -1,2 +1,3 @@
 /target
 .firecrawl/
+scripts/__pycache__/
