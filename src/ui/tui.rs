@@ -358,13 +358,7 @@ impl State {
     /// Everything not yet committed to scrollback, in draw order: the turn's
     /// finished cells, then the block still streaming, then a pending question.
     fn lines(&self, width: usize) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        for cell in &self.pending {
-            // Every cell is wrapped, not just the text blocks: a tool call that
-            // shows a change is several lines, and a long one clips silently if
-            // the terminal is left to deal with it.
-            lines.extend(wrapped_lines(&cell.spans(), width));
-        }
+        let mut lines = cell_lines(&self.pending, width);
         if let Some((style, text)) = &self.live {
             lines.extend(wrapped_lines(&[Span::new(*style, text.clone())], width));
         }
@@ -574,6 +568,13 @@ impl State {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } if self.textarea.is_empty() => Submitted::Exit,
+            // Ctrl-O shows the transcript full screen. The keys that scroll it
+            // belong to that view, so this one only opens it.
+            KeyEvent {
+                code: KeyCode::Char('o'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => Submitted::Scroll,
             // Up and Down mean the picker while it is open and the history
             // otherwise: the picker is only open while a command is being named,
             // so the two never compete for the same keystroke.
@@ -891,6 +892,84 @@ impl State {
     }
 }
 
+// ------------------------------------------------------------ scroll view ---
+
+/// Where the full-screen transcript is scrolled to.
+///
+/// Held as lines back from the newest one, because that is where it opens: the
+/// tail is what the reader was already looking at.
+#[derive(Debug, Default, Clone, Copy)]
+struct Scroll {
+    back: usize,
+}
+
+impl Scroll {
+    /// Scroll by `step` lines, positive being towards the newest line, as far as
+    /// there is anything to see.
+    ///
+    /// `total` and `height` are the transcript's length and the rows available for
+    /// it; together they say how far back the start is.
+    fn by(&mut self, step: isize, total: usize, height: usize) {
+        let most = total.saturating_sub(height) as isize;
+        self.back = (self.back as isize - step).clamp(0, most) as usize;
+    }
+
+    /// Go to the beginning of the transcript.
+    fn top(&mut self, total: usize, height: usize) {
+        self.back = total.saturating_sub(height);
+    }
+
+    /// Go back to the end, which is where it starts.
+    fn bottom(&mut self) {
+        self.back = 0;
+    }
+
+    /// The first line to draw.
+    fn first(&self, total: usize, height: usize) -> usize {
+        total.saturating_sub(height).saturating_sub(self.back)
+    }
+}
+
+/// Draw one frame of the scroll view: a header saying where the view sits, then
+/// the transcript from there down.
+///
+/// Generic over the backend, and a function of the lines rather than of the cells,
+/// so that what it draws can be asserted on in memory -- the terminal-touching
+/// half of a view is exactly the half that is otherwise never checked.
+fn draw_scroll<B: Backend>(
+    terminal: &mut Terminal<B>,
+    view: &Scroll,
+    lines: &[Line<'static>],
+) -> Result<(), B::Error> {
+    terminal.draw(|frame| {
+        let rows =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(frame.area());
+        let body = rows[1].height as usize;
+        let first = view.first(lines.len(), body);
+        let last = (first + body).min(lines.len());
+        // Which lines are on screen, and how many there are: enough to know both
+        // where the view is and whether there is more of it.
+        let where_ = if lines.is_empty() {
+            "nothing to show".to_owned()
+        } else {
+            format!("lines {}–{} of {}", first + 1, last, lines.len())
+        };
+        let header = format!("transcript · {where_} · ↑↓ PgUp/PgDn Home/End · esc closes");
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                header,
+                RStyle::new().add_modifier(Modifier::DIM),
+            )),
+            rows[0],
+        );
+        frame.render_widget(
+            Paragraph::new(Text::from(lines[first..last].to_vec())),
+            rows[1],
+        );
+    })?;
+    Ok(())
+}
+
 /// The viewport: a terminal, and the state it shows.
 ///
 /// Generic over the backend so that what it draws can be asserted on. The
@@ -977,6 +1056,92 @@ impl Screen<CrosstermBackend<Stdout>> {
         self.terminal.show_cursor()?;
         println!();
         Ok(())
+    }
+
+    /// Show the transcript full screen, and give the viewport back untouched.
+    ///
+    /// The alternate screen is what makes this cost nothing: it covers the inline
+    /// viewport for the duration and restores it on the way out, so no cells have
+    /// to be committed, re-committed or scrolled out of the way to make room -- and
+    /// the batching that committing uses is not involved at all.
+    ///
+    /// `cells` is the whole session, folded from its log by the same call replay
+    /// uses, plus whatever the current turn has not committed yet. Nothing is
+    /// written while the view is open, so there is nothing that could disagree with
+    /// the scrollback underneath it.
+    fn scroll(&mut self, cells: &[Cell]) -> io::Result<()> {
+        crossterm::execute!(
+            self.terminal.backend_mut(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::cursor::Hide
+        )?;
+        // A terminal of its own: a viewport cannot be changed on a live one, and
+        // the inline viewport is still in place underneath this one, waiting to be
+        // shown again.
+        let backend = CrosstermBackend::new(std::io::stdout());
+        let mut full = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fullscreen,
+            },
+        )?;
+        let result = self.scroll_loop(&mut full, cells);
+        crossterm::execute!(
+            full.backend_mut(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::cursor::Show
+        )?;
+        // The inline viewport shows what the terminal held before the alternate
+        // screen covered it, which is not what this screen drew last.
+        self.drawn = None;
+        result
+    }
+
+    /// The scroll view's own loop, which owns the keyboard until it is closed.
+    ///
+    /// The turn is not polled here, and that is why Ctrl-O is only read at the
+    /// prompt: a turn's notifications arrive on a channel that only the event loop
+    /// drains, and its future is only driven by the loop that races the keyboard,
+    /// so opening this from inside a turn would stall the turn for as long as the
+    /// view stayed open.
+    fn scroll_loop(
+        &self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        cells: &[Cell],
+    ) -> io::Result<()> {
+        let mut view = Scroll::default();
+        loop {
+            let size = terminal.size()?;
+            let lines = cell_lines(cells, size.width as usize);
+            // A row is the header, so the transcript gets the rest.
+            let height = size.height.saturating_sub(1) as usize;
+            draw_scroll(terminal, &view, &lines)?;
+            let Some(event) = poll_key(TICK)? else {
+                continue;
+            };
+            let Event::Key(key) = event else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                // Both hands on the same keys: a reader reaching for the arrows and
+                // one reaching for the vi keys are both served, and neither has to
+                // be told which this is.
+                KeyCode::Up | KeyCode::Char('k') => view.by(-1, lines.len(), height),
+                KeyCode::Down | KeyCode::Char('j') => view.by(1, lines.len(), height),
+                KeyCode::PageUp => view.by(-(height as isize), lines.len(), height),
+                KeyCode::PageDown => view.by(height as isize, lines.len(), height),
+                KeyCode::Home | KeyCode::Char('g') => view.top(lines.len(), height),
+                KeyCode::End | KeyCode::Char('G') => view.bottom(),
+                KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -1075,10 +1240,7 @@ impl<B: Backend> Screen<B> {
         let batch = commit_batch(size.height);
         let cells = std::mem::take(&mut self.state.pending);
         // Each cell wraps on its own: a cell boundary is always a line boundary.
-        let lines: Vec<Line<'static>> = cells
-            .iter()
-            .flat_map(|c| wrapped_lines(&c.spans(), width))
-            .collect();
+        let lines = cell_lines(&cells, width);
         for chunk in lines.chunks(batch) {
             let chunk = chunk.to_vec();
             self.terminal.insert_before(chunk.len() as u16, |buf| {
@@ -1126,6 +1288,19 @@ fn input_box() -> TextArea<'static> {
 /// Progress is guaranteed even when a single character is wider than the whole
 /// field: the first character is taken regardless, so a narrow terminal degrades
 /// to a clipped wide glyph rather than looping forever.
+/// The lines cells occupy at `width`.
+///
+/// One function, because the live area, the scrollback it is committed into and
+/// the scroll view that reads it back are three places the same cells are laid
+/// out, and a session that reads differently in any of them is a session that was
+/// not really one transcript.
+fn cell_lines(cells: &[Cell], width: usize) -> Vec<Line<'static>> {
+    cells
+        .iter()
+        .flat_map(|c| wrapped_lines(&c.spans(), width))
+        .collect()
+}
+
 fn wrapped_lines(spans: &[Span], width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -1231,6 +1406,8 @@ enum Submitted {
     Line,
     /// The user asked to leave.
     Exit,
+    /// The user asked for the transcript, full screen.
+    Scroll,
     /// Nothing to run; keep waiting.
     Nothing,
 }
@@ -1279,6 +1456,17 @@ pub async fn run(
                 Some(event) => match screen.state.key(event) {
                     Submitted::Line => break screen.state.take_line(),
                     Submitted::Exit => break String::new(),
+                    Submitted::Scroll => {
+                        // The whole session, as the cells replay would fold it out
+                        // of the log, and then whatever this process has produced
+                        // that has not been committed yet.
+                        let mut cells = cell::from_messages(&agent.session.messages);
+                        cells.extend(screen.state.pending.iter().cloned());
+                        screen.scroll(&cells)?;
+                        // The viewport it comes back to is the one it left, and
+                        // what that shows is decided by the draw at the top of the
+                        // loop.
+                    }
                     Submitted::Nothing => {}
                 },
                 None => continue,
@@ -1592,6 +1780,82 @@ mod tests {
         let now = Instant::now();
         state.begin_turn(now - elapsed);
         (state, now)
+    }
+
+    /// One row of what a terminal holds, without the padding.
+    fn term_row(terminal: &Terminal<ratatui::backend::TestBackend>, y: u16) -> String {
+        let buf = terminal.backend().buffer();
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    }
+
+    #[test]
+    fn the_scroll_view_opens_at_the_end_and_stops_there() {
+        let mut view = Scroll::default();
+        let (total, height) = (30, 10);
+        assert_eq!(view.first(total, height), 20, "it opens on the tail");
+        view.by(1, total, height);
+        assert_eq!(view.first(total, height), 20, "nothing lies past the end");
+        view.by(-5, total, height);
+        assert_eq!(view.first(total, height), 15);
+        view.by(-100, total, height);
+        assert_eq!(view.first(total, height), 0, "nor before the start");
+        view.by(100, total, height);
+        assert_eq!(view.first(total, height), 20);
+    }
+
+    #[test]
+    fn a_transcript_that_fits_does_not_scroll() {
+        let mut view = Scroll::default();
+        let (total, height) = (5, 10);
+        view.by(-3, total, height);
+        assert_eq!(view.first(total, height), 0);
+        assert_eq!(view.back, 0, "there is nowhere to go");
+    }
+
+    #[test]
+    fn home_and_end_reach_the_ends_of_the_transcript() {
+        let mut view = Scroll::default();
+        let (total, height) = (100, 10);
+        view.top(total, height);
+        assert_eq!(view.first(total, height), 0);
+        view.bottom();
+        assert_eq!(view.first(total, height), 90);
+    }
+
+    #[test]
+    fn the_scroll_view_draws_a_header_and_the_lines_it_is_at() {
+        let lines: Vec<Line<'static>> = (0..30).map(|i| Line::from(format!("line {i}"))).collect();
+        // Eight rows: one of header, seven of transcript.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+        let mut view = Scroll::default();
+        draw_scroll(&mut terminal, &view, &lines).unwrap();
+        assert!(
+            term_row(&terminal, 0).starts_with("transcript · lines 24–30 of 30"),
+            "{:?}",
+            term_row(&terminal, 0)
+        );
+        assert_eq!(term_row(&terminal, 1), "line 23");
+        assert_eq!(term_row(&terminal, 7), "line 29");
+
+        view.top(30, 7);
+        draw_scroll(&mut terminal, &view, &lines).unwrap();
+        assert_eq!(term_row(&terminal, 1), "line 0");
+        assert!(
+            term_row(&terminal, 0).starts_with("transcript · lines 1–7 of 30"),
+            "{:?}",
+            term_row(&terminal, 0)
+        );
+    }
+
+    #[test]
+    fn a_session_with_nothing_in_it_says_so() {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+        draw_scroll(&mut terminal, &Scroll::default(), &[]).unwrap();
+        assert!(term_row(&terminal, 0).contains("nothing to show"));
     }
 
     /// One row of what was drawn, without the padding.

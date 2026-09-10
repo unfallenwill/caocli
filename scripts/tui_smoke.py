@@ -338,6 +338,17 @@ def main() -> int:
             term.send("\r")
             ok &= term.expect("switched to session", 30)
 
+            # The transcript, full screen: what the session holds is readable in the
+            # application, not only in the terminal's own scrollback. The resumed
+            # turn is in there, which is what makes this the whole session rather
+            # than what happens to fit above the box.
+            ok &= term.quiet(2.0, 30)
+            term.send("\x0f")  # Ctrl-O
+            ok &= term.expect("esc closes", 15)
+            ok &= term.expect("change a.txt", 15)
+            term.send("\x1b")  # esc
+            ok &= term.expect(VIEWPORT, 15)  # and the box is back
+
             if is_live:
                 ok &= live(term, home)
 
