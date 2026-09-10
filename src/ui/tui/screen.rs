@@ -214,71 +214,46 @@ impl<B: Backend> Screen<B> {
     /// change key with what was drawn rather than with what it expected.
     pub(super) fn draw_at(&mut self) -> Result<Rect, B::Error> {
         let drawn = self.terminal.draw(|frame| {
+            let state = &mut self.state;
             let area = frame.area();
             let width = area.width as usize;
-            let input = self.state.input_rows(area.height);
+            let input = state.input_rows(area.height);
             // What is waiting to run, drawn at the bottom of the transcript: the
             // session, then what comes next, then the box, and under the box the
             // session summary. Asked for before the layout, because how many rows
             // it takes is what the transcript gives up.
-            let queue = Text::from(self.state.queue_lines(width));
+            let queue = Text::from(state.queue_lines(width));
             let queued = queue.height() as u16;
             let rows = screen_rows(area, input, queued);
-            self.state.reset_box_scroll(input);
+            state.reset_box_scroll(input);
             // What the transcript has to show, in the three pieces it is made of:
             // the cells that are laid out and kept, then the block still being
             // written, then a question if one is open.
-            self.state.ensure_laid(width);
-            let live = self.state.live_lines(width);
-            let question = self.state.question_lines(width);
-            let total = self.state.laid_rows() + live.len() + question.len();
+            state.ensure_laid(width);
+            let live = state.live_lines(width);
+            let question = state.question_lines(width);
+            let total = state.laid_rows() + live.len() + question.len();
             // The rows the transcript really has: the layout's answer, not a copy
             // of its arithmetic.
             let room = rows[0].height as usize;
             // The window over the transcript: its end unless the reader scrolled
             // back. The picker belongs to the line being typed, so it takes the
             // box's end of the transcript with it.
-            let picker = self.state.picker_lines();
+            let picker = state.picker_lines();
             let first = if picker.is_empty() {
-                self.state.window(total, room)
+                state.window(total, room)
             } else {
-                self.state.follow();
+                state.follow();
                 total.saturating_sub(room)
             };
             let last = (first + room).min(total);
-            let transcript = Text::from(self.state.window_lines(first, last, &live, &question));
-            let status = self.state.status_line(width);
-            let cursor = self.state.textarea.screen_cursor();
-            // The box's rules, its marker, and the columns the draft is written in
-            // between them. Its marker is the box's own rather than a character of
-            // the draft or of the placeholder, so it is drawn whether the box holds
-            // a line, a hint or nothing at all -- and typing cannot take it away,
-            // which is what the marker inside the placeholder did.
-            let field = box_field(rows[2]);
+            let transcript = Text::from(state.window_lines(first, last, &live, &question));
 
             frame.render_widget(Paragraph::new(transcript), rows[0]);
-            if !picker.is_empty() {
-                let height = picker.len().min(PICKER_ROWS) as u16;
-                let over = Rect {
-                    x: rows[0].x,
-                    y: rows[0].bottom().saturating_sub(height),
-                    width: rows[0].width,
-                    height,
-                };
-                // Cleared first: a shorter list must not leave the tail of a
-                // longer one behind it.
-                frame.render_widget(Clear, over);
-                frame.render_widget(Paragraph::new(Text::from(picker)), over);
-            }
+            draw_picker(frame, &picker, rows[0]);
             frame.render_widget(Paragraph::new(queue), rows[1]);
-            frame.render_widget(self.state.box_rule(rows[2].width as usize), rows[2]);
-            frame.render_widget(
-                Paragraph::new(Line::styled(cell::USER_MARKER, style_of(Style::Dim))),
-                box_marker(rows[2]),
-            );
-            frame.render_widget(&self.state.textarea, field);
-            place_cursor(frame, field, cursor);
-            frame.render_widget(Paragraph::new(status), rows[3]);
+            draw_box(frame, state, rows[2]);
+            draw_status(frame, state, rows[3]);
         })?;
         Ok(drawn.area)
     }
@@ -307,4 +282,47 @@ fn place_cursor(frame: &mut Frame, field: Rect, cursor: ScreenCursor) {
     if x < field.right() && y < field.bottom() {
         frame.set_cursor_position((x, y));
     }
+}
+
+/// The picker, drawn over the bottom of the transcript it stands for.
+fn draw_picker(frame: &mut Frame, picker: &[Line<'static>], transcript: Rect) {
+    if picker.is_empty() {
+        return;
+    }
+    let height = picker.len().min(PICKER_ROWS) as u16;
+    let over = Rect {
+        x: transcript.x,
+        y: transcript.bottom().saturating_sub(height),
+        width: transcript.width,
+        height,
+    };
+    // Cleared first: a shorter list must not leave the tail of a longer one
+    // behind it.
+    frame.render_widget(Clear, over);
+    frame.render_widget(Paragraph::new(Text::from(picker.to_vec())), over);
+}
+
+/// The input box: its rules, its marker, and the columns the draft is written in
+/// between them.
+///
+/// The box's marker is the box's own rather than a character of the draft or of
+/// the placeholder, so it is drawn whether the box holds a line, a hint or
+/// nothing at all -- and typing cannot take it away, which is what the marker
+/// inside the placeholder did.
+fn draw_box(frame: &mut Frame, state: &State, area: Rect) {
+    frame.render_widget(state.box_rule(area.width as usize), area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(cell::USER_MARKER, style_of(Style::Dim))),
+        box_marker(area),
+    );
+    let field = box_field(area);
+    frame.render_widget(&state.textarea, field);
+    let cursor = state.textarea.screen_cursor();
+    place_cursor(frame, field, cursor);
+}
+
+/// The session summary, pinned under the box.
+fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
+    let status = state.status_line(area.width as usize);
+    frame.render_widget(Paragraph::new(status), area);
 }
