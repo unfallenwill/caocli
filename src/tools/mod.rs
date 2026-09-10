@@ -3,6 +3,9 @@ mod shell;
 
 use crate::types::ToolDef;
 
+/// 供审批门策略引用的只读工具名（永远不需要询问用户）。
+pub const READ_NAME: &str = fs::READ_NAME;
+
 /// 工具输出回传上限（字节）。
 pub const MAX_OUTPUT: usize = 10 * 1024;
 /// 单文件读写上限（字节），防止把超大文件读进内存或上下文。

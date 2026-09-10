@@ -85,6 +85,16 @@ pub const INTERRUPTED_RESULT: &str = "error: interrupted before execution; no re
 /// 后者是取消时真实落盘（进程还活着，必须写进文件）。
 pub const CANCELLED_RESULT: &str = "error: cancelled by user before a result was recorded";
 
+/// 审批门拒绝时为该调用落盘的结果。确定性常量；模型读到后可自行调整方案。
+pub const DENIED_RESULT: &str = "error: the user declined this tool call";
+
+/// 单回合工具步上限（每个 ExecTool 动作计一步，含被拒绝的）。
+/// 终止性的产品兜底：模型抽风无限循环时最多烧到这里。
+pub const MAX_TOOL_STEPS: usize = 500;
+
+/// 步数超限时为调用落盘的结果。确定性常量。
+pub const STEP_LIMIT_RESULT: &str = "error: tool step limit reached; turn aborted";
+
 /// 下一拍该做什么。由日志折叠得出的机器决策出口。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {

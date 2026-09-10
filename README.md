@@ -62,6 +62,7 @@ newlines also works (bracketed paste).
 | `-c, --cont` | Continue the most recent session |
 | `--resume <ID>` | Resume a specific session by id |
 | `--list` | List sessions and exit |
+| `--ask` | Approval gate: ask y/N before Bash/Edit/Write (Read always allowed). Denials are recorded as deterministic markers the model can see and adapt to. |
 | `--no-status-bar` | Disable the REPL status bar |
 | `-h, --help` / `-V, --version` | Print help / version |
 
@@ -153,6 +154,11 @@ Limits: 10 KiB of output per tool result, 10 MB per file read/write.
   markers committed to the log, and history stays request-valid — so the
   next prompt simply continues from a clean, honest state instead of a
   400-ing one.
+- **Approval gate and step cap.** With `--ask`, Bash/Edit/Write wait for an
+  explicit y/N (Read never blocks); a denial is committed as a tool result
+  the model reads and adapts to. Every turn is also capped at
+  `machine::MAX_TOOL_STEPS` (500) tool-call steps so a looping model cannot
+  burn tokens forever — the cap closes the turn with deterministic markers.
 - **Crash healing at load.** A session interrupted between an assistant
   message with `tool_calls` and its tool results would otherwise produce an
   invalid request on resume. `Session::load` synthesizes deterministic

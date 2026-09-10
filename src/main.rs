@@ -124,6 +124,7 @@ async fn run(cli: Cli) -> Result<()> {
     }
 
     let mut agent = Agent::new(api, session);
+    agent.confirm_tools = cli.ask;
     ui.set_model(&agent.session.meta.model);
 
     // 单次执行模式（agent 自测的主通道）
@@ -381,6 +382,12 @@ mod tests {
     fn no_status_bar_flag_parses() {
         assert!(cli(&["--no-status-bar"]).no_status_bar);
         assert!(!cli(&[]).no_status_bar);
+    }
+
+    #[test]
+    fn ask_flag_defaults_off_and_parses() {
+        assert!(!cli(&[]).ask, "默认信任执行，不询问");
+        assert!(cli(&["--ask"]).ask);
     }
 
     #[test]

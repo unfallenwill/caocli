@@ -38,4 +38,8 @@ pub struct Cli {
     /// 关闭 REPL 底部状态栏（缓存命中率）
     #[arg(long)]
     pub no_status_bar: bool,
+
+    /// 审批门：Bash/Edit/Write 执行前询问 y/N（Read 永远放行）
+    #[arg(long)]
+    pub ask: bool,
 }

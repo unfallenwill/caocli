@@ -152,6 +152,9 @@ pub trait Ui {
     fn usage(&mut self, u: &Usage);
     /// 回合被用户取消（Ctrl-C）：闭合流式块，打出中断提示。
     fn interrupted(&mut self);
+    /// 审批门询问：回显工具与参数摘要，提示 y/N（应答由 Input 通道读入，
+    /// 不经由本 trait——Notice 永不回传数据）。
+    fn approval_requested(&mut self, name: &str, args: &str);
 }
 
 /// 流式渲染器。思维链与正文是两个独立渲染块：
@@ -401,6 +404,19 @@ impl Ui for Renderer {
         self.raw("\n");
     }
 
+    fn approval_requested(&mut self, name: &str, args: &str) {
+        let hint = serde_json::from_str::<serde_json::Value>(args)
+            .ok()
+            .and_then(|v| {
+                v.get("command")
+                    .or_else(|| v.get("file_path"))
+                    .and_then(|c| c.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| args.chars().take(80).collect());
+        self.raw(&self.paint(YELLOW, &format!("▸ {name} {hint} — 允许执行？[y/N] ")));
+    }
+
     fn usage(&mut self, u: &Usage) {
         let cache = match u.cache() {
             Some(c) => format!("hit {}/miss {}", c.hit, c.miss),
@@ -588,6 +604,15 @@ mod tests {
         let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(s.contains("已中断"), "{s}");
         assert!(s.ends_with("\x1b[0m\n"), "复位颜色收尾: {s}");
+    }
+
+    #[test]
+    fn approval_requested_asks_without_newline() {
+        let (mut r, buf) = Renderer::with_buffer(false);
+        r.approval_requested("Bash", r#"{"command":"rm -rf /"}"#);
+        let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(s.contains("▸ Bash rm -rf /"), "{s}");
+        assert!(s.ends_with("[y/N] "), "以 y/N 提示收尾且不换行: {s:?}");
     }
 
     #[test]

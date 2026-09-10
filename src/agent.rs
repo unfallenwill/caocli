@@ -7,7 +7,7 @@ use crate::config::DEFAULT_EFFORT;
 use crate::machine::{self, Action};
 use crate::session::Session;
 use crate::tools;
-use crate::types::{ChatRequest, Message, Thinking, TurnAccumulator, Usage};
+use crate::types::{ChatRequest, Message, Thinking, ToolCall, TurnAccumulator, Usage};
 use crate::ui::Ui;
 
 /// 参与请求前缀（KVCache）。禁止注入时间、cwd、随机 id 等任何动态内容，
@@ -17,11 +17,22 @@ pub const SYSTEM_PROMPT: &str = "You are caocli, a terminal coding agent. You ca
 pub struct Agent {
     api: Client,
     pub session: Session,
+    /// 审批门：开启后 Bash/Edit/Write 执行前询问用户（Read 永远放行）。
+    pub confirm_tools: bool,
+    /// 单回合工具步上限（终止性的产品兜底）。
+    pub max_tool_steps: usize,
+    tool_steps: usize,
 }
 
 impl Agent {
     pub fn new(api: Client, session: Session) -> Self {
-        Self { api, session }
+        Self {
+            api,
+            session,
+            confirm_tools: false,
+            max_tool_steps: machine::MAX_TOOL_STEPS,
+            tool_steps: 0,
+        }
     }
 
     /// 控制面唯一入口：`/new`、`/resume` 等 shell 命令经此替换机器的持久
@@ -63,9 +74,28 @@ impl Agent {
     /// 渲染器由调用方持有并传入：状态栏与流式输出必须走同一个 `Ui` 实现，
     /// 否则 `usage()` 记录到的缓存统计不会反映到已建栏的实例上。
     pub async fn turn(&mut self, input: &str, ui: &mut impl Ui) -> Result<()> {
-        self.turn_with(input, ui, || async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        self.turn_with(
+            input,
+            ui,
+            || async {
+                let _ = tokio::signal::ctrl_c().await;
+            },
+            |_call| async {
+                // 审批应答（Input 事件）：一行 stdin，默认拒绝。
+                // 用阻塞读包进 spawn_blocking：全局 stdin 缓冲跨调用共享，
+                // 多余的预输入不会丢。（代价：取消时残留一个阻塞线程，
+                // 之后的第一行输入会被它吞掉——已知取舍。）
+                tokio::task::spawn_blocking(|| {
+                    let mut line = String::new();
+                    let read = std::io::stdin().read_line(&mut line);
+                    let line = line.trim();
+                    read.map(|n| n > 0).unwrap_or(false)
+                        && (line.eq_ignore_ascii_case("y") || line.starts_with('y'))
+                })
+                .await
+                .unwrap_or(false)
+            },
+        )
         .await
     }
 
@@ -75,15 +105,18 @@ impl Agent {
     /// 已声明未应答的调用以 CANCELLED_RESULT 落盘闭合窗口，
     /// 历史保持 is_request_valid，下一回合从合法前缀继续。
     /// 取消在解释器层处理，不进 `next_action`（带外，任何状态可达）。
-    pub async fn turn_with<F, Fut>(
+    async fn turn_with<F, Fut, A, FutA>(
         &mut self,
         input: &str,
         ui: &mut impl Ui,
         mut interrupt: F,
+        mut approve: A,
     ) -> Result<()>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = ()>,
+        A: FnMut(&ToolCall) -> FutA,
+        FutA: Future<Output = bool>,
     {
         self.session.append_message(&Message::user(input))?;
         let mut cancelled = false;
@@ -111,16 +144,51 @@ impl Agent {
                 }
                 Some(Action::ExecTool(call)) => {
                     ui.tool_start(&call.function.name, &call.function.arguments);
-                    let out = tokio::select! {
-                        biased;
-                        out = tools::execute(&call.function.name, &call.function.arguments) => out,
-                        _ = interrupt() => machine::CANCELLED_RESULT.to_string(),
-                    };
-                    let cancelled_call = out == machine::CANCELLED_RESULT;
-                    ui.tool_result(&out);
-                    self.session.append_message(&Message::tool(&call.id, out))?;
-                    if cancelled_call {
-                        cancelled = true;
+                    // 步数上限：每个 ExecTool 动作计一步（含被拒绝的），
+                    // 超限即以确定性标记收尾，防模型抽风无限循环。
+                    if self.tool_steps >= self.max_tool_steps {
+                        ui.tool_result(machine::STEP_LIMIT_RESULT);
+                        self.session.append_message(&Message::tool(
+                            &call.id,
+                            machine::STEP_LIMIT_RESULT.to_string(),
+                        ))?;
+                        self.close_open_calls(ui, machine::STEP_LIMIT_RESULT)?;
+                        break;
+                    }
+                    self.tool_steps += 1;
+                    // 审批门：Bash/Edit/Write 先询问，拒绝以 DENIED_RESULT 闭合该调用
+                    let mut denied = false;
+                    if self.confirm_tools && call.function.name != tools::READ_NAME {
+                        ui.approval_requested(&call.function.name, &call.function.arguments);
+                        let approved = tokio::select! {
+                            biased;
+                            ok = approve(&call) => ok,
+                            _ = interrupt() => { cancelled = true; false }
+                        };
+                        if cancelled {
+                            break;
+                        }
+                        if !approved {
+                            denied = true;
+                            ui.tool_result(machine::DENIED_RESULT);
+                            self.session.append_message(&Message::tool(
+                                &call.id,
+                                machine::DENIED_RESULT.to_string(),
+                            ))?;
+                        }
+                    }
+                    if !denied {
+                        let out = tokio::select! {
+                            biased;
+                            out = tools::execute(&call.function.name, &call.function.arguments) => out,
+                            _ = interrupt() => machine::CANCELLED_RESULT.to_string(),
+                        };
+                        let cancelled_call = out == machine::CANCELLED_RESULT;
+                        ui.tool_result(&out);
+                        self.session.append_message(&Message::tool(&call.id, out))?;
+                        if cancelled_call {
+                            cancelled = true;
+                        }
                     }
                 }
                 Some(Action::Done) | None => break,
@@ -130,19 +198,18 @@ impl Agent {
             }
         }
         if cancelled {
-            self.close_open_calls(ui)?;
+            self.close_open_calls(ui, machine::CANCELLED_RESULT)?;
             ui.interrupted();
         }
         Ok(())
     }
 
-    /// 取消收尾：把已声明但未应答的调用以取消标记落盘，闭合窗口。
-    /// 落盘而非仅内存视图——进程还活着，文件必须如实记录取消。
-    fn close_open_calls(&mut self, ui: &mut impl Ui) -> Result<()> {
+    /// 中断/超限收尾：把已声明但未应答的调用以给定标记落盘，闭合窗口。
+    /// 落盘而非仅内存视图——进程还活着，文件必须如实记录。
+    fn close_open_calls(&mut self, ui: &mut impl Ui, marker: &str) -> Result<()> {
         for id in machine::open_call_ids(&self.session.messages) {
-            self.session
-                .append_message(&Message::tool(&id, machine::CANCELLED_RESULT))?;
-            ui.tool_result(machine::CANCELLED_RESULT);
+            self.session.append_message(&Message::tool(&id, marker))?;
+            ui.tool_result(marker);
         }
         Ok(())
     }
@@ -251,10 +318,10 @@ mod tests {
         let dir = tmpdir();
         let mut s = Session::create(&dir, test_meta()).unwrap();
         s.append_message(&Message::user("q1")).unwrap();
-        let agent = Agent {
-            api: Client::new("k".into(), crate::config::DEEPSEEK.url.into()).unwrap(),
-            session: s,
-        };
+        let agent = Agent::new(
+            Client::new("k".into(), crate::config::DEEPSEEK.url.into()).unwrap(),
+            s,
+        );
         let req = agent.build_request();
         assert_eq!(req.messages.len(), 2);
         assert_eq!(req.messages[0].role, Role::System);
@@ -272,10 +339,10 @@ mod tests {
         let mut s = Session::create(&dir, test_meta()).unwrap();
         s.meta.reasoning_effort = None;
         s.append_message(&Message::user("q1")).unwrap();
-        let agent = Agent {
-            api: Client::new("k".into(), crate::config::DEEPSEEK.url.into()).unwrap(),
-            session: s,
-        };
+        let agent = Agent::new(
+            Client::new("k".into(), crate::config::DEEPSEEK.url.into()).unwrap(),
+            s,
+        );
         let req = agent.build_request();
         assert_eq!(req.reasoning_effort.as_deref(), Some("max"));
         std::fs::remove_dir_all(&dir).unwrap();
@@ -435,7 +502,12 @@ mod tests {
         let mut ui = Renderer::new();
         // 第一个取消点（pump select）立即触发
         agent
-            .turn_with("原始指令", &mut ui, || Box::pin(async {}))
+            .turn_with(
+                "原始指令",
+                &mut ui,
+                || Box::pin(async {}),
+                |_| std::future::ready(true),
+            )
             .await
             .unwrap();
         assert_eq!(agent.session.messages.len(), 1);
@@ -469,11 +541,16 @@ mod tests {
         steps.push_back(Box::pin(std::future::pending::<()>()));
         steps.push_back(Box::pin(async {}));
         agent
-            .turn_with("跑两个慢命令", &mut ui, move || {
-                steps
-                    .pop_front()
-                    .unwrap_or_else(|| Box::pin(std::future::pending()))
-            })
+            .turn_with(
+                "跑两个慢命令",
+                &mut ui,
+                move || {
+                    steps
+                        .pop_front()
+                        .unwrap_or_else(|| Box::pin(std::future::pending()))
+                },
+                |_| std::future::ready(true),
+            )
             .await
             .unwrap();
 
@@ -490,6 +567,140 @@ mod tests {
         // 窗口闭合：历史合法，下一回合的决策是发请求而不是复活僵尸调用
         assert!(machine::is_request_valid(msgs));
         assert_eq!(machine::next_action(msgs), Some(machine::Action::CallModel));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 审批门拒绝：DENIED_RESULT 闭合该调用，窗口合法，下一拍继续消化。
+    #[tokio::test]
+    async fn approval_denied_commits_denial_marker() {
+        let server = MockServer::start().await;
+        let turn1 = [
+            sse(json!({"tool_calls":[{"index":0,"id":"call_d1","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"echo blocked\"}"}}]}), None, None),
+            sse(json!({"content":""}), Some("tool_calls"), None),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        mount_chat(&server, turn1, Some(1)).await;
+        let turn2 = [
+            sse(json!({"content":"已跳过该命令。"}), None, None),
+            sse(json!({"content":""}), Some("stop"), None),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        mount_chat(&server, turn2, None).await;
+        let dir = tmpdir();
+        let mut agent = test_agent(&server, &dir);
+        agent.confirm_tools = true;
+        let mut ui = Renderer::new();
+        agent
+            .turn_with(
+                "执行被禁止的命令",
+                &mut ui,
+                || Box::pin(std::future::pending::<()>()),
+                |_| std::future::ready(false),
+            )
+            .await
+            .unwrap();
+        let msgs = &agent.session.messages;
+        assert_eq!(
+            msgs.len(),
+            4,
+            "user / assistant / 拒绝标记 / 收尾 assistant"
+        );
+        assert_eq!(msgs[2].content.as_deref(), Some(machine::DENIED_RESULT));
+        assert!(machine::is_request_valid(msgs));
+        // 窗口已闭合且拒绝结果回传模型：收尾 assistant 证明模型消化了拒绝
+        assert_eq!(msgs[3].role, Role::Assistant);
+        assert!(
+            msgs[3]
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("跳过")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 审批等待中 Ctrl-C：未应答调用以取消标记落盘（与拒绝标记区分）。
+    #[tokio::test]
+    async fn cancel_during_approval_wait_commits_cancelled() {
+        let server = MockServer::start().await;
+        let turn1 = [
+            sse(json!({"tool_calls":[{"index":0,"id":"call_w1","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"echo hi\"}"}}]}), None, None),
+            sse(json!({"content":""}), Some("tool_calls"), None),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        mount_chat(&server, turn1, Some(1)).await;
+        let dir = tmpdir();
+        let mut agent = test_agent(&server, &dir);
+        agent.confirm_tools = true;
+        let mut ui = Renderer::new();
+        // 取消点队列：pump 处不触发；审批等待处立即触发
+        let mut steps: std::collections::VecDeque<std::pin::Pin<Box<dyn Future<Output = ()>>>> =
+            Default::default();
+        steps.push_back(Box::pin(std::future::pending::<()>()));
+        steps.push_back(Box::pin(async {}));
+        agent
+            .turn_with(
+                "执行它",
+                &mut ui,
+                move || {
+                    steps
+                        .pop_front()
+                        .unwrap_or_else(|| Box::pin(std::future::pending()))
+                },
+                |_| std::future::pending(),
+            )
+            .await
+            .unwrap();
+        let msgs = &agent.session.messages;
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2].content.as_deref(), Some(machine::CANCELLED_RESULT));
+        assert!(machine::is_request_valid(msgs));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 步数上限：达到上限后不再执行新工具，剩余调用以上限标记闭合。
+    #[tokio::test]
+    async fn step_limit_aborts_with_deterministic_markers() {
+        let server = MockServer::start().await;
+        let calls = ["one", "two", "three"]
+            .iter()
+            .enumerate()
+            .map(|(i, word)| {
+                json!({"index": i, "id": format!("call_s{}", i + 1), "type": "function",
+                       "function": {"name": "Bash", "arguments": format!("{{\"command\":\"echo {word}\"}}")}})
+            })
+            .collect::<Vec<_>>();
+        let turn1 = [
+            sse(json!({"tool_calls": calls}), None, None),
+            sse(json!({"content":""}), Some("tool_calls"), None),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        mount_chat(&server, turn1, Some(1)).await;
+        let dir = tmpdir();
+        let mut agent = test_agent(&server, &dir);
+        agent.max_tool_steps = 2;
+        let mut ui = Renderer::new();
+        agent
+            .turn_with(
+                "跑三个命令",
+                &mut ui,
+                || Box::pin(std::future::pending::<()>()),
+                |_| std::future::ready(true),
+            )
+            .await
+            .unwrap();
+        let msgs = &agent.session.messages;
+        assert_eq!(msgs.len(), 5, "user / assistant(3 calls) / tool×3");
+        assert_eq!(
+            msgs[4].content.as_deref(),
+            Some(machine::STEP_LIMIT_RESULT),
+            "第 3 个调用因超限收到标记而非执行"
+        );
+        assert!(machine::is_request_valid(msgs));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
