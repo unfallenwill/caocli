@@ -12,9 +12,9 @@ use crate::repl;
 use crate::session;
 use crate::ui::text;
 
-use super::State;
 use super::layout::picker_window;
 use super::paint::more_line;
+use super::state::State;
 
 /// How many command rows the picker shows at once. It draws over the bottom of the
 /// transcript, so it has to leave the transcript somewhere to live.
