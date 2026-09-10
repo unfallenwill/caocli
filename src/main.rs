@@ -3,6 +3,7 @@ mod api;
 mod cli;
 mod config;
 mod machine;
+mod repl;
 mod session;
 mod tools;
 mod types;
@@ -16,7 +17,7 @@ use crate::agent::{Agent, Sigint, StdinApproval};
 use crate::api::Client;
 use crate::cli::Cli;
 use crate::session::{Session, SessionMeta};
-use crate::ui::Renderer;
+use crate::ui::{Front, Renderer};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -201,59 +202,21 @@ async fn run(cli: Cli) -> Result<()> {
                     continue;
                 }
                 let _ = rl.add_history_entry(line);
-                match line {
-                    "/exit" | "/quit" | "/q" => break,
-                    "/help" => print_help(),
-                    "/sessions" => {
-                        for s in session::list(&sdir)? {
-                            ui.info(&format!(
-                                "{}\t{} messages\t{}",
-                                s.id, s.message_count, s.preview
-                            ));
-                        }
-                    }
-                    "/new" => match Session::create(&sdir, agent.session.meta.clone()) {
-                        Ok(s) => {
-                            ui.info(&format!("new session {}", s.id));
-                            agent.adopt(s);
-                            ui.reset_stats();
-                            ui.set_model(&agent.session.meta.model);
-                        }
-                        Err(e) => ui.error(&format!("{e:#}")),
-                    },
-                    _ if line.starts_with("/resume ") => {
-                        let id = line.trim_start_matches("/resume ").trim();
-                        let path = sdir.join(format!("{id}.jsonl"));
-                        match Session::load(&path) {
-                            Ok(s) => {
-                                ui.info(&format!(
-                                    "switched to session {} ({} messages)",
-                                    s.id,
-                                    s.messages.len()
-                                ));
-                                ui.replay(&s.messages);
-                                agent.adopt(s);
-                                ui.reset_stats();
-                                ui.set_model(&agent.session.meta.model);
-                            }
-                            Err(e) => ui.error(&format!("{e:#}")),
-                        }
-                    }
-                    _ if line.starts_with('/') => {
-                        ui.info("unknown command; /help lists the available commands")
-                    }
-                    _ => {
-                        // One interrupt listener per turn, subscribed before
-                        // the turn's first await point (see Agent::turn).
-                        let mut interrupt = Sigint::new()?;
-                        let mut approve = StdinApproval;
-                        if let Err(e) = agent
-                            .turn(line, &mut ui, &mut interrupt, &mut approve)
-                            .await
-                        {
-                            ui.error(&format!("{e:#}"));
-                        }
-                    }
+                // One interrupt listener per turn, subscribed before the turn's
+                // first await point (see Agent::turn).
+                let mut interrupt = Sigint::new()?;
+                let mut approve = StdinApproval;
+                let outcome = repl::handle(
+                    &mut agent,
+                    &mut ui,
+                    &sdir,
+                    line,
+                    &mut interrupt,
+                    &mut approve,
+                )
+                .await?;
+                if outcome == repl::Outcome::Exit {
+                    break;
                 }
             }
             Err(rustyline::error::ReadlineError::Interrupted) => continue, // Ctrl-C clears the line
@@ -267,15 +230,6 @@ async fn run(cli: Cli) -> Result<()> {
     let _ = rl.save_history(&hist_path);
     ui.teardown();
     Ok(())
-}
-
-fn print_help() {
-    println!("{}", help_text());
-}
-
-fn help_text() -> String {
-    "Commands:\n  /exit /quit /q   quit\n  /new             start a new session\n  /sessions        list sessions\n  /resume <id>     switch to a specific session\nInput:\n  Enter            submit\n  Ctrl-J           newline (multi-line input)\nStartup flags:\n  -c / --continue  continue the most recent session\n  --resume <id>    resume a specific session\n  --provider deepseek|glm\n  --effort low|high|max --model <id>\n  -p \"prompt\"      run once and exit"
-        .to_string()
 }
 
 #[cfg(test)]
@@ -421,21 +375,6 @@ mod tests {
             "execution is trusted by default, so do not ask"
         );
         assert!(cli(&["--ask"]).ask);
-    }
-
-    #[test]
-    fn help_text_lists_slash_commands_and_flags() {
-        let t = help_text();
-        for expected in [
-            "/resume <id>",
-            "-c / --continue",
-            "--provider deepseek|glm",
-            "--effort low|high|max",
-            "-p \"prompt\"",
-            "Ctrl-J",
-        ] {
-            assert!(t.contains(expected), "missing {expected:?}\n{t}");
-        }
     }
 
     #[test]

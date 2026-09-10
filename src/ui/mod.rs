@@ -157,6 +157,28 @@ pub trait Ui {
     fn approval_requested(&mut self, name: &str, args: &str);
 }
 
+/// What a front end offers the *application*, as opposed to [`Ui`], which is what
+/// the *machine* sends.
+///
+/// The two are kept apart on purpose: `Ui` is the machine's notification
+/// vocabulary and stays that, while this is the handful of operations the
+/// submitted-line handling needs from whichever front end is running -- the
+/// plain renderer, or the interactive one that owns the terminal.
+pub trait Front: Ui {
+    /// Draw a resumed session's history.
+    fn replay(&mut self, messages: &[Message]);
+    /// A dim informational line.
+    fn info(&mut self, s: &str);
+    /// A failure. The plain front end writes it to the error stream so it
+    /// survives a redirected stdout; an interactive one has to place it in its
+    /// own output, which is why this takes `&mut self`.
+    fn error(&mut self, s: &str);
+    /// Adopt the model id the status line reports.
+    fn set_model(&mut self, model: &str);
+    /// Clear the session's cache statistics.
+    fn reset_stats(&mut self);
+}
+
 /// Streaming renderer. Thinking and body text are two independent render blocks:
 /// - thinking is dim, body text is the normal color
 /// - blocks are separated by a newline; switching from thinking to body adds an
@@ -258,22 +280,11 @@ impl Renderer {
 
     /// Set the model id shown in the status bar (called when a session is created
     /// or switched, since it follows the session meta).
-    pub fn set_model(&mut self, model: &str) {
-        self.status.set_model(model);
-        self.redraw_status_bar();
-    }
-
     /// Cache statistics accumulated for the current session (the status bar's data
     /// source). Read by tests only.
     #[cfg(test)]
     pub fn stats(&self) -> status::CacheStats {
         self.status.stats()
-    }
-
-    /// Clear the cache statistics when switching sessions.
-    pub fn reset_stats(&mut self) {
-        self.status.reset_stats();
-        self.redraw_status_bar();
     }
 
     /// Restore the terminal before exiting (reset the scroll region, clear the
@@ -355,20 +366,36 @@ impl Renderer {
     /// the same painter, so a resumed session is laid out exactly like the one
     /// that was watched live -- including the tool summaries, which are a
     /// property of the cell and so cannot be forgotten here.
-    pub fn replay(&mut self, messages: &[Message]) {
+    fn replay_messages(&mut self, messages: &[Message]) {
         for cell in cell::from_messages(messages) {
             self.paint_cell(&cell);
         }
         // Separate the replayed history from the prompt that follows it.
         self.raw("\n");
     }
+}
 
-    pub fn info(&mut self, s: &str) {
+impl Front for Renderer {
+    fn replay(&mut self, messages: &[Message]) {
+        self.replay_messages(messages);
+    }
+
+    fn info(&mut self, s: &str) {
         self.paint_cell(&Cell::Notice(s.to_owned()));
     }
 
-    pub fn error(&self, s: &str) {
+    fn error(&mut self, s: &str) {
         eprintln!("{}", self.paint(Style::Red, s));
+    }
+
+    fn set_model(&mut self, model: &str) {
+        self.status.set_model(model);
+        self.redraw_status_bar();
+    }
+
+    fn reset_stats(&mut self) {
+        self.status.reset_stats();
+        self.redraw_status_bar();
     }
 }
 

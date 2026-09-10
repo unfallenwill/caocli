@@ -188,7 +188,7 @@ impl Agent {
     pub async fn turn(
         &mut self,
         input: &str,
-        ui: &mut impl Ui,
+        ui: &mut dyn Ui,
         interrupt: &mut dyn Interrupt,
         approve: &mut dyn Approve,
     ) -> Result<()> {
@@ -287,7 +287,7 @@ impl Agent {
     /// were declared but not answered, closing the window.
     /// Persisted rather than kept in the in-memory view only — the process is
     /// still alive, so the file has to record it faithfully.
-    fn close_open_calls(&mut self, ui: &mut impl Ui, marker: &str) -> Result<()> {
+    fn close_open_calls(&mut self, ui: &mut dyn Ui, marker: &str) -> Result<()> {
         for id in machine::open_call_ids(&self.session.messages) {
             self.session.append_message(&Message::tool(&id, marker))?;
             ui.tool_result(marker);
@@ -299,7 +299,7 @@ impl Agent {
     /// delta) and aggregate a complete assistant message.
     /// Errors propagate upward; at that point the assistant message has not been
     /// persisted, so the session stays at a valid prefix.
-    async fn pump(&self, req: &ChatRequest, ui: &mut impl Ui) -> Result<(Message, Option<Usage>)> {
+    async fn pump(&self, req: &ChatRequest, ui: &mut dyn Ui) -> Result<(Message, Option<Usage>)> {
         let mut stream = self.api.stream_chat(req).await?;
         let mut acc = TurnAccumulator::default();
         let mut usage: Option<Usage> = None;
