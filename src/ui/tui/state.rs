@@ -21,8 +21,8 @@ use crate::ui::tui::layout::BOX_BORDERS;
 use crate::ui::tui::notice::Notice;
 use crate::ui::tui::paint::{cell_lines, live_cell};
 
-use super::Answer;
-use super::input_box;
+use super::input::Answer;
+use super::input::input_box;
 use super::picker::Picker;
 
 /// The lines one wheel notch moves the window over the transcript: the step a
