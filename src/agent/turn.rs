@@ -268,3 +268,6 @@ impl Turn<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

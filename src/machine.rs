@@ -355,6 +355,30 @@ mod tests {
         assert_eq!(msgs.len(), 4);
     }
 
+    /// The markers are in the log, and history is replayed byte for byte: a
+    /// changed letter is a different history and voids the prefix cache of every
+    /// session that ran before it. Pinned so that rewording one is a decision
+    /// rather than an accident.
+    #[test]
+    fn marker_texts_are_frozen() {
+        assert_eq!(
+            Marker::Interrupted.text(),
+            "error: interrupted before execution; no result was recorded"
+        );
+        assert_eq!(
+            Marker::Cancelled.text(),
+            "error: cancelled by user before a result was recorded"
+        );
+        assert_eq!(
+            Marker::Denied.text(),
+            "error: the user declined this tool call"
+        );
+        assert_eq!(
+            Marker::StepLimit.text(),
+            "error: tool step limit reached; turn aborted"
+        );
+    }
+
     #[test]
     fn orphan_calls_get_synthetic_results() {
         // Crash site: both calls were cut off before executing

@@ -16,6 +16,14 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// The command-line flag becomes a policy in one place, and the policy says
+/// which way round it points (a bare `bool` field would not).
+#[test]
+fn the_ask_flag_becomes_the_gate_policy() {
+    assert_eq!(Approval::from_flag(true), Approval::Ask);
+    assert_eq!(Approval::from_flag(false), Approval::Trusted);
+}
+
 fn tmpdir() -> std::path::PathBuf {
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let d = std::env::temp_dir().join(format!(
