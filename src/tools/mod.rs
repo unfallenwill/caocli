@@ -3,15 +3,18 @@ mod shell;
 
 use crate::types::ToolDef;
 
-/// 供审批门策略引用的只读工具名（永远不需要询问用户）。
+/// Name of the read-only tool referenced by the approval gate policy (never
+/// needs to ask the user).
 pub const READ_NAME: &str = fs::READ_NAME;
 
-/// 工具输出回传上限（字节）。
+/// Cap on tool output sent back to the model (bytes).
 pub const MAX_OUTPUT: usize = 10 * 1024;
-/// 单文件读写上限（字节），防止把超大文件读进内存或上下文。
+/// Per-file read/write cap (bytes), so a huge file cannot be pulled into memory
+/// or into the context window.
 pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
-/// 全部工具定义。顺序固定：顺序变化会改变请求前缀，导致 KVCache 全量 miss。
+/// All tool definitions. The order is fixed: changing it changes the request
+/// prefix and causes a full KVCache miss.
 pub fn definitions() -> Vec<ToolDef> {
     vec![
         shell::definition(),
@@ -21,8 +24,9 @@ pub fn definitions() -> Vec<ToolDef> {
     ]
 }
 
-/// 按名字分派执行。永不返回 Err：一切错误（未知工具、坏参数、IO 失败）
-/// 都以文本形式作为 tool 结果回传给模型，由模型决定下一步。
+/// Dispatch by name. Never returns Err: every failure (unknown tool, bad
+/// arguments, IO error) is passed back to the model as tool result text and the
+/// model decides what to do next.
 pub async fn execute(name: &str, args_json: &str) -> String {
     match name {
         shell::NAME => shell::execute(args_json).await,
@@ -30,7 +34,7 @@ pub async fn execute(name: &str, args_json: &str) -> String {
         fs::EDIT_NAME => fs::edit(args_json),
         fs::WRITE_NAME => fs::write(args_json),
         other => format!(
-            "error: 未知工具 {other:?}。可用工具: Bash, {}, {}, {}",
+            "error: unknown tool {other:?}. Available tools: Bash, {}, {}, {}",
             fs::READ_NAME,
             fs::EDIT_NAME,
             fs::WRITE_NAME
@@ -38,20 +42,21 @@ pub async fn execute(name: &str, args_json: &str) -> String {
     }
 }
 
-/// 解析工具参数 JSON。错误文本直接作为 tool 结果返回。
+/// Parse tool arguments JSON. Error text is returned as the tool result.
 fn parse_args(args_json: &str) -> Result<serde_json::Value, String> {
-    serde_json::from_str(args_json).map_err(|e| format!("error: 参数不是合法 JSON: {e}"))
+    serde_json::from_str(args_json).map_err(|e| format!("error: arguments are not valid JSON: {e}"))
 }
 
-/// 取必填字符串参数。
+/// Fetch a required string argument.
 fn str_arg(v: &serde_json::Value, key: &str) -> Result<String, String> {
     v.get(key)
         .and_then(|x| x.as_str())
         .map(str::to_owned)
-        .ok_or_else(|| format!("error: 缺少必填参数 {key} (string)"))
+        .ok_or_else(|| format!("error: missing required argument {key} (string)"))
 }
 
-/// 按字节上限截断，回退到 UTF-8 字符边界，避免截断多字节字符。
+/// Truncate at a byte limit, backing off to a UTF-8 character boundary so a
+/// multi-byte character is never cut in half.
 fn truncate(s: &str, max: usize) -> (String, bool) {
     if s.len() <= max {
         return (s.to_owned(), false);
@@ -69,11 +74,11 @@ mod tests {
 
     #[test]
     fn truncate_respects_char_boundary() {
-        let s = "中文".repeat(4096); // 每个 UTF-8 中文 3 字节，共 24576 字节
+        let s = "€".repeat(4096); // each € is 3 bytes in UTF-8, 12288 bytes total
         let (out, cut) = truncate(&s, 10);
         assert!(cut);
-        // 10 字节处不是字符边界，回退到 9（= 3 个完整字符）
-        assert_eq!(out, "中文中");
+        // byte 10 is not a char boundary, so back off to 9 (= 3 complete chars)
+        assert_eq!(out, "€€€");
         let (out2, cut2) = truncate("short", 10);
         assert!(!cut2);
         assert_eq!(out2, "short");
@@ -88,7 +93,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_tool_returns_error_text() {
         let out = execute("Delete", "{}").await;
-        assert!(out.contains("未知工具"));
+        assert!(out.contains("unknown tool"));
         assert!(out.contains("Bash"));
     }
 

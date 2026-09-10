@@ -13,21 +13,26 @@ pub fn definition() -> ToolDef {
         function: FunctionDef {
             name: NAME.into(),
             description: Some(
-                "在本地机器上执行一条 bash 命令，返回 exit_code、stdout、stderr（三者分开返回）。\
-                 每次调用都是全新的 shell：工作目录和环境变量不会保留，\
-                 需要特定目录时请在同一条命令里写 cd /abs/path && ...，并优先用绝对路径。\
-                 适用：运行程序、构建、测试、git、目录操作、批量文本处理。\
-                 不适用：读文本文件用 Read，改已有文件用 Edit，新建或整文件重写用 Write；\
-                 不要用 cat/sed -i/tee 代替它们。\
-                 stdout/stderr 各超过 10240 字节会被截断并标记 [已截断]，\
-                 请用 head/tail/grep/wc 主动收窄输出。\
-                 不要执行交互式或常驻命令（vim、top、裸 read 等），会阻塞至 120 秒超时被杀且输出丢失。"
+                "Run one bash command on the local machine; returns exit_code, stdout and stderr \
+                 (returned separately). \
+                 Every call is a fresh shell: the working directory and environment variables do \
+                 not persist, so to target a directory write cd /abs/path && ... inside the same \
+                 command, and prefer absolute paths. \
+                 Use for: running programs, builds, tests, git, directory operations, bulk text \
+                 processing. \
+                 Not for: reading a text file (use Read), modifying an existing file (use Edit), \
+                 creating or fully rewriting a file (use Write); do not substitute cat/sed -i/tee \
+                 for them. \
+                 stdout and stderr are each truncated at 10240 bytes and marked [truncated]; \
+                 narrow the output yourself with head/tail/grep/wc. \
+                 Do not run interactive or long-lived commands (vim, top, a bare read, etc.): they \
+                 block until the 120s timeout kills them and the output is lost."
                     .into(),
             ),
             parameters: Some(json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "要执行的 bash 命令" }
+                    "command": { "type": "string", "description": "the bash command to run" }
                 },
                 "required": ["command"]
             })),
@@ -35,15 +40,15 @@ pub fn definition() -> ToolDef {
     }
 }
 
-/// 执行 shell 命令。永不返回 Err：坏参数、命令失败、超时都以文本形式
-/// 作为 tool 结果回传给模型。
+/// Run a shell command. Never returns Err: bad arguments, command failure and
+/// timeouts all come back as tool result text.
 pub async fn execute(args_json: &str) -> String {
     let command = match super::parse_args(args_json) {
         Ok(v) => v.get("command").and_then(|c| c.as_str()).map(str::to_owned),
         Err(e) => return e,
     };
     let Some(command) = command else {
-        return "error: 缺少必填参数 command (string)".into();
+        return "error: missing required argument command (string)".into();
     };
 
     let child = tokio::process::Command::new("bash")
@@ -56,15 +61,16 @@ pub async fn execute(args_json: &str) -> String {
         .spawn();
 
     let output = match child {
-        Err(e) => return format!("exit_code: 127\n--- stderr ---\n无法启动 bash: {e}"),
+        Err(e) => return format!("exit_code: 127\n--- stderr ---\nfailed to start bash: {e}"),
         Ok(child) => {
             match tokio::time::timeout(Duration::from_secs(TIMEOUT_SECS), child.wait_with_output())
                 .await
             {
                 Err(_) => {
                     return format!(
-                        "exit_code: 124\ntimeout: 命令超过 {TIMEOUT_SECS}s 已被终止，输出丢失。\
-                     请改用更快的命令或将长任务放入后台并轮询输出文件。"
+                        "exit_code: 124\ntimeout: the command ran longer than {TIMEOUT_SECS}s and \
+                     was killed; its output is lost. Use a faster command, or run a long task in \
+                     the background and poll an output file."
                     );
                 }
                 Ok(Err(e)) => return format!("exit_code: -1\nerror: {e}"),
@@ -81,12 +87,12 @@ pub async fn execute(args_json: &str) -> String {
 
     let mut s = format!("exit_code: {exit_code}\n--- stdout ---\n{stdout}");
     if stdout_cut {
-        s.push_str("\n[stdout 已截断]");
+        s.push_str("\n[stdout truncated]");
     }
     s.push_str("\n--- stderr ---\n");
     s.push_str(&stderr);
     if stderr_cut {
-        s.push_str("\n[stderr 已截断]");
+        s.push_str("\n[stderr truncated]");
     }
     s
 }
@@ -98,13 +104,13 @@ mod tests {
     #[tokio::test]
     async fn execute_bad_json_returns_error_text() {
         let out = execute("not json").await;
-        assert!(out.starts_with("error: 参数不是合法 JSON"));
+        assert!(out.starts_with("error: arguments are not valid JSON"));
     }
 
     #[tokio::test]
     async fn execute_missing_command_returns_error_text() {
         let out = execute(r#"{"cmd":"ls"}"#).await;
-        assert!(out.starts_with("error: 缺少必填参数 command"));
+        assert!(out.starts_with("error: missing required argument command"));
     }
 
     #[tokio::test]
@@ -121,11 +127,11 @@ mod tests {
             r#"{"command":"head -c 30000 /dev/zero | tr '\\0' 'a'; head -c 30000 /dev/zero | tr '\\0' 'b' >&2"}"#,
         )
         .await;
-        assert!(out.contains("[stdout 已截断]"), "{out}");
-        assert!(out.contains("[stderr 已截断]"), "{out}");
+        assert!(out.contains("[stdout truncated]"), "{out}");
+        assert!(out.contains("[stderr truncated]"), "{out}");
         assert!(
             out.len() < crate::tools::MAX_OUTPUT * 2 + 512,
-            "输出应被截断"
+            "output should be truncated"
         );
     }
 }

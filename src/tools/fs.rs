@@ -14,16 +14,19 @@ pub fn read_definition() -> ToolDef {
         function: FunctionDef {
             name: READ_NAME.into(),
             description: Some(
-                "读取一个文本文件的完整内容。修改文件前应先用本工具确认原文。\
-                 仅支持 UTF-8 文本：目录会报错，二进制文件会被解码成乱码而不报错。\
-                 超过 10240 字节会按字节截断并提示，文件超过 10MB 直接报错；\
-                 两种情况都请改用 Bash 分段读取，如 sed -n '100,200p'。"
+                "Read the full contents of a text file. Confirm the original text with this tool \
+                 before modifying a file. \
+                 UTF-8 text only: a directory raises an error, while a binary file is decoded \
+                 into garbage without raising one. \
+                 Output over 10240 bytes is truncated on a byte boundary and reported, and a \
+                 file over 10MB raises an error; in either case read it in pieces with Bash \
+                 instead, e.g. sed -n '100,200p'."
                     .into(),
             ),
             parameters: Some(json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "要读取的文件路径" }
+                    "file_path": { "type": "string", "description": "path of the file to read" }
                 },
                 "required": ["file_path"]
             })),
@@ -37,20 +40,24 @@ pub fn edit_definition() -> ToolDef {
         function: FunctionDef {
             name: EDIT_NAME.into(),
             description: Some(
-                "对已有文件做精确字符串替换（old_string -> new_string）。\
-                 不能创建新文件；新建或整文件重写请用 Write。\
-                 old_string 必须与文件内容逐字符完全一致，包括缩进、tab 与空格的差异、换行符——\
-                 差一个字符就会报「未找到」，缩进不确定时先用 Read 查看原文。\
-                 old_string 必须在文件中唯一出现（0 次或多次都报错），一次只替换这一处，\
-                 多处修改需多次调用。old_string 不能为空；new_string 为空字符串表示删除匹配内容。"
+                "Make an exact string replacement in an existing file \
+                 (old_string -> new_string). \
+                 Cannot create a new file; use Write to create one or to rewrite a whole file. \
+                 old_string must match the file content character for character, including \
+                 indentation, tab-versus-space differences and line endings — one character off \
+                 is reported as not found, so use Read to check the original when the \
+                 indentation is uncertain. \
+                 old_string must occur exactly once in the file (zero or multiple occurrences is \
+                 an error); one call replaces one occurrence, so make several calls for several \
+                 edits. old_string must not be empty; an empty new_string deletes the matched text."
                     .into(),
             ),
             parameters: Some(json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "要修改的文件路径" },
-                    "old_string": { "type": "string", "description": "被替换的原文本，必须在文件中唯一出现" },
-                    "new_string": { "type": "string", "description": "替换后的新文本；空字符串表示删除匹配内容" }
+                    "file_path": { "type": "string", "description": "path of the file to modify" },
+                    "old_string": { "type": "string", "description": "the original text to replace; must occur exactly once in the file" },
+                    "new_string": { "type": "string", "description": "the replacement text; an empty string deletes the matched text" }
                 },
                 "required": ["file_path", "old_string", "new_string"]
             })),
@@ -64,17 +71,20 @@ pub fn write_definition() -> ToolDef {
         function: FunctionDef {
             name: WRITE_NAME.into(),
             description: Some(
-                "新建文件或整文件覆盖写入，父目录不存在会自动创建。\
-                 已有文件会被完全覆盖且不可恢复，覆盖前请先用 Read 确认；\
-                 仅用于新建或整体重写，对已有文件做局部修改请用 Edit。\
-                 content 超过 10MB 会被拒绝。"
+                "Create a file, or overwrite a whole file; missing parent directories are \
+                 created automatically. \
+                 An existing file is overwritten completely and unrecoverably, so use Read to \
+                 check it first; \
+                 use this only to create a file or rewrite one wholesale, and use Edit for \
+                 partial changes to an existing file. \
+                 A content larger than 10MB is rejected."
                     .into(),
             ),
             parameters: Some(json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "要写入的文件路径" },
-                    "content": { "type": "string", "description": "写入文件的完整内容" }
+                    "file_path": { "type": "string", "description": "path of the file to write" },
+                    "content": { "type": "string", "description": "the full contents to write" }
                 },
                 "required": ["file_path", "content"]
             })),
@@ -82,7 +92,7 @@ pub fn write_definition() -> ToolDef {
     }
 }
 
-/// Read：返回文件全文；超 MAX_OUTPUT 截断并提示。
+/// Read: returns the whole file; truncated with a notice beyond MAX_OUTPUT.
 pub fn read(args_json: &str) -> String {
     let v = match parse_args(args_json) {
         Ok(v) => v,
@@ -97,7 +107,9 @@ pub fn read(args_json: &str) -> String {
         Ok(text) => {
             let (out, cut) = truncate(&text, MAX_OUTPUT);
             if cut {
-                format!("{out}\n[已截断到 {MAX_OUTPUT} 字节；剩余内容请用 Bash 分段读取]")
+                format!(
+                    "{out}\n[truncated to {MAX_OUTPUT} bytes; read the rest in pieces with Bash]"
+                )
             } else {
                 out
             }
@@ -105,7 +117,7 @@ pub fn read(args_json: &str) -> String {
     }
 }
 
-/// Edit：唯一匹配才替换；写回采用 tmp+rename 原子替换。
+/// Edit: replaces only on a unique match; writes back via an atomic tmp+rename.
 pub fn edit(args_json: &str) -> String {
     let v = match parse_args(args_json) {
         Ok(v) => v,
@@ -124,29 +136,37 @@ pub fn edit(args_json: &str) -> String {
         Err(e) => return e,
     };
     if old.is_empty() {
-        return "error: old_string 不能为空".into();
+        return "error: old_string must not be empty".into();
     }
     let content = match read_text(&path) {
         Err(e) => return e,
         Ok(c) => c,
     };
     match content.matches(&old).count() {
-        0 => return format!("error: old_string 在 {path} 中未找到。请先用 Read 确认原文"),
+        0 => {
+            return format!(
+                "error: old_string not found in {path}. Use Read to check the original text first"
+            );
+        }
         n if n > 1 => {
             return format!(
-                "error: old_string 在 {path} 中出现 {n} 次，不唯一。请补充上下文使其唯一后重试"
+                "error: old_string occurs {n} times in {path}, so it is not unique. Add \
+                 surrounding context to make it unique and retry"
             );
         }
         _ => {}
     }
     let updated = content.replacen(&old, &new, 1);
     match atomic_write(Path::new(&path), &updated) {
-        Ok(()) => format!("ok: 已替换 1 处，{path} 现有 {} 字节", updated.len()),
-        Err(e) => format!("error: 写入 {path} 失败: {e}"),
+        Ok(()) => format!(
+            "ok: replaced 1 occurrence; {path} is now {} bytes",
+            updated.len()
+        ),
+        Err(e) => format!("error: failed to write {path}: {e}"),
     }
 }
 
-/// Write：新建或整文件覆盖；父目录自动创建。
+/// Write: creates or overwrites a whole file; parent directories are created.
 pub fn write(args_json: &str) -> String {
     let v = match parse_args(args_json) {
         Ok(v) => v,
@@ -162,7 +182,7 @@ pub fn write(args_json: &str) -> String {
     };
     if content.len() as u64 > MAX_FILE_BYTES {
         return format!(
-            "error: content 大小 {} 字节，超过 {MAX_FILE_BYTES} 字节上限",
+            "error: content is {} bytes, over the {MAX_FILE_BYTES} byte limit",
             content.len()
         );
     }
@@ -171,32 +191,37 @@ pub fn write(args_json: &str) -> String {
         && !parent.as_os_str().is_empty()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
-        return format!("error: 创建目录 {} 失败: {e}", parent.display());
+        return format!(
+            "error: failed to create directory {}: {e}",
+            parent.display()
+        );
     }
     match atomic_write(p, &content) {
-        Ok(()) => format!("ok: 已写入 {path}（{} 字节）", content.len()),
-        Err(e) => format!("error: 写入 {path} 失败: {e}"),
+        Ok(()) => format!("ok: wrote {path} ({} bytes)", content.len()),
+        Err(e) => format!("error: failed to write {path}: {e}"),
     }
 }
 
-/// 读取 UTF-8 文本文件。所有失败都转成给模型看的错误文本。
+/// Read a UTF-8 text file. Every failure becomes error text for the model.
 fn read_text(path: &str) -> Result<String, String> {
     let p = Path::new(path);
-    let meta = std::fs::metadata(p).map_err(|e| format!("error: 无法访问 {path}: {e}"))?;
+    let meta = std::fs::metadata(p).map_err(|e| format!("error: cannot access {path}: {e}"))?;
     if meta.is_dir() {
-        return Err(format!("error: {path} 是目录，不是文件"));
+        return Err(format!("error: {path} is a directory, not a file"));
     }
     if meta.len() > MAX_FILE_BYTES {
         return Err(format!(
-            "error: 文件 {path} 大小 {} 字节，超过 {MAX_FILE_BYTES} 字节上限；请用 Bash 分段读取（如 sed -n '1,200p'）",
+            "error: file {path} is {} bytes, over the {MAX_FILE_BYTES} byte limit; read it in \
+             pieces with Bash (e.g. sed -n '1,200p')",
             meta.len()
         ));
     }
-    let bytes = std::fs::read(p).map_err(|e| format!("error: 读取 {path} 失败: {e}"))?;
-    String::from_utf8(bytes).map_err(|_| format!("error: {path} 不是合法 UTF-8 文本"))
+    let bytes = std::fs::read(p).map_err(|e| format!("error: failed to read {path}: {e}"))?;
+    String::from_utf8(bytes).map_err(|_| format!("error: {path} is not valid UTF-8 text"))
 }
 
-/// 同目录 tmp + rename，避免写到一半崩溃损坏原文件。
+/// tmp file in the same directory + rename, so a crash mid-write cannot corrupt
+/// the original file.
 fn atomic_write(path: &Path, data: &str) -> std::io::Result<()> {
     let file_name = path
         .file_name()
@@ -243,10 +268,10 @@ mod tests {
     fn read_returns_content_and_errors_on_missing() {
         let dir = tmpdir();
         let p = dir.join("f.txt");
-        std::fs::write(&p, "内容").unwrap();
-        assert_eq!(read(&args(&p, "")), "内容");
+        std::fs::write(&p, "content").unwrap();
+        assert_eq!(read(&args(&p, "")), "content");
         let missing = read(&args(&dir.join("nope.txt"), ""));
-        assert!(missing.contains("无法访问"), "{missing}");
+        assert!(missing.contains("cannot access"), "{missing}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -256,7 +281,7 @@ mod tests {
         let p = dir.join("big.txt");
         std::fs::write(&p, "x".repeat(MAX_OUTPUT + 100)).unwrap();
         let out = read(&args(&p, ""));
-        assert!(out.contains("[已截断到"), "应提示截断");
+        assert!(out.contains("[truncated to"), "should report truncation");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -277,7 +302,7 @@ mod tests {
         let p = dir.join("f.txt");
         std::fs::write(&p, "alpha").unwrap();
         let out = edit(&args(&p, r#","old_string":"zzz","new_string":"y""#));
-        assert!(out.contains("未找到"), "{out}");
+        assert!(out.contains("not found"), "{out}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "alpha");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -288,7 +313,7 @@ mod tests {
         let p = dir.join("f.txt");
         std::fs::write(&p, "aa bb aa").unwrap();
         let out = edit(&args(&p, r#","old_string":"aa","new_string":"cc""#));
-        assert!(out.contains("出现 2 次"), "{out}");
+        assert!(out.contains("occurs 2 times"), "{out}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "aa bb aa");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -299,7 +324,7 @@ mod tests {
         let p = dir.join("f.txt");
         std::fs::write(&p, "x").unwrap();
         let out = edit(&args(&p, r#","old_string":"","new_string":"y""#));
-        assert!(out.contains("不能为空"), "{out}");
+        assert!(out.contains("must not be empty"), "{out}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -320,15 +345,15 @@ mod tests {
         let p = dir.join("bin");
         std::fs::write(&p, [0xff, 0xfe, 0x00]).unwrap();
         let out = edit(&args(&p, r#","old_string":"a","new_string":"b""#));
-        assert!(out.contains("不是合法 UTF-8"), "{out}");
+        assert!(out.contains("not valid UTF-8"), "{out}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn missing_args_are_reported() {
-        assert!(read("{}").contains("缺少必填参数 file_path"));
-        assert!(edit(r#"{"file_path":"/x"}"#).contains("缺少必填参数 old_string"));
-        assert!(write(r#"{"file_path":"/x"}"#).contains("缺少必填参数 content"));
+        assert!(read("{}").contains("missing required argument file_path"));
+        assert!(edit(r#"{"file_path":"/x"}"#).contains("missing required argument old_string"));
+        assert!(write(r#"{"file_path":"/x"}"#).contains("missing required argument content"));
     }
 
     #[test]
@@ -337,9 +362,9 @@ mod tests {
             read("not json"),
             edit("not json"),
             write("not json"),
-            edit("{}"),                                     // 缺 file_path
-            edit(r#"{"file_path":"/x","old_string":"a"}"#), // 缺 new_string
-            write("{}"),                                    // 缺 file_path
+            edit("{}"),                                     // missing file_path
+            edit(r#"{"file_path":"/x","old_string":"a"}"#), // missing new_string
+            write("{}"),                                    // missing file_path
         ] {
             assert!(call.starts_with("error:"), "{call}");
         }
@@ -348,14 +373,14 @@ mod tests {
     #[test]
     fn read_rejects_directory_and_oversized_file() {
         let dir = tmpdir();
-        // 目录：报"是目录"
+        // a directory reports "is a directory"
         let out = read(&args(&dir, ""));
-        assert!(out.contains("是目录"), "{out}");
-        // 超过单文件上限
+        assert!(out.contains("is a directory"), "{out}");
+        // over the per-file limit
         let big = dir.join("huge.bin");
         std::fs::write(&big, vec![b'x'; MAX_FILE_BYTES as usize + 1]).unwrap();
         let out = read(&args(&big, ""));
-        assert!(out.contains("超过"), "{out}");
+        assert!(out.contains("over the"), "{out}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -368,7 +393,7 @@ mod tests {
             r#"{{"file_path":{:?},"content":"{content}"}}"#,
             p.to_string_lossy()
         ));
-        assert!(out.contains("超过"), "{out}");
+        assert!(out.contains("over the"), "{out}");
         assert!(!p.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -382,12 +407,12 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
-            let p = ro.join("sub/x.txt"); // 父目录只读，create_dir_all 失败
+            let p = ro.join("sub/x.txt"); // read-only parent, create_dir_all fails
             let out = write(&format!(
                 r#"{{"file_path":{:?},"content":"hi"}}"#,
                 p.to_string_lossy()
             ));
-            assert!(out.contains("创建目录"), "{out}");
+            assert!(out.contains("failed to create directory"), "{out}");
             std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         std::fs::remove_dir_all(&dir).unwrap();
@@ -399,21 +424,24 @@ mod tests {
         let ro = dir.join("ro");
         std::fs::create_dir_all(&ro).unwrap();
         let target = ro.join("f.txt");
-        std::fs::write(&target, "内容").unwrap();
+        std::fs::write(&target, "content").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
-            // Edit：读成功、tmp 写入失败
-            let out = edit(&args(&target, r#","old_string":"内容","new_string":"改""#));
-            assert!(out.contains("写入"), "{out}");
-            // Write：tmp 写入失败
+            // Edit: read succeeds, writing the tmp file fails
+            let out = edit(&args(
+                &target,
+                r#","old_string":"content","new_string":"changed""#,
+            ));
+            assert!(out.contains("failed to write"), "{out}");
+            // Write: writing the tmp file fails
             let out = write(&format!(
                 r#"{{"file_path":{:?},"content":"overwrite"}}"#,
                 target.to_string_lossy()
             ));
-            assert!(out.contains("写入"), "{out}");
-            assert_eq!(std::fs::read_to_string(&target).unwrap(), "内容"); // 原文件未被破坏
+            assert!(out.contains("failed to write"), "{out}");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "content"); // original intact
             std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         std::fs::remove_dir_all(&dir).unwrap();
