@@ -21,13 +21,13 @@ pub enum Style {
     Dim,
     /// The thinking behind an answer.
     ///
-    /// Its own style rather than `Dim`, because faint text is not a distinction
-    /// every terminal makes -- SGR 2 is ignored by some, and on those a reader
-    /// cannot tell thinking from an answer -- while a ground is.
-    ///
-    /// Only the line-drawing front end fills that ground across the width: it has
-    /// the row in hand and redraws it, where the plain one writes a line as it
-    /// arrives and has nothing to paint the blanks with afterwards.
+    /// A style of its own rather than `Plain` because the block machinery keys on
+    /// it -- a fragment in a different style is a different block -- and not
+    /// because it looks different: it renders dim, exactly as [`Style::Dim`] does.
+    /// What tells thinking apart from a tool result is the rule in its gutter,
+    /// which is a difference in the layout rather than in the colors, and so one
+    /// that survives both a terminal that ignores SGR 2 and a reader who has
+    /// turned color off.
     Reasoning,
     /// Attention text: tool calls, interruptions.
     Yellow,
@@ -40,15 +40,13 @@ pub enum Style {
 impl Style {
     /// The escape sequence that opens this style.
     ///
-    /// [`Style::Reasoning`] sets a foreground as well as a ground, and that is
-    /// deliberate: a fixed dark ground under the terminal's own foreground is
-    /// unreadable on a light theme, so the pair is chosen together rather than
-    /// inherited.
+    /// [`Style::Reasoning`] shares `Dim`'s sequence on purpose: the two are
+    /// different blocks and not different colors. Everything a reader is meant to
+    /// tell apart here is told apart by where it sits, not by what it is painted.
     pub fn code(self) -> &'static str {
         match self {
             Style::Plain => "",
-            Style::Dim => "\x1b[2m",
-            Style::Reasoning => "\x1b[38;5;245;48;5;236m",
+            Style::Dim | Style::Reasoning => "\x1b[2m",
             Style::Yellow => "\x1b[33m",
             Style::Green => "\x1b[32m",
             Style::Red => "\x1b[31m",
@@ -93,8 +91,9 @@ pub enum DiffKind {
 /// One unit of transcript output.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cell {
-    /// A user line. Only replay produces one: live input is echoed by the line
-    /// editor's own prompt, not by the renderer.
+    /// A user line. Only the plain front end leaves these to replay: its line
+    /// editor echoes what was typed itself, while the front end that owns the
+    /// screen has to place the line in the transcript it owns.
     User(String),
     /// A thinking block.
     Reasoning(String),
@@ -122,6 +121,45 @@ pub enum Cell {
     Approval { name: String, hint: String },
 }
 
+/// The columns a cell opens in.
+///
+/// The answer is the only cell that starts in column zero. It is what a reader is
+/// here for, and a left edge that one kind of line and nothing else touches is a
+/// left edge the eye can run down to find every answer on the screen. Everything
+/// else -- the thinking, the calls, the changes, the results, the notices -- is
+/// set two columns past it, where it reads as the machinery around the answer
+/// rather than as part of it.
+///
+/// The marker is columns of its own rather than a prefix on the text, which is why
+/// it is not in [`Cell::spans`]: a block that wraps has to keep one left edge, and
+/// only the layer that does the wrapping knows where the lines fall. A front end
+/// that lets the terminal wrap -- the plain one -- can therefore set a block's
+/// first line in and leave the rest to the terminal, but it cannot indent a line
+/// it never sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gutter {
+    /// What opens the cell: a marker saying which kind of line this is, or two
+    /// blanks for a line that is only being set off.
+    pub head: &'static str,
+    /// What a wrapped continuation opens in. Always as wide as `head`, so every
+    /// line of a cell starts in the same column.
+    pub rest: &'static str,
+    /// The style both are written in.
+    pub style: Style,
+}
+
+impl Gutter {
+    const fn new(head: &'static str, rest: &'static str, style: Style) -> Self {
+        Self { head, rest, style }
+    }
+
+    /// The columns the gutter takes. `head` and `rest` are the same width, so this
+    /// is the inset of every line of the cell.
+    pub fn width(&self) -> usize {
+        text::width(self.head)
+    }
+}
+
 impl Cell {
     /// A tool call, with the argument summary derived from the raw arguments.
     pub fn tool_call(name: &str, args: &str) -> Self {
@@ -140,24 +178,51 @@ impl Cell {
         }
     }
 
-    /// The cell's styled spans, without the separating blank line or the line
-    /// ending the painter adds.
+    /// The columns this cell is set in, or `None` for the answer, which is the one
+    /// cell that starts at the left edge.
+    ///
+    /// The markers are a small vocabulary and it is the whole of what a reader has
+    /// to learn here: `›` is something they said, `▸` is something about to happen,
+    /// `┆` is the model thinking, `·` is a result or a note. A line with no marker
+    /// at all is the answer.
+    pub fn gutter(&self) -> Option<Gutter> {
+        match self {
+            // The one cell on the left edge.
+            Cell::Content(_) => None,
+            Cell::User(_) => Some(Gutter::new("› ", "  ", Style::Dim)),
+            // The thinking keeps its rule on every line: it is what makes a long
+            // think read as one asided block rather than as a run of loose text. The
+            // rule is painted in the thinking's own style, not a second one: it is
+            // part of the block, and one block is one style run.
+            Cell::Reasoning(_) => Some(Gutter::new("┆ ", "┆ ", Style::Reasoning)),
+            Cell::ToolCall { .. } | Cell::Approval { .. } => {
+                Some(Gutter::new("▸ ", "  ", Style::Yellow))
+            }
+            Cell::ToolResult(_) => Some(Gutter::new("· ", "  ", Style::Dim)),
+            Cell::Notice(_) => Some(Gutter::new("  ", "  ", Style::Dim)),
+            Cell::Failure(_) => Some(Gutter::new("  ", "  ", Style::Red)),
+            Cell::Interrupted => Some(Gutter::new("  ", "  ", Style::Yellow)),
+            Cell::Usage { .. } => Some(Gutter::new("  ", "  ", Style::Dim)),
+        }
+    }
+
+    /// The cell's styled spans, without the columns its [`Cell::gutter`] sets it
+    /// in, the separating blank line, or the line ending the painter adds.
     pub fn spans(&self) -> Vec<Span> {
         match self {
-            Cell::User(text) => vec![
-                Span::new(Style::Dim, "› "),
-                Span::new(Style::Plain, text.as_str()),
-            ],
+            Cell::User(text) => vec![Span::new(Style::Plain, text.as_str())],
             Cell::Reasoning(text) => vec![Span::new(Style::Reasoning, text.as_str())],
             Cell::Content(text) => vec![Span::new(Style::Plain, text.as_str())],
             Cell::ToolCall { name, hint, diff } => {
-                let mut spans = vec![Span::new(Style::Yellow, format!("▸ {name} {hint}"))];
+                let mut spans = vec![Span::new(Style::Yellow, format!("{name} {hint}"))];
+                // A line of the change is a line of the cell, so it lands in the
+                // gutter's continuation columns and lines up under the call.
                 for line in diff {
                     spans.push(match line.kind {
-                        DiffKind::Removed => Span::new(Style::Red, format!("\n  - {}", line.text)),
-                        DiffKind::Added => Span::new(Style::Green, format!("\n  + {}", line.text)),
+                        DiffKind::Removed => Span::new(Style::Red, format!("\n- {}", line.text)),
+                        DiffKind::Added => Span::new(Style::Green, format!("\n+ {}", line.text)),
                         DiffKind::Omitted(n) => {
-                            Span::new(Style::Dim, format!("\n  … {n} more line(s)"))
+                            Span::new(Style::Dim, format!("\n… {n} more line(s)"))
                         }
                     });
                 }
@@ -172,7 +237,7 @@ impl Cell {
             }
             Cell::Approval { name, hint } => vec![Span::new(
                 Style::Yellow,
-                format!("▸ {name} {hint} — run it? [y/N] "),
+                format!("{name} {hint} — run it? [y/N] "),
             )],
         }
     }
@@ -412,10 +477,16 @@ mod tests {
     }
 
     #[test]
-    fn user_line_marks_itself_then_hands_over_to_body_text() {
-        let spans = Cell::User("hello".into()).spans();
-        assert_eq!(spans[0], Span::new(Style::Dim, "› "));
-        assert_eq!(spans[1], Span::new(Style::Plain, "hello"));
+    fn user_line_marks_itself_and_hands_over_to_body_text() {
+        // The marker is the gutter's, not the text's, so the body is the line as it
+        // was said: a front end that writes the gutter itself cannot end up with a
+        // second copy of the marker inside the text it is marking.
+        let cell = Cell::User("hello".into());
+        assert_eq!(cell.spans(), vec![Span::new(Style::Plain, "hello")]);
+        let gutter = cell.gutter().expect("a user line is set in");
+        assert_eq!(gutter.head, "› ");
+        assert_eq!(gutter.rest, "  ", "and it wraps to the column it opened in");
+        assert_eq!(gutter.style, Style::Dim);
     }
 
     #[test]
@@ -521,14 +592,16 @@ mod tests {
 
     #[test]
     fn the_rendered_call_is_its_header_then_its_lines() {
-        let spans = Cell::tool_call("Edit", &edit("old", "new")).spans();
+        let cell = Cell::tool_call("Edit", &edit("old", "new"));
+        assert_eq!(cell.gutter().unwrap().head, "▸ ");
         assert_eq!(
-            spans,
+            cell.spans(),
             vec![
-                Span::new(Style::Yellow, "▸ Edit src/main.rs"),
-                Span::new(Style::Red, "\n  - old"),
-                Span::new(Style::Green, "\n  + new"),
-            ]
+                Span::new(Style::Yellow, "Edit src/main.rs"),
+                Span::new(Style::Red, "\n- old"),
+                Span::new(Style::Green, "\n+ new"),
+            ],
+            "each line of the change is a line of the cell, set in with it"
         );
     }
 
@@ -542,12 +615,18 @@ mod tests {
             }
             other => panic!("expected a tool call, got {other:?}"),
         }
-        let spans = Cell::tool_call("Bash", r#"{"command":"ls"}"#).spans();
-        assert_eq!(spans, vec![Span::new(Style::Yellow, "▸ Bash ls")]);
-        let spans = Cell::approval("Bash", r#"{"command":"rm -rf /"}"#).spans();
+        let cell = Cell::tool_call("Bash", r#"{"command":"ls"}"#);
+        assert_eq!(cell.spans(), vec![Span::new(Style::Yellow, "Bash ls")]);
+        assert_eq!(cell.gutter().unwrap().head, "▸ ");
+        let cell = Cell::approval("Bash", r#"{"command":"rm -rf /"}"#);
         assert_eq!(
-            spans,
-            vec![Span::new(Style::Yellow, "▸ Bash rm -rf / — run it? [y/N] ")]
+            cell.spans(),
+            vec![Span::new(Style::Yellow, "Bash rm -rf / — run it? [y/N] ")]
+        );
+        assert_eq!(
+            cell.gutter().unwrap().head,
+            "▸ ",
+            "the gate is a call, and is marked as one"
         );
     }
 
@@ -687,10 +766,68 @@ mod tests {
     fn styles_map_to_their_escape_sequences() {
         assert_eq!(Style::Plain.code(), "");
         assert_eq!(Style::Dim.code(), "\x1b[2m");
-        // A ground as well as a weight: faint text is a distinction some terminals
-        // ignore, and the ground is the one they cannot.
-        assert_eq!(Style::Reasoning.code(), "\x1b[38;5;245;48;5;236m");
+        // The same weight as `Dim`, and deliberately: thinking is told apart from a
+        // tool result by the rule in its gutter, which the terminal cannot lose, not
+        // by a color it may or may not honor.
+        assert_eq!(Style::Reasoning.code(), "\x1b[2m");
         assert_eq!(Style::Yellow.code(), "\x1b[33m");
         assert_eq!(Style::Red.code(), "\x1b[31m");
+    }
+
+    /// One of every kind of cell, so a rule about cells can be asked of all of them.
+    fn one_of_each() -> Vec<Cell> {
+        vec![
+            Cell::User("hi".into()),
+            Cell::Reasoning("hmm".into()),
+            Cell::Content("answer".into()),
+            Cell::tool_call("Bash", r#"{"command":"ls"}"#),
+            Cell::ToolResult("ok".into()),
+            Cell::Notice("noted".into()),
+            Cell::Failure("broken".into()),
+            Cell::Interrupted,
+            Cell::Usage {
+                usage: Usage::default(),
+                stream: Duration::ZERO,
+            },
+            Cell::approval("Bash", r#"{"command":"ls"}"#),
+        ]
+    }
+
+    /// The contract the whole layout is read down: one cell on the left edge, and
+    /// everything else in columns past it -- the same columns on every line of a
+    /// cell, which is what keeps a wrapped block on one left edge.
+    #[test]
+    fn the_answer_is_the_only_cell_without_a_gutter() {
+        for cell in one_of_each() {
+            let gutter = cell.gutter();
+            if matches!(cell, Cell::Content(_)) {
+                assert!(gutter.is_none(), "{cell:?} is the answer");
+                continue;
+            }
+            let gutter = gutter.unwrap_or_else(|| panic!("{cell:?} is set in"));
+            assert_eq!(
+                gutter.width(),
+                text::width(gutter.rest),
+                "{cell:?} wraps to the column it opens in"
+            );
+            assert!(gutter.width() > 0, "{cell:?} is set in, not flush");
+        }
+    }
+
+    /// Every cell that is set in is set in by the same number of columns, so that one
+    /// of them can answer for all of them -- a front end that has to write the gutter
+    /// itself can ask any cell how wide it is.
+    #[test]
+    fn every_gutter_is_the_width_of_every_other() {
+        let cells = one_of_each();
+        let mut widths = cells
+            .iter()
+            .filter_map(|cell| cell.gutter())
+            .map(|gutter| gutter.width());
+        let first = widths.next().expect("some cell is set in");
+        assert!(
+            widths.all(|width| width == first),
+            "the markers are not all one width"
+        );
     }
 }

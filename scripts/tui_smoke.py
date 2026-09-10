@@ -389,6 +389,19 @@ class Terminal:
                 return False
             self.pump(0.3)
 
+    def left_edge(self, needle: str) -> int | None:
+        """The column `needle` starts in, or None when it is not on the screen.
+
+        The column rather than the row, because the left edge is what the layout is
+        read down: it is the one thing the answer and the machinery around it are
+        told apart by, and so the one thing worth asking a real terminal about.
+        """
+        for line in self.screen.lines():
+            at = line.find(needle)
+            if at >= 0:
+                return at
+        return None
+
     def box_rows(self) -> list[str]:
         """The input box as drawn: the two rules that close it in and what lies
         between them, which is what says how tall it is. The box has no vertical
@@ -577,12 +590,34 @@ def main() -> int:
             # anything that is running now.
             ok &= term.expect("  - one", 15)
             ok &= term.expect("  + two", 15)
-            # The thinking of that turn is drawn as a block with a ground of its
-            # own, not as faint text: this is the terminal being told to paint one.
+            # The thinking is set in behind a rule of its own -- faint, in the columns
+            # past the marker -- and no longer on a ground: the ground was the loudest
+            # thing on the screen and the hardest thing on it to read, and the columns
+            # say the same thing in a way a terminal cannot lose.
             ok &= term.expect("weighing the change", 15)
-            if b"48;5;236" not in term.raw:
-                print("  ✗ the thinking block has no ground")
+            if b"48;5;236" in term.raw:
+                print("  ✗ the thinking still paints a ground")
                 ok = False
+            # The layout contract: the answer is the only thing on the left edge, and
+            # everything the model did or was thinking is set in past it. Asked of the
+            # columns rather than of the style, because that is what a reader uses.
+            edges = {
+                needle: term.left_edge(needle)
+                for needle in (
+                    "中文宽度测试",
+                    "weighing the change",
+                    "change a.txt",
+                    "Edit a.txt",
+                    "ok: a.txt",
+                )
+            }
+            if edges["中文宽度测试"] != 0:
+                print(f"  ✗ the answer is not the left edge: {edges}")
+                ok = False
+            for set_in in ("weighing the change", "change a.txt", "Edit a.txt", "ok: a.txt"):
+                if edges[set_in] != 2:
+                    print(f"  ✗ {set_in!r} is not set in: {edges}")
+                    ok = False
             # Those characters have to sit together on the screen: a space in the
             # column a wide character covers is what the bug looks like.
             if not term.screen.find("中文宽度测试"):

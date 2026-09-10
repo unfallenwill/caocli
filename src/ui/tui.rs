@@ -109,12 +109,6 @@ fn screen_rows(area: Rect, input: u16, queued: u16) -> Rc<[Rect]> {
 /// of losing the place rather than of reading.
 const WHEEL_LINES: isize = 3;
 
-/// The thinking block's ground and foreground, by their numbers in ANSI's
-/// 256-colour palette. The same pair the plain front end writes as an escape
-/// sequence; here as numbers because ratatui takes colours rather than sequences.
-const REASONING_GROUND: u8 = 236;
-const REASONING_FOREGROUND: u8 = 245;
-
 /// How many rows of the queue are drawn above the input box. The queue is what
 /// was asked for while a turn ran, and a long one costs the transcript rows it is
 /// capped at: what is worth seeing is that the line arrived.
@@ -652,22 +646,29 @@ impl State {
         out
     }
 
-    /// The block still being streamed, wrapped, or nothing when no turn is writing
+    /// The block still being streamed, laid out, or nothing when no turn is writing
     /// one.
+    ///
+    /// Laid out through the same [`cell_lines`] a filed cell goes through, and not
+    /// merely because the two look alike: a live block that took no gutter would
+    /// jump two columns left the moment the block closed, which is the one reading
+    /// position a reader is sitting on when the model stops typing.
     fn live_lines(&self, width: usize) -> Vec<Line<'static>> {
         match &self.live {
-            Some((style, text)) => wrapped_lines(&[Span::new(*style, text.clone())], width),
+            Some((style, text)) => cell_lines(&live_cell(*style, text), width),
             None => Vec::new(),
         }
     }
 
-    /// The question standing over the box, wrapped, or nothing when none is open.
+    /// The question standing over the box, laid out, or nothing when none is open.
     ///
     /// The question is what the answer is about, and the call in it can be a long
-    /// command: one that is clipped gives the user nothing to decide with.
+    /// command: one that is clipped gives the user nothing to decide with. It is a
+    /// cell like any other, so it carries the marker its kind carries, and the
+    /// answer typed into the box below it starts in the column its own text does.
     fn question_lines(&self, width: usize) -> Vec<Line<'static>> {
         match &self.question {
-            Some(question) => wrapped_lines(&question.spans(), width),
+            Some(question) => cell_lines(question, width),
             None => Vec::new(),
         }
     }
@@ -923,10 +924,7 @@ impl State {
     /// notice, and in the first case it is the only thing that has changed.
     fn end_block(&mut self) {
         if let Some((style, text)) = self.live.take() {
-            let cell = match style {
-                Style::Reasoning => Cell::Reasoning(text),
-                _ => Cell::Content(text),
-            };
+            let cell = live_cell(style, &text);
             self.revision += 1;
             self.transcript.push(cell);
         }
@@ -1846,42 +1844,39 @@ fn input_box() -> TextArea<'static> {
 /// session's output arrives in and it does not change once it is pushed, so it is
 /// also the unit [`State`] lays out and remembers.
 fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
-    let fill = fill_of(cell);
-    wrapped_lines(&cell.spans(), width)
+    let Some(gutter) = cell.gutter() else {
+        // The answer: the one cell that starts at the left edge.
+        return wrapped_lines(&cell.spans(), width);
+    };
+    // Wrapped into what the gutter leaves, so a line of a set-in cell carries as
+    // much as a line of the answer rather than two columns more.
+    wrapped_lines(&cell.spans(), width.saturating_sub(gutter.width()))
         .into_iter()
-        .map(|mut line| {
-            if let Some(style) = fill {
-                // A style on the line itself would not do it: a paragraph
-                // renders a line by writing its styled graphemes and leaving
-                // the columns past the text alone, so the ground would stop
-                // where the words stop and read as a highlight rather than
-                // as a block. The blanks are written out instead.
-                //
-                // `Buffer::set_style(area, style)` is what the framework keeps
-                // for painting a ground across a region, and it wants a rect:
-                // this is lines, because it is the same layout the plain front
-                // end writes into a fixed-width buffer and the same one a resumed
-                // session is replayed through. Painting the block would mean a
-                // paragraph per cell rendered into a rect of its own -- a second
-                // layout, which is the thing the cells being values is there to
-                // prevent. The price is a row of blanks that are really there.
-                let used = line.width();
-                if used < width {
-                    line.spans
-                        .push(RSpan::styled(" ".repeat(width - used), style));
-                }
-            }
-            line
+        .enumerate()
+        .map(|(i, line)| {
+            // The marker opens the cell, and the lines after it continue in the
+            // same columns: that is what keeps a wrapped block -- and with it the
+            // left edge the whole layout is read down -- on one line.
+            let lead = if i == 0 { gutter.head } else { gutter.rest };
+            let mut spans = vec![RSpan::styled(lead, style_of(gutter.style))];
+            spans.extend(line.spans);
+            Line::from(spans)
         })
         .collect()
 }
 
-/// The style a cell's whole width is painted in, for the cells that read as blocks
-/// rather than as lines of text.
-fn fill_of(cell: &Cell) -> Option<RStyle> {
-    match cell {
-        Cell::Reasoning(_) => Some(style_of(Style::Reasoning)),
-        _ => None,
+/// The cell a streaming block is: what a run of deltas becomes once it stops
+/// arriving.
+///
+/// One function because a block laid out while it streams and the cell the same
+/// block is filed away as have to be the same value. [`State::live_lines`] lays
+/// one out and [`State::end_block`] stores the other, and a second copy of this
+/// match would be a second answer to what a fragment in a style means -- which is
+/// the answer a resumed session is replayed through.
+fn live_cell(style: Style, text: &str) -> Cell {
+    match style {
+        Style::Reasoning => Cell::Reasoning(text.to_owned()),
+        _ => Cell::Content(text.to_owned()),
     }
 }
 
@@ -1999,12 +1994,11 @@ fn style_of(style: Style) -> RStyle {
     match style {
         Style::Plain => RStyle::new(),
         Style::Dim => RStyle::new().add_modifier(Modifier::DIM),
-        // The same dark ground and light foreground the plain front end writes, so
-        // the thinking reads the same way in both. Indexed colours rather than
-        // RGB: a terminal that has 256 of them is the one this is drawn for.
-        Style::Reasoning => RStyle::new()
-            .fg(Color::Indexed(REASONING_FOREGROUND))
-            .bg(Color::Indexed(REASONING_GROUND)),
+        // Dim, the same as the line above, and deliberately: thinking is told
+        // apart from a tool result by the rule in its gutter, which is a
+        // difference in the layout and so one that does not depend on a terminal
+        // honoring SGR 2 or on a theme having a readable idea of what dim is.
+        Style::Reasoning => RStyle::new().add_modifier(Modifier::DIM),
         Style::Yellow => RStyle::new().fg(Color::Yellow),
         Style::Green => RStyle::new().fg(Color::Green),
         Style::Red => RStyle::new().fg(Color::Red),
@@ -2441,6 +2435,27 @@ mod tests {
             .to_owned()
     }
 
+    /// A transcript row with its gutter taken off, for the tests that ask which
+    /// line is where rather than which columns it is set in.
+    ///
+    /// The gutter itself is what the tests about the left edge are for: a test about
+    /// scrolling that had to name the marker would fail the day the marker changed,
+    /// and would have failed for a reason that has nothing to do with scrolling.
+    fn body(screen: &Screen<ratatui::backend::TestBackend>, y: u16) -> String {
+        unset(&row(screen, y))
+    }
+
+    /// The same, for a test that already holds the drawn rows.
+    fn unset(drawn: &str) -> String {
+        // Skipped by character and not by column: every marker is one column, which is
+        // the whole reason the gutters are one width. The width is asked of a cell
+        // rather than written down, since one gutter answers for all of them.
+        let gutter = Cell::Notice(String::new())
+            .gutter()
+            .expect("a notice is set in");
+        drawn.chars().skip(gutter.width()).collect()
+    }
+
     /// Where the drawn area is. A full screen starts at the origin, and a test
     /// asks rather than assumes: the frame is what says where the rows are.
     fn origin(screen: &mut Screen<ratatui::backend::TestBackend>) -> Rect {
@@ -2717,40 +2732,53 @@ mod tests {
         screen.draw().unwrap();
         let top = origin(&mut screen).y;
         assert_eq!(row(&screen, top + 1), format!("  + {}", "x".repeat(16)));
-        assert_eq!(row(&screen, top + 2), "x".repeat(14));
+        assert_eq!(row(&screen, top + 2), format!("  {}", "x".repeat(14)));
     }
 
     #[test]
-    fn thinking_is_drawn_as_a_block_that_reaches_the_edge() {
-        // Its own ground, painted across the whole row rather than under the
-        // characters only: a block that stops where the text stops does not read as
-        // a block, and the answer below it must not be caught by it.
+    fn thinking_is_set_in_behind_a_rule_of_its_own() {
+        // The thinking is the machinery around an answer rather than the answer, so
+        // it is set in two columns -- faintly, behind a rule -- and no longer on a
+        // ground of its own. The rule is the whole of what says "this is thinking",
+        // which is what makes it a difference a terminal cannot lose: a ground is in
+        // the colors and SGR 2 is not honored everywhere, while the columns are in
+        // the layout.
         let mut screen = screen_for_test(40, 20);
         screen.state.transcript.push(Cell::Reasoning("hmm".into()));
         screen.state.transcript.push(Cell::Content("answer".into()));
         screen.draw().unwrap();
         let top = origin(&mut screen).y;
         let buf = screen.terminal.backend().buffer();
-        assert_eq!(row(&screen, top), "hmm");
-        assert_eq!(buf[(0, top)].bg, Color::Indexed(REASONING_GROUND));
-        assert_eq!(buf[(3, top)].bg, Color::Indexed(REASONING_GROUND));
+        assert_eq!(row(&screen, top), "┆ hmm");
         assert_eq!(
-            buf[(39, top)].bg,
-            Color::Indexed(REASONING_GROUND),
-            "all the way to the edge"
-        );
-        assert_eq!(
-            buf[(0, top)].fg,
-            Color::Indexed(REASONING_FOREGROUND),
-            "and readable on it"
-        );
-        assert_eq!(row(&screen, top + 1), "answer");
-        assert_eq!(
-            buf[(0, top + 1)].bg,
+            buf[(0, top)].bg,
             Color::Reset,
-            "the answer keeps its own"
+            "no ground to reach the edge with"
         );
-        assert_eq!(buf[(39, top + 1)].bg, Color::Reset);
+        assert_eq!(buf[(39, top)].bg, Color::Reset);
+        assert_eq!(
+            row(&screen, top + 1),
+            "answer",
+            "and the answer keeps the edge"
+        );
+        assert_eq!(buf[(0, top + 1)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn a_wrapped_think_keeps_the_rule_on_every_line() {
+        // A continuation line that came back to the left edge would be a line that
+        // reads as an answer, in the middle of a block that is not one.
+        let mut screen = screen_for_test(12, 20);
+        screen
+            .state
+            .transcript
+            .push(Cell::Reasoning("aaaa bbbb cccc".into()));
+        screen.state.transcript.push(Cell::Content("answer".into()));
+        screen.draw().unwrap();
+        let top = origin(&mut screen).y;
+        assert_eq!(row(&screen, top), "┆ aaaa bbbb");
+        assert_eq!(row(&screen, top + 1), "┆ cccc");
+        assert_eq!(row(&screen, top + 2), "answer");
     }
 
     #[test]
@@ -2784,8 +2812,8 @@ mod tests {
                 .push(Cell::Notice(format!("line {i}")));
         }
         screen.draw().unwrap();
-        assert_eq!(row(&screen, 0), "line 5", "the first five are off the top");
-        assert_eq!(row(&screen, rows as u16 - 1), format!("line {}", rows + 4));
+        assert_eq!(body(&screen, 0), "line 5", "the first five are off the top");
+        assert_eq!(body(&screen, rows as u16 - 1), format!("line {}", rows + 4));
     }
 
     #[test]
@@ -2803,19 +2831,19 @@ mod tests {
         // A screen back: the window is the one above the end.
         press(&mut screen.state, KeyCode::PageUp);
         screen.draw().unwrap();
-        assert_eq!(row(&screen, 0), format!("line {}", last - rows * 2));
+        assert_eq!(body(&screen, 0), format!("line {}", last - rows * 2));
         assert_eq!(
-            row(&screen, rows as u16 - 1),
+            body(&screen, rows as u16 - 1),
             format!("line {}", last - rows - 1)
         );
         // Forward again, one page at a time.
         press(&mut screen.state, KeyCode::PageDown);
         screen.draw().unwrap();
-        assert_eq!(row(&screen, rows as u16 - 1), format!("line {}", last - 1));
+        assert_eq!(body(&screen, rows as u16 - 1), format!("line {}", last - 1));
         // And no further: there is nothing past the end.
         press(&mut screen.state, KeyCode::PageDown);
         screen.draw().unwrap();
-        assert_eq!(row(&screen, rows as u16 - 1), format!("line {}", last - 1));
+        assert_eq!(body(&screen, rows as u16 - 1), format!("line {}", last - 1));
     }
 
     #[test]
@@ -2837,7 +2865,7 @@ mod tests {
         ));
         screen.draw().unwrap();
         assert_eq!(
-            row(&screen, rows as u16 - 1),
+            body(&screen, rows as u16 - 1),
             format!("line {}", last - 1 - WHEEL_LINES as usize)
         );
         // Down: back to where the writing ends, and no further, since there is
@@ -2846,7 +2874,7 @@ mod tests {
             screen.state.key(mouse(MouseEventKind::ScrollDown));
         }
         screen.draw().unwrap();
-        assert_eq!(row(&screen, rows as u16 - 1), format!("line {}", last - 1));
+        assert_eq!(body(&screen, rows as u16 - 1), format!("line {}", last - 1));
         assert_eq!(screen.state.scroll.back, 0, "following the end again");
     }
 
@@ -2975,7 +3003,10 @@ mod tests {
         screen.state.transcript.push(Cell::Notice(long.into()));
         screen.draw().unwrap();
         let rows = all_rows(&screen);
-        let joined: String = rows[..transcript_rows(30, BOX_ROWS, 0) as usize].concat();
+        let joined: String = rows[..transcript_rows(30, BOX_ROWS, 0) as usize]
+            .iter()
+            .map(|r| unset(r))
+            .collect();
         assert_eq!(joined, long, "every column survived, in order");
     }
 
@@ -2988,7 +3019,7 @@ mod tests {
         screen.state.transcript.push(Cell::Notice("second".into()));
         screen.commit();
         screen.draw().unwrap();
-        let rows = all_rows(&screen);
+        let rows: Vec<String> = all_rows(&screen).iter().map(|r| unset(r)).collect();
         let first = rows.iter().position(|r| r == "first").expect("still there");
         assert_eq!(rows[first + 1], "second", "in order, on the next row");
     }

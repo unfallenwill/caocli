@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::types::{Message, Usage};
 
-use cell::{Cell, Style};
+use cell::{Cell, Span, Style};
 use status::Status;
 
 const RESET: &str = "\x1b[0m";
@@ -390,17 +390,59 @@ impl Renderer {
         format!("{}{s}{}", self.open_style(style), self.close_style())
     }
 
-    /// Write a cell: the blank line separating it from the previous one, its
-    /// spans, then its line ending.
+    /// Paint a run of spans: one style code per run rather than one per span, and the
+    /// columns the cell continues in after every line break inside it.
+    ///
+    /// A `\n` in a cell is a line of that cell, not a line the terminal wrapped, so it
+    /// is set in like every other line of it. For this front end that means writing
+    /// the continuation columns itself -- without them a change's lines would come out
+    /// two columns left of the call they belong to, in the column the answers are in.
+    /// A line the terminal wraps because it is longer than the screen is the one thing
+    /// neither front end can set in: only the terminal knows where it breaks.
+    ///
+    /// The opened style runs across the break and over the columns, so the
+    /// continuation is painted in the style of the line it continues rather than in the
+    /// gutter's own. The two differ only for a cell whose marker is not blank, and for
+    /// that one they are the same style by construction.
+    fn paint_spans(&self, spans: &[Span], rest: &str) -> String {
+        let mut out = String::new();
+        let mut open: Option<Style> = None;
+        for span in spans {
+            if open != Some(span.style) {
+                if open.is_some() {
+                    out.push_str(self.close_style());
+                }
+                out.push_str(self.open_style(span.style));
+                open = Some(span.style);
+            }
+            for (i, piece) in span.text.split('\n').enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                    out.push_str(rest);
+                }
+                out.push_str(piece);
+            }
+        }
+        if open.is_some() {
+            out.push_str(self.close_style());
+        }
+        out
+    }
+
+    /// Write a cell: the blank line separating it from the previous one, its marker
+    /// in its gutter, its spans, then its line ending.
     fn paint_cell(&mut self, cell: &Cell) {
         if cell.gap_after(self.prev_was_block) {
             self.raw("\n");
         }
-        let painted: String = cell
-            .spans()
-            .iter()
-            .map(|s| self.paint(s.style, &s.text))
-            .collect();
+        // The marker first, then the cell's own spans: a cell is set in past its
+        // gutter, and this front end is the one that writes those columns itself --
+        // the front end that owns the screen lays the cell out, and would otherwise
+        // write the marker twice.
+        let gutter = cell.gutter();
+        let led = gutter.map(|g| Span::new(g.style, g.head));
+        let spans: Vec<Span> = led.into_iter().chain(cell.spans()).collect();
+        let painted = self.paint_spans(&spans, gutter.map_or("", |g| g.rest));
         self.raw(&painted);
         if cell.ends_line() {
             self.raw("\n");
@@ -409,9 +451,18 @@ impl Renderer {
     }
 
     /// Start streaming a text block: write the separating blank line and open the
-    /// block's style, so the deltas that follow inherit it. A no-op when the
-    /// block is already open, which is what keeps a run of deltas to a single
-    /// style run.
+    /// block's style, so the deltas that follow inherit it. A no-op when the block
+    /// is already open, which is what keeps a run of deltas to a single style run.
+    ///
+    /// The block's marker goes on after its style is open, and not before: the marker
+    /// belongs to the block -- a gutter's style is the style of the cell it opens --
+    /// so inheriting it here is what keeps a streamed block to one run, and what
+    /// makes what is streamed and what is replayed the same bytes.
+    ///
+    /// Only the first line can be set in here. This front end writes a line as it
+    /// arrives and leaves the wrapping to the terminal, so the columns of a line it
+    /// never sees are not its to choose; the front end that owns the screen lays the
+    /// whole block out and sets in every line of it.
     fn open_block(&mut self, block: Block) {
         if self.live == Some(block) {
             return;
@@ -421,6 +472,9 @@ impl Renderer {
             self.raw("\n");
         }
         self.raw(self.open_style(block.style()));
+        if let Some(gutter) = block.cell().gutter() {
+            self.raw(gutter.head);
+        }
         self.live = Some(block);
     }
 
@@ -564,7 +618,7 @@ mod tests {
         r.finish_turn();
         assert_eq!(
             String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-            "\x1b[38;5;245;48;5;236mthinking...\x1b[0m\n\nanswer\x1b[0m\n"
+            "\x1b[2m┆ thinking...\x1b[0m\n\nanswer\x1b[0m\n"
         );
     }
 
@@ -576,7 +630,7 @@ mod tests {
         r.finish_turn();
         assert_eq!(
             String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-            "partial\x1b[0m\n\n\x1b[38;5;245;48;5;236mmore thinking\x1b[0m\n"
+            "partial\x1b[0m\n\n\x1b[2m┆ more thinking\x1b[0m\n"
         );
     }
 
@@ -588,7 +642,7 @@ mod tests {
         r.finish_turn();
         assert_eq!(
             String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-            "thought\n\ntext\n"
+            "┆ thought\n\ntext\n"
         );
     }
 
@@ -610,7 +664,7 @@ mod tests {
         r.finish_turn();
         assert_eq!(
             String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-            "\x1b[38;5;245;48;5;236mhmm\x1b[0m\n"
+            "\x1b[2m┆ hmm\x1b[0m\n"
         );
     }
 
@@ -624,7 +678,7 @@ mod tests {
         r.finish_turn();
         assert_eq!(
             String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-            "\x1b[38;5;245;48;5;236mab\x1b[0m\n\nxy\x1b[0m\n"
+            "\x1b[2m┆ ab\x1b[0m\n\nxy\x1b[0m\n"
         );
     }
 
@@ -666,8 +720,8 @@ mod tests {
         let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(s.contains("\x1b[2m› \x1b[0mtake a look"), "{s}");
         assert!(
-            s.contains("\x1b[38;5;245;48;5;236mlet me think\x1b[0m"),
-            "thinking has a ground of its own: {s}"
+            s.contains("\x1b[2m┆ let me think\x1b[0m"),
+            "thinking is set in behind its own rule: {s}"
         );
         assert!(s.contains("running it"), "{s}");
         assert!(s.contains("▸ Bash ls -la"), "tool calls are yellow: {s}");
@@ -810,7 +864,7 @@ mod tests {
         let (mut r, buf) = Renderer::with_buffer(true);
         r.info("ok");
         let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert_eq!(s, "\x1b[2mok\x1b[0m\n");
+        assert_eq!(s, "\x1b[2m  ok\x1b[0m\n");
         r.error("boom"); // eprintln, does not write to buf; only checks it does not
         // panic and that the red paint call is covered
     }
@@ -821,7 +875,64 @@ mod tests {
         r.info("plain");
         assert_eq!(
             String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-            "plain\n"
+            "  plain\n"
+        );
+    }
+
+    /// A block watched live and the same block replayed after a resume come out as
+    /// the same bytes.
+    ///
+    /// This is what the marker belonging to the cell buys. A streamed block writes it
+    /// through the block's own open style; a replayed cell paints it as the gutter of
+    /// the cell it opens. The two agree because a gutter's style is the style of the
+    /// cell it sets in -- and they would stop agreeing the day one of them drifted,
+    /// which is a comparison of escape sequences that no reader makes by eye.
+    #[test]
+    fn a_streamed_block_and_the_same_block_replayed_are_the_same_bytes() {
+        let (mut live, live_buf) = Renderer::with_buffer(true);
+        live.reasoning_delta("thinking");
+        live.content_delta("answer");
+        live.finish_turn();
+
+        let (mut replayed, replay_buf) = Renderer::with_buffer(true);
+        replayed.replay(&[Message {
+            role: Role::Assistant,
+            content: Some("answer".into()),
+            reasoning_content: Some("thinking".into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+
+        // The replay's own trailing separator is the one thing that is not the same:
+        // it is what sets the history off from the prompt that follows it.
+        assert_eq!(buf_of(&live_buf).trim_end(), buf_of(&replay_buf).trim_end());
+    }
+
+    /// A line break inside a cell is a line of that cell, not a line the terminal
+    /// wrapped, so it is set in with the rest of them.
+    ///
+    /// The two are easy to confuse and they are not the same thing: what the terminal
+    /// wraps is beyond either front end's reach, and what a cell breaks itself cannot be
+    /// left out without a change's lines landing in the column the answers are in.
+    #[test]
+    fn a_cells_own_line_breaks_are_set_in_too() {
+        let (mut r, buf) = Renderer::with_buffer(false);
+        r.tool_start(
+            "Edit",
+            r#"{"file_path":"a.txt","old_string":"one","new_string":"two"}"#,
+        );
+        let drawn = buf_of(&buf);
+        assert!(
+            drawn.contains("▸ Edit a.txt\n  - one\n  + two"),
+            "a change is set in under its call: {drawn:?}"
+        );
+
+        let (mut r, buf) = Renderer::with_buffer(false);
+        r.replay(&[Message::user("alpha\nbeta")]);
+        let drawn = buf_of(&buf);
+        assert!(
+            drawn.contains("› alpha\n  beta"),
+            "a draft that was sent with a line in it reads back the same way: {drawn:?}"
         );
     }
 

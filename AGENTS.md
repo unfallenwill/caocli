@@ -93,6 +93,17 @@ that talks to a network API and drives an interactive terminal.
   notification or is folded out of the session log when resuming. A resumed session
   must be laid out exactly like the one that was watched live — adding a notification
   means adding a cell, never a second formatting path.
+- **A cell's marker is columns of its own, not a prefix on its text.** It lives in
+  `Cell::gutter`, so that the layer doing the wrapping is the one that sets in every
+  line of a wrapped block — a prefix in the spans would set in the first line only, and
+  the rest would come back to the left edge. Both front ends read the same gutter, and
+  the plain one writes it for the block's first line alone because the terminal wraps
+  the rest.
+- **The answer is the only cell on the left edge.** `Cell::Content` is the one cell
+  with no gutter; everything else is set in two columns behind a marker, so a reader
+  can run their eye down column zero and find what the model said rather than what it
+  did. A new kind of cell has to choose a marker, and the ones in use are a short
+  vocabulary: `›` the user, `▸` a call about to run, `┆` thinking, `·` a result.
 - **Ctrl-C during a turn is an out-of-band Command (graceful cancel), not a process
   kill**: the current effect is dropped (stream disconnected, child process
   `kill_on_drop`), unanswered calls are persisted with a deterministic cancellation
