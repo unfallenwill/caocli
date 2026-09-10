@@ -1,6 +1,7 @@
 mod cell;
 mod contract;
 mod status;
+mod status_bar;
 mod terminal;
 pub(crate) mod text;
 pub mod tui;
@@ -16,6 +17,7 @@ use crate::types::{Message, Usage};
 
 use cell::{Cell, Span, Style};
 use status::Status;
+use status_bar::StatusBar;
 use terminal::{RealTerminal, Terminal};
 
 const RESET: &str = "\x1b[0m";
@@ -82,82 +84,6 @@ fn available_columns() -> Option<usize> {
     RealTerminal
         .size()
         .map(|(_, cols)| (cols as usize).saturating_sub(cell::MARKER_COLUMNS))
-}
-
-/// Fixed status bar at the bottom: it occupies the terminal's last line and the
-/// scroll region is restricted to 1..rows-1, so scrolling output cannot push the
-/// bar off the screen.
-/// Cost: lines that scroll out of the scroll region never reach the terminal's
-/// scrollback buffer (history has to come from the session file).
-/// Not enabled at all with `--no-status-bar` or when stdout is not a TTY.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StatusBar {
-    rows: u16,
-    cols: u16,
-}
-
-impl StatusBar {
-    /// Enabled only with at least 3 rows: the status bar line + at least one line
-    /// of output area + one row of slack.
-    const MIN_ROWS: u16 = 3;
-
-    /// Give up immediately when stdout is not a terminal or the terminal says it
-    /// cannot address the screen (`TERM=dumb`), without asking for a size.
-    fn detect(term: &dyn Terminal) -> Option<Self> {
-        if !term.is_tty() || term.is_dumb() {
-            return None;
-        }
-        Self::from_size(term.size())
-    }
-
-    fn from_size(size: Option<(u16, u16)>) -> Option<Self> {
-        match size {
-            Some((rows, cols)) if rows >= Self::MIN_ROWS && cols > 1 => Some(Self { rows, cols }),
-            _ => None,
-        }
-    }
-
-    /// Usable width: the last column is left free, so writing there cannot
-    /// trigger automatic wrapping.
-    fn width(&self) -> usize {
-        self.cols as usize - 1
-    }
-
-    /// Set the scroll region → move the cursor to its bottom.
-    fn setup(&self, out: &mut dyn Write) {
-        let _ = write!(
-            out,
-            "\x1b[{};1H\x1b[2K\x1b[1;{}r\x1b[{};1H",
-            self.rows,
-            self.rows - 1,
-            self.rows - 1
-        );
-        let _ = out.flush();
-    }
-
-    /// Reset the scroll region → clear the status bar line → newline, so the
-    /// shell prompt lands on a clean line.
-    fn teardown(&self, out: &mut dyn Write) {
-        let _ = write!(out, "\x1b[r\x1b[{};1H\x1b[2K\r\n", self.rows);
-        let _ = out.flush();
-    }
-
-    /// Right-aligned redraw: save the cursor → clear the line → write padding +
-    /// text → restore the cursor.
-    /// `visible` is used to compute the width (it carries no color codes), while
-    /// `painted` is what actually gets written. The measurement is in columns,
-    /// not chars, so a wide character is charged for both of its columns.
-    fn render(&self, out: &mut dyn Write, visible: &str, painted: &str) {
-        let pad = self.width().saturating_sub(text::width(visible));
-        let _ = write!(
-            out,
-            "\x1b7\x1b[{};1H\x1b[2K{}{}\x1b8",
-            self.rows,
-            " ".repeat(pad),
-            painted
-        );
-        let _ = out.flush();
-    }
 }
 
 /// A text block being streamed.
