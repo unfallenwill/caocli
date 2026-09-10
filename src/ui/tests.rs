@@ -33,6 +33,31 @@ pub(super) struct StandIn {
     size: Option<(u16, u16)>,
     tty: bool,
     dumb: bool,
+    color: bool,
+    /// Whether the echo is off right now. The guard turns it back on.
+    echo: std::rc::Rc<std::cell::Cell<bool>>,
+    /// What `read_line` answers, one per call; empty is an end of input.
+    lines: std::cell::RefCell<std::collections::VecDeque<String>>,
+}
+
+/// A read on whether the echo is off, held after the stand-in is moved away.
+pub(super) struct EchoHandle(std::rc::Rc<std::cell::Cell<bool>>);
+
+impl EchoHandle {
+    pub(super) fn is_off(&self) -> bool {
+        self.0.get()
+    }
+}
+
+/// Put back on drop, the way the real terminal's echo is restored.
+struct Silence(std::rc::Rc<std::cell::Cell<bool>>);
+
+impl Echo for Silence {}
+
+impl Drop for Silence {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
 }
 
 impl StandIn {
@@ -42,7 +67,24 @@ impl StandIn {
             size: Some((24, 80)),
             tty: true,
             dumb: false,
+            color: true,
+            echo: std::rc::Rc::new(std::cell::Cell::new(false)),
+            lines: std::cell::RefCell::new(std::collections::VecDeque::new()),
         }
+    }
+
+    /// The lines this terminal answers with, one per call.
+    pub(super) fn answering(self, lines: &[&str]) -> Self {
+        let queue = lines.iter().map(|l| (*l).to_owned()).collect();
+        *self.lines.borrow_mut() = queue;
+        self
+    }
+
+    /// The echo's current state, readable after the stand-in has been moved into
+    /// a renderer: what a test about a secret has to look at while the answer is
+    /// being read.
+    pub(super) fn echo_handle(&self) -> EchoHandle {
+        EchoHandle(self.echo.clone())
     }
 
     pub(super) fn tty(mut self, tty: bool) -> Self {
@@ -80,16 +122,23 @@ impl Terminal for StandIn {
         self.dumb
     }
 
-    /// Nothing to silence, which is the answer a terminal that is not there
-    /// gives: the answer is still read, it is just not hidden.
     fn echo_off(&self) -> Option<Box<dyn Echo>> {
-        None
+        self.echo.set(true);
+        Some(Box::new(Silence(self.echo.clone())))
     }
 
     fn read_line(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + '_>> {
-        Box::pin(async { None })
+        let line = self.lines.borrow_mut().pop_front();
+        Box::pin(async move { line })
+    }
+
+    /// Answered from the stand-in rather than the environment, so a test says
+    /// what the terminal wants instead of setting a variable the whole process
+    /// shares.
+    fn wants_color(&self) -> bool {
+        self.color
     }
 }
 /// The whole line, as an 80-column terminal would show it: the terminal it is
@@ -838,8 +887,99 @@ fn status_bar_shows_model_and_updates_on_switch() {
 #[test]
 fn refresh_status_bar_without_tty_is_noop_and_teardown_idempotent() {
     let (mut r, buf) = Renderer::with_buffer(false);
-    r.refresh_status_bar(); // cargo test's stdout is a pipe → not enabled
+    r.refresh_status_bar(); // the stand-in is not a terminal → not enabled
     assert!(buf_of(&buf).is_empty());
     r.teardown(); // idempotent when not enabled
     assert!(buf_of(&buf).is_empty());
+}
+
+/// A renderer writing into a buffer, on a terminal the test describes.
+fn renderer_on(
+    term: StandIn,
+    color: bool,
+) -> (Renderer, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    (
+        Renderer::on(Box::new(SharedBuf(buf.clone())), color, Box::new(term)),
+        buf,
+    )
+}
+
+/// The whole point of the terminal being a capability: what used to be reachable
+/// only under a pty -- the bar coming up, the echo going off -- is a decision a
+/// test can make, because it is a function of facts the test supplies.
+#[test]
+fn a_bar_comes_up_on_a_terminal_that_can_host_it_and_goes_down_on_teardown() {
+    let (mut r, buf) = renderer_on(StandIn::new().sized(24, 80), true);
+    r.refresh_status_bar();
+    let s = buf_of(&buf);
+    // the scroll region stops one line short of the bottom, and the bar's first
+    // frame is drawn on the line it leaves
+    assert!(s.contains("\x1b[1;23r"), "the scroll region: {s:?}");
+    assert!(s.contains("cache 0.0% · hit 0 · miss 0"), "{s:?}");
+    // a second refresh with the same size only redraws
+    let before = s.len();
+    r.refresh_status_bar();
+    let tail = &buf_of(&buf)[before..];
+    assert!(tail.contains("\x1b[24;1H"), "{tail:?}");
+    assert!(!tail.contains("\x1b[1;23r"), "no second region: {tail:?}");
+
+    r.teardown();
+    let tail = &buf_of(&buf)[before..];
+    assert!(tail.ends_with("\x1b[r\x1b[24;1H\x1b[2K\r\n"), "{tail:?}");
+}
+
+/// A terminal that says it cannot address the screen is one the bar stays off
+/// for, whether it is dumb or has no rows to spare.
+#[test]
+fn a_terminal_that_cannot_host_the_bar_leaves_it_off() {
+    for term in [
+        StandIn::new().dumb(true),
+        StandIn::new().unmeasurable(),
+        StandIn::new().sized(2, 80),
+    ] {
+        let (mut r, buf) = renderer_on(term, true);
+        r.refresh_status_bar();
+        assert!(
+            buf_of(&buf).is_empty(),
+            "nothing may be written for a bar that is not enabled"
+        );
+    }
+}
+
+/// The secret is the one question the plain front end asks, and the echo is the
+/// part of it a unit test could never see: it goes off before the question is
+/// written, and comes back on when the answer does.
+#[tokio::test]
+async fn the_echo_is_off_while_the_secret_is_awaited_and_back_on_after() {
+    let term = StandIn::new().answering(&["sk-secret"]);
+    let echo = term.echo_handle();
+    let (mut r, buf) = renderer_on(term, false);
+
+    let asked = r.ask_secret("the API key");
+    // The question is on the screen before the answer is waited for: an answer
+    // nobody knows is being asked for is not an answer.
+    assert!(buf_of(&buf).contains("the API key"), "{}", buf_of(&buf));
+    assert!(
+        echo.is_off(),
+        "the echo is off before the first await point"
+    );
+
+    assert_eq!(asked.await.as_deref(), Some("sk-secret"));
+    assert!(
+        !echo.is_off(),
+        "and back on once the answer has arrived: a terminal left quiet stops showing what is typed into it"
+    );
+}
+
+/// No input left is not a failure: it is the same `None` a cancellation is, and
+/// the echo still goes back on.
+#[tokio::test]
+async fn a_secret_with_no_input_left_answers_nothing() {
+    let term = StandIn::new();
+    let echo = term.echo_handle();
+    let (mut r, _buf) = renderer_on(term, false);
+
+    assert_eq!(r.ask_secret("the API key").await, None);
+    assert!(!echo.is_off());
 }
