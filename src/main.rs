@@ -26,7 +26,8 @@ fn main() -> Result<()> {
     rt.block_on(run(cli))
 }
 
-/// 新会话的 meta：模型来自 `--model`，否则用该供应商的默认模型。
+/// Meta for a new session: the model comes from `--model`, otherwise the
+/// provider's default model is used.
 fn fresh_meta(cli: &Cli, provider: config::Provider) -> SessionMeta {
     SessionMeta {
         model: cli
@@ -40,11 +41,13 @@ fn fresh_meta(cli: &Cli, provider: config::Provider) -> SessionMeta {
     }
 }
 
-/// 恢复会话时：CLI 显式给出的参数覆盖 meta，未给出的沿用会话内保存值。
-/// 返回 true 表示 meta 发生变化（需要追加 meta 行）。
+/// When resuming a session: parameters given explicitly on the command line
+/// override the meta, while those not given keep the value stored in the session.
+/// Returning true means the meta changed (a meta line must be appended).
 fn apply_overrides(meta: &mut SessionMeta, cli: &Cli, provider: config::Provider) -> bool {
     let mut changed = false;
-    // 显式切供应商但未指定模型：跟随该供应商的默认模型，避免把旧模型名发给新后端
+    // An explicit provider switch without a model: follow that provider's default
+    // model, so the old model name is not sent to the new backend
     if cli.provider.is_some() && cli.model.is_none() && meta.model != provider.default_model {
         meta.model = provider.default_model.to_string();
         changed = true;
@@ -64,20 +67,24 @@ fn apply_overrides(meta: &mut SessionMeta, cli: &Cli, provider: config::Provider
     changed
 }
 
-/// Ctrl-J 插入换行而不是提交，用于多行输入；Enter 仍然提交整段。
-/// rustyline 默认把 Ctrl-J 和 Enter 都绑到 AcceptOrInsertLine，这里覆盖 Ctrl-J。
+/// Ctrl-J inserts a newline instead of submitting, for multi-line input; Enter
+/// still submits the whole thing.
+/// rustyline binds both Ctrl-J and Enter to AcceptOrInsertLine by default, so
+/// Ctrl-J is overridden here.
 fn enable_multiline(rl: &mut rustyline::DefaultEditor) {
     let _ = rl.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
 }
 
-/// `--effort` 只接受 `low|high|max`。DeepSeek 对越界值返回 400，
-/// GLM 则静默接受并退化成默认档——所以本地先拒，行为才一致。
+/// `--effort` accepts only `low|high|max`. DeepSeek returns 400 for an
+/// out-of-range value while GLM silently accepts it and degrades to its default
+/// tier — so reject it locally first, which is the only way to keep the two
+/// consistent.
 fn validate_effort(cli: &Cli) -> Result<()> {
     if let Some(e) = &cli.effort
         && !config::EFFORTS.contains(&e.as_str())
     {
         bail!(
-            "无效的 --effort {e:?}；可用: {}",
+            "invalid --effort {e:?}; available: {}",
             config::EFFORTS.join(" | ")
         );
     }
@@ -92,7 +99,7 @@ async fn run(cli: Cli) -> Result<()> {
     if cli.list {
         for s in session::list(&sdir)? {
             println!(
-                "{}\t{}条消息\t{}\t{}",
+                "{}\t{} messages\t{}\t{}",
                 s.id,
                 s.message_count,
                 s.preview,
@@ -102,14 +109,15 @@ async fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    // 供应商与鉴权在会话之前确定：--provider 决定端点、默认模型与 key 环境变量
+    // Provider and authentication are settled before the session: --provider
+    // determines the endpoint, the default model and the key environment variable
     let provider = config::provider(cli.provider.as_deref().unwrap_or(config::DEFAULT_PROVIDER))?;
     let api = Client::new(config::api_key(&provider)?, provider.url.to_string())?;
 
-    // 会话解析优先级: --resume > --continue > 新建
+    // Session resolution priority: --resume > --continue > create new
     let mut session = if let Some(id) = &cli.resume {
         let path = sdir.join(format!("{id}.jsonl"));
-        Session::load(&path).with_context(|| format!("恢复会话 {id} 失败"))?
+        Session::load(&path).with_context(|| format!("failed to resume session {id}"))?
     } else if cli.cont {
         match session::latest(sdir.clone())? {
             Some(path) => Session::load(&path)?,
@@ -127,10 +135,10 @@ async fn run(cli: Cli) -> Result<()> {
     agent.confirm_tools = cli.ask;
     ui.set_model(&agent.session.meta.model);
 
-    // 单次执行模式（agent 自测的主通道）
+    // One-shot mode (the agent's primary self-test channel)
     if let Some(prompt) = &cli.prompt {
         ui.info(&format!(
-            "会话 {} · {}{}",
+            "session {} · {}{}",
             agent.session.id,
             agent.session.meta.model,
             agent
@@ -154,26 +162,28 @@ async fn run(cli: Cli) -> Result<()> {
     let hist_path = config::history_file()?;
     let _ = rl.load_history(&hist_path);
 
-    // 底部状态栏：只在 REPL + TTY 下启用
+    // Bottom status bar: only enabled in the REPL on a TTY
     if !cli.no_status_bar {
         ui.refresh_status_bar();
     }
 
-    // --continue / --resume 恢复后提示来源文件，path 有诊断价值
+    // After --continue / --resume, show the source file; the path has diagnostic
+    // value
     ui.info(&format!(
-        "caocli · 会话 {}（{} 条历史，{}）· {} · /help 查看命令",
+        "caocli · session {} ({} messages, {}) · {} · /help for commands",
         agent.session.id,
         agent.session.messages.len(),
         agent.session.path.display(),
         agent.session.meta.model
     ));
-    // 恢复的会话把历史回放到屏幕，否则只有提示行、看不到上下文
+    // A resumed session replays its history to the screen, otherwise only the
+    // banner is visible and there is no context
     if !agent.session.messages.is_empty() {
         ui.replay(&agent.session.messages);
     }
 
     loop {
-        // 每轮输入前同步状态栏（顺带处理窗口缩放）
+        // Sync the status bar before each input (which also handles window resizes)
         if !cli.no_status_bar {
             ui.refresh_status_bar();
         }
@@ -189,12 +199,15 @@ async fn run(cli: Cli) -> Result<()> {
                     "/help" => print_help(),
                     "/sessions" => {
                         for s in session::list(&sdir)? {
-                            ui.info(&format!("{}\t{}条\t{}", s.id, s.message_count, s.preview));
+                            ui.info(&format!(
+                                "{}\t{} messages\t{}",
+                                s.id, s.message_count, s.preview
+                            ));
                         }
                     }
                     "/new" => match Session::create(&sdir, agent.session.meta.clone()) {
                         Ok(s) => {
-                            ui.info(&format!("新会话 {}", s.id));
+                            ui.info(&format!("new session {}", s.id));
                             agent.adopt(s);
                             ui.reset_stats();
                             ui.set_model(&agent.session.meta.model);
@@ -207,7 +220,7 @@ async fn run(cli: Cli) -> Result<()> {
                         match Session::load(&path) {
                             Ok(s) => {
                                 ui.info(&format!(
-                                    "已切换到会话 {}（{} 条历史）",
+                                    "switched to session {} ({} messages)",
                                     s.id,
                                     s.messages.len()
                                 ));
@@ -219,7 +232,9 @@ async fn run(cli: Cli) -> Result<()> {
                             Err(e) => ui.error(&format!("{e:#}")),
                         }
                     }
-                    _ if line.starts_with('/') => ui.info("未知命令，/help 查看可用命令"),
+                    _ if line.starts_with('/') => {
+                        ui.info("unknown command; /help lists the available commands")
+                    }
                     _ => {
                         if let Err(e) = agent.turn(line, &mut ui).await {
                             ui.error(&format!("{e:#}"));
@@ -227,10 +242,10 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
-            Err(rustyline::error::ReadlineError::Interrupted) => continue, // Ctrl-C 清行
-            Err(rustyline::error::ReadlineError::Eof) => break,            // Ctrl-D 退出
+            Err(rustyline::error::ReadlineError::Interrupted) => continue, // Ctrl-C clears the line
+            Err(rustyline::error::ReadlineError::Eof) => break,            // Ctrl-D exits
             Err(e) => {
-                ui.error(&format!("readline 错误: {e}"));
+                ui.error(&format!("readline error: {e}"));
                 break;
             }
         }
@@ -245,7 +260,7 @@ fn print_help() {
 }
 
 fn help_text() -> String {
-    "命令:\n  /exit /quit /q   退出\n  /new             开新会话\n  /sessions        列出会话\n  /resume <id>     切换到指定会话\n输入:\n  Enter            提交\n  Ctrl-J           换行（多行输入）\n启动参数:\n  -c / --continue  继续最近会话\n  --resume <id>    恢复指定会话\n  --provider deepseek|glm\n  --effort low|high|max --model <id>\n  -p \"prompt\"     单次执行后退出"
+    "Commands:\n  /exit /quit /q   quit\n  /new             start a new session\n  /sessions        list sessions\n  /resume <id>     switch to a specific session\nInput:\n  Enter            submit\n  Ctrl-J           newline (multi-line input)\nStartup flags:\n  -c / --continue  continue the most recent session\n  --resume <id>    resume a specific session\n  --provider deepseek|glm\n  --effort low|high|max --model <id>\n  -p \"prompt\"      run once and exit"
         .to_string()
 }
 
@@ -260,7 +275,8 @@ mod tests {
 
     #[test]
     fn no_cli_args_keeps_session_meta_untouched() {
-        // 不带 --effort 时不能把默认档 max 写进已有会话，必须沿用会话里存的值。
+        // Without --effort, the default tier max must not be written into an
+        // existing session; the value stored in the session has to be kept.
         let mut meta = SessionMeta {
             model: "deepseek-v4-pro".into(),
             reasoning_effort: Some("low".into()),
@@ -298,7 +314,7 @@ mod tests {
         ));
         assert_eq!(meta.model, "GLM-5.3-Flash");
 
-        // 显式给了 --model 就听 --model
+        // an explicit --model wins over the provider default
         let mut meta2 = SessionMeta {
             model: "deepseek-v4-flash".into(),
             reasoning_effort: None,
@@ -324,7 +340,7 @@ mod tests {
         ));
         assert_eq!(meta.reasoning_effort.as_deref(), Some("low"));
 
-        // 相同值不触发写盘
+        // an identical value does not trigger a write
         assert!(!apply_overrides(
             &mut meta,
             &cli(&["--effort", "low"]),
@@ -369,7 +385,7 @@ mod tests {
         for ok in ["low", "high", "max"] {
             assert!(validate_effort(&cli(&["--effort", ok])).is_ok(), "{ok}");
         }
-        assert!(validate_effort(&cli(&[])).is_ok()); // 不传 = 后端默认档
+        assert!(validate_effort(&cli(&[])).is_ok()); // not passed = the backend default tier
         for bad in ["none", "minimal", "medium", "xhigh", "HIGH", "bogus", ""] {
             let err = validate_effort(&cli(&["--effort", bad]))
                 .unwrap_err()
@@ -386,7 +402,10 @@ mod tests {
 
     #[test]
     fn ask_flag_defaults_off_and_parses() {
-        assert!(!cli(&[]).ask, "默认信任执行，不询问");
+        assert!(
+            !cli(&[]).ask,
+            "execution is trusted by default, so do not ask"
+        );
         assert!(cli(&["--ask"]).ask);
     }
 
@@ -401,7 +420,7 @@ mod tests {
             "-p \"prompt\"",
             "Ctrl-J",
         ] {
-            assert!(t.contains(expected), "缺少 {expected:?}\n{t}");
+            assert!(t.contains(expected), "missing {expected:?}\n{t}");
         }
     }
 
@@ -409,8 +428,9 @@ mod tests {
     fn ctrl_j_is_bound_to_newline() {
         let mut rl = rustyline::DefaultEditor::new().unwrap();
         enable_multiline(&mut rl);
-        // 已绑定的键再绑一次会返回旧处理器：证明 Ctrl-J 确实被占用，
-        // 否则它仍走默认的 AcceptOrInsertLine（Enter 语义，无法换行）。
+        // Binding an already-bound key again returns the previous handler: this
+        // proves Ctrl-J is really taken, otherwise it would still go to the default
+        // AcceptOrInsertLine (Enter semantics, no newline).
         let prev = rl.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
         assert!(prev.is_some());
     }

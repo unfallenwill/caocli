@@ -6,7 +6,8 @@ const DIM: &str = "\x1b[2m";
 const YELLOW: &str = "\x1b[33m";
 const RESET: &str = "\x1b[0m";
 
-/// 会话级缓存统计（状态栏用）。累加本次进程内每个子请求的 hit/miss。
+/// Session-level cache statistics (for the status bar). Accumulates the hit/miss
+/// of every sub-request within this process.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CacheStats {
     pub hit: u64,
@@ -15,21 +16,22 @@ pub struct CacheStats {
 
 impl CacheStats {
     pub fn record(&mut self, u: &Usage) {
-        // 归一化：DeepSeek 扁平字段 / GLM 嵌套 details 都在 Usage::cache() 里收敛。
-        // 供应商不报告缓存时不记，避免把"未知"显示成 0% 命中。
+        // Normalization: DeepSeek's flat fields and GLM's nested details both
+        // converge in Usage::cache(). When a provider does not report caching,
+        // nothing is recorded, so "unknown" is never displayed as 0% hit.
         if let Some(c) = u.cache() {
             self.hit += c.hit;
             self.miss += c.miss;
         }
     }
 
-    /// 命中率百分比；尚无数据时 None。
+    /// Hit rate as a percentage; None while there is no data yet.
     pub fn hit_rate(&self) -> Option<f64> {
         let total = self.hit + self.miss;
         (total > 0).then(|| self.hit as f64 * 100.0 / total as f64)
     }
 
-    /// 状态栏文本（不含左填充）。
+    /// Status bar text (without the left padding).
     pub fn label(&self) -> String {
         match self.hit_rate() {
             Some(rate) => format!("cache {rate:.1}% · hit {} · miss {}", self.hit, self.miss),
@@ -38,11 +40,12 @@ impl CacheStats {
     }
 }
 
-/// 终端尺寸（行, 列）。非 unix 或 ioctl 失败时 None。
+/// Terminal size (rows, cols). None on non-unix or when the ioctl fails.
 #[cfg(unix)]
 fn terminal_size() -> Option<(u16, u16)> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    // SAFETY: STDOUT_FILENO 是有效 fd，ws 是 TIOCGWINSZ 要求的 winsize 布局
+    // SAFETY: STDOUT_FILENO is a valid fd, and ws has the winsize layout that
+    // TIOCGWINSZ requires
     let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
     (rc == 0 && ws.ws_row > 0 && ws.ws_col > 0).then_some((ws.ws_row, ws.ws_col))
 }
@@ -52,10 +55,12 @@ fn terminal_size() -> Option<(u16, u16)> {
     None
 }
 
-/// 底部固定状态栏：占用终端最后一行，滚动区域限制为 1..rows-1，
-/// 所以输出滚动不会把状态栏顶掉。
-/// 代价：滚动区域内的行滚出屏幕后不进终端回滚缓冲（历史需靠会话文件）。
-/// 用 `--no-status-bar` 或非 TTY 时完全不启用。
+/// Fixed status bar at the bottom: it occupies the terminal's last line and the
+/// scroll region is restricted to 1..rows-1, so scrolling output cannot push the
+/// bar off the screen.
+/// Cost: lines that scroll out of the scroll region never reach the terminal's
+/// scrollback buffer (history has to come from the session file).
+/// Not enabled at all with `--no-status-bar` or when stdout is not a TTY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StatusBar {
     rows: u16,
@@ -63,10 +68,11 @@ struct StatusBar {
 }
 
 impl StatusBar {
-    /// 至少 3 行才启用：最后一行状态栏 + 至少一行输出区 + 一行余量。
+    /// Enabled only with at least 3 rows: the status bar line + at least one line
+    /// of output area + one row of slack.
     const MIN_ROWS: u16 = 3;
 
-    /// `tty=false` 或 TERM=dumb 时直接放弃，不发 ioctl。
+    /// Give up immediately when `tty=false` or TERM=dumb, without issuing ioctl.
     fn detect(tty: bool) -> Option<Self> {
         if !tty || std::env::var("TERM").is_ok_and(|t| t == "dumb") {
             return None;
@@ -81,12 +87,13 @@ impl StatusBar {
         }
     }
 
-    /// 可用宽度：留出最后一列，避免在末列写字触发自动换行。
+    /// Usable width: the last column is left free, so writing there cannot
+    /// trigger automatic wrapping.
     fn width(&self) -> usize {
         self.cols as usize - 1
     }
 
-    /// 设滚动区域 → 光标移到区域底部。
+    /// Set the scroll region → move the cursor to its bottom.
     fn setup(&self, out: &mut dyn Write) {
         let _ = write!(
             out,
@@ -98,14 +105,17 @@ impl StatusBar {
         let _ = out.flush();
     }
 
-    /// 复位滚动区域 → 清掉状态栏行 → 换行，让 shell 提示符落在干净行。
+    /// Reset the scroll region → clear the status bar line → newline, so the
+    /// shell prompt lands on a clean line.
     fn teardown(&self, out: &mut dyn Write) {
         let _ = write!(out, "\x1b[r\x1b[{};1H\x1b[2K\r\n", self.rows);
         let _ = out.flush();
     }
 
-    /// 右对齐重绘：保存光标 → 清行 → 写填充+文本 → 恢复光标。
-    /// `visible` 用于算宽度（不含色码），`painted` 是实际写出的内容。
+    /// Right-aligned redraw: save the cursor → clear the line → write padding +
+    /// text → restore the cursor.
+    /// `visible` is used to compute the width (it carries no color codes), while
+    /// `painted` is what actually gets written.
     fn render(&self, out: &mut dyn Write, visible: &str, painted: &str) {
         let pad = self.width().saturating_sub(visible.chars().count());
         let _ = write!(
@@ -119,7 +129,8 @@ impl StatusBar {
     }
 }
 
-/// 按字符数截断，保证不会写超出状态栏宽度。
+/// Truncate by character count, so nothing is ever written past the status bar
+/// width.
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_owned();
@@ -134,39 +145,46 @@ enum Mode {
     Content,
 }
 
-/// 机器 → UI 的通知词汇表（Notice 通道）。
-/// 纪律：只收通知、不回传数据；实现不得阻塞，终端写失败视为致命。
-/// 机器（agent）只依赖此 trait，不依赖具体渲染器；进程内唯一实现是 [`Renderer`]。
+/// The machine → UI notification vocabulary (the Notice channel).
+/// Discipline: notifications only, never returning data back; implementations
+/// must not block, and a failed terminal write counts as fatal.
+/// The machine (agent) depends only on this trait, not on a concrete renderer;
+/// the only in-process implementation is [`Renderer`].
 pub trait Ui {
-    /// 思维链片段（先于正文到达）。
+    /// A thinking fragment (arrives before the body text).
     fn reasoning_delta(&mut self, s: &str);
-    /// 正文片段。
+    /// A body-text fragment.
     fn content_delta(&mut self, s: &str);
-    /// 一轮流式输出结束，块复位。
+    /// One streaming round is over; blocks are reset.
     fn finish_turn(&mut self);
-    /// 工具开始执行：回显工具名与参数摘要。
+    /// A tool is starting: echo the tool name and an argument summary.
     fn tool_start(&mut self, name: &str, args: &str);
-    /// 工具结果摘要。
+    /// A tool result summary.
     fn tool_result(&mut self, result: &str);
-    /// 子请求 token 用量（同时累计会话级缓存统计）。
+    /// Token usage for a sub-request (also accumulates session-level cache stats).
     fn usage(&mut self, u: &Usage);
-    /// 回合被用户取消（Ctrl-C）：闭合流式块，打出中断提示。
+    /// The turn was cancelled by the user (Ctrl-C): close the streaming block and
+    /// print an interruption notice.
     fn interrupted(&mut self);
-    /// 审批门询问：回显工具与参数摘要，提示 y/N（应答由 Input 通道读入，
-    /// 不经由本 trait——Notice 永不回传数据）。
+    /// Approval gate question: echo the tool and an argument summary and prompt
+    /// y/N (the answer is read through the Input channel, not through this trait —
+    /// a Notice never returns data).
     fn approval_requested(&mut self, name: &str, args: &str);
 }
 
-/// 流式渲染器。思维链与正文是两个独立渲染块：
-/// - 思维链灰色（DIM），正文正常色
-/// - 块与块之间换行分隔；思维链转正文时额外空一行
-/// - NO_COLOR 环境变量或非 TTY 时不发色码，但块分隔保留
+/// Streaming renderer. Thinking and body text are two independent render blocks:
+/// - thinking is gray (DIM), body text is the normal color
+/// - blocks are separated by a newline; switching from thinking to body adds an
+///   extra blank line
+/// - with the NO_COLOR environment variable or when not a TTY no color codes are
+///   emitted, but the block separation is kept
 pub struct Renderer {
     out: Box<dyn Write>,
     color: bool,
     mode: Mode,
     stats: CacheStats,
-    /// 状态栏左段显示的模型 id（建立/切换会话时更新）。
+    /// Model id shown in the status bar's left segment (updated when a session is
+    /// created or switched).
     model: Option<String>,
     bar: Option<StatusBar>,
 }
@@ -198,8 +216,9 @@ impl Renderer {
         (r, buf)
     }
 
-    /// 按当前终端尺寸同步状态栏：REPL 启动时和每轮输入前调用，
-    /// 顺带处理窗口缩放（尺寸变了就拆了重建）。
+    /// Sync the status bar against the current terminal size: called when the REPL
+    /// starts and before each input, which also handles window resizes (if the
+    /// size changed, the bar is torn down and rebuilt).
     pub fn refresh_status_bar(&mut self) {
         let current = StatusBar::detect(std::io::stdout().is_terminal());
         self.apply_status_bar(current);
@@ -227,7 +246,7 @@ impl Renderer {
         }
     }
 
-    /// 重绘状态栏（不重新探测尺寸）。
+    /// Redraw the status bar (without re-detecting the size).
     fn redraw_status_bar(&mut self) {
         let Some(bar) = self.bar else { return };
         let visible = truncate_chars(&self.status_label(), bar.width());
@@ -235,7 +254,8 @@ impl Renderer {
         bar.render(self.out.as_mut(), &visible, &painted);
     }
 
-    /// 状态栏文本：`<model> · cache ...`；模型未知时退化为纯缓存统计。
+    /// Status bar text: `<model> · cache ...`; falls back to pure cache stats when
+    /// the model is unknown.
     fn status_label(&self) -> String {
         let cache = self.stats.label();
         match &self.model {
@@ -244,25 +264,28 @@ impl Renderer {
         }
     }
 
-    /// 设置状态栏显示的模型 id（建立/切换会话时调用，随会话 meta 变化）。
+    /// Set the model id shown in the status bar (called when a session is created
+    /// or switched, since it follows the session meta).
     pub fn set_model(&mut self, model: &str) {
         self.model = Some(model.to_owned());
         self.redraw_status_bar();
     }
 
-    /// 当前会话累计的缓存统计（状态栏数据源）。仅测试读取。
+    /// Cache statistics accumulated for the current session (the status bar's data
+    /// source). Read by tests only.
     #[cfg(test)]
     pub fn stats(&self) -> CacheStats {
         self.stats
     }
 
-    /// 切换会话时清零缓存统计。
+    /// Clear the cache statistics when switching sessions.
     pub fn reset_stats(&mut self) {
         self.stats = CacheStats::default();
         self.redraw_status_bar();
     }
 
-    /// 退出前还原终端（复位滚动区域、清掉状态栏行）。幂等。
+    /// Restore the terminal before exiting (reset the scroll region, clear the
+    /// status bar line). Idempotent.
     pub fn teardown(&mut self) {
         if let Some(bar) = self.bar.take() {
             bar.teardown(self.out.as_mut());
@@ -282,7 +305,8 @@ impl Renderer {
         }
     }
 
-    /// 结束当前块：复位颜色 + 换行；blank=true 时再补一个空行（块间距）。
+    /// End the current block: reset the color + newline; when blank=true add one
+    /// more blank line (block spacing).
     fn close_block(&mut self, blank: bool) {
         if self.mode != Mode::Idle {
             if self.color {
@@ -295,10 +319,14 @@ impl Renderer {
         }
     }
 
-    /// 回放历史消息（恢复会话时用），样式与实时渲染保持一致：
-    /// 用户消息带 `›` 前缀，assistant 思维链灰色、正文正常、工具调用黄色，
-    /// tool 消息只显示摘要（与实时一致，不刷 10KB 原文）。
-    /// 会话文件不含 system 消息（SYSTEM_PROMPT 是编译期常量），无需过滤。
+    /// Replay history messages (used when resuming a session), styled consistently
+    /// with live rendering:
+    /// user messages get a `›` prefix, assistant thinking is gray, body text is
+    /// normal, tool calls are yellow, and
+    /// tool messages show only a summary (same as live, without flushing the 10KB
+    /// original text).
+    /// The session file contains no system message (SYSTEM_PROMPT is a compile-time
+    /// constant), so there is nothing to filter.
     pub fn replay(&mut self, messages: &[Message]) {
         for m in messages {
             match m.role {
@@ -400,7 +428,7 @@ impl Ui for Renderer {
     fn interrupted(&mut self) {
         self.close_block(false);
         self.mode = Mode::Idle;
-        self.raw(&self.paint(YELLOW, "⏹ 已中断（Ctrl-C）"));
+        self.raw(&self.paint(YELLOW, "⏹ interrupted (Ctrl-C)"));
         self.raw("\n");
     }
 
@@ -414,7 +442,7 @@ impl Ui for Renderer {
                     .map(str::to_owned)
             })
             .unwrap_or_else(|| args.chars().take(80).collect());
-        self.raw(&self.paint(YELLOW, &format!("▸ {name} {hint} — 允许执行？[y/N] ")));
+        self.raw(&self.paint(YELLOW, &format!("▸ {name} {hint} — run it? [y/N] ")));
     }
 
     fn usage(&mut self, u: &Usage) {
@@ -514,9 +542,9 @@ mod tests {
     fn same_mode_deltas_do_not_reopen_block() {
         let (mut r, buf) = Renderer::with_buffer(true);
         r.reasoning_delta("a");
-        r.reasoning_delta("b"); // 仍是 Reasoning：不重复发色码
+        r.reasoning_delta("b"); // still Reasoning: no repeated color code
         r.content_delta("x");
-        r.content_delta("y"); // 仍是 Content：不换块
+        r.content_delta("y"); // still Content: no new block
         r.finish_turn();
         assert_eq!(
             String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
@@ -533,7 +561,7 @@ mod tests {
         let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(s.contains("▸ Bash ls -la"), "{s}");
         assert!(s.contains("▸ Read /a/b.txt"), "{s}");
-        assert!(s.contains("▸ Write not json at all"), "{s}"); // 坏 JSON 回落成原文
+        assert!(s.contains("▸ Write not json at all"), "{s}"); // bad JSON falls back to raw text
     }
 
     #[test]
@@ -541,11 +569,11 @@ mod tests {
         use crate::types::{ToolCall, ToolCallFunction};
         let (mut r, buf) = Renderer::with_buffer(true);
         r.replay(&[
-            Message::user("帮我看看"),
+            Message::user("take a look"),
             Message {
                 role: Role::Assistant,
-                content: Some("先执行".into()),
-                reasoning_content: Some("想一下".into()),
+                content: Some("running it".into()),
+                reasoning_content: Some("let me think".into()),
                 tool_calls: Some(vec![ToolCall {
                     id: "call_1".into(),
                     r#type: "function".into(),
@@ -557,17 +585,26 @@ mod tests {
                 tool_call_id: None,
             },
             Message::tool("call_1", "exit_code: 0\n--- stdout ---\nSECRET_BODY"),
-            Message::system("不该出现"),
+            Message::system("must not appear"),
         ]);
         let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert!(s.contains("\x1b[2m› \x1b[0m帮我看看"), "{s}");
-        assert!(s.contains("\x1b[2m想一下\x1b[0m"), "思维链灰色: {s}");
-        assert!(s.contains("先执行"), "{s}");
-        assert!(s.contains("▸ Bash ls -la"), "工具调用黄色: {s}");
-        // tool 消息只给摘要，不刷全文
+        assert!(s.contains("\x1b[2m› \x1b[0mtake a look"), "{s}");
+        assert!(
+            s.contains("\x1b[2mlet me think\x1b[0m"),
+            "thinking is gray: {s}"
+        );
+        assert!(s.contains("running it"), "{s}");
+        assert!(s.contains("▸ Bash ls -la"), "tool calls are yellow: {s}");
+        // tool messages only get a summary, never the full text
         assert!(s.contains("exit_code: 0 · 39 bytes"), "{s}");
-        assert!(!s.contains("SECRET_BODY"), "不应回放工具全文: {s}");
-        assert!(!s.contains("不该出现"), "system 消息不回放: {s}");
+        assert!(
+            !s.contains("SECRET_BODY"),
+            "tool output must not be replayed: {s}"
+        );
+        assert!(
+            !s.contains("must not appear"),
+            "system messages are not replayed: {s}"
+        );
     }
 
     #[test]
@@ -599,11 +636,11 @@ mod tests {
     #[test]
     fn interrupted_closes_block_and_prints_notice() {
         let (mut r, buf) = Renderer::with_buffer(true);
-        r.reasoning_delta("想");
+        r.reasoning_delta("thinking");
         r.interrupted();
         let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert!(s.contains("已中断"), "{s}");
-        assert!(s.ends_with("\x1b[0m\n"), "复位颜色收尾: {s}");
+        assert!(s.contains("interrupted"), "{s}");
+        assert!(s.ends_with("\x1b[0m\n"), "color reset closes the line: {s}");
     }
 
     #[test]
@@ -612,7 +649,10 @@ mod tests {
         r.approval_requested("Bash", r#"{"command":"rm -rf /"}"#);
         let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(s.contains("▸ Bash rm -rf /"), "{s}");
-        assert!(s.ends_with("[y/N] "), "以 y/N 提示收尾且不换行: {s:?}");
+        assert!(
+            s.ends_with("[y/N] "),
+            "ends on the y/N prompt without a newline: {s:?}"
+        );
     }
 
     #[test]
@@ -622,7 +662,7 @@ mod tests {
         r.tool_result("");
         let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(s.contains("exit_code: 3 · 33 bytes"), "{s}");
-        assert!(s.contains(" · 0 bytes"), "{s}"); // 空结果
+        assert!(s.contains(" · 0 bytes"), "{s}"); // empty result
     }
 
     #[test]
@@ -636,20 +676,21 @@ mod tests {
             prompt_cache_miss_tokens: 4,
             ..Default::default()
         });
-        r.info("会话 abc");
+        r.info("session abc");
         let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(s.contains("tokens: in 10/15 (hit 6/miss 4) · out 5"), "{s}");
-        assert!(s.contains("会话 abc"), "{s}");
+        assert!(s.contains("session abc"), "{s}");
     }
 
     #[test]
     fn color_variants_render_codes_and_plain() {
-        // color=true：info/usage 走 paint 的染色分支；error 走红色
+        // color=true: info/usage take paint's colored branch; error goes red
         let (mut r, buf) = Renderer::with_buffer(true);
         r.info("ok");
         let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert_eq!(s, "\x1b[2mok\x1b[0m\n");
-        r.error("boom"); // eprintln，不写 buf；仅保证不 panic 且覆盖 paint(红)
+        r.error("boom"); // eprintln, does not write to buf; only checks it does not
+        // panic and that the red paint call is covered
     }
 
     #[test]
@@ -691,7 +732,8 @@ mod tests {
 
     #[test]
     fn cache_stats_read_glm_nested_details() {
-        // GLM 形状：只给 prompt_tokens_details.cached_tokens，miss 需推导。
+        // GLM shape: only prompt_tokens_details.cached_tokens is given, so miss
+        // has to be derived.
         let mut s = CacheStats::default();
         s.record(&Usage {
             prompt_tokens: 1200,
@@ -717,8 +759,8 @@ mod tests {
     #[test]
     fn status_bar_from_size_guards() {
         assert_eq!(StatusBar::from_size(None), None);
-        assert_eq!(StatusBar::from_size(Some((2, 80))), None); // 行数不足
-        assert_eq!(StatusBar::from_size(Some((24, 1))), None); // 宽度不足
+        assert_eq!(StatusBar::from_size(Some((2, 80))), None); // too few rows
+        assert_eq!(StatusBar::from_size(Some((24, 1))), None); // too narrow
         assert_eq!(
             StatusBar::from_size(Some((24, 80))),
             Some(StatusBar { rows: 24, cols: 80 })
@@ -734,7 +776,8 @@ mod tests {
     fn truncate_chars_keeps_char_boundaries() {
         assert_eq!(truncate_chars("abc", 5), "abc");
         assert_eq!(truncate_chars("abcd", 2), "ab");
-        assert_eq!(truncate_chars("命中率", 2), "命中"); // 多字节不切坏
+        // the 2-byte "é" is dropped whole, never split in half
+        assert_eq!(truncate_chars("café", 3), "caf");
     }
 
     #[test]
@@ -752,11 +795,11 @@ mod tests {
     fn status_bar_render_right_aligns_and_paints() {
         let bar = StatusBar { rows: 10, cols: 40 }; // width = 39
         let (mut r, buf) = Renderer::with_buffer(true);
-        let label = "cache 98.6% · hit 32384 · miss 461"; // 34 字符
+        let label = "cache 98.6% · hit 32384 · miss 461"; // 34 characters
         let painted = r.paint(DIM, label);
         bar.render(r.out.as_mut(), label, &painted);
         let s = buf_of(&buf);
-        // 39 - 34 = 5 个空格左填充，右对齐
+        // 39 - 34 = 5 spaces of left padding, right aligned
         assert!(
             s.contains(&format!(
                 "\x1b7\x1b[10;1H\x1b[2K     \x1b[2m{label}\x1b[0m\x1b8"
@@ -790,24 +833,24 @@ mod tests {
         let a = StatusBar { rows: 10, cols: 40 };
         let b = StatusBar { rows: 12, cols: 50 };
 
-        // (None, None)：无输出
+        // (None, None): no output
         let (mut r, buf) = Renderer::with_buffer(false);
         r.apply_status_bar(None);
         assert!(buf_of(&buf).is_empty());
 
-        // (None, Some)：建栏 + 首绘
+        // (None, Some): create the bar + first draw
         r.apply_status_bar(Some(a));
         let s = buf_of(&buf);
         assert!(s.contains("\x1b[1;9r"), "{s:?}");
         assert!(s.contains("cache —"), "{s:?}");
         assert_eq!(r.bar, Some(a));
 
-        // (Some, Some(相同))：只重绘
+        // (Some, Some(same)): redraw only
         let before = buf_of(&buf).len();
         r.apply_status_bar(Some(a));
         assert!(buf_of(&buf)[before..].contains("\x1b[10;1H\x1b[2K"));
 
-        // (Some, Some(不同))：拆旧建新
+        // (Some, Some(different)): tear down the old one, build the new one
         let before = buf_of(&buf).len();
         r.apply_status_bar(Some(b));
         let tail = &buf_of(&buf)[before..];
@@ -815,7 +858,7 @@ mod tests {
         assert!(tail.contains("\x1b[1;11r"), "{tail:?}");
         assert_eq!(r.bar, Some(b));
 
-        // (Some, None)：拆栏
+        // (Some, None): tear the bar down
         let before = buf_of(&buf).len();
         r.apply_status_bar(None);
         assert!(buf_of(&buf)[before..].contains("\x1b[r"));
@@ -834,7 +877,7 @@ mod tests {
             s.contains("tokens: in 10/10 (hit 6/miss 4) · out 0"),
             "{s:?}"
         );
-        // 会话累计：18 hit / 12 miss = 60.0%
+        // session accumulation: 18 hit / 12 miss = 60.0%
         assert!(s.contains("cache 60.0% · hit 18 · miss 12"), "{s:?}");
 
         r.reset_stats();
@@ -876,13 +919,13 @@ mod tests {
             "{s:?}"
         );
 
-        // 切换模型：重绘后只剩新模型
+        // switching models: after the redraw only the new model is left
         r.set_model("deepseek-v4-pro");
         let tail = &buf_of(&buf)[s.len()..];
         assert!(tail.contains("deepseek-v4-pro · cache 60.0%"), "{tail:?}");
         assert!(!tail.contains("deepseek-v4-flash"), "{tail:?}");
 
-        // reset_stats 只清缓存统计，模型保留
+        // reset_stats clears only the cache stats and keeps the model
         let before = buf_of(&buf).len();
         r.reset_stats();
         let tail = &buf_of(&buf)[before..];
@@ -892,9 +935,9 @@ mod tests {
     #[test]
     fn refresh_status_bar_without_tty_is_noop_and_teardown_idempotent() {
         let (mut r, buf) = Renderer::with_buffer(false);
-        r.refresh_status_bar(); // cargo test 的 stdout 是管道 → 不启用
+        r.refresh_status_bar(); // cargo test's stdout is a pipe → not enabled
         assert!(buf_of(&buf).is_empty());
-        r.teardown(); // 未启用时幂等
+        r.teardown(); // idempotent when not enabled
         assert!(buf_of(&buf).is_empty());
     }
 }
