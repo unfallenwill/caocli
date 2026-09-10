@@ -16,25 +16,13 @@
 //! applies them and redraws, and both channels above are answered from the same
 //! loop. Nothing on the machine's side ever touches the terminal.
 
-#[cfg(test)]
-use crossterm::event::MouseEventKind;
-#[cfg(test)]
-use paint::{cell_lines, wrapped_lines};
-#[cfg(test)]
-use ratatui::style::Modifier;
 use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
 use std::time::Duration;
-#[cfg(test)]
-use std::time::Instant;
 
 use crossterm::event::Event;
-#[cfg(test)]
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-#[cfg(test)]
-use ratatui::style::Color;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::agent::{Agent, Approve, Interrupt};
@@ -42,16 +30,8 @@ use crate::config;
 use crate::history;
 use crate::repl;
 use crate::session;
-#[cfg(test)]
-use crate::types::Usage;
 use crate::types::{Message, ToolCall};
-#[cfg(test)]
-use crate::ui::{Front, Ui};
 
-#[cfg(test)]
-use super::cell::Span;
-#[cfg(test)]
-use super::cell::Style;
 use super::cell::{self, Cell};
 
 mod input;
@@ -59,49 +39,14 @@ mod layout;
 mod notice;
 mod screen;
 
-#[cfg(test)]
-use ratatui::backend::Backend;
-#[cfg(test)]
-use ratatui::layout::Rect;
-#[cfg(test)]
-use ratatui::text::Line;
 use screen::Screen;
-#[cfg(test)]
-use screen::fullscreen;
 mod paint;
 mod picker;
 mod state;
 
 use input::Submitted;
-#[cfg(test)]
-use input::{
-    ANSWER_PLACEHOLDER, IDLE_PLACEHOLDER, QUEUE_PLACEHOLDER, QUEUE_ROWS, SECRET_MASK,
-    SECRET_PLACEHOLDER,
-};
-#[cfg(test)]
-#[cfg(test)]
-use layout::box_rows;
-#[cfg(test)]
-use layout::{BOX_GUTTER, BOX_ROWS, PINNED_ROWS, Window, picker_window};
-#[cfg(test)]
-use layout::{box_field, screen_rows};
-#[cfg(test)]
-use notice::Notice;
 use notice::{Notifier, drain};
-#[cfg(test)]
-use paint::{MEASURE, THINKING_LINES};
-
-#[cfg(test)]
-use picker::PICKER_ROWS;
-#[cfg(test)]
-use picker::{Choice, named_rows};
 use picker::{Choosing, choice_rows};
-#[cfg(test)]
-use state::SPINNER;
-#[cfg(test)]
-use state::State;
-#[cfg(test)]
-use state::{Scroll, WHEEL_LINES};
 
 // ------------------------------------------------------------- activity ---
 

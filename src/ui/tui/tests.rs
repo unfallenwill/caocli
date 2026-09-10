@@ -1,10 +1,13 @@
 //! The tests for the front end as a whole.
-use super::input::Submitted;
+use super::input::{
+    ANSWER_PLACEHOLDER, IDLE_PLACEHOLDER, QUEUE_PLACEHOLDER, QUEUE_ROWS, SECRET_MASK,
+    SECRET_PLACEHOLDER, Submitted,
+};
 use super::layout::box_rows;
 use super::layout::{BOX_GUTTER, BOX_ROWS, PINNED_ROWS, Window, picker_window};
 use super::layout::{box_field, screen_rows};
 use super::notice::Notice;
-use super::notice::{Notifier, drain};
+use super::notice::Notifier;
 use super::paint::{MEASURE, THINKING_LINES};
 use super::paint::{cell_lines, wrapped_lines};
 use super::picker::PICKER_ROWS;
@@ -15,14 +18,11 @@ use super::screen::fullscreen;
 use super::state::SPINNER;
 use super::state::State;
 use super::state::{Scroll, WHEEL_LINES};
-use super::*;
-use crate::agent::{Agent, Approve, Interrupt};
 use crate::config;
 use crate::history;
-use crate::repl;
 use crate::session;
+use crate::types::Message;
 use crate::types::Usage;
-use crate::types::{Message, ToolCall};
 use crate::ui::Renderer;
 use crate::ui::cell::Span;
 use crate::ui::cell::Style;
@@ -37,10 +37,6 @@ use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::text::Line;
-use std::future::Future;
-use std::io;
-use std::path::Path;
-use std::pin::Pin;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot, watch};
