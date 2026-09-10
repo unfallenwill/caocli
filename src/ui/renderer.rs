@@ -109,19 +109,6 @@ impl Renderer {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn with_buffer(color: bool) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        // A stand-in that is not a terminal, so a test never touches the real
-        // one: the tests about a terminal say which one through `Renderer::on`.
-        let r = Self::on(
-            Box::new(super::tests::SharedBuf(buf.clone())),
-            color,
-            Box::new(super::tests::StandIn::new().tty(false)),
-        );
-        (r, buf)
-    }
-
     /// Sync the status bar against the current terminal size: called when the REPL
     /// starts and before each input, which also handles window resizes (if the
     /// size changed, the bar is torn down and rebuilt).
@@ -168,10 +155,10 @@ impl Renderer {
         bar.render(self.out.as_mut(), visible, &painted);
     }
 
-    /// Set the model id shown in the status bar (called when a session is created
-    /// or switched, since it follows the session meta).
-    /// Cache statistics accumulated for the current session (the status bar's data
-    /// source). Read by tests only.
+    /// Cache statistics accumulated for the current session, the status bar's
+    /// data source. Read by tests -- here and in the agent's, where the
+    /// accumulation across sub-requests is asserted -- so it exists only under
+    /// `cfg(test)`, the way `Status::stats` does.
     #[cfg(test)]
     pub fn stats(&self) -> super::status::CacheStats {
         self.status.stats()

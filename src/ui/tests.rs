@@ -11,7 +11,7 @@ use super::*;
 use crate::types::{Message, Role, Usage};
 use status::CacheStats;
 
-pub(super) struct SharedBuf(pub(super) std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+pub(super) struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
 impl Write for SharedBuf {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -244,7 +244,7 @@ fn the_banner_keeps_everything_when_there_is_no_terminal() {
 
 #[test]
 fn reasoning_then_content_are_separate_blocks() {
-    let (mut r, buf) = Renderer::with_buffer(true);
+    let (mut r, buf) = with_buffer(true);
     r.reasoning_delta("thinking...");
     r.content_delta("answer");
     r.finish_turn();
@@ -256,7 +256,7 @@ fn reasoning_then_content_are_separate_blocks() {
 
 #[test]
 fn content_then_reasoning_second_subturn_separated() {
-    let (mut r, buf) = Renderer::with_buffer(true);
+    let (mut r, buf) = with_buffer(true);
     r.content_delta("partial");
     r.reasoning_delta("more thinking");
     r.finish_turn();
@@ -268,7 +268,7 @@ fn content_then_reasoning_second_subturn_separated() {
 
 #[test]
 fn no_color_still_separates_blocks() {
-    let (mut r, buf) = Renderer::with_buffer(false);
+    let (mut r, buf) = with_buffer(false);
     r.reasoning_delta("thought");
     r.content_delta("text");
     r.finish_turn();
@@ -280,7 +280,7 @@ fn no_color_still_separates_blocks() {
 
 #[test]
 fn content_only_has_no_leading_separator() {
-    let (mut r, buf) = Renderer::with_buffer(true);
+    let (mut r, buf) = with_buffer(true);
     r.content_delta("hi");
     r.finish_turn();
     assert_eq!(
@@ -291,7 +291,7 @@ fn content_only_has_no_leading_separator() {
 
 #[test]
 fn reasoning_only_block_closes_cleanly() {
-    let (mut r, buf) = Renderer::with_buffer(true);
+    let (mut r, buf) = with_buffer(true);
     r.reasoning_delta("hmm");
     r.finish_turn();
     assert_eq!(
@@ -302,7 +302,7 @@ fn reasoning_only_block_closes_cleanly() {
 
 #[test]
 fn same_mode_deltas_do_not_reopen_block() {
-    let (mut r, buf) = Renderer::with_buffer(true);
+    let (mut r, buf) = with_buffer(true);
     r.reasoning_delta("a");
     r.reasoning_delta("b"); // still Reasoning: no repeated color code
     r.content_delta("x");
@@ -316,7 +316,7 @@ fn same_mode_deltas_do_not_reopen_block() {
 
 #[test]
 fn tool_start_extracts_command_hint() {
-    let (mut r, buf) = Renderer::with_buffer(true);
+    let (mut r, buf) = with_buffer(true);
     r.tool_start("Bash", r#"{"command":"ls -la"}"#);
     r.tool_start("Read", r#"{"file_path":"/a/b.txt"}"#);
     r.tool_start("Write", "not json at all");
@@ -329,7 +329,7 @@ fn tool_start_extracts_command_hint() {
 #[test]
 fn replay_renders_history_compactly_with_colors() {
     use crate::types::{ToolCall, ToolCallFunction};
-    let (mut r, buf) = Renderer::with_buffer(true);
+    let (mut r, buf) = with_buffer(true);
     r.replay(&[
         Message::user("take a look"),
         Message {
@@ -371,7 +371,7 @@ fn replay_renders_history_compactly_with_colors() {
 
 #[test]
 fn replay_empty_history_emits_only_blank_line() {
-    let (mut r, buf) = Renderer::with_buffer(false);
+    let (mut r, buf) = with_buffer(false);
     r.replay(&[]);
     assert_eq!(
         String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
@@ -381,7 +381,7 @@ fn replay_empty_history_emits_only_blank_line() {
 
 #[test]
 fn replay_skips_empty_assistant_fields() {
-    let (mut r, buf) = Renderer::with_buffer(false);
+    let (mut r, buf) = with_buffer(false);
     r.replay(&[Message {
         role: Role::Assistant,
         content: Some(String::new()),
@@ -408,14 +408,14 @@ fn live_and_replay_lay_out_a_turn_identically() {
 
     // The order the agent drives the renderer in: a streaming round first,
     // then the tool calls it asked for.
-    let (mut live, live_buf) = Renderer::with_buffer(true);
+    let (mut live, live_buf) = with_buffer(true);
     live.reasoning_delta("let me think");
     live.content_delta("running it");
     live.finish_turn();
     live.tool_start("Bash", r#"{"command":"ls -la"}"#);
     live.tool_result("exit_code: 0\n--- stdout ---\nBODY");
 
-    let (mut replayed, replay_buf) = Renderer::with_buffer(true);
+    let (mut replayed, replay_buf) = with_buffer(true);
     replayed.replay(&[
         Message {
             role: Role::Assistant,
@@ -450,7 +450,7 @@ fn live_and_replay_lay_out_a_turn_identically() {
 /// bar coming down as the terminal goes back.
 #[test]
 fn the_plain_front_ends_stream_is_frozen() {
-    let (mut r, buf) = Renderer::with_buffer(true);
+    let (mut r, buf) = with_buffer(true);
     r.set_model("deepseek-v4-pro");
     r.set_effort("max");
     r.apply_status_bar(Some(StatusBar { rows: 24, cols: 80 }));
@@ -520,7 +520,7 @@ fn the_plain_front_ends_stream_is_frozen() {
 
 #[test]
 fn interrupted_closes_block_and_prints_notice() {
-    let (mut r, buf) = Renderer::with_buffer(true);
+    let (mut r, buf) = with_buffer(true);
     r.reasoning_delta("thinking");
     r.interrupted();
     let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
@@ -530,7 +530,7 @@ fn interrupted_closes_block_and_prints_notice() {
 
 #[test]
 fn approval_requested_asks_without_newline() {
-    let (mut r, buf) = Renderer::with_buffer(false);
+    let (mut r, buf) = with_buffer(false);
     r.approval_requested("Bash", r#"{"command":"rm -rf /"}"#);
     let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
     assert!(s.contains("▸ Bash rm -rf /"), "{s}");
@@ -542,7 +542,7 @@ fn approval_requested_asks_without_newline() {
 
 #[test]
 fn tool_result_shows_exit_line_and_bytes() {
-    let (mut r, buf) = Renderer::with_buffer(false);
+    let (mut r, buf) = with_buffer(false);
     r.tool_result("exit_code: 3\n--- stdout ---\nhello");
     r.tool_result("");
     let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
@@ -552,7 +552,7 @@ fn tool_result_shows_exit_line_and_bytes() {
 
 #[test]
 fn usage_and_info_render_dims() {
-    let (mut r, buf) = Renderer::with_buffer(false);
+    let (mut r, buf) = with_buffer(false);
     r.usage(
         &Usage {
             prompt_tokens: 10,
@@ -573,7 +573,7 @@ fn usage_and_info_render_dims() {
 #[test]
 fn color_variants_render_codes_and_plain() {
     // color=true: info/usage take paint's colored branch; error goes red
-    let (mut r, buf) = Renderer::with_buffer(true);
+    let (mut r, buf) = with_buffer(true);
     r.info("ok");
     let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
     assert_eq!(s, "\x1b[2m  ok\x1b[0m\n");
@@ -583,7 +583,7 @@ fn color_variants_render_codes_and_plain() {
 
 #[test]
 fn no_color_paint_returns_plain_text() {
-    let (mut r, buf) = Renderer::with_buffer(false);
+    let (mut r, buf) = with_buffer(false);
     r.info("plain");
     assert_eq!(
         String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
@@ -601,12 +601,12 @@ fn no_color_paint_returns_plain_text() {
 /// which is a comparison of escape sequences that no reader makes by eye.
 #[test]
 fn a_streamed_block_and_the_same_block_replayed_are_the_same_bytes() {
-    let (mut live, live_buf) = Renderer::with_buffer(true);
+    let (mut live, live_buf) = with_buffer(true);
     live.reasoning_delta("thinking");
     live.content_delta("answer");
     live.finish_turn();
 
-    let (mut replayed, replay_buf) = Renderer::with_buffer(true);
+    let (mut replayed, replay_buf) = with_buffer(true);
     replayed.replay(&[Message {
         role: Role::Assistant,
         content: Some("answer".into()),
@@ -628,7 +628,7 @@ fn a_streamed_block_and_the_same_block_replayed_are_the_same_bytes() {
 /// left out without a change's lines landing in the column the answers are in.
 #[test]
 fn a_cells_own_line_breaks_are_set_in_too() {
-    let (mut r, buf) = Renderer::with_buffer(false);
+    let (mut r, buf) = with_buffer(false);
     r.tool_start(
         "Edit",
         r#"{"file_path":"a.txt","old_string":"one","new_string":"two"}"#,
@@ -639,7 +639,7 @@ fn a_cells_own_line_breaks_are_set_in_too() {
         "a change is set in under its call: {drawn:?}"
     );
 
-    let (mut r, buf) = Renderer::with_buffer(false);
+    let (mut r, buf) = with_buffer(false);
     r.replay(&[Message::user("alpha\nbeta")]);
     let drawn = buf_of(&buf);
     assert!(
@@ -694,7 +694,7 @@ fn status_bar_detect_rejects_a_terminal_that_cannot_host_it() {
 #[test]
 fn status_bar_render_charges_wide_chars_two_columns() {
     let bar = StatusBar { rows: 10, cols: 20 }; // width = 19
-    let (mut r, buf) = Renderer::with_buffer(false);
+    let (mut r, buf) = with_buffer(false);
     // two ideographs + space + rocket = 7 columns but only 4 chars
     let label = "\u{6df1}\u{5ea6} \u{1f680}";
     assert_eq!(label.chars().count(), 4);
@@ -713,7 +713,7 @@ fn status_bar_render_charges_wide_chars_two_columns() {
 #[test]
 fn status_bar_setup_teardown_sequences() {
     let bar = StatusBar { rows: 10, cols: 40 };
-    let (mut r, buf) = Renderer::with_buffer(false);
+    let (mut r, buf) = with_buffer(false);
     bar.setup(r.out.as_mut());
     bar.teardown(r.out.as_mut());
     let s = buf_of(&buf);
@@ -724,7 +724,7 @@ fn status_bar_setup_teardown_sequences() {
 #[test]
 fn status_bar_render_right_aligns_and_paints() {
     let bar = StatusBar { rows: 10, cols: 40 }; // width = 39
-    let (mut r, buf) = Renderer::with_buffer(true);
+    let (mut r, buf) = with_buffer(true);
     let label = "cache 98.6% · hit 32384 · miss 461"; // 34 characters
     let painted = r.paint(Style::Dim, label);
     bar.render(r.out.as_mut(), label, &painted);
@@ -744,7 +744,7 @@ fn apply_status_bar_transitions() {
     let b = StatusBar { rows: 12, cols: 50 };
 
     // (None, None): no output
-    let (mut r, buf) = Renderer::with_buffer(false);
+    let (mut r, buf) = with_buffer(false);
     r.apply_status_bar(None);
     assert!(buf_of(&buf).is_empty());
 
@@ -778,7 +778,7 @@ fn apply_status_bar_transitions() {
 #[test]
 fn usage_paints_session_cache_bar_and_reset_clears_it() {
     let bar = StatusBar { rows: 10, cols: 60 };
-    let (mut r, buf) = Renderer::with_buffer(false);
+    let (mut r, buf) = with_buffer(false);
     r.apply_status_bar(Some(bar));
     r.usage(&usage_fixture(6, 4), Duration::ZERO);
     r.usage(&usage_fixture(12, 8), Duration::ZERO);
@@ -799,7 +799,7 @@ fn usage_paints_session_cache_bar_and_reset_clears_it() {
 /// The status bar line the renderer draws at the given terminal width, with
 /// a model and cache statistics already in place.
 fn bar_line(cols: u16, model: &str) -> String {
-    let (mut r, buf) = Renderer::with_buffer(false);
+    let (mut r, buf) = with_buffer(false);
     r.set_model(model);
     r.usage(&usage_fixture(6, 4), Duration::ZERO);
     // The bar is attached last, so the redraw it triggers is the first one
@@ -858,7 +858,7 @@ fn status_bar_chooses_variants_by_display_width() {
 #[test]
 fn status_bar_shows_model_and_updates_on_switch() {
     let bar = StatusBar { rows: 10, cols: 80 };
-    let (mut r, buf) = Renderer::with_buffer(false);
+    let (mut r, buf) = with_buffer(false);
     r.apply_status_bar(Some(bar));
     r.set_model("deepseek-v4-flash");
     r.usage(&usage_fixture(6, 4), Duration::ZERO);
@@ -886,11 +886,18 @@ fn status_bar_shows_model_and_updates_on_switch() {
 
 #[test]
 fn refresh_status_bar_without_tty_is_noop_and_teardown_idempotent() {
-    let (mut r, buf) = Renderer::with_buffer(false);
+    let (mut r, buf) = with_buffer(false);
     r.refresh_status_bar(); // the stand-in is not a terminal → not enabled
     assert!(buf_of(&buf).is_empty());
     r.teardown(); // idempotent when not enabled
     assert!(buf_of(&buf).is_empty());
+}
+
+/// A renderer writing into a buffer, on a stand-in that is not a terminal: the
+/// shape every test here starts from, since none of them is about a terminal
+/// unless it says so.
+fn with_buffer(color: bool) -> (Renderer, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+    renderer_on(StandIn::new().tty(false), color)
 }
 
 /// A renderer writing into a buffer, on a terminal the test describes.
