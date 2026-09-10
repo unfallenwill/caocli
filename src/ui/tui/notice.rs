@@ -69,11 +69,11 @@ impl Notifier {
 }
 
 impl Ui for Notifier {
-    fn reasoning_delta(&mut self, s: &str) {
-        self.send(Notice::Reasoning(s.to_owned()));
+    fn reasoning_delta(&mut self, text: &str) {
+        self.send(Notice::Reasoning(text.to_owned()));
     }
-    fn content_delta(&mut self, s: &str) {
-        self.send(Notice::Content(s.to_owned()));
+    fn content_delta(&mut self, text: &str) {
+        self.send(Notice::Content(text.to_owned()));
     }
     fn finish_turn(&mut self) {
         self.send(Notice::FinishTurn);
@@ -87,8 +87,8 @@ impl Ui for Notifier {
     fn tool_result(&mut self, result: &str) {
         self.send(Notice::ToolResult(result.to_owned()));
     }
-    fn usage(&mut self, u: &Usage, stream: Duration) {
-        self.send(Notice::Usage(u.clone(), stream));
+    fn usage(&mut self, usage: &Usage, stream: Duration) {
+        self.send(Notice::Usage(usage.clone(), stream));
     }
     fn interrupted(&mut self) {
         self.send(Notice::Interrupted);
@@ -105,11 +105,11 @@ impl Front for Notifier {
     fn replay(&mut self, messages: &[Message]) {
         self.send(Notice::Replay(messages.to_vec()));
     }
-    fn info(&mut self, s: &str) {
-        self.send(Notice::Info(s.to_owned()));
+    fn info(&mut self, text: &str) {
+        self.send(Notice::Info(text.to_owned()));
     }
-    fn error(&mut self, s: &str) {
-        self.send(Notice::Error(s.to_owned()));
+    fn error(&mut self, text: &str) {
+        self.send(Notice::Error(text.to_owned()));
     }
     fn set_model(&mut self, model: &str) {
         self.send(Notice::SetModel(model.to_owned()));
