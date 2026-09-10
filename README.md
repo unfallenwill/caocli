@@ -43,6 +43,7 @@ place for a key to hide in.
 | `/resume <id>` | Switch to an existing session, replaying its history to the screen |
 | `/login` | Choose a provider and store its API key. The list shows each provider by *name* (`DeepSeek`, `Z.AI Coding CN`); the plain prompt prints the id beside it, since that is what `/login <id>` takes |
 | `/model` | Choose a model, named `<provider id>/<modelid>` (`deepseek/deepseek-v4-pro`, `zai-coding-cn/glm-5.3`); it switches the model and, when the name carries another provider, the backend with it |
+| `/effort` | Choose the reasoning effort tier — the list is the provider in use's own (`low`, `high`, `max`), with the one in effect marked; the choice is stored in the session, so a resume keeps it |
 | `/exit`, `/quit`, `/q` | Quit |
 
 `/login` asks for the key as a question rather than as a line: the prompt is
@@ -56,6 +57,11 @@ A model is named by the provider that serves it — `deepseek/deepseek-v4-pro`,
 (`/model deepseek-v4-pro`, `--model deepseek-v4-pro`) belongs to the provider
 the session is running on. Switching to a model whose provider has no key yet is
 refused, with `/login <provider id>` as the reason.
+
+The reasoning effort is the provider's list too: `/effort` offers the tiers the
+provider in use accepts, and a tier is checked against that list before it is
+stored — the same check `--effort` passes at startup, so neither route can put a
+value in the session the backend would reject or quietly ignore.
 
 A provider has an id and a name, and they are used for different things: the id
 (`deepseek`, `zai-coding-cn`) is what addresses it — `--provider`, `/login <id>`,
@@ -79,7 +85,7 @@ newlines also works (bracketed paste).
 | `-p <PROMPT>` | Run one prompt (including the tool loop), then exit |
 | `--provider <NAME>` | Backend provider: `deepseek` (default) or `zai-coding-cn`. Settles the endpoint of a new session; a resumed session keeps the one its meta names |
 | `--model <MODEL>` | Model id as `<provider>/<modelid>`, or bare for `--provider`; defaults to the provider's default model |
-| `--effort <EFFORT>` | Reasoning effort: `low`, `high`, or `max` (default `max`); other values are rejected locally. On GLM, `low` answers without emitting `reasoning_content`. |
+| `--effort <EFFORT>` | Reasoning effort: `low`, `high`, or `max` (default `max`); other values are rejected locally. `/effort` switches it inside a session. On GLM, `low` answers without emitting `reasoning_content`. |
 | `-c, --cont` | Continue the most recent session |
 | `--resume <ID>` | Resume a specific session by id |
 | `--list` | List sessions and exit |
@@ -112,14 +118,14 @@ ok: package.name = caocli (312 bytes)
 ─────────────────────────────────────────⠸ 12s · ~38 token/s
 ›  the turn is running · Enter queues · Ctrl-C stops
 ──────────────────────────────────────────────────────────────────────────
-zai-coding-cn/glm-5.3 · cache 95.3% · hit 846912 · miss 41538
+zai-coding-cn/glm-5.3 · effort max · cache 95.3% · hit 846912 · miss 41538
 ```
 
 - **The status line** is the row under the box, always the session summary:
-  the model, the cache hit rate, and the raw hit/miss counts. A new session
-  opens with the defaults (`cache 0.0% · hit 0 · miss 0`) and the counts move
-  as the provider reports usage; what a turn is doing is the transcript's to
-  say, not the status line's.
+  the model, the reasoning effort tier, the cache hit rate, and the raw hit/miss
+  counts. A new session opens with the defaults (`cache 0.0% · hit 0 · miss 0`)
+  and the counts move as the provider reports usage; what a turn is doing is the
+  transcript's to say, not the status line's.
 - **While a turn runs, the box's top border says so**: a spinner and the seconds
   it has run, and — once the turn has lasted long enough for an average to mean
   anything — an estimated `~N token/s`. Estimated, because the provider reports
@@ -157,15 +163,16 @@ a terminal), which is the front end the status bar below belongs to.
 
 ### Status bar
 
-In the plain REPL (`--no-tui`), a status bar pinned to the bottom line shows the active model
-and the session's cumulative cache hit rate, right-aligned:
+In the plain REPL (`--no-tui`), a status bar pinned to the bottom line shows the active model,
+the reasoning effort tier and the session's cumulative cache hit rate, right-aligned:
 
 ```
-deepseek/deepseek-flash · cache 98.6% · hit 32384 · miss 461
+deepseek/deepseek-flash · effort max · cache 98.6% · hit 32384 · miss 461
 ```
 
-The model segment names the model by its provider and is refreshed on
-`/new`, `/resume`, `/model` and CLI overrides.
+The model segment names the model by its provider; the effort segment is the
+tier the next request carries. Both follow the session, so they are refreshed on
+`/new`, `/resume`, `/model`, `/effort` and CLI overrides.
 
 It appears only when stdout is a TTY and the terminal has at least 3 rows;
 `--no-status-bar` turns it off. The bar reserves the last terminal line via
@@ -192,7 +199,8 @@ The id is what the flags, the menus' arguments, the session meta and
 calls the provider.
 
 The model list is what `/model` offers; naming one the table does not list is
-allowed, and up to the backend to accept or reject.
+allowed, and up to the backend to accept or reject. The effort tiers are the
+same table's: `/effort` offers exactly the list `--effort` is checked against.
 
 Both speak the same `thinking` / `reasoning_content` protocol, so the request
 builder and stream parser are shared. Thinking is always on.
