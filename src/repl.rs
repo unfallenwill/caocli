@@ -348,6 +348,10 @@ mod tests {
         // A session file has a single writer, and `other` still holds it: drop
         // the handle or the resume below is refused.
         drop(other);
+        // The file looks locked for a moment after the handle goes: a `fork` in
+        // another test copies the file description the lock lives on. See
+        // `session::wait_until_released`.
+        session::wait_until_released(&dir.join(format!("{id}.jsonl")));
 
         let mut ui = Recording::default();
         assert_eq!(

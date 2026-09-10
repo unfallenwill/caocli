@@ -78,19 +78,73 @@ fn write_line<T: Serialize>(file: &mut std::fs::File, value: &T) -> Result<()> {
 /// it right at the entrance.
 #[cfg(unix)]
 fn lock_exclusive(file: &std::fs::File, path: &Path) -> Result<()> {
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(());
+        }
+        // A signal delivered mid-call is not a lock held somewhere else, and the
+        // call is asking the same question either way.
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
         bail!(
-            "session {} is already in use by another process (single-writer constraint)",
+            "session {} is already in use by another process (single-writer constraint): {err}",
             path.display()
         );
     }
-    Ok(())
 }
 
 #[cfg(not(unix))]
 fn lock_exclusive(_file: &std::fs::File, _path: &Path) -> Result<()> {
     Ok(())
+}
+
+/// Open a session file that was just closed, waiting for the lock to go with
+/// the handle.
+///
+/// `flock` locks belong to the open file description, and `fork` copies file
+/// descriptions: a child process that has not reached `exec` yet is still holding
+/// the lock its parent dropped, so for a moment the file looks busy with nothing
+/// wrong with it. Any test that spawns a child can put another test in that
+/// window (measured: a few in every hundred attempts against a thread spawning
+/// `true` in a loop), and a test that reopens a session right away would fail on
+/// luck alone.
+///
+/// A real single-writer conflict is permanent, which is why production never
+/// waits: it reports.
+#[cfg(test)]
+pub(crate) fn load_when_released(path: &Path) -> Session {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match Session::load(path) {
+            Ok(open) => return open,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => panic!("still locked after waiting {e:#}"),
+        }
+    }
+}
+
+/// The same wait, for a caller that has to go through a path it does not own
+/// (a command that loads the session itself) and only needs the lock gone.
+#[cfg(test)]
+pub(crate) fn wait_until_released(path: &Path) {
+    drop(load_when_released(path));
+}
+
+#[cfg(not(unix))]
+#[cfg(test)]
+pub(crate) fn load_when_released(path: &Path) -> Session {
+    Session::load(path).unwrap()
+}
+
+#[cfg(not(unix))]
+#[cfg(test)]
+pub(crate) fn wait_until_released(path: &Path) {
+    drop(load_when_released(path));
 }
 
 impl Session {
@@ -330,7 +384,7 @@ mod tests {
         let path = s.path.clone();
         let id = s.id.clone();
         drop(s); // the flock is held by the live Session, so release it before reloading
-        let loaded = Session::load(&path).unwrap();
+        let loaded = load_when_released(&path);
         assert_eq!(loaded.id, id);
         assert_eq!(loaded.messages.len(), 3);
         assert_eq!(
@@ -357,7 +411,7 @@ mod tests {
 
         let path = s.path.clone();
         drop(s);
-        let loaded = Session::load(&path).unwrap();
+        let loaded = load_when_released(&path);
         assert_eq!(loaded.messages.len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -400,7 +454,7 @@ mod tests {
 
         let path = s.path.clone();
         drop(s);
-        let loaded = Session::load(&path).unwrap();
+        let loaded = load_when_released(&path);
         let msgs = &loaded.messages;
         assert_eq!(
             msgs.len(),
@@ -441,7 +495,9 @@ mod tests {
         );
         let path = s.path.clone();
         drop(s); // release the lock (it is also released automatically at process exit)
-        assert!(Session::load(&path).is_ok());
+        // Getting it back at all is the assertion: the lock went with the
+        // handle.
+        wait_until_released(&path);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -456,7 +512,7 @@ mod tests {
         .unwrap();
         let path = s.path.clone();
         drop(s);
-        let loaded = Session::load(&path).unwrap();
+        let loaded = load_when_released(&path);
         assert_eq!(loaded.meta.model, "deepseek-v4-pro");
         assert_eq!(loaded.meta.reasoning_effort.as_deref(), Some("max"));
         std::fs::remove_dir_all(&dir).unwrap();
