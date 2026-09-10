@@ -1908,6 +1908,17 @@ fn box_marker(area: Rect) -> Rect {
     }
 }
 
+/// How many lines of a think the transcript keeps before it says how many are
+/// behind it.
+///
+/// Thinking is the one block that grows without bound -- at `max` effort a
+/// hundred lines is an ordinary turn -- and the one block nobody is still
+/// reading by the time the answer lands. Kept whole it evicts the answer from
+/// the window that pins to the newest line; folded to its head and a count it
+/// costs a dozen rows instead of a screenful. The full text stays in the
+/// session log, which is where the durable copy lives either way.
+const THINKING_LINES: usize = 12;
+
 /// The lines one cell occupies at `width`.
 ///
 /// One function, because the transcript on screen, the window over it and the
@@ -1925,19 +1936,36 @@ fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
     };
     // Wrapped into what the gutter leaves, so a line of a set-in cell carries as
     // much as a line of the answer rather than two columns more.
-    wrapped_lines(&cell.spans(), width.saturating_sub(gutter.width()))
-        .into_iter()
-        .enumerate()
-        .map(|(i, line)| {
-            // The marker opens the cell, and the lines after it continue in the
-            // same columns: that is what keeps a wrapped block -- and with it the
-            // left edge the whole layout is read down -- on one line.
-            let lead = if i == 0 { gutter.head } else { gutter.rest };
-            let mut spans = vec![RSpan::styled(lead, style_of(gutter.style))];
-            spans.extend(line.spans);
-            Line::from(spans)
-        })
-        .collect()
+    let mut lines: Vec<Line<'static>> =
+        wrapped_lines(&cell.spans(), width.saturating_sub(gutter.width()))
+            .into_iter()
+            .enumerate()
+            .map(|(i, line)| {
+                // The marker opens the cell, and the lines after it continue in the
+                // same columns: that is what keeps a wrapped block -- and with it the
+                // left edge the whole layout is read down -- on one line.
+                let lead = if i == 0 { gutter.head } else { gutter.rest };
+                let mut spans = vec![RSpan::styled(lead, style_of(gutter.style))];
+                spans.extend(line.spans);
+                Line::from(spans)
+            })
+            .collect();
+    // A long think folds to its head and a count. The rule lives in this layer
+    // rather than in the cell because it is a budget of the screen, like the
+    // wrapping width is: the plain front end has no screen to keep one on, and
+    // streams the block as it arrives. It reaches the live block through this
+    // same call, which is what keeps a folded think from jumping open the
+    // moment it closes: the block that is filed away and the block that was
+    // watched have to lay out to the same lines.
+    if matches!(cell, Cell::Reasoning(_)) && lines.len() > THINKING_LINES {
+        let hidden = lines.len() - THINKING_LINES;
+        lines.truncate(THINKING_LINES);
+        lines.push(Line::styled(
+            format!("{}… {hidden} more line(s)", gutter.head),
+            style_of(gutter.style),
+        ));
+    }
+    lines
 }
 
 /// The cell a streaming block is: what a run of deltas becomes once it stops
@@ -2851,6 +2879,89 @@ mod tests {
         assert_eq!(row(&screen, top), "┆ aaaa bbbb");
         assert_eq!(row(&screen, top + 1), "┆ cccc");
         assert_eq!(row(&screen, top + 2), "answer");
+    }
+
+    #[test]
+    fn a_long_think_folds_to_its_head_and_a_count() {
+        // The think is the one block that grows without bound, and the window
+        // pins to the newest line: kept whole, a hundred lines of faint text
+        // would be exactly the thing standing between the reader and the answer
+        // the turn was for.
+        let mut screen = screen_for_test(40, 30);
+        let think = (0..30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        screen.state.transcript.push(Cell::Reasoning(think));
+        screen.state.transcript.push(Cell::Content("answer".into()));
+        screen.draw().unwrap();
+        let top = origin(&mut screen).y;
+        for i in 0..THINKING_LINES {
+            assert_eq!(row(&screen, top + i as u16), format!("┆ line {i}"));
+        }
+        assert_eq!(
+            row(&screen, top + THINKING_LINES as u16),
+            format!("┆ … {} more line(s)", 30 - THINKING_LINES),
+            "the count wears the block's own rule and says what is behind it"
+        );
+        assert_eq!(
+            row(&screen, top + THINKING_LINES as u16 + 1),
+            "answer",
+            "and the answer is still on the screen the think was folded for"
+        );
+    }
+
+    #[test]
+    fn a_think_at_the_cap_is_not_folded() {
+        // The count exists to say that something was left out; a block that
+        // gave up nothing would be paying a row to say nothing.
+        let mut screen = screen_for_test(40, 30);
+        let think = (0..THINKING_LINES)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        screen.state.transcript.push(Cell::Reasoning(think));
+        screen.draw().unwrap();
+        let drawn = all_rows(&screen).join("\n");
+        assert!(
+            !drawn.contains("more line(s)"),
+            "nothing is hidden, so nothing is counted: {drawn}"
+        );
+    }
+
+    #[test]
+    fn only_a_think_folds() {
+        // The fold is about dim machinery evicting the answer. The answer
+        // itself is the thing the transcript is here for, and it is never
+        // counted away.
+        let mut screen = screen_for_test(40, 30);
+        let long = (0..30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        screen.state.transcript.push(Cell::Content(long));
+        screen.draw().unwrap();
+        let drawn = all_rows(&screen).join("\n");
+        assert!(drawn.contains("line 29"), "kept whole: {drawn}");
+        assert!(!drawn.contains("more line(s)"), "{drawn}");
+    }
+
+    #[test]
+    fn a_folded_think_does_not_jump_open_when_it_closes() {
+        // The live block and the cell it becomes go through the same layout, so
+        // the frame that files the block away is allowed to change nothing: the
+        // think the reader watched is the think the transcript keeps.
+        let mut screen = screen_for_test(40, 30);
+        let think = (0..30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        screen.state.apply(Notice::Reasoning(think));
+        screen.draw().unwrap();
+        let live = screen.state.lines(40);
+        screen.state.apply(Notice::FinishTurn);
+        screen.draw().unwrap();
+        assert_eq!(screen.state.lines(40), live, "the same lines either way");
     }
 
     #[test]
