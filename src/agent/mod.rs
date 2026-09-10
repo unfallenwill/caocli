@@ -6,19 +6,15 @@
 //! session — the log is the state — and the two things a turn needs from
 //! whoever is watching: an answer for the approval gate and a signal to stop.
 
-use anyhow::Result;
-
 use crate::api::Client;
-use crate::machine::{self, Action};
+use crate::machine;
 use crate::provider;
 use crate::session::Session;
-use crate::tools;
-use crate::types::{ChatRequest, Message};
-use crate::ui::Ui;
-use crate::ui::{Approve, Cancel, Verdict};
+use crate::types::ChatRequest;
 
 mod request;
 mod stream;
+mod turn;
 
 pub use request::build_request;
 
@@ -29,18 +25,12 @@ pub struct Agent {
     /// answer ceiling all come from it, and the model is named by it: the
     /// status line reads `<provider>/<modelid>` from here.
     provider: provider::Provider,
-    /// Ceiling on one answer, in tokens: the provider preset's value, sent as
-    /// `max_tokens` on every request.
-    max_tokens: u32,
     /// Whether the approval gate is on: with it, Bash/Edit/Write ask the user
     /// before running (Read is always allowed).
     pub approval: Approval,
-    /// Per-turn tool step cap (product-level termination guarantee).
+    /// Per-turn tool step cap (product-level termination guarantee). The turn in
+    /// flight counts against it (`turn::Turn`), and the next turn gets it whole.
     pub max_tool_steps: usize,
-    /// Steps taken by the turn in flight. Counted per turn, not per process: a
-    /// long session may spend this much again on its next question, and only a
-    /// turn that cannot finish inside one budget is stopped.
-    tool_steps: usize,
 }
 
 /// Whether a tool call that changes something runs or is asked about first.
@@ -72,10 +62,8 @@ impl Agent {
             api,
             session,
             provider,
-            max_tokens: provider.max_tokens,
             approval: Approval::Trusted,
             max_tool_steps: machine::MAX_TOOL_STEPS,
-            tool_steps: 0,
         }
     }
 
@@ -101,12 +89,13 @@ impl Agent {
             .unwrap_or(self.provider.default_effort)
     }
 
-    /// Point the machine at a provider: a client for its endpoint and key, and
-    /// the ceiling its preset declares. The session's meta is the caller's to
-    /// write -- it is a change to the log, and the interpreter writes the log.
+    /// Point the machine at a provider: a client for its endpoint and key. The
+    /// ceiling the request is sent with comes from the preset itself (see
+    /// `request::build_request`), so there is nothing to carry over here. The
+    /// session's meta is the caller's to write -- it is a change to the log, and
+    /// the interpreter writes the log.
     pub fn bind(&mut self, provider: provider::Provider, api: Client) {
         self.provider = provider;
-        self.max_tokens = provider.max_tokens;
         self.api = api;
     }
 
@@ -121,154 +110,6 @@ impl Agent {
 
     fn build_request(&self) -> ChatRequest {
         build_request(&self.provider, &self.session.meta, &self.session.messages)
-    }
-
-    /// One conversational turn: may contain several sub-requests (the model keeps
-    /// going after calling tools, until finish_reason=stop).
-    /// The renderer is held by the caller and passed in: the status bar and the
-    /// streaming output must go through the same `Ui` implementation, otherwise
-    /// the cache stats recorded by `usage()` never reach the instance that
-    /// already drew the bar.
-    ///
-    /// Exactly one cancel source is subscribed per turn, and the caller
-    /// subscribes it before calling this: tokio's signal notifications ride on a
-    /// watch, so if a listener were created inside each `select`, a SIGINT
-    /// arriving in the gap between two `select`s would be broadcast away before
-    /// the new listener subscribed and would be lost forever (measured in the
-    /// pty smoke test, a millisecond-scale window). The caller owning the
-    /// subscription also keeps the interpreter independent of how a cancel
-    /// arrives: `Sigint` is only one possible source.
-    ///
-    /// `cancel` is the source of an out-of-band Command (Ctrl-C): every await
-    /// point races against it (biased: if the effect finishes first its result is
-    /// kept).
-    /// When it fires, the current effect is dropped — the stream disconnects and
-    /// the Bash child process is killed by kill_on_drop; the calls that were
-    /// declared but not answered are persisted with a cancellation marker to
-    /// close the window, the history stays is_request_valid, and the next turn
-    /// continues from a valid prefix.
-    /// Cancellation is handled in the interpreter layer and never enters
-    /// `next_action` (it is out-of-band and every state is reachable).
-    ///
-    /// `approve` answers the approval gate. Both are supplied by the caller
-    /// rather than built here because both depend on which front end is running:
-    /// a front end that owns the terminal in raw mode leaves no SIGINT to listen
-    /// for, so it answers both channels from its own event loop.
-    pub async fn turn(
-        &mut self,
-        input: &str,
-        ui: &mut dyn Ui,
-        cancel: &mut dyn Cancel,
-        approve: &mut dyn Approve,
-    ) -> Result<()> {
-        self.session.append_message(&Message::user(input))?;
-        self.tool_steps = 0;
-        let mut cancelled = false;
-        // Interpreter loop: each beat asks the machine for a decision (an Action
-        // folded out of the log) and writes the result back into the log, until
-        // Done. The loop itself carries no state — the log is the only history.
-        loop {
-            match machine::next_action(&self.session.messages) {
-                Some(Action::CallModel) => {
-                    let request = self.build_request();
-                    // The future is dropped when the select expression ends, which
-                    // ends the borrow of self
-                    let done = tokio::select! {
-                        biased;
-                        reply = self.stream_reply(&request, ui) => Some(reply?),
-                        _ = cancel.wait() => None,
-                    };
-                    match done {
-                        Some(reply) => {
-                            self.session.append_message(&reply.message)?;
-                            if let Some(usage) = &reply.usage {
-                                ui.usage(usage, reply.stream_time);
-                            }
-                        }
-                        None => cancelled = true,
-                    }
-                }
-                Some(Action::ExecTool(call)) => {
-                    ui.tool_start(&call.function.name, &call.function.arguments);
-                    // Step cap: every ExecTool action counts as a step (including
-                    // denied ones); exceeding it ends the turn with a
-                    // deterministic marker, so a model that goes haywire in a loop
-                    // cannot run forever.
-                    if self.tool_steps >= self.max_tool_steps {
-                        let marker = machine::Marker::StepLimit;
-                        ui.tool_result(marker.text());
-                        self.session
-                            .append_message(&Message::tool(&call.id, marker.text()))?;
-                        self.close_open_calls(ui, marker)?;
-                        break;
-                    }
-                    self.tool_steps += 1;
-                    // Approval gate: Bash/Edit/Write ask first; a denial closes
-                    // that call with the denial marker
-                    let mut denied = false;
-                    if self.approval == Approval::Ask && call.function.name != tools::READ_NAME {
-                        ui.approval_requested(&call.function.name, &call.function.arguments);
-                        let verdict = tokio::select! {
-                            biased;
-                            verdict = approve.approve(&call) => verdict,
-                            _ = cancel.wait() => { cancelled = true; Verdict::Denied }
-                        };
-                        if cancelled {
-                            break;
-                        }
-                        if verdict == Verdict::Denied {
-                            denied = true;
-                            ui.tool_result(machine::Marker::Denied.text());
-                            self.session.append_message(&Message::tool(
-                                &call.id,
-                                machine::Marker::Denied.text(),
-                            ))?;
-                        }
-                    }
-                    if !denied {
-                        // The arm that wins decides the outcome. A tool result
-                        // that happens to read like the cancellation marker is
-                        // still a result: only the cancel arm can end the call as
-                        // cancelled.
-                        let (tool_output, cancelled_call) = tokio::select! {
-                            biased;
-                            output = tools::execute(&call.function.name, &call.function.arguments) => (output, false),
-                            _ = cancel.wait() => {
-                                (machine::Marker::Cancelled.text().to_owned(), true)
-                            }
-                        };
-                        ui.tool_result(&tool_output);
-                        self.session
-                            .append_message(&Message::tool(&call.id, tool_output))?;
-                        if cancelled_call {
-                            cancelled = true;
-                        }
-                    }
-                }
-                Some(Action::Done) | None => break,
-            }
-            if cancelled {
-                break;
-            }
-        }
-        if cancelled {
-            self.close_open_calls(ui, machine::Marker::Cancelled)?;
-            ui.interrupted();
-        }
-        Ok(())
-    }
-
-    /// Interruption/step-limit cleanup: persist the given marker for calls that
-    /// were declared but not answered, closing the window.
-    /// Persisted rather than kept in the in-memory view only — the process is
-    /// still alive, so the file has to record it faithfully.
-    fn close_open_calls(&mut self, ui: &mut dyn Ui, marker: machine::Marker) -> Result<()> {
-        for id in machine::open_call_ids(&self.session.messages) {
-            self.session
-                .append_message(&Message::tool(&id, marker.text()))?;
-            ui.tool_result(marker.text());
-        }
-        Ok(())
     }
 }
 
@@ -324,7 +165,8 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
 
-    use crate::types::ToolCall;
+    use crate::types::{Message, ToolCall};
+    use crate::ui::{Approve, Cancel, Verdict};
     // The prompt is asserted on here, but it lives with the request it belongs
     // to; the pure request tests move next to it in the same file.
     use super::request::SYSTEM_PROMPT;
