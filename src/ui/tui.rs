@@ -788,6 +788,21 @@ impl State {
         }
     }
 
+    /// Take a submitted line as part of the session: it goes into the transcript
+    /// the way replay would put it there, and into the history for recall.
+    ///
+    /// A command is not part of the session: the handler answers it without the
+    /// model ever seeing it, so a session replayed later does not have it either,
+    /// and showing one live would make the same session read two ways depending on
+    /// when it was looked at.
+    fn submit(&mut self, line: &str) {
+        self.remember(line);
+        if !line.starts_with('/') {
+            self.revision += 1;
+            self.pending.push(Cell::User(line.to_owned()));
+        }
+    }
+
     /// The picker as it is drawn: one row per choice, the highlighted one
     /// reversed.
     fn picker_lines(&self) -> Vec<Line<'static>> {
@@ -1475,7 +1490,7 @@ pub async fn run(
         if line.is_empty() {
             break Ok(());
         }
-        screen.state.remember(&line);
+        screen.state.submit(&line);
         // `/resume` with nothing to resume is a request for the list rather than a
         // command to run: the plain front end can only say so, and this one can
         // offer it. The chosen row is submitted as `/resume <id>`, which is the
@@ -2553,6 +2568,41 @@ mod tests {
         let mut n = Notifier { tx };
         n.content_delta("hi");
         assert!(matches!(rx.try_recv(), Ok(Notice::Content(s)) if s == "hi"));
+    }
+
+    #[test]
+    fn what_the_user_says_becomes_part_of_the_transcript() {
+        // Replay reads the user's line out of the log, so a live turn has to put it
+        // in the same place: the same session must not read two ways depending on
+        // when it was looked at.
+        let mut state = State::default();
+        state.submit("look at src/main.rs");
+        assert_eq!(
+            state.pending,
+            vec![Cell::User("look at src/main.rs".into())]
+        );
+        assert_eq!(state.history, vec!["look at src/main.rs"]);
+    }
+
+    #[test]
+    fn a_command_is_not_part_of_the_transcript() {
+        // The handler answers commands without the model seeing them, so a replayed
+        // session does not have them either.
+        let mut state = State::default();
+        state.submit("/help");
+        assert!(state.pending.is_empty(), "nothing to replay");
+        assert_eq!(state.history, vec!["/help"], "but it is worth recalling");
+    }
+
+    #[test]
+    fn a_submitted_line_is_drawn_above_what_the_turn_says() {
+        let mut screen = screen_for_test(40, 20);
+        screen.state.submit("look at src/main.rs");
+        screen.state.pending.push(Cell::Content("on it".into()));
+        screen.draw().unwrap();
+        let top = origin(&mut screen).y;
+        assert_eq!(row(&screen, top), "› look at src/main.rs");
+        assert_eq!(row(&screen, top + 1), "on it");
     }
 
     #[test]

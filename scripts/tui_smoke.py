@@ -250,6 +250,12 @@ def live(term: "Terminal", home: str) -> bool:
     ok = True
     # The status line reports the turn while it runs, on a clock of its own: it
     # moves without anything else about the screen changing.
+    # Note: what the user said is in here, but it is not asserted on screen. The
+    # live area is ten rows, and a turn that fails or answers quickly fills them
+    # before the first frame is painted -- and the screen is written
+    # incrementally, so a line that was never painted never appears in the byte
+    # stream either. The cell a submitted line produces is covered by unit tests
+    # and by the resumed turn above, which draws one out of the log.
     term.send(f"use the Read tool to read {ROOT}/Cargo.toml\r")
     ok &= term.expect(SPINNER, 15)
     ok &= term.spinner_moved(5)
