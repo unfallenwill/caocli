@@ -29,7 +29,7 @@ use ratatui::style::{Color, Modifier, Style as RStyle};
 use ratatui::text::{Line, Span as RSpan, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
-use ratatui_textarea::{ScreenCursor, TextArea};
+use ratatui_textarea::{CursorMove, ScreenCursor, TextArea};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::agent::{Agent, Approve, Interrupt};
@@ -43,16 +43,37 @@ use super::Ui;
 use super::cell::{self, Cell, Span, Style};
 use super::status::Status;
 
-/// Rows the pinned region needs: the status line, the tip line, then the input box
-/// (border, text, border).
-const PINNED_ROWS: u16 = 1 + 1 + 3;
+/// Rows the pinned region needs besides the input box: the status line, then the
+/// tip line.
+const PINNED_ROWS: u16 = 1 + 1;
 
-/// How many rows of the transcript a terminal `height` rows tall shows.
+/// The rows the input box takes when it holds nothing: a border, the empty line,
+/// a border. An empty box is still a box.
+const BOX_ROWS: u16 = 3;
+
+/// The rows the input box takes when it holds `lines` lines of text: one row each
+/// -- a line added with Ctrl-J is a line the box has to show -- plus the two
+/// borders.
+///
+/// Capped at what a terminal `height` rows tall can spare once the status line,
+/// the tip line and a row of transcript are accounted for: a draft taller than
+/// the screen scrolls inside the box rather than leaving the screen with nothing
+/// but a box on it.
+fn box_rows(lines: usize, height: u16) -> u16 {
+    let wanted = u16::try_from(lines)
+        .unwrap_or(u16::MAX)
+        .saturating_add(BOX_ROWS - 1);
+    let most = height.saturating_sub(PINNED_ROWS + 1).max(BOX_ROWS);
+    wanted.clamp(BOX_ROWS, most)
+}
+
+/// How many rows of the transcript a terminal `height` rows tall shows, with an
+/// input box `input` rows tall.
 ///
 /// Never zero, even on a terminal too short for the pinned region: the box is
 /// worth a cramped transcript, where an empty screen is worth nothing.
-fn transcript_rows(height: u16) -> u16 {
-    height.saturating_sub(PINNED_ROWS).max(1)
+fn transcript_rows(height: u16, input: u16) -> u16 {
+    height.saturating_sub(PINNED_ROWS + input).max(1)
 }
 
 /// The spinner, advanced while work is in progress. One column each, so it can
@@ -355,6 +376,9 @@ struct State {
     /// need them, and both are the terminal's to say rather than the state's.
     drawn_lines: usize,
     drawn_rows: usize,
+    /// How many lines the box held at the last draw, so that a box that has just
+    /// lost lines can be told from one that has not.
+    drawn_draft: usize,
     /// When the front end started, which is the clock the tip line runs on. Its
     /// own clock rather than the turn's: the tips keep coming round whether or not
     /// anything is happening.
@@ -442,6 +466,7 @@ impl Default for State {
             scroll: Scroll::default(),
             drawn_lines: 0,
             drawn_rows: 0,
+            drawn_draft: 0,
             started: Instant::now(),
             live: None,
             question: None,
@@ -838,6 +863,45 @@ impl State {
     /// What is in the box.
     fn text(&self) -> String {
         self.textarea.lines().join("\n")
+    }
+
+    /// How many rows the box needs on a terminal `height` rows tall: one per line
+    /// of the draft, so that Ctrl-J -- the key that makes the draft multi-line --
+    /// makes room for the line it adds.
+    fn input_rows(&self, height: u16) -> u16 {
+        box_rows(self.textarea.lines().len(), height)
+    }
+
+    /// Put the box's window back where the draft it now holds wants it, for a box
+    /// `rows` rows tall -- what [`input_rows`] says it is.
+    ///
+    /// A box tall enough for every line has nothing to hide, but the editor
+    /// remembers where it was scrolled to while the box was shorter and only moves
+    /// that window when the cursor leaves it: a draft that has just lost lines, or
+    /// a terminal that has just grown, would be drawn from the remembered row --
+    /// the lines above it missing, blank rows where they were. Scrolling the window
+    /// to the top is what clears that, and the editor then puts it where the cursor
+    /// needs it; the cursor is put back afterwards, since a scroll takes it along.
+    ///
+    /// Called before the box is drawn, which is the only time the window matters.
+    fn reset_box_scroll(&mut self, rows: u16) {
+        let lines = self.textarea.lines().len();
+        let shrank = lines < self.drawn_draft;
+        self.drawn_draft = lines;
+        // A draft too tall for the box is the editor's to page -- the window is the
+        // point there, and taking it over would undo what the box's own keys did.
+        // One that has just lost lines is the exception, whatever its length: it
+        // was paged against a longer draft than it is now.
+        if !shrank && lines + 2 > usize::from(rows) {
+            return;
+        }
+        let cursor = self.textarea.cursor();
+        // Scrolling further than there is to scroll is how the window is sent to
+        // the top from wherever it was: the editor has no "go to the top".
+        self.textarea.scroll((-i16::MAX, 0));
+        if let (Ok(row), Ok(col)) = (u16::try_from(cursor.0), u16::try_from(cursor.1)) {
+            self.textarea.move_cursor(CursorMove::Jump(row, col));
+        }
     }
 
     /// Replace what is in the box, leaving the cursor after it.
@@ -1318,12 +1382,15 @@ impl<B: Backend> Screen<B> {
     }
 
     /// Draw the screen: the window on the transcript, the status line, the input
-    /// box.
+    /// box. The box is sized for what is in it, so the transcript gives up rows to
+    /// a multi-line draft and takes them back when the line is submitted.
     fn draw_at(&mut self, now: Instant) -> Result<(), B::Error> {
         let size = self.terminal.size()?;
         let width = size.width as usize;
+        let input = self.state.input_rows(size.height);
+        self.state.reset_box_scroll(input);
         let lines = self.state.lines(width);
-        let rows = transcript_rows(size.height);
+        let rows = transcript_rows(size.height, input);
         // The window over the transcript: its end unless the reader scrolled back.
         // The picker belongs to the line being typed, so it takes the box's end of
         // the transcript with it.
@@ -1345,7 +1412,7 @@ impl<B: Backend> Screen<B> {
                 Constraint::Min(0),
                 Constraint::Length(1),
                 Constraint::Length(1),
-                Constraint::Length(3),
+                Constraint::Length(input),
             ])
             .split(frame.area());
             frame.render_widget(Paragraph::new(transcript), rows[0]);
@@ -1971,6 +2038,91 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_j_makes_the_box_a_line_taller() {
+        // The box is the draft's shape: the line Ctrl-J adds has a row to be typed
+        // on, and the transcript gives one up for it.
+        let mut screen = screen_for_test(40, 20);
+        type_in(&mut screen.state, "first");
+        screen.draw().unwrap();
+        let last = screen.terminal.backend().buffer().area.height - 1;
+        assert!(
+            row(&screen, last - 2).starts_with('┌'),
+            "one line, three rows"
+        );
+
+        screen.state.key(ctrl_j());
+        type_in(&mut screen.state, "second");
+        screen.draw().unwrap();
+        assert!(
+            row(&screen, last - 3).starts_with('┌'),
+            "two lines, four rows"
+        );
+        assert!(row(&screen, last - 2).contains("first"), "the first line");
+        assert!(row(&screen, last - 1).contains("second"), "and the second");
+        assert!(row(&screen, last).starts_with('└'), "the bottom stays put");
+    }
+
+    #[test]
+    fn a_submitted_line_gives_its_rows_back_to_the_transcript() {
+        // The box is as tall as the draft and no taller: what a multi-line line
+        // borrowed goes back when the line is sent.
+        let mut screen = screen_for_test(40, 20);
+        let last = screen.terminal.backend().buffer().area.height - 1;
+        type_in(&mut screen.state, "first");
+        screen.state.key(ctrl_j());
+        type_in(&mut screen.state, "second");
+        screen.draw().unwrap();
+        assert!(
+            row(&screen, last - 3).starts_with('┌'),
+            "two lines, four rows"
+        );
+
+        screen.state.take_line();
+        screen.draw().unwrap();
+        assert!(row(&screen, last - 2).starts_with('┌'), "empty, three rows");
+    }
+
+    #[test]
+    fn a_draft_that_has_lost_lines_is_drawn_from_its_first_one() {
+        // A draft taller than the box scrolls inside it. When lines are deleted
+        // the box gets shorter with them, and the rows it was scrolled to must not
+        // hide the top of what is left -- the editor would otherwise draw from
+        // the row it remembered and leave the rest of the box blank.
+        let height = 12;
+        let shows = usize::from(box_rows(usize::MAX, height)) - 2;
+        let (draft, kept) = (shows + 4, shows - 2);
+        let letters: Vec<char> = "abcdefghijklmnopqrstuvwxyz".chars().take(draft).collect();
+        let mut screen = screen_for_test(40, height);
+        for (i, letter) in letters.iter().enumerate() {
+            if i > 0 {
+                screen.state.key(ctrl_j());
+            }
+            type_in(&mut screen.state, &letter.to_string());
+        }
+        screen.draw().unwrap();
+
+        // Each line is a letter and a newline, so this leaves the first `kept` of
+        // them and the cursor on the last.
+        for _ in 0..(2 * (draft - kept)) {
+            press(&mut screen.state, KeyCode::Backspace);
+        }
+        screen.draw().unwrap();
+
+        let top = 1 + all_rows(&screen)
+            .iter()
+            .position(|r| r.starts_with('┌'))
+            .expect("the box is drawn");
+        for (i, letter) in letters[..kept].iter().enumerate() {
+            let drawn = row(&screen, (top + i) as u16);
+            assert!(drawn.starts_with(&format!("│{letter}")), "{drawn:?}");
+        }
+        assert!(
+            row(&screen, (top + kept) as u16).starts_with('└'),
+            "and nothing below the last line"
+        );
+    }
+
+    #[test]
     fn the_status_line_says_what_the_turn_is_doing() {
         // The line as drawn, not as formatted: the word is painted in its own
         // colour, and the row is the only place that can be seen.
@@ -1987,7 +2139,7 @@ mod tests {
             args: "{}".into(),
         });
         screen.draw_at(now).unwrap();
-        let pinned = screen.terminal.backend().buffer().area.height - PINNED_ROWS;
+        let pinned = screen.terminal.backend().buffer().area.height - PINNED_ROWS - BOX_ROWS;
         assert_eq!(
             row(&screen, pinned),
             "· Julienning… (0s · ↓ 259 tokens · running read_file)"
@@ -2087,7 +2239,7 @@ mod tests {
         // The whole screen is the transcript, less the pinned rows -- and what
         // does not fit is off the top, because the end is what was just written.
         let mut screen = screen_for_test(40, 20);
-        let rows = transcript_rows(20) as usize;
+        let rows = transcript_rows(20, BOX_ROWS) as usize;
         for i in 0..(rows + 5) {
             screen
                 .state
@@ -2102,7 +2254,7 @@ mod tests {
     #[test]
     fn paging_back_moves_the_window_and_paging_forward_returns_it() {
         let mut screen = screen_for_test(40, 20);
-        let rows = transcript_rows(20) as usize;
+        let rows = transcript_rows(20, BOX_ROWS) as usize;
         for i in 0..(rows * 3) {
             screen
                 .state
@@ -2135,7 +2287,7 @@ mod tests {
         // has to stay on the line they were on instead of sliding to the end
         // under them.
         let mut screen = screen_for_test(40, 20);
-        let rows = transcript_rows(20) as usize;
+        let rows = transcript_rows(20, BOX_ROWS) as usize;
         for i in 0..(rows * 3) {
             screen
                 .state
@@ -2159,7 +2311,7 @@ mod tests {
     #[test]
     fn submitting_a_line_returns_to_the_end_of_the_transcript() {
         let mut screen = screen_for_test(40, 20);
-        for i in 0..(transcript_rows(20) as usize * 2) {
+        for i in 0..(transcript_rows(20, BOX_ROWS) as usize * 2) {
             screen
                 .state
                 .transcript
@@ -2181,7 +2333,7 @@ mod tests {
         screen.state.transcript.push(Cell::Notice(long.into()));
         screen.draw().unwrap();
         let rows = all_rows(&screen);
-        let joined: String = rows[..transcript_rows(30) as usize].concat();
+        let joined: String = rows[..transcript_rows(30, BOX_ROWS) as usize].concat();
         assert_eq!(joined, long, "every column survived, in order");
     }
 
@@ -2237,6 +2389,11 @@ mod tests {
         for c in text.chars() {
             press(state, KeyCode::Char(c));
         }
+    }
+
+    /// Ctrl-J: the newline key, and so the one the box has to make room for.
+    fn ctrl_j() -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL))
     }
 
     #[test]
@@ -2510,9 +2667,37 @@ mod tests {
 
     #[test]
     fn the_transcript_gets_the_rows_the_pinned_region_leaves() {
-        assert_eq!(transcript_rows(24), 24 - PINNED_ROWS);
-        assert_eq!(transcript_rows(1), 1, "never zero, even on a tiny terminal");
-        assert_eq!(transcript_rows(0), 1);
+        assert_eq!(transcript_rows(24, BOX_ROWS), 24 - PINNED_ROWS - BOX_ROWS);
+        assert_eq!(
+            transcript_rows(1, BOX_ROWS),
+            1,
+            "never zero, even on a tiny terminal"
+        );
+        assert_eq!(transcript_rows(0, BOX_ROWS), 1);
+    }
+
+    #[test]
+    fn the_box_grows_with_the_lines_in_it() {
+        // One row per line, borders on top and bottom -- and Ctrl-J is what puts
+        // lines in it, so this is the arithmetic that makes that key visible.
+        assert_eq!(box_rows(0, 20), BOX_ROWS, "empty is still a box");
+        assert_eq!(box_rows(1, 20), BOX_ROWS);
+        assert_eq!(box_rows(2, 20), 4);
+        assert_eq!(box_rows(6, 20), 8);
+    }
+
+    #[test]
+    fn a_box_taller_than_the_screen_gives_way_to_the_transcript() {
+        // A draft longer than the terminal can show still leaves a row of
+        // transcript: past that the box scrolls inside itself.
+        let height = 12;
+        let most = height - PINNED_ROWS - 1;
+        assert_eq!(box_rows(100, height), most);
+        assert_eq!(transcript_rows(height, box_rows(100, height)), 1);
+        // And a terminal too short for even that still gets its one transcript
+        // row, because the alternative is an empty screen.
+        assert_eq!(box_rows(100, 2), BOX_ROWS);
+        assert_eq!(transcript_rows(2, box_rows(100, 2)), 1);
     }
 
     #[test]

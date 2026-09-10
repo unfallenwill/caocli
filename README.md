@@ -76,8 +76,9 @@ result summaries as they were rendered live (full tool output is not replayed).
 ### The screen front end
 
 By default caocli takes the whole screen. The transcript fills it, and the last
-four rows are the pinned region: what the current turn is doing, a tip, and the
-input box.
+rows are the pinned region: what the current turn is doing, a tip, and the
+input box. The box is as tall as what is in it — `Ctrl-J` adds a line and room
+for it — and the transcript takes those rows back when the line is submitted.
 
 ```
 ▸ Read Cargo.toml

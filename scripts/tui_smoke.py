@@ -332,6 +332,20 @@ class Terminal:
                 return rows[y - 2]
         return ""
 
+    def box_rows(self) -> list[str]:
+        """The input box as drawn: its border rows and what is between them, which
+        is what says how tall it is."""
+        rows = self.screen.lines()
+        top = next(
+            (y for y in range(len(rows) - 1, 1, -1) if rows[y].startswith("┌")), None
+        )
+        if top is None:
+            return []
+        bottom = next(
+            (y for y in range(top, len(rows)) if rows[y].startswith("└")), top
+        )
+        return rows[top : bottom + 1]
+
     def spinner_moved(self, timeout: float) -> bool:
         """Watch the working line's first column: a spinner that only ever shows
         one frame is not a spinner, and this is the only path that runs one."""
@@ -471,6 +485,38 @@ def main() -> int:
             # column a wide character covers is what the bug looks like.
             if not term.screen.find("中文宽度测试"):
                 print("  ✗ wide characters are drawn with a gap after each one")
+                ok = False
+            # The box is the draft's shape. Raw mode sends Ctrl-J as \n, and the
+            # box -- three rows while it is empty -- has to grow to keep the line
+            # it adds on screen, and give the rows back when the draft goes. The
+            # screen is read back rather than the byte stream: a drawn cell that
+            # did not change is never written again.
+            term.quiet(2.0, 30)
+            empty = term.box_rows()
+            term.send("alpha\nbeta")  # Ctrl-J between the two lines
+            ok &= term.expect("beta", 15)
+            grown = term.box_rows()
+            if len(grown) != len(empty) + 1 or not any("alpha" in row for row in grown):
+                print(f"  ✗ Ctrl-J did not grow the box: {grown}")
+                ok = False
+            # ... and the cursor is on the line that key added, with the text it
+            # was typed after: a grown box the cursor is not drawn in would be no
+            # better than the one-row box it replaced.
+            lines = term.screen.lines()
+            typed = next((y for y, line in enumerate(lines) if "beta" in line), None)
+            if typed is None or (term.screen.row, term.screen.col) != (
+                typed,
+                lines[typed].index("beta") + len("beta"),
+            ):
+                print(
+                    f"  ✗ the cursor is not on the line Ctrl-J added: "
+                    f"{term.screen.row},{term.screen.col}"
+                )
+                ok = False
+            term.send("\x03")  # Ctrl-C clears the line
+            ok &= term.expect(VIEWPORT, 15)
+            if len(term.box_rows()) != len(empty):
+                print("  ✗ the emptied box did not go back to three rows")
                 ok = False
             # Typing a command prefix opens the picker, which draws over the live
             # area: it is the one widget that is not part of either the
