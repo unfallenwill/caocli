@@ -1580,8 +1580,12 @@ impl<B: Backend> Screen<B> {
     ///
     /// The loop wakes on a tick to stay responsive to the keyboard, and most of
     /// those ticks have nothing new to show: a turn spends its time waiting to be
-    /// told something, and repainting an unchanged screen would be a whole-screen
-    /// write every tick.
+    /// told something. The framework compares each frame with the last and writes
+    /// only the difference, so an unchanged frame costs no write -- what it costs
+    /// is being built, and this check is what keeps a tick from paying for that.
+    /// It is a coarser question than the framework's (one frame against another)
+    /// and it is asked on purpose: what it is sparing is the building, not the
+    /// writing.
     fn draw_if_changed(&mut self) -> Result<(), B::Error> {
         let key = self.view_key()?;
         if self.drawn == Some(key) {
@@ -1722,6 +1726,15 @@ fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
                 // the columns past the text alone, so the ground would stop
                 // where the words stop and read as a highlight rather than
                 // as a block. The blanks are written out instead.
+                //
+                // `Buffer::set_style(area, style)` is what the framework keeps
+                // for painting a ground across a region, and it wants a rect:
+                // this is lines, because it is the same layout the plain front
+                // end writes into a fixed-width buffer and the same one a resumed
+                // session is replayed through. Painting the block would mean a
+                // paragraph per cell rendered into a rect of its own -- a second
+                // layout, which is the thing the cells being values is there to
+                // prevent. The price is a row of blanks that are really there.
                 let used = line.width();
                 if used < width {
                     line.spans
@@ -1750,6 +1763,16 @@ fn fill_of(cell: &Cell) -> Option<RStyle> {
 /// and `insert_before` renders into a fixed-width buffer, where an over-long line
 /// is silently cut off -- unlike the plain front end, where the terminal wraps
 /// and nothing is lost.
+///
+/// Written here rather than handed to the framework, which has nothing to hand it
+/// to. The framework wraps inside the widget that draws: `Paragraph::wrap` wraps
+/// into the area it is rendered into and keeps the result, so the lines never come
+/// back -- `Paragraph::line_count` answers with a number, and asking it before a
+/// render means wrapping everything twice to get one. `reflow::WordWrapper`, which
+/// is what does the wrapping in there, is a private module. What this returns is a
+/// value instead, and the same value serves all three places the transcript is
+/// laid out: the window on screen, the plain front end's fixed-width buffer, and
+/// the row count the window is computed from.
 ///
 /// Progress is guaranteed even when a single character is wider than the whole
 /// field: the first character is taken regardless, so a narrow terminal degrades
