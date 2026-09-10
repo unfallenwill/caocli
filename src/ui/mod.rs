@@ -33,12 +33,23 @@ impl CacheStats {
         (total > 0).then(|| self.hit as f64 * 100.0 / total as f64)
     }
 
-    /// Status bar text (without the left padding).
-    pub fn label(&self) -> String {
+    /// Status segments, most significant first: the hit rate, then the raw
+    /// counts. A provider that reports no cache usage yields a single
+    /// "unknown" segment, so it is never displayed as 0% hit.
+    fn segments(&self) -> Vec<String> {
         match self.hit_rate() {
-            Some(rate) => format!("cache {rate:.1}% · hit {} · miss {}", self.hit, self.miss),
-            None => "cache —".to_string(),
+            Some(rate) => vec![
+                format!("cache {rate:.1}%"),
+                format!("hit {} · miss {}", self.hit, self.miss),
+            ],
+            None => vec!["cache —".to_string()],
         }
+    }
+
+    /// Full status text (without the left padding).
+    #[cfg(test)]
+    pub fn label(&self) -> String {
+        self.segments().join(" · ")
     }
 }
 
@@ -241,22 +252,46 @@ impl Renderer {
     }
 
     /// Redraw the status bar (without re-detecting the size).
+    ///
+    /// Picks the richest segment combination that fits, so a narrow terminal
+    /// loses detail by whole segments instead of having a number cut in half.
     fn redraw_status_bar(&mut self) {
         let Some(bar) = self.bar else { return };
-        let label = self.status_label();
-        let visible = text::truncate(&label, bar.width());
+        let width = bar.width();
+        // Walk from the richest join down to the shortest. A candidate that
+        // fits ends the walk; if none fits, the walk leaves the shortest one,
+        // which gets clipped below rather than leaving the bar blank.
+        let parts = self.status_parts();
+        let mut label = String::new();
+        for n in (1..=parts.len()).rev() {
+            label = parts[..n].join(" · ");
+            if text::width(&label) <= width {
+                break;
+            }
+        }
+        let visible = text::truncate(&label, width);
         let painted = self.paint(DIM, visible);
         bar.render(self.out.as_mut(), visible, &painted);
     }
 
-    /// Status bar text: `<model> · cache ...`; falls back to pure cache stats when
-    /// the model is unknown.
-    fn status_label(&self) -> String {
-        let cache = self.stats.label();
-        match &self.model {
-            Some(m) if !m.is_empty() => format!("{m} · {cache}"),
-            _ => cache,
+    /// Status segments, most significant first: the model, then the cache
+    /// statistics. This is the order a narrow bar drops them in.
+    fn status_parts(&self) -> Vec<String> {
+        let mut parts = Vec::new();
+        if let Some(m) = &self.model
+            && !m.is_empty()
+        {
+            parts.push(m.clone());
         }
+        parts.extend(self.stats.segments());
+        parts
+    }
+
+    /// Status bar text: every segment joined. This is what a bar wide enough
+    /// for everything displays.
+    #[cfg(test)]
+    fn status_label(&self) -> String {
+        self.status_parts().join(" · ")
     }
 
     /// Set the model id shown in the status bar (called when a session is created
@@ -912,6 +947,65 @@ mod tests {
         let (mut r, _buf) = Renderer::with_buffer(false);
         r.set_model("");
         assert_eq!(r.status_label(), "cache —");
+    }
+
+    /// The status bar line the renderer draws at the given terminal width, with
+    /// a model and cache statistics already in place.
+    fn bar_line(cols: u16, model: &str) -> String {
+        let (mut r, buf) = Renderer::with_buffer(false);
+        r.set_model(model);
+        r.usage(&usage_fixture(6, 4));
+        // The bar is attached last, so the redraw it triggers is the first one
+        // that has anything to draw.
+        r.apply_status_bar(Some(StatusBar { rows: 10, cols }));
+        buf_of(&buf)
+    }
+
+    /// Assert that the bar's content is exactly `label`: clipping it would
+    /// break the `\x1b8` cursor restore that immediately follows.
+    fn assert_bar_exactly(cols: u16, model: &str, label: &str) {
+        let s = bar_line(cols, model);
+        assert!(
+            s.contains(&format!("{label}\x1b8")),
+            "cols={cols} expected {label:?} in {s:?}"
+        );
+    }
+
+    /// Progressive disclosure: a bar too narrow for everything drops whole
+    /// segments from the end instead of cutting a number in half.
+    #[test]
+    fn status_bar_drops_whole_segments_on_narrow_terminals() {
+        let model = "deepseek-v4-flash";
+        // 79 columns: everything fits
+        assert_bar_exactly(
+            80,
+            model,
+            "deepseek-v4-flash · cache 60.0% · hit 6 · miss 4",
+        );
+        // 34 columns: the counts go, the model and rate stay
+        assert_bar_exactly(35, model, "deepseek-v4-flash · cache 60.0%");
+        // 19 columns: only the model is left
+        assert_bar_exactly(20, model, "deepseek-v4-flash");
+    }
+
+    /// When not even the shortest combination fits, it is clipped rather than
+    /// leaving the bar blank.
+    #[test]
+    fn status_bar_clips_the_shortest_segment_as_a_last_resort() {
+        assert_bar_exactly(10, "deepseek-v4-flash", "deepseek-");
+    }
+
+    /// Variants are chosen by display width, not by char count: at 21 columns
+    /// the rate segment is 22 columns wide (18 chars), so it has to be dropped.
+    #[test]
+    fn status_bar_chooses_variants_by_display_width() {
+        let wide_model = "\u{6df1}\u{5ea6}\u{6c42}\u{7d22}"; // 8 columns, 4 chars
+        assert_bar_exactly(
+            25,
+            wide_model,
+            "\u{6df1}\u{5ea6}\u{6c42}\u{7d22} · cache 60.0%",
+        );
+        assert_bar_exactly(21, wide_model, wide_model);
     }
 
     #[test]
