@@ -43,7 +43,7 @@ pub struct Span {
 }
 
 impl Span {
-    fn new(style: Style, text: impl Into<String>) -> Self {
+    pub fn new(style: Style, text: impl Into<String>) -> Self {
         Self {
             style,
             text: text.into(),
@@ -67,6 +67,9 @@ pub enum Cell {
     ToolResult(String),
     /// A dim informational line.
     Notice(String),
+    /// A failure. The plain front end writes these to the error stream; a front
+    /// end owning the screen has to place them in its own output instead.
+    Failure(String),
     /// The turn was cancelled.
     Interrupted,
     /// Token usage for one sub-request.
@@ -108,6 +111,7 @@ impl Cell {
             }
             Cell::ToolResult(result) => vec![Span::new(Style::Dim, summary(result))],
             Cell::Notice(text) => vec![Span::new(Style::Dim, text.as_str())],
+            Cell::Failure(text) => vec![Span::new(Style::Red, format!("error: {text}"))],
             Cell::Interrupted => vec![Span::new(Style::Yellow, "⏹ interrupted (Ctrl-C)")],
             Cell::Usage(u) => vec![Span::new(Style::Dim, usage_line(u))],
             Cell::Approval { name, hint } => vec![Span::new(

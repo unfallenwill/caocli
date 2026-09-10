@@ -9,6 +9,8 @@ mod tools;
 mod types;
 mod ui;
 
+use std::io::IsTerminal;
+
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers};
@@ -17,6 +19,7 @@ use crate::agent::{Agent, Sigint, StdinApproval};
 use crate::api::Client;
 use crate::cli::Cli;
 use crate::session::{Session, SessionMeta};
+use crate::ui::tui;
 use crate::ui::{Front, Renderer};
 
 fn main() -> Result<()> {
@@ -164,6 +167,30 @@ async fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    // After --continue / --resume, show the source file; the path has diagnostic
+    // value
+    let banner = format!(
+        "caocli · session {} ({} messages, {}) · {} · /help for commands",
+        agent.session.id,
+        agent.session.messages.len(),
+        agent.session.path.display(),
+        agent.session.meta.model
+    );
+
+    // Interactive front end: it owns the terminal, so nothing may have been
+    // printed before it and nothing may be printed after it while it runs.
+    // It declines rather than fails when the terminal cannot host it -- an
+    // inline viewport has to ask where the cursor is, and a terminal that does
+    // not answer leaves no way to place it.
+    if !cli.no_tui && std::io::stdout().is_terminal() {
+        // Cloned because the front end borrows the agent mutably for the whole
+        // session; this is once, at startup.
+        let history = agent.session.messages.clone();
+        if tui::run(&mut agent, &sdir, &banner, &history).await? {
+            return Ok(());
+        }
+    }
+
     // REPL
     let mut rl = rustyline::DefaultEditor::new()?;
     enable_multiline(&mut rl);
@@ -175,15 +202,7 @@ async fn run(cli: Cli) -> Result<()> {
         ui.refresh_status_bar();
     }
 
-    // After --continue / --resume, show the source file; the path has diagnostic
-    // value
-    ui.info(&format!(
-        "caocli · session {} ({} messages, {}) · {} · /help for commands",
-        agent.session.id,
-        agent.session.messages.len(),
-        agent.session.path.display(),
-        agent.session.meta.model
-    ));
+    ui.info(&banner);
     // A resumed session replays its history to the screen, otherwise only the
     // banner is visible and there is no context
     if !agent.session.messages.is_empty() {

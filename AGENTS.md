@@ -55,8 +55,10 @@ that talks to a network API and drives an interactive terminal.
 - **Deliberate minimalism**: one main loop. Providers are expressed as a static preset
   table — no dynamic registration, plugin systems, or other indirect layers; write it
   directly when you can. `trait Ui` is the only exception — it is not an abstraction
-  layer but the machine's notification vocabulary (exactly one in-process
-  implementation, `Renderer`).
+  layer but the machine's notification vocabulary. There is one implementation per
+  front end and the front ends are mutually exclusive (the plain prompt when stdout is
+  not a terminal or the terminal declines the viewport; the interactive one otherwise),
+  so the machine never chooses between them.
 - **The machine decides, never executes**: turn flow is determined by
   `machine::next_action` (a pure fold over the persisted history); the interpreter
   executes and writes back. To add behavior to the loop, extend the vocabulary first
@@ -78,11 +80,14 @@ that talks to a network API and drives an interactive terminal.
   kill**: the current effect is dropped (stream disconnected, child process
   `kill_on_drop`), unanswered calls are persisted with a deterministic cancellation
   marker, and the history still satisfies `is_request_valid`; cancellation is handled
-  in the interpreter layer and never enters `next_action`. The SIGINT listener is
-  created once per turn and subscribed at construction time — constructing a listener
-  inside each `select` leaves a window between two `select`s in which a signal that
-  arrives exactly then is swallowed forever (tokio watch semantics, measured in the
-  pty smoke test).
+  in the interpreter layer and never enters `next_action`.
+  **The cancel channel is supplied by the front end, not built by the agent.** A front
+  end owning the terminal runs it in raw mode, and raw mode clears `ISIG`: Ctrl-C then
+  arrives as a key event and there is no SIGINT left to listen for (measured under a
+  pty — `isig_after_raw=false`, the handler never fires). The listener must also exist
+  before the turn's first await point: constructing one inside each `select` leaves a
+  window between two `select`s in which a signal arriving exactly then is swallowed
+  forever (tokio watch semantics, measured in the pty smoke test).
 - **Turn step cap**: at most `machine::MAX_TOOL_STEPS` (500) tool-call steps per turn;
   exceeding it ends the turn with a deterministic marker — a product-level
   termination guarantee.
@@ -98,10 +103,19 @@ that talks to a network API and drives an interactive terminal.
   synthesized text must be a constant, otherwise the prefix cache becomes unstable).
 - **Exactly one renderer per process**: streaming output and usage accounting must go
   through the same instance, otherwise counts are lost.
+- **A front end that cannot take the terminal declines; it does not fail.** An inline
+  viewport has to ask the terminal where the cursor is, and not every terminal answers
+  (a bare pty does not — measured). Starting the session must survive that by falling
+  back to the plain front end.
 - Truncating or clipping text must land on a UTF-8 character boundary, and any text
   measured against a terminal width must be measured in **display columns**, not
   chars: a CJK ideograph or an emoji is one char but two columns, so char-based
   arithmetic silently overruns the field it was sizing.
+- Text that is committed to the terminal instead of being written to a scrolling stream
+  must be **wrapped, never clipped**: a fixed-width rendering path cuts an over-long
+  line off, where the terminal's own soft wrapping would have kept every column. The
+  plain front end may leave wrapping to the terminal; a front end that draws into a
+  region may not.
 
 ## Prefix cache (must read before changing request or message construction)
 

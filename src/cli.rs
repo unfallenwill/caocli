@@ -39,6 +39,12 @@ pub struct Cli {
     #[arg(long)]
     pub no_status_bar: bool,
 
+    /// Keep the plain prompt instead of the full-screen front end. The plain
+    /// prompt is used anyway on a terminal that cannot host the viewport, or
+    /// when stdout is not a terminal.
+    #[arg(long)]
+    pub no_tui: bool,
+
     /// Approval gate: ask y/N before Bash/Edit/Write executes (Read is always allowed)
     #[arg(long)]
     pub ask: bool,

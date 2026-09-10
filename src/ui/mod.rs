@@ -1,6 +1,7 @@
 mod cell;
 mod status;
 mod text;
+pub mod tui;
 
 use std::io::{IsTerminal, Write};
 
@@ -385,6 +386,8 @@ impl Front for Renderer {
     }
 
     fn error(&mut self, s: &str) {
+        // Straight to the error stream: the plain front end does not own the
+        // screen, so an error survives a redirected stdout.
         eprintln!("{}", self.paint(Style::Red, s));
     }
 
