@@ -21,6 +21,7 @@ use std::future::Future;
 use std::io::{self, Stdout};
 use std::path::Path;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
@@ -67,21 +68,39 @@ const BOX_BORDERS: Borders = Borders::TOP.union(Borders::BOTTOM);
 /// and a row of transcript are accounted for: a draft taller than the
 /// screen scrolls inside the box rather than leaving the screen with nothing but
 /// a box on it.
+///
+/// The floor gives way with the cap. The pinned region and the transcript cannot
+/// both have all of what they ask for on a short terminal, and the draft is the
+/// one of the three that can be bounded without losing the session -- so the box
+/// shrinks first, down to nothing at all. Asking for a three-row box on a
+/// two-row terminal is asking the layout for rows it does not have, and the rows
+/// it then takes come out of some other region's answer.
 fn box_rows(lines: usize, height: u16) -> u16 {
     let wanted = u16::try_from(lines)
         .unwrap_or(u16::MAX)
         .saturating_add(BOX_ROWS - 1);
-    let most = height.saturating_sub(PINNED_ROWS + 1).max(BOX_ROWS);
-    wanted.clamp(BOX_ROWS, most)
+    let most = height.saturating_sub(PINNED_ROWS + 1);
+    wanted.clamp(BOX_ROWS.min(most), most)
 }
 
-/// How many rows of the transcript a terminal `height` rows tall shows, with an
-/// input box `input` rows tall and `queued` rows given to the queue.
+/// The screen's rows, from the area the frame is drawn into: the transcript, the
+/// queue waiting to run, the input box, and the status line under it.
 ///
-/// Never zero, even on a terminal too short for the pinned region: the box is
-/// worth a cramped transcript, where an empty screen is worth nothing.
-fn transcript_rows(height: u16, input: u16, queued: u16) -> u16 {
-    height.saturating_sub(PINNED_ROWS + input + queued).max(1)
+/// The transcript's height is the layout's to decide and is read back from it
+/// rather than worked out a second time here: two copies of the arithmetic are
+/// two answers, and only one of them is the area the frame was laid out with. A
+/// terminal too short for the pinned region has no transcript row to give, and
+/// the window has to hear that from the layout -- it is the difference between a
+/// window over the end of the transcript and one over a row that was never
+/// drawn.
+fn screen_rows(area: Rect, input: u16, queued: u16) -> Rc<[Rect]> {
+    Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(queued),
+        Constraint::Length(input),
+        Constraint::Length(1),
+    ])
+    .split(area)
 }
 
 /// The lines one wheel notch moves the window over the transcript: the step a
@@ -1461,63 +1480,72 @@ impl<B: Backend> Screen<B> {
         if self.drawn == Some(key) {
             return Ok(());
         }
-        self.draw_at()?;
-        // Only after the draw succeeded: a failed one leaves the screen showing
-        // something else, so the next call has to try again.
-        self.drawn = Some(key);
+        let area = self.draw_at()?;
+        // Stamped from the frame that was drawn rather than from the size the
+        // check above was made against, and only after the draw succeeded: a
+        // failed draw leaves the screen showing something else, and a resize that
+        // lands between the check and the draw leaves a key that describes an area
+        // the screen is not showing -- either way the next call has to try again.
+        self.drawn = Some(ViewKey {
+            revision: self.state.revision,
+            width: area.width,
+            height: area.height,
+        });
         Ok(())
     }
 
     /// Draw the screen as of now, for tests that do not care about the clock.
     #[cfg(test)]
     fn draw(&mut self) -> Result<(), B::Error> {
-        self.draw_at()
+        self.draw_at().map(|_| ())
     }
 
     /// Draw the screen: the window on the transcript, the input box, and the
     /// status line under it. The box is sized for what is in it, so the transcript
     /// gives up rows to a multi-line draft and takes them back when the line is
     /// submitted.
-    fn draw_at(&mut self) -> Result<(), B::Error> {
-        let size = self.terminal.size()?;
-        let width = size.width as usize;
-        let input = self.state.input_rows(size.height);
-        // What is waiting to run, drawn at the bottom of the transcript: the
-        // session, then what comes next, then the box, and under the box the
-        // session summary. Asked for before the layout, because how many rows it
-        // takes is what the transcript gives up.
-        let queue = Text::from(self.state.queue_lines(width));
-        let queued = queue.height() as u16;
-        self.state.reset_box_scroll(input);
-        let lines = self.state.lines(width);
-        let rows = transcript_rows(size.height, input, queued);
-        // The window over the transcript: its end unless the reader scrolled back.
-        // The picker belongs to the line being typed, so it takes the box's end of
-        // the transcript with it.
-        let picker = self.state.picker_lines();
-        let first = if picker.is_empty() {
-            self.state.window(lines.len(), rows as usize)
-        } else {
-            self.state.follow();
-            lines.len().saturating_sub(rows as usize)
-        };
-        let last = (first + rows as usize).min(lines.len());
-        let transcript = Text::from(lines[first..last].to_vec());
-        let status = self.state.status_line(width);
-        let cursor = self.state.textarea.screen_cursor();
+    ///
+    /// Everything that depends on the size is asked of the frame inside the
+    /// callback: the width the text is wrapped at and the rows each region gets
+    /// come from the same [`Rect`], so the layout and the text laid out for it
+    /// cannot disagree. The area drawn is returned, so the caller stamps its
+    /// change key with what was drawn rather than with what it expected.
+    fn draw_at(&mut self) -> Result<Rect, B::Error> {
+        let drawn = self.terminal.draw(|frame| {
+            let area = frame.area();
+            let width = area.width as usize;
+            let input = self.state.input_rows(area.height);
+            // What is waiting to run, drawn at the bottom of the transcript: the
+            // session, then what comes next, then the box, and under the box the
+            // session summary. Asked for before the layout, because how many rows
+            // it takes is what the transcript gives up.
+            let queue = Text::from(self.state.queue_lines(width));
+            let queued = queue.height() as u16;
+            let rows = screen_rows(area, input, queued);
+            self.state.reset_box_scroll(input);
+            let lines = self.state.lines(width);
+            // The rows the transcript really has: the layout's answer, not a copy
+            // of its arithmetic.
+            let room = rows[0].height as usize;
+            // The window over the transcript: its end unless the reader scrolled
+            // back. The picker belongs to the line being typed, so it takes the
+            // box's end of the transcript with it.
+            let picker = self.state.picker_lines();
+            let first = if picker.is_empty() {
+                self.state.window(lines.len(), room)
+            } else {
+                self.state.follow();
+                lines.len().saturating_sub(room)
+            };
+            let last = (first + room).min(lines.len());
+            let transcript = Text::from(lines[first..last].to_vec());
+            let status = self.state.status_line(width);
+            let cursor = self.state.textarea.screen_cursor();
 
-        self.terminal.draw(|frame| {
-            let rows = Layout::vertical([
-                Constraint::Min(0),
-                Constraint::Length(queued),
-                Constraint::Length(input),
-                Constraint::Length(1),
-            ])
-            .split(frame.area());
             frame.render_widget(Paragraph::new(transcript), rows[0]);
             if !picker.is_empty() {
                 let height = picker.len().min(PICKER_ROWS) as u16;
-                let area = Rect {
+                let over = Rect {
                     x: rows[0].x,
                     y: rows[0].bottom().saturating_sub(height),
                     width: rows[0].width,
@@ -1525,15 +1553,15 @@ impl<B: Backend> Screen<B> {
                 };
                 // Cleared first: a shorter list must not leave the tail of a
                 // longer one behind it.
-                frame.render_widget(Clear, area);
-                frame.render_widget(Paragraph::new(Text::from(picker)), area);
+                frame.render_widget(Clear, over);
+                frame.render_widget(Paragraph::new(Text::from(picker)), over);
             }
             frame.render_widget(Paragraph::new(queue), rows[1]);
             frame.render_widget(&self.state.textarea, rows[2]);
             place_cursor(frame, rows[2], cursor);
             frame.render_widget(Paragraph::new(status), rows[3]);
         })?;
-        Ok(())
+        Ok(drawn.area)
     }
 
     /// A turn is over: close the block that was still being streamed.
@@ -2113,6 +2141,14 @@ mod tests {
             tty: None,
             drawn: None,
         }
+    }
+
+    /// How many rows a test's transcript has on a terminal `height` rows tall,
+    /// with a box `input` rows tall and `queued` rows for the queue: the layout's
+    /// answer, asked the same way the screen asks it, so that a test that fills
+    /// the transcript fills the rows that are really there.
+    fn transcript_rows(height: u16, input: u16, queued: u16) -> u16 {
+        screen_rows(Rect::new(0, 0, 40, height), input, queued)[0].height
     }
 
     #[test]
@@ -3048,16 +3084,30 @@ mod tests {
 
     #[test]
     fn the_transcript_gets_the_rows_the_pinned_region_leaves() {
+        // Asked of the layout rather than worked out here. What a terminal too
+        // short for the pinned region has to say about it is the whole point: the
+        // transcript gets no rows at all there, and a window that believed the
+        // arithmetic instead would be scrolling against a row that was never
+        // drawn.
+        let transcript = |height: u16, input: u16, queued: u16| {
+            screen_rows(Rect::new(0, 0, 80, height), input, queued)[0].height
+        };
         assert_eq!(
-            transcript_rows(24, BOX_ROWS, 0),
-            24 - PINNED_ROWS - BOX_ROWS
+            transcript(24, BOX_ROWS, 0),
+            24 - PINNED_ROWS - BOX_ROWS,
+            "the box has its borders and the status line its row"
         );
         assert_eq!(
-            transcript_rows(1, BOX_ROWS, 0),
+            transcript(5, BOX_ROWS, 0),
             1,
-            "never zero, even on a tiny terminal"
+            "one row, on the shortest terminal that can spare it"
         );
-        assert_eq!(transcript_rows(0, BOX_ROWS, 0), 1);
+        assert_eq!(
+            transcript(1, BOX_ROWS, 0),
+            0,
+            "and none at all when there is nothing to spare"
+        );
+        assert_eq!(transcript(1, 0, 0), 0, "the status line has the only row");
     }
 
     #[test]
@@ -3077,11 +3127,69 @@ mod tests {
         let height = 12;
         let most = height - PINNED_ROWS - 1;
         assert_eq!(box_rows(100, height), most);
-        assert_eq!(transcript_rows(height, box_rows(100, height), 0), 1);
-        // And a terminal too short for even that still gets its one transcript
-        // row, because the alternative is an empty screen.
-        assert_eq!(box_rows(100, 2), BOX_ROWS);
-        assert_eq!(transcript_rows(2, box_rows(100, 2), 0), 1);
+        assert_eq!(
+            screen_rows(Rect::new(0, 0, 80, height), box_rows(100, height), 0)[0].height,
+            1
+        );
+        // And a terminal too short for the box, the status line and a transcript
+        // row all at once takes it out of the box. Asking for the three rows the
+        // box wants on a two-row terminal is asking the layout for rows it does
+        // not have: it answers with a one-row box, and the transcript's own answer
+        // is nothing -- which is how the transcript ends up windowed against a row
+        // nobody drew.
+        assert_eq!(
+            screen_rows(Rect::new(0, 0, 80, 2), BOX_ROWS, 0)
+                .iter()
+                .map(|r| r.height)
+                .collect::<Vec<_>>(),
+            vec![0, 0, 1, 1],
+            "what the layout does with a request it cannot grant"
+        );
+        assert_eq!(box_rows(100, 2), 0, "so the box asks for nothing instead");
+        assert_eq!(
+            screen_rows(Rect::new(0, 0, 80, 2), box_rows(100, 2), 0)[0].height,
+            1,
+            "and the transcript gets the row the box no longer holds"
+        );
+        assert_eq!(box_rows(100, 3), 1, "a box with one row is the next line");
+        assert_eq!(
+            screen_rows(Rect::new(0, 0, 80, 3), box_rows(100, 3), 0)[0].height,
+            1,
+            "and the transcript keeps its row"
+        );
+    }
+
+    #[test]
+    fn a_cramped_screen_windows_the_rows_the_layout_gave_it() {
+        // Every height, however short: what the window is measured against has to
+        // be the rows the transcript was actually drawn into. The two were worked
+        // out separately, and below the height the pinned region needs they
+        // disagreed -- so the window scrolled against a row that was never drawn,
+        // and `drawn_rows` is what paging and staying put both read.
+        for height in 1..8u16 {
+            let mut screen = screen_for_test(40, height);
+            screen.state.transcript.push(Cell::Content("one".into()));
+            screen.state.transcript.push(Cell::Content("two".into()));
+            screen.draw().unwrap();
+            let area = origin(&mut screen);
+            let input = screen.state.input_rows(height);
+            let queued = screen.state.queue_lines(40).len() as u16;
+            assert_eq!(
+                screen.state.drawn_rows,
+                screen_rows(area, input, queued)[0].height as usize,
+                "a {height}-row terminal"
+            );
+        }
+        // And the row it drew is the one the window asked for: the room the
+        // layout gave it, taken from the end of the transcript. Five rows is the
+        // shortest terminal with room for the box as well as a transcript row.
+        let mut screen = screen_for_test(40, 5);
+        screen.state.transcript.push(Cell::Content("one".into()));
+        screen.state.transcript.push(Cell::Content("two".into()));
+        screen.draw().unwrap();
+        assert_eq!(row(&screen, 0), "two", "the last line of the transcript");
+        assert!(row(&screen, 1).starts_with('─'), "then the box");
+        assert!(row(&screen, 4).contains("cache"), "and the status line");
     }
 
     #[test]
