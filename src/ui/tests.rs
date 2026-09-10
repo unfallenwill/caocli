@@ -1,5 +1,15 @@
 //! The tests for the plain front end.
 
+use std::io::Write;
+use std::time::Duration;
+
+use super::cell::Style;
+use super::status_bar::StatusBar;
+use super::terminal::{Echo, Terminal};
+use super::*;
+use crate::types::{Message, Role, Usage};
+use status::CacheStats;
+
 pub(super) struct SharedBuf(pub(super) std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
 impl Write for SharedBuf {
@@ -11,9 +21,6 @@ impl Write for SharedBuf {
         Ok(())
     }
 }
-
-use super::terminal::{Echo, Terminal};
-use super::*;
 
 /// A terminal that answers what a test tells it to rather than what the
 /// process's own does.
@@ -84,9 +91,6 @@ impl Terminal for StandIn {
         Box::pin(async { None })
     }
 }
-use crate::types::Role;
-use status::CacheStats;
-
 /// The whole line, as an 80-column terminal would show it: the terminal it is
 /// most likely to be read on is the one the old line broke in half.
 #[test]
