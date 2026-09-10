@@ -362,11 +362,14 @@ impl State {
         Line::from(self.status.line(width.saturating_sub(1)))
     }
 
-    /// A turn is starting.
-    pub(super) fn begin_turn(&mut self) {
+    /// A turn is starting at `started`.
+    ///
+    /// The clock is handed in rather than read here, so what a turn's timer
+    /// shows can be exercised without waiting for one.
+    pub(super) fn begin_turn(&mut self, started: Instant) {
         self.revision += 1;
         self.turn_running = true;
-        self.turn_started = Some(Instant::now());
+        self.turn_started = Some(started);
         self.streamed_chars = 0;
         self.chars_since_usage = 0;
         self.refresh_placeholder();
@@ -390,10 +393,16 @@ impl State {
     /// drops the estimate whole first and hides the indicator entirely second —
     /// never a clipped number, the same rule the status line keeps to.
     pub(super) fn activity_title(&self, width: usize) -> Option<String> {
+        self.activity_title_at(Instant::now(), width)
+    }
+
+    /// The indicator's words at `now`, without reading the clock.
+    fn activity_title_at(&self, now: Instant, width: usize) -> Option<String> {
         if self.reply.is_some() {
             return None;
         }
-        let elapsed = self.turn_started?.elapsed();
+        let started = self.turn_started?;
+        let elapsed = now - started;
         let frame = SPINNER[(elapsed.as_millis() / SPINNER_MS) as usize % SPINNER.len()];
         let count = format!("{frame} {}s", elapsed.as_secs());
         let mut title = count.clone();
@@ -447,8 +456,8 @@ impl State {
     /// shows or the second the clock reads has changed, so the border keeps
     /// moving while nothing else arrives and no redraw is spent when it has
     /// nothing new to show.
-    pub(super) fn tick_activity(&mut self) {
-        let Some(title) = self.activity_title(usize::MAX) else {
+    pub(super) fn tick_activity(&mut self, now: Instant) {
+        let Some(title) = self.activity_title_at(now, usize::MAX) else {
             return;
         };
         if Some(&title) != self.ticked_activity.as_ref() {

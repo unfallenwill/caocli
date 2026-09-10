@@ -20,7 +20,7 @@ use std::future::Future;
 use std::io::{self, Stdout};
 use std::path::Path;
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::Event;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -323,7 +323,7 @@ async fn run_turn(
     };
     let turn = repl::handle(agent, handle, sdir, line, &mut interrupt, &mut approve);
     tokio::pin!(turn);
-    screen.state.begin_turn();
+    screen.state.begin_turn(Instant::now());
     let outcome = loop {
         // Keys are read here, never on another thread: see `poll_key`.
         if let Some(event) = poll_key(TICK)? {
@@ -335,7 +335,7 @@ async fn run_turn(
         for reply in drain(&mut channels.asked) {
             screen.state.open_question(reply);
         }
-        screen.state.tick_activity();
+        screen.state.tick_activity(Instant::now());
         screen.draw_if_changed()?;
         tokio::select! {
             outcome = &mut turn => break outcome,

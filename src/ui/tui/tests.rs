@@ -611,7 +611,7 @@ fn the_status_line_is_the_summary_whether_or_not_a_turn_runs() {
     screen.draw().unwrap();
     let last = screen.terminal.backend().buffer().area.height - 1;
     assert_eq!(row(&screen, last), "m-1 · cache 60.0% · hit 6 · miss 4");
-    screen.state.begin_turn();
+    screen.state.begin_turn(Instant::now());
     screen.state.apply(Notice::ToolStart {
         name: "read_file".into(),
         args: "{}".into(),
@@ -1164,7 +1164,7 @@ fn a_question_takes_the_border_title_back() {
 #[test]
 fn the_border_shows_the_working_turn_and_then_does_not() {
     let mut screen = screen_for_test(60, 20);
-    screen.state.begin_turn();
+    screen.state.begin_turn(Instant::now());
     screen.state.turn_started = Some(Instant::now() - Duration::from_secs(12));
     screen.state.streamed_chars = 4000;
     screen.state.chars_per_token = 4.0;
@@ -1277,7 +1277,7 @@ fn escape_dismisses_the_command_picker_and_the_line_it_was_filtering() {
 #[test]
 fn escape_while_a_turn_runs_gives_the_queue_line_back() {
     let mut screen = State::default();
-    screen.begin_turn();
+    screen.begin_turn(Instant::now());
     type_in(&mut screen, "/s");
     press(&mut screen, KeyCode::Esc);
     assert!(screen.picker.is_none());
@@ -2052,7 +2052,7 @@ fn an_unchanged_screen_is_not_drawn_again() {
     assert_eq!(frames.get(), 2);
     // So does a turn starting: the box's placeholder says so, which is a
     // change the revision has to carry.
-    screen.state.begin_turn();
+    screen.state.begin_turn(Instant::now());
     screen.draw_if_changed().unwrap();
     assert_eq!(frames.get(), 3);
 }
@@ -2229,7 +2229,7 @@ fn the_box_says_what_enter_will_do() {
     let mut state = State::default();
     assert_eq!(state.textarea.placeholder_text(), IDLE_PLACEHOLDER);
 
-    state.begin_turn();
+    state.begin_turn(Instant::now());
     assert_eq!(state.textarea.placeholder_text(), QUEUE_PLACEHOLDER);
 
     let (reply, _answer) = oneshot::channel();
@@ -2253,7 +2253,7 @@ fn a_line_being_typed_is_held_aside_while_the_gate_is_open() {
     // box is not one. The gate takes the box for its answer and gives it back.
     let mut state = State::default();
     let (cancel, _cancelled) = watch::channel(false);
-    state.begin_turn();
+    state.begin_turn(Instant::now());
     type_while_working(&mut state, "and then refactor", &cancel);
     let (reply, answer) = oneshot::channel();
     state.open_question(reply);
@@ -2335,7 +2335,7 @@ fn the_answer_to_a_secret_never_reaches_the_transcript_or_the_queue() {
     let mut screen = screen_for_test(60, 20);
     let (cancel, _cancelled) = watch::channel(false);
     let (reply, answer) = oneshot::channel();
-    screen.state.begin_turn();
+    screen.state.begin_turn(Instant::now());
     screen.state.apply(Notice::Secret {
         prompt: "glm API key".into(),
         reply,
@@ -2384,7 +2384,7 @@ fn what_is_drawn_while_a_secret_is_asked_for_says_what_the_box_wants() {
 fn a_line_being_typed_is_held_aside_while_a_secret_is_open() {
     let mut state = State::default();
     let (cancel, _cancelled) = watch::channel(false);
-    state.begin_turn();
+    state.begin_turn(Instant::now());
     type_while_working(&mut state, "and then refactor", &cancel);
     let (reply, _answer) = oneshot::channel();
     state.apply(Notice::Secret {
