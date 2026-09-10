@@ -16,6 +16,7 @@
 //! applies them and redraws, and both channels above are answered from the same
 //! loop. Nothing on the machine's side ever touches the terminal.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io::{self, Stdout};
 use std::path::Path;
@@ -68,12 +69,12 @@ fn box_rows(lines: usize, height: u16) -> u16 {
 }
 
 /// How many rows of the transcript a terminal `height` rows tall shows, with an
-/// input box `input` rows tall.
+/// input box `input` rows tall and `queued` rows given to the queue.
 ///
 /// Never zero, even on a terminal too short for the pinned region: the box is
 /// worth a cramped transcript, where an empty screen is worth nothing.
-fn transcript_rows(height: u16, input: u16) -> u16 {
-    height.saturating_sub(PINNED_ROWS + input).max(1)
+fn transcript_rows(height: u16, input: u16, queued: u16) -> u16 {
+    height.saturating_sub(PINNED_ROWS + input + queued).max(1)
 }
 
 /// The lines one wheel notch moves the window over the transcript: the step a
@@ -178,16 +179,33 @@ const TIP_PERIOD: Duration = Duration::from_secs(20);
 /// The tips, in the order they come round. One line each, short enough to read at
 /// a glance, and every one of them true: a tip about a key that does nothing is
 /// worse than no tip at all.
-const TIPS: [&str; 8] = [
+const TIPS: [&str; 9] = [
     "Tab completes · Up and Down browse what you typed",
     "Ctrl-J adds a line · Enter sends it",
     "PageUp and PageDown read back through the session",
     "Ctrl-C stops a turn, and the model is told",
+    "Type while it works · Enter queues the line for afterwards",
     "/resume switches session · /new starts one",
     "Start with --ask to approve a tool before it runs",
     "/help lists every command",
     "The wheel reads back too · Shift-drag selects text",
 ];
+
+/// How many rows of the queue are drawn above the status line. The queue is what
+/// was asked for while a turn ran, and a long one costs the transcript rows it is
+/// capped at: what is worth seeing is that the line arrived.
+const QUEUE_ROWS: usize = 3;
+
+/// What the box says while a turn runs: the line being typed is not this turn's
+/// message, it is the one to run when this turn ends.
+const QUEUE_PLACEHOLDER: &str = "›  the turn is running · Enter queues this line";
+
+/// What the box says while nothing runs.
+const IDLE_PLACEHOLDER: &str = "›  type a message · /help for commands";
+
+/// What the box says while the approval gate is open. The box is where the answer
+/// goes, so it says so rather than inviting the next message.
+const ANSWER_PLACEHOLDER: &str = "y to allow · anything else denies";
 
 /// How many command rows the picker shows at once. It draws over the bottom of the
 /// transcript, so it has to leave the transcript somewhere to live.
@@ -399,6 +417,14 @@ struct State {
     reply: Option<oneshot::Sender<bool>>,
     /// The answer being typed.
     textarea: TextArea<'static>,
+    /// Lines submitted while a turn was running, oldest first. They are not part
+    /// of the session until they run, so they are held here rather than in the
+    /// transcript: the head runs as soon as the turn in flight ends, interrupted
+    /// or not.
+    queued: VecDeque<String>,
+    /// What was in the box when the approval gate opened. The answer is typed
+    /// there, and a line being composed is not an answer.
+    held_draft: Option<String>,
     /// The command picker, while what is in the box is a command still being
     /// named.
     picker: Option<Picker>,
@@ -479,6 +505,8 @@ impl Default for State {
             question: None,
             reply: None,
             textarea: input_box(),
+            queued: VecDeque::new(),
+            held_draft: None,
             picker: None,
             history: Vec::new(),
             browsing: None,
@@ -675,6 +703,7 @@ impl State {
         self.turn_started = Some(now);
         self.verb = verb_for(seed());
         self.turn_tokens = None;
+        self.refresh_placeholder();
     }
 
     /// The turn is over: stop the clock, and forget what it was doing, which a turn
@@ -683,6 +712,7 @@ impl State {
         self.revision += 1;
         self.turn_started = None;
         self.phase = Phase::default();
+        self.refresh_placeholder();
     }
 
     /// Fold one notice into the state.
@@ -954,6 +984,10 @@ impl State {
             box_.insert_str(text);
         }
         self.textarea = box_;
+        // A box built from scratch carries the idle invitation, and the box this
+        // replaces may have been saying something else: what it says is the
+        // state's, not the constructor's.
+        self.refresh_placeholder();
     }
 
     /// Recompute what the picker offers for what is in the box, keeping the
@@ -1164,9 +1198,13 @@ impl State {
 
     /// Handle a key while a turn is running.
     ///
-    /// Two things take typing here: the cancel key, always, and the answer to an
-    /// approval question, while the gate is waiting for one. Everything else is
-    /// dropped, because a turn is not the place to start composing the next line.
+    /// Three things take typing here: the cancel key, always; the answer to an
+    /// approval question, while the gate is waiting for one; and otherwise the
+    /// next line, which Enter puts in the queue rather than running now. A turn is
+    /// not the place to *start* anything -- the one in flight is what the user is
+    /// watching -- but it is exactly the place to say what should follow it, which
+    /// is what the queue is for: it runs from its head when the turn ends, whether
+    /// it ended by finishing or by being interrupted.
     fn key_while_working(&mut self, event: Event, cancel: &watch::Sender<bool>) {
         // A resize arrives here too, and it changes the layout, so anything
         // arriving at all is reason enough to redraw -- and a draw that was not
@@ -1188,13 +1226,21 @@ impl State {
             let _ = cancel.send(true);
             return;
         }
-        // Everything below concerns the gate, and there is no gate open for the
-        // rest of a turn.
+        // No gate is open, so the box is free for the next line. Enter queues it,
+        // which is the whole point of typing here. One key is still dropped --
+        // Ctrl-D, which leaves the session -- because a turn in flight is not the
+        // place to leave from either.
         if self.reply.is_none() {
+            if let Submitted::Line = self.key(event) {
+                let line = self.take_line();
+                self.enqueue(line);
+            }
             return;
         }
-        // Enter submits the answer whether or not anything was typed: a blank
-        // line denies, which is the rule the plain front end reads from stdin.
+        // The gate is open: the box is where the answer goes and nowhere else, so
+        // what is typed is the answer and Enter gives it.
+        // Enter submits it whether or not anything was typed: a blank line denies,
+        // which is the rule the plain front end reads from stdin.
         let answering = matches!(
             &event,
             Event::Key(key)
@@ -1210,10 +1256,62 @@ impl State {
         }
     }
 
+    /// Put a line after the running turn. It is the whole of what Enter does
+    /// during a turn: a session written as if this turn had ended would record two
+    /// answers at once.
+    fn enqueue(&mut self, line: String) {
+        self.revision += 1;
+        self.queued.push_back(line);
+    }
+
+    /// Take the head of the queue: the line to run next, if there is one.
+    fn dequeue(&mut self) -> Option<String> {
+        let next = self.queued.pop_front();
+        if next.is_some() {
+            self.revision += 1;
+        }
+        next
+    }
+
+    /// The queue as it is drawn: one dim line per queued line, the end of it last,
+    /// like the transcript's own window. Capped at [`QUEUE_ROWS`] rows, so that a
+    /// queue longer than that -- more lines, or longer ones -- costs the transcript
+    /// those rows and no more. What the end of the window keeps is the newest line,
+    /// which is the one just typed and the one being waited for.
+    fn queue_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        for line in &self.queued {
+            lines.extend(wrapped_lines(
+                &[Span::new(Style::Dim, format!("› {line}"))],
+                width,
+            ));
+        }
+        lines.split_off(lines.len().saturating_sub(QUEUE_ROWS))
+    }
+
+    /// The placeholder for what the box is for right now: the answer while the
+    /// gate is open, the queue while a turn runs, the next message otherwise.
+    fn placeholder(&self) -> &'static str {
+        if self.reply.is_some() {
+            ANSWER_PLACEHOLDER
+        } else if self.turn_started.is_some() {
+            QUEUE_PLACEHOLDER
+        } else {
+            IDLE_PLACEHOLDER
+        }
+    }
+
+    /// Put that placeholder on the box, which is a thing of the box's own rather
+    /// than of the screen's.
+    fn refresh_placeholder(&mut self) {
+        self.textarea.set_placeholder_text(self.placeholder());
+    }
+
     /// Take the submitted line out of the box, leaving it empty for the next one.
     fn take_line(&mut self) -> String {
         let line = self.text();
         self.textarea = input_box();
+        self.refresh_placeholder();
         self.picker = None;
         self.browsing = None;
         self.draft.clear();
@@ -1224,10 +1322,12 @@ impl State {
     fn open_question(&mut self, reply: oneshot::Sender<bool>) {
         self.revision += 1;
         self.reply = Some(reply);
-        // The box is where the answer goes, so it says so rather than inviting
-        // the next message: nothing else can be typed while a turn runs.
-        self.textarea
-            .set_placeholder_text("y to allow · anything else denies");
+        // A line being composed when the question arrives is held aside: the
+        // answer to "run it?" is a `y`, and a sentence that happened to be in the
+        // box is not one. It comes back when the gate closes.
+        self.held_draft = Some(self.text());
+        self.textarea = input_box();
+        self.refresh_placeholder();
     }
 
     /// Answer the open question from what the user submitted, if anything. A line
@@ -1238,9 +1338,11 @@ impl State {
         if let Some(reply) = self.reply.take() {
             let answer = self.textarea.lines().join("\n").trim().to_lowercase();
             let _ = reply.send(answer.starts_with('y'));
-            self.textarea = input_box();
+            let held = self.held_draft.take().unwrap_or_default();
+            self.set_text(&held);
         }
         self.question = None;
+        self.refresh_placeholder();
     }
 }
 
@@ -1458,9 +1560,15 @@ impl<B: Backend> Screen<B> {
         let size = self.terminal.size()?;
         let width = size.width as usize;
         let input = self.state.input_rows(size.height);
+        // What is waiting to run, drawn between the transcript and the status
+        // line: the session, then what comes next, then how the turn is doing and
+        // what Enter does with what is being typed. Asked for before the layout,
+        // because how many rows it takes is what the transcript gives up.
+        let queue = Text::from(self.state.queue_lines(width));
+        let queued = queue.height() as u16;
         self.state.reset_box_scroll(input);
         let lines = self.state.lines(width);
-        let rows = transcript_rows(size.height, input);
+        let rows = transcript_rows(size.height, input, queued);
         // The window over the transcript: its end unless the reader scrolled back.
         // The picker belongs to the line being typed, so it takes the box's end of
         // the transcript with it.
@@ -1480,6 +1588,7 @@ impl<B: Backend> Screen<B> {
         self.terminal.draw(|frame| {
             let rows = Layout::vertical([
                 Constraint::Min(0),
+                Constraint::Length(queued),
                 Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Length(input),
@@ -1499,10 +1608,11 @@ impl<B: Backend> Screen<B> {
                 frame.render_widget(Clear, area);
                 frame.render_widget(Paragraph::new(Text::from(picker)), area);
             }
-            frame.render_widget(Paragraph::new(status), rows[1]);
-            frame.render_widget(Paragraph::new(tip), rows[2]);
-            frame.render_widget(&self.state.textarea, rows[3]);
-            place_cursor(frame, rows[3], cursor);
+            frame.render_widget(Paragraph::new(queue), rows[1]);
+            frame.render_widget(Paragraph::new(status), rows[2]);
+            frame.render_widget(Paragraph::new(tip), rows[3]);
+            frame.render_widget(&self.state.textarea, rows[4]);
+            place_cursor(frame, rows[4], cursor);
         })?;
         Ok(())
     }
@@ -1526,7 +1636,7 @@ fn input_box() -> TextArea<'static> {
             .borders(Borders::ALL)
             .border_style(RStyle::new().add_modifier(Modifier::DIM)),
     );
-    textarea.set_placeholder_text("›  type a message · /help for commands");
+    textarea.set_placeholder_text(IDLE_PLACEHOLDER);
     textarea.set_cursor_line_style(RStyle::new());
     textarea
 }
@@ -1727,12 +1837,12 @@ pub async fn run(
     let (ask_tx, mut asked) = mpsc::unbounded_channel();
     let mut handle = Notifier { tx };
 
-    let result: anyhow::Result<()> = loop {
+    let result: anyhow::Result<()> = 'session: loop {
         // Idle: draw, then wait for something to submit.
         if let Err(e) = screen.draw_if_changed() {
-            break Err(e.into());
+            break 'session Err(e.into());
         }
-        let line = loop {
+        let mut line = loop {
             for notice in drain(&mut notices) {
                 screen.state.apply(notice);
             }
@@ -1746,75 +1856,96 @@ pub async fn run(
                 None => continue,
             }
         };
-        if line.is_empty() {
-            break Ok(());
-        }
-        screen.state.submit(&line);
-        // `/resume` with nothing to resume is a request for the list rather than a
-        // command to run: the plain front end can only say so, and this one can
-        // offer it. The chosen row is submitted as `/resume <id>`, which is the
-        // line the plain prompt would have been given, so the switching itself is
-        // unchanged. An empty directory falls through to that same reply.
-        if line.trim() == "/resume" && screen.state.open_sessions(&session::list(sdir)?) {
-            continue;
-        }
+        // Everything from here runs without returning to the keyboard in between,
+        // and the next line is the head of the queue: what was asked for while the
+        // last one ran is what comes after it. That is the whole point of the
+        // queue -- an interruption ends the turn, not the sequence.
+        loop {
+            if line.is_empty() {
+                break 'session Ok(());
+            }
+            screen.state.submit(&line);
+            // `/resume` with nothing to resume is a request for the list rather
+            // than a command to run: the plain front end can only say so, and this
+            // one can offer it. The chosen row is submitted as `/resume <id>`,
+            // which is the line the plain prompt would have been given, so the
+            // switching itself is unchanged. An empty directory falls through to
+            // that same reply.
+            // The choice is typed, so the queue waits behind it: a picker answered
+            // by a line that is still in the queue would answer itself.
+            if line.trim() == "/resume" && screen.state.open_sessions(&session::list(sdir)?) {
+                break;
+            }
 
-        // A turn: it races against the keyboard, so Ctrl-C can reach it.
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let mut interrupt = CtrlC(cancel_rx);
-        let mut approve = Ask { tx: ask_tx.clone() };
-        let turn = repl::handle(
-            agent,
-            &mut handle,
-            sdir,
-            &line,
-            &mut interrupt,
-            &mut approve,
-        );
-        tokio::pin!(turn);
-        // The clock starts here rather than when the line was submitted: what the
-        // status line reports is the turn, and a turn is what is being waited for.
-        screen.state.begin_turn(Instant::now());
-        let outcome = loop {
-            // Keys are read here, never on another thread: see `poll_key`.
-            if let Some(event) = poll_key(TICK)? {
-                screen.state.key_while_working(event, &cancel_tx);
+            // A turn: it races against the keyboard, so Ctrl-C can reach it.
+            // The block is what bounds the borrow of `line`: it ends with the
+            // turn, and the queue then hands the same variable the next line.
+            let outcome = {
+                let (cancel_tx, cancel_rx) = watch::channel(false);
+                let mut interrupt = CtrlC(cancel_rx);
+                let mut approve = Ask { tx: ask_tx.clone() };
+                let turn = repl::handle(
+                    agent,
+                    &mut handle,
+                    sdir,
+                    &line,
+                    &mut interrupt,
+                    &mut approve,
+                );
+                tokio::pin!(turn);
+                // The clock starts here rather than when the line was submitted:
+                // what the status line reports is the turn, and a turn is what is
+                // being waited for.
+                screen.state.begin_turn(Instant::now());
+                let outcome = loop {
+                    // Keys are read here, never on another thread: see `poll_key`.
+                    if let Some(event) = poll_key(TICK)? {
+                        screen.state.key_while_working(event, &cancel_tx);
+                    }
+                    for notice in drain(&mut notices) {
+                        screen.state.apply(notice);
+                    }
+                    for reply in drain(&mut asked) {
+                        screen.state.open_question(reply);
+                    }
+                    screen.draw_if_changed()?;
+                    tokio::select! {
+                        outcome = &mut turn => break outcome,
+                        // Nothing else to wait on: the tick above paces the loop,
+                        // and this branch only gives the turn a real waker so that
+                        // it is driven by readiness rather than by the tick.
+                        _ = tokio::time::sleep(TICK) => {}
+                    }
+                };
+                // Drain once more before closing the turn. The turn is polled
+                // *inside* the select above, so its last notifications are sent
+                // after the loop's last drain and are still queued when it
+                // resolves; closing the block without them would leave the tail of
+                // the turn to open one of its own.
+                for notice in drain(&mut notices) {
+                    screen.state.apply(notice);
+                }
+                for reply in drain(&mut asked) {
+                    screen.state.open_question(reply);
+                }
+                outcome
+            };
+            screen.state.end_turn();
+            screen.state.close_question();
+            screen.commit();
+            match outcome {
+                Ok(repl::Outcome::Exit) => break 'session Ok(()),
+                Ok(repl::Outcome::Continue) => {}
+                Err(e) => {
+                    // `repl::handle` reports turn failures itself; anything
+                    // escaping it is a session-level problem worth showing.
+                    screen.state.show(Cell::Failure(format!("{e:#}")));
+                }
             }
-            for notice in drain(&mut notices) {
-                screen.state.apply(notice);
-            }
-            for reply in drain(&mut asked) {
-                screen.state.open_question(reply);
-            }
-            screen.draw_if_changed()?;
-            tokio::select! {
-                outcome = &mut turn => break outcome,
-                // Nothing else to wait on: the tick above paces the loop, and
-                // this branch only gives the turn a real waker so that it is
-                // driven by readiness rather than by the tick.
-                _ = tokio::time::sleep(TICK) => {}
-            }
-        };
-        // Drain once more before closing the turn. The turn is polled *inside*
-        // the select above, so its last notifications are sent after the loop's
-        // last drain and are still queued when it resolves; closing the block
-        // without them would leave the tail of the turn to open one of its own.
-        for notice in drain(&mut notices) {
-            screen.state.apply(notice);
-        }
-        for reply in drain(&mut asked) {
-            screen.state.open_question(reply);
-        }
-        screen.state.end_turn();
-        screen.state.close_question();
-        screen.commit();
-        match outcome {
-            Ok(repl::Outcome::Exit) => break Ok(()),
-            Ok(repl::Outcome::Continue) => {}
-            Err(e) => {
-                // `repl::handle` reports turn failures itself; anything escaping
-                // it is a session-level problem worth showing.
-                screen.state.show(Cell::Failure(format!("{e:#}")));
+            // Next: the head of the queue, or back to the keyboard.
+            match screen.state.dequeue() {
+                Some(next) => line = next,
+                None => break,
             }
         }
     };
@@ -2109,6 +2240,99 @@ mod tests {
     }
 
     #[test]
+    fn the_queue_is_drawn_above_the_status_line_until_it_is_run() {
+        // What was typed during a turn has to be visible somewhere, or the only
+        // proof it arrived is that something happens later. It is drawn as the
+        // user line it is about to become, dimmed to say it has not run, between
+        // the transcript and the status line -- and it takes rows from the
+        // transcript rather than covering it.
+        let mut screen = screen_for_test(40, 20);
+        screen.state.status.set_model("m-1");
+        let last = screen.terminal.backend().buffer().area.height - 1;
+        screen.state.enqueue("first".into());
+        screen.state.enqueue("second".into());
+        screen.draw().unwrap();
+        assert_eq!(row(&screen, last - 6), "› first");
+        assert_eq!(row(&screen, last - 5), "› second");
+        assert!(
+            screen.terminal.backend().buffer()[(0, last - 6)]
+                .style()
+                .add_modifier
+                .contains(Modifier::DIM),
+            "dimmed: it is waiting, not part of the session"
+        );
+        // ... and the status line, the tip and the box are where they always are:
+        // the queue is inserted, not drawn over anything.
+        assert_eq!(row(&screen, last - 4), "m-1 · cache —");
+        assert!(row(&screen, last - 2).starts_with('┌'));
+
+        // Run one: the queue gives a row back, and what ran is drawn as the
+        // transcript's own line -- the same line the queue was showing, in the
+        // place the session keeps it, and no longer dimmed.
+        screen.state.submit("first");
+        assert_eq!(screen.state.dequeue().as_deref(), Some("first"));
+        screen.draw().unwrap();
+        assert_eq!(row(&screen, 0), "› first", "the transcript has it now");
+        assert_eq!(row(&screen, last - 6), "", "the row it gave back");
+        assert_eq!(
+            row(&screen, last - 5),
+            "› second",
+            "only what is still waiting is in the queue"
+        );
+        assert_eq!(row(&screen, last - 4), "m-1 · cache —");
+        let buf = screen.terminal.backend().buffer();
+        assert!(
+            !buf[(2, 0)].style().add_modifier.contains(Modifier::DIM),
+            "the line that ran reads as the session's, not as something waiting"
+        );
+        assert!(
+            buf[(2, last - 5)]
+                .style()
+                .add_modifier
+                .contains(Modifier::DIM),
+            "and the one behind it still waits"
+        );
+    }
+
+    #[test]
+    fn the_queue_is_capped_and_keeps_its_end() {
+        // A queue longer than its rows is drawn from its end, like the transcript:
+        // the line that was just typed is the one being looked for, and the rest
+        // are waiting behind it either way.
+        let mut state = State::default();
+        for i in 0..(QUEUE_ROWS + 2) {
+            state.enqueue(format!("line {i}"));
+        }
+        assert_eq!(state.queue_lines(40).len(), QUEUE_ROWS, "capped, in rows");
+        assert_eq!(
+            state
+                .queue_lines(40)
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>(),
+            vec!["› line 2", "› line 3", "› line 4"]
+        );
+    }
+
+    #[test]
+    fn a_queued_line_wider_than_the_screen_is_wrapped_not_clipped() {
+        // Queued lines are wrapped like everything else that is committed to the
+        // screen: a fixed-width path would cut the end off the command that is
+        // about to be run.
+        let mut state = State::default();
+        let typed = "x".repeat(50);
+        state.enqueue(typed.clone());
+        let lines: Vec<String> = state
+            .queue_lines(20)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(lines.len(), 3, "52 columns at 20 columns a row");
+        assert!(lines.iter().all(|l| super::super::text::width(l) <= 20));
+        assert_eq!(lines.concat(), format!("› {typed}"));
+    }
+
+    #[test]
     fn ctrl_j_makes_the_box_a_line_taller() {
         // The box is the draft's shape: the line Ctrl-J adds has a row to be typed
         // on, and the transcript gives one up for it.
@@ -2310,7 +2534,7 @@ mod tests {
         // The whole screen is the transcript, less the pinned rows -- and what
         // does not fit is off the top, because the end is what was just written.
         let mut screen = screen_for_test(40, 20);
-        let rows = transcript_rows(20, BOX_ROWS) as usize;
+        let rows = transcript_rows(20, BOX_ROWS, 0) as usize;
         for i in 0..(rows + 5) {
             screen
                 .state
@@ -2325,7 +2549,7 @@ mod tests {
     #[test]
     fn paging_back_moves_the_window_and_paging_forward_returns_it() {
         let mut screen = screen_for_test(40, 20);
-        let rows = transcript_rows(20, BOX_ROWS) as usize;
+        let rows = transcript_rows(20, BOX_ROWS, 0) as usize;
         for i in 0..(rows * 3) {
             screen
                 .state
@@ -2355,7 +2579,7 @@ mod tests {
     #[test]
     fn a_wheel_notch_moves_the_window_three_lines() {
         let mut screen = screen_for_test(40, 20);
-        let rows = transcript_rows(20, BOX_ROWS) as usize;
+        let rows = transcript_rows(20, BOX_ROWS, 0) as usize;
         for i in 0..(rows * 3) {
             screen
                 .state
@@ -2391,7 +2615,7 @@ mod tests {
         // -- which is a wheel that reads back through what was typed instead of
         // through what was said.
         let mut screen = screen_for_test(40, 20);
-        let rows = transcript_rows(20, BOX_ROWS) as usize;
+        let rows = transcript_rows(20, BOX_ROWS, 0) as usize;
         for i in 0..(rows * 3) {
             screen
                 .state
@@ -2411,7 +2635,7 @@ mod tests {
     #[test]
     fn a_click_is_not_a_notch_and_moves_nothing() {
         let mut screen = screen_for_test(40, 20);
-        let rows = transcript_rows(20, BOX_ROWS) as usize;
+        let rows = transcript_rows(20, BOX_ROWS, 0) as usize;
         for i in 0..(rows * 3) {
             screen
                 .state
@@ -2438,7 +2662,7 @@ mod tests {
         // A turn is when there is most to read: the window is the one thing a key
         // pressed during one is allowed to move.
         let mut screen = screen_for_test(40, 20);
-        let rows = transcript_rows(20, BOX_ROWS) as usize;
+        let rows = transcript_rows(20, BOX_ROWS, 0) as usize;
         for i in 0..(rows * 3) {
             screen
                 .state
@@ -2463,7 +2687,7 @@ mod tests {
         // has to stay on the line they were on instead of sliding to the end
         // under them.
         let mut screen = screen_for_test(40, 20);
-        let rows = transcript_rows(20, BOX_ROWS) as usize;
+        let rows = transcript_rows(20, BOX_ROWS, 0) as usize;
         for i in 0..(rows * 3) {
             screen
                 .state
@@ -2487,7 +2711,7 @@ mod tests {
     #[test]
     fn submitting_a_line_returns_to_the_end_of_the_transcript() {
         let mut screen = screen_for_test(40, 20);
-        for i in 0..(transcript_rows(20, BOX_ROWS) as usize * 2) {
+        for i in 0..(transcript_rows(20, BOX_ROWS, 0) as usize * 2) {
             screen
                 .state
                 .transcript
@@ -2509,7 +2733,7 @@ mod tests {
         screen.state.transcript.push(Cell::Notice(long.into()));
         screen.draw().unwrap();
         let rows = all_rows(&screen);
-        let joined: String = rows[..transcript_rows(30, BOX_ROWS) as usize].concat();
+        let joined: String = rows[..transcript_rows(30, BOX_ROWS, 0) as usize].concat();
         assert_eq!(joined, long, "every column survived, in order");
     }
 
@@ -2854,13 +3078,16 @@ mod tests {
 
     #[test]
     fn the_transcript_gets_the_rows_the_pinned_region_leaves() {
-        assert_eq!(transcript_rows(24, BOX_ROWS), 24 - PINNED_ROWS - BOX_ROWS);
         assert_eq!(
-            transcript_rows(1, BOX_ROWS),
+            transcript_rows(24, BOX_ROWS, 0),
+            24 - PINNED_ROWS - BOX_ROWS
+        );
+        assert_eq!(
+            transcript_rows(1, BOX_ROWS, 0),
             1,
             "never zero, even on a tiny terminal"
         );
-        assert_eq!(transcript_rows(0, BOX_ROWS), 1);
+        assert_eq!(transcript_rows(0, BOX_ROWS, 0), 1);
     }
 
     #[test]
@@ -2880,11 +3107,11 @@ mod tests {
         let height = 12;
         let most = height - PINNED_ROWS - 1;
         assert_eq!(box_rows(100, height), most);
-        assert_eq!(transcript_rows(height, box_rows(100, height)), 1);
+        assert_eq!(transcript_rows(height, box_rows(100, height), 0), 1);
         // And a terminal too short for even that still gets its one transcript
         // row, because the alternative is an empty screen.
         assert_eq!(box_rows(100, 2), BOX_ROWS);
-        assert_eq!(transcript_rows(2, box_rows(100, 2)), 1);
+        assert_eq!(transcript_rows(2, box_rows(100, 2), 0), 1);
     }
 
     #[test]
@@ -3270,9 +3497,10 @@ mod tests {
 
     #[test]
     fn the_gate_is_answered_by_typing_at_it_while_the_turn_runs() {
-        // The answer is typed during a turn, when every other key is dropped, so
-        // this is the one path that has to let it through: an answer that never
-        // arrives leaves the turn waiting on a question nobody can see.
+        // The answer is typed while a turn runs, where the box is otherwise the
+        // next line's: this is the one path where a keystroke is not the queue's,
+        // and it has to work -- an answer that never arrives leaves the turn
+        // waiting on a question nobody can see.
         let mut state = State::default();
         let (cancel, _cancelled) = watch::channel(false);
         let (reply, answer) = oneshot::channel();
@@ -3294,17 +3522,127 @@ mod tests {
         assert_eq!(answer.blocking_recv(), Ok(false));
     }
 
+    /// Type into the box the way the event loop delivers a key while a turn runs.
+    fn type_while_working(state: &mut State, text: &str, cancel: &watch::Sender<bool>) {
+        for c in text.chars() {
+            state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Char(c))), cancel);
+        }
+    }
+
     #[test]
-    fn keys_are_dropped_while_a_turn_runs_and_no_gate_is_open() {
+    fn a_line_typed_while_a_turn_runs_is_queued_and_not_dropped() {
+        // A turn is not the place to start anything -- but it is the place to say
+        // what should follow it, and that is what the box is for while it runs.
         let mut state = State::default();
         let (cancel, cancelled) = watch::channel(false);
-        state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Char('h'))), &cancel);
-        assert!(state.textarea.is_empty(), "not the place for the next line");
+        type_while_working(&mut state, "the next thing", &cancel);
+        assert_eq!(state.textarea.lines(), ["the next thing"]);
+        state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Enter)), &cancel);
+        assert_eq!(state.queued, ["the next thing"]);
+        assert!(
+            state.textarea.is_empty(),
+            "the box is freed for the one after"
+        );
+        assert!(
+            state.transcript.is_empty(),
+            "nothing has run, so nothing is part of the session yet"
+        );
+        assert!(!*cancelled.borrow(), "queuing is not cancelling");
+    }
+
+    #[test]
+    fn a_key_meant_for_the_prompt_is_dropped_only_where_it_would_leave() {
+        // Ctrl-D leaves the session at the prompt, and a turn in flight is not the
+        // place to leave from: it is dropped, and the turn goes on.
+        let mut state = State::default();
+        let (cancel, _cancelled) = watch::channel(false);
+        state.key_while_working(
+            Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            &cancel,
+        );
+        assert!(state.queued.is_empty(), "not queued as a line");
+        assert!(state.textarea.is_empty(), "and not typed into the box");
+    }
+
+    #[test]
+    fn the_cancel_key_is_still_the_cancel_key_while_a_line_is_being_queued() {
+        let mut state = State::default();
+        let (cancel, cancelled) = watch::channel(false);
+        type_while_working(&mut state, "half a thought", &cancel);
         state.key_while_working(
             Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             &cancel,
         );
-        assert!(*cancelled.borrow(), "the cancel key is the exception");
+        assert!(*cancelled.borrow(), "Ctrl-C cancels the turn");
+        assert!(state.queued.is_empty(), "and is not a line of its own");
+        assert_eq!(
+            state.textarea.lines(),
+            ["half a thought"],
+            "what was being typed is still there: the cancellation is the turn's, \
+             not the box's"
+        );
+    }
+
+    #[test]
+    fn the_queue_runs_from_its_head() {
+        let mut state = State::default();
+        state.enqueue("first".into());
+        state.enqueue("second".into());
+        assert_eq!(state.dequeue().as_deref(), Some("first"));
+        assert_eq!(state.dequeue().as_deref(), Some("second"));
+        assert_eq!(state.dequeue(), None, "and then the keyboard is waited on");
+    }
+
+    #[test]
+    fn the_box_says_what_enter_will_do() {
+        // Three states, three invitations: the answer to a question, the line for
+        // after the turn, and the next message. The box is where all three are
+        // typed, so it is the only place that can say which one it is.
+        let mut state = State::default();
+        assert_eq!(state.textarea.placeholder_text(), IDLE_PLACEHOLDER);
+
+        state.begin_turn(Instant::now());
+        assert_eq!(state.textarea.placeholder_text(), QUEUE_PLACEHOLDER);
+
+        let (reply, _answer) = oneshot::channel();
+        state.open_question(reply);
+        assert_eq!(state.textarea.placeholder_text(), ANSWER_PLACEHOLDER);
+
+        state.close_question();
+        assert_eq!(
+            state.textarea.placeholder_text(),
+            QUEUE_PLACEHOLDER,
+            "the turn is still running"
+        );
+
+        state.end_turn();
+        assert_eq!(state.textarea.placeholder_text(), IDLE_PLACEHOLDER);
+    }
+
+    #[test]
+    fn a_line_being_typed_is_held_aside_while_the_gate_is_open() {
+        // The answer to "run it?" is a `y`, and a sentence that was already in the
+        // box is not one. The gate takes the box for its answer and gives it back.
+        let mut state = State::default();
+        let (cancel, _cancelled) = watch::channel(false);
+        state.begin_turn(Instant::now());
+        type_while_working(&mut state, "and then refactor", &cancel);
+        let (reply, answer) = oneshot::channel();
+        state.open_question(reply);
+        assert!(
+            state.textarea.is_empty(),
+            "the answer starts from an empty box"
+        );
+
+        state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Char('y'))), &cancel);
+        state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Enter)), &cancel);
+        assert_eq!(answer.blocking_recv(), Ok(true), "the gate got its answer");
+        assert_eq!(
+            state.textarea.lines(),
+            ["and then refactor"],
+            "and the line came back"
+        );
+        assert!(state.queued.is_empty(), "it was never submitted");
     }
 
     #[test]
