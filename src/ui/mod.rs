@@ -18,6 +18,7 @@
 //! rather than under it: the two are mutually exclusive, and neither is a
 //! fallback for the other at the level of a single line of output.
 
+mod answers;
 mod banner;
 mod cell;
 mod contract;
@@ -28,8 +29,9 @@ mod terminal;
 pub(crate) mod text;
 pub mod tui;
 
+pub use answers::{Sigint, StdinApproval};
 pub(crate) use banner::banner;
-pub use contract::{Front, Ui};
+pub use contract::{Approve, Front, Interrupt, Ui};
 pub use renderer::Renderer;
 
 #[cfg(test)]

@@ -71,11 +71,12 @@ that talks to a network API and drives an interactive terminal.
 
 - **Deliberate minimalism**: one main loop. Providers are expressed as a static preset
   table — no dynamic registration, plugin systems, or other indirect layers; write it
-  directly when you can. `trait Ui` is the only exception — it is not an abstraction
-  layer but the machine's notification vocabulary. There is one implementation per
-  front end and the front ends are mutually exclusive (the plain prompt when stdout is
-  not a terminal, or `--no-tui`, or a terminal that will not take raw mode; the
-  interactive one otherwise), so the machine never chooses between them.
+  directly when you can. The traits a front end implements (`ui::contract`) are the only
+  exception — they are not an abstraction layer but the machine's own vocabulary: what it
+  notifies with, and the two questions it asks. There is one implementation per front end
+  and the front ends are mutually exclusive (the plain prompt when stdout is not a
+  terminal, or `--no-tui`, or a terminal that will not take raw mode; the interactive one
+  otherwise), so the machine never chooses between them.
 - **The machine decides, never executes**: turn flow is determined by
   `machine::next_action` (a pure fold over the persisted history); the interpreter
   executes and writes back. To add behavior to the loop, extend the vocabulary first

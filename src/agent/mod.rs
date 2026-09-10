@@ -8,8 +8,6 @@
 
 use anyhow::Result;
 
-use std::future::Future;
-use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use crate::api::Client;
@@ -17,8 +15,9 @@ use crate::machine::{self, Action};
 use crate::provider;
 use crate::session::Session;
 use crate::tools;
-use crate::types::{ChatRequest, Message, ToolCall, TurnAccumulator, Usage};
+use crate::types::{ChatRequest, Message, TurnAccumulator, Usage};
 use crate::ui::Ui;
+use crate::ui::{Approve, Interrupt};
 
 mod request;
 
@@ -40,82 +39,6 @@ pub struct Agent {
     /// Per-turn tool step cap (product-level termination guarantee).
     pub max_tool_steps: usize,
     tool_steps: usize,
-}
-
-/// Out-of-band cancellation (Ctrl-C) source: one long-lived listener is held for
-/// the whole turn and lends out a droppable wait future on demand. Waiting is
-/// cancel-safe: dropping the future does not lose the signal (the state lives in
-/// the listener), and an unconsumed signal makes the next `wait()` ready
-/// immediately.
-/// The output lifetime is bound to `&mut self` — the `Fn` family cannot express
-/// "the return value borrows the receiver".
-pub trait Interrupt {
-    fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>>;
-}
-
-/// The real SIGINT listener. It subscribes to tokio's watch at construction time
-/// (no poll needed), so a signal arriving at any moment from the start of the
-/// turn to its end cannot be lost to a "no listener" gap.
-pub struct Sigint(
-    #[cfg(unix)] tokio::signal::unix::Signal,
-    #[cfg(not(unix))] tokio::signal::windows::CtrlC,
-);
-
-impl Sigint {
-    /// Subscribe to SIGINT. The caller constructs one per turn, before the first
-    /// await point, so no signal can arrive before the subscription exists.
-    pub fn new() -> Result<Self> {
-        #[cfg(unix)]
-        let listener = Self(tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::interrupt(),
-        )?);
-        #[cfg(not(unix))]
-        let listener = Self(tokio::signal::windows::ctrl_c()?);
-        Ok(listener)
-    }
-}
-
-impl Interrupt for Sigint {
-    fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
-        Box::pin(async {
-            self.0.recv().await;
-        })
-    }
-}
-
-/// The approval gate's answer source: the Input channel that pairs with the
-/// Notice a `Ui` sends when it asks. A Notice never returns data, so the answer
-/// comes back through a channel of its own -- this is that channel.
-///
-/// Like `Interrupt` it is a trait rather than a closure so that a front end
-/// owning the terminal can take the answer from its own event loop, and so the
-/// output lifetime can be bound to `&mut self`.
-pub trait Approve {
-    fn ask(&mut self, call: &ToolCall) -> Pin<Box<dyn Future<Output = bool> + '_>>;
-}
-
-/// One line of stdin per question, denial by default: the plain front end's
-/// answer source.
-pub struct StdinApproval;
-
-impl Approve for StdinApproval {
-    fn ask(&mut self, _call: &ToolCall) -> Pin<Box<dyn Future<Output = bool> + '_>> {
-        Box::pin(async {
-            // The blocking read is wrapped in spawn_blocking: the global stdin
-            // buffer is shared across calls, so surplus type-ahead is not lost.
-            // (Cost: on cancellation a blocked thread lingers and swallows the
-            // first line typed afterwards -- a known trade-off.)
-            tokio::task::spawn_blocking(|| {
-                let mut line = String::new();
-                let read = std::io::stdin().read_line(&mut line);
-                let line = line.trim();
-                read.map(|n| n > 0).unwrap_or(false)
-                    && (line.eq_ignore_ascii_case("y") || line.starts_with('y'))
-            })
-            .await
-            .unwrap_or(false)
-        })
-    }
 }
 
 impl Agent {
@@ -402,6 +325,10 @@ mod tests {
     }
 
     use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use crate::types::ToolCall;
     // The prompt is asserted on here, but it lives with the request it belongs
     // to; the pure request tests move next to it in the same file.
     use super::request::SYSTEM_PROMPT;

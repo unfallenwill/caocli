@@ -17,12 +17,13 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers};
 
-use crate::agent::{Agent, Sigint, StdinApproval};
+use crate::agent::Agent;
 use crate::api::Client;
 use crate::cli::Cli;
 use crate::session::{Session, SessionMeta};
 use crate::ui::tui;
 use crate::ui::{Front, Renderer};
+use crate::ui::{Sigint, StdinApproval};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();

@@ -7,13 +7,14 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::agent::{Agent, Approve, Interrupt};
+use crate::agent::Agent;
 use crate::api::Client;
 use crate::config;
 use crate::provider;
 use crate::session::{self, Session};
 use crate::ui::Front;
 use crate::ui::text::{padded, width};
+use crate::ui::{Approve, Interrupt};
 
 /// What a submitted line asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

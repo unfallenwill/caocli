@@ -1,16 +1,17 @@
-//! The two channels between the machine and a front end, and nothing else.
+//! The channels between the machine and a front end, and nothing else.
 //!
-//! [`Ui`] is the vocabulary the machine notifies with; [`Front`] is what handling
-//! a submitted line asks of whichever front end is running. Keeping the two
-//! apart from any implementation is what lets a front end be written against
-//! them alone -- the plain renderer, the one that owns the screen, or a double
-//! in a test -- without depending on how any of them draws.
+//! [`Ui`] is the vocabulary the machine notifies with; [`Interrupt`] and
+//! [`Approve`] are the two it asks its questions on; [`Front`] is what handling a
+//! submitted line asks of whichever front end is running. Keeping all of them
+//! apart from any implementation is what lets a front end be written against them
+//! alone -- the plain renderer, the one that owns the screen, or a double in a
+//! test -- without depending on how any of them draws.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use crate::types::{Message, Usage};
+use crate::types::{Message, ToolCall, Usage};
 
 /// The machine → UI notification vocabulary (the Notice channel).
 /// Discipline: notifications only, never returning data back; implementations
@@ -73,4 +74,32 @@ pub trait Front: Ui {
     /// with the text hidden; the plain one writes the prompt and reads a line
     /// from its own input with the terminal's echo off.
     fn ask_secret(&mut self, prompt: &str) -> Pin<Box<dyn Future<Output = Option<String>> + '_>>;
+}
+
+// ------------------------------------------------- the machine's questions ---
+
+// The two channels the machine *asks* on, as opposed to the one it notifies on
+// (`Ui`). Both are traits rather than closures so that the answer can be taken
+// from wherever the front end already is -- an event loop, a blocking read, a
+// test -- and so the output lifetime is bound to `&mut self`: the `Fn` family
+// cannot express "the return value borrows the receiver".
+
+/// Out-of-band cancellation (Ctrl-C) source: one long-lived listener is held for
+/// the whole turn and lends out a droppable wait future on demand. Waiting is
+/// cancel-safe: dropping the future does not lose the signal (the state lives in
+/// the listener), and an unconsumed signal makes the next `wait()` ready
+/// immediately.
+pub trait Interrupt {
+    fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>>;
+}
+
+/// The approval gate's answer source: the Input channel that pairs with the
+/// Notice a `Ui` sends when it asks. A Notice never returns data, so the answer
+/// comes back through a channel of its own -- this is that channel.
+///
+/// Like `Interrupt` it is a trait rather than a closure so that a front end
+/// owning the terminal can take the answer from its own event loop, and so the
+/// output lifetime can be bound to `&mut self`.
+pub trait Approve {
+    fn ask(&mut self, call: &ToolCall) -> Pin<Box<dyn Future<Output = bool> + '_>>;
 }

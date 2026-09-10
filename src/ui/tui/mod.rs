@@ -25,12 +25,13 @@ use std::time::{Duration, Instant};
 use crossterm::event::Event;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::agent::{Agent, Approve, Interrupt};
+use crate::agent::Agent;
 use crate::config;
 use crate::history;
 use crate::repl;
 use crate::session;
 use crate::types::{Message, ToolCall};
+use crate::ui::{Approve, Interrupt};
 
 use super::cell::{self, Cell};
 
