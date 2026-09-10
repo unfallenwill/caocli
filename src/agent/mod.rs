@@ -8,18 +8,17 @@
 
 use anyhow::Result;
 
-use std::time::{Duration, Instant};
-
 use crate::api::Client;
 use crate::machine::{self, Action};
 use crate::provider;
 use crate::session::Session;
 use crate::tools;
-use crate::types::{ChatRequest, Message, TurnAccumulator, Usage};
+use crate::types::{ChatRequest, Message};
 use crate::ui::Ui;
 use crate::ui::{Approve, Interrupt};
 
 mod request;
+mod stream;
 
 pub use request::build_request;
 
@@ -144,19 +143,19 @@ impl Agent {
         loop {
             match machine::next_action(&self.session.messages) {
                 Some(Action::CallModel) => {
-                    let req = self.build_request();
+                    let request = self.build_request();
                     // The future is dropped when the select expression ends, which
                     // ends the borrow of self
                     let done = tokio::select! {
                         biased;
-                        r = self.pump(&req, ui) => Some(r?),
+                        reply = self.stream_reply(&request, ui) => Some(reply?),
                         _ = interrupt.wait() => None,
                     };
                     match done {
-                        Some((msg, usage, stream_time)) => {
-                            self.session.append_message(&msg)?;
-                            if let Some(u) = usage {
-                                ui.usage(&u, stream_time);
+                        Some(reply) => {
+                            self.session.append_message(&reply.message)?;
+                            if let Some(usage) = &reply.usage {
+                                ui.usage(usage, reply.stream_time);
                             }
                         }
                         None => cancelled = true,
@@ -237,42 +236,6 @@ impl Agent {
             ui.tool_result(marker);
         }
         Ok(())
-    }
-
-    /// Run one sub-request: consume the SSE stream (notifying the UI delta by
-    /// delta) and aggregate a complete assistant message.
-    /// Errors propagate upward; at that point the assistant message has not been
-    /// persisted, so the session stays at a valid prefix.
-    async fn pump(
-        &self,
-        req: &ChatRequest,
-        ui: &mut dyn Ui,
-    ) -> Result<(Message, Option<Usage>, Duration)> {
-        let mut stream = self.api.stream_chat(req).await?;
-        // The wall time the stream took, first chunk to last: what a
-        // tokens-per-second figure divides the reported completion tokens by.
-        // Connection setup is not counted -- the speed of a stream is the speed
-        // of the tokens, not of the handshake.
-        let started = Instant::now();
-        let mut acc = TurnAccumulator::default();
-        let mut usage: Option<Usage> = None;
-        while let Some(chunk) = stream.next_chunk().await? {
-            for choice in chunk.choices {
-                let Some(delta) = choice.delta else { continue };
-                if let Some(s) = &delta.reasoning_content {
-                    ui.reasoning_delta(s);
-                }
-                if let Some(s) = &delta.content {
-                    ui.content_delta(s);
-                }
-                acc.feed(&delta);
-            }
-            if chunk.usage.is_some() {
-                usage = chunk.usage;
-            }
-        }
-        ui.finish_turn();
-        Ok((acc.finish(), usage, started.elapsed()))
     }
 }
 
