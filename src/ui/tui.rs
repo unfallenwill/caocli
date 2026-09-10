@@ -369,7 +369,10 @@ impl State {
             lines.extend(wrapped_lines(&[Span::new(*style, text.clone())], width));
         }
         if let Some(question) = &self.question {
-            lines.push(one_line(&question.spans()));
+            // Wrapped like everything else. The question is what the answer is
+            // about, and the call in it can be a long command: one that is
+            // clipped gives the user nothing to decide with.
+            lines.extend(wrapped_lines(&question.spans(), width));
         }
         lines
     }
@@ -1111,16 +1114,6 @@ fn input_box() -> TextArea<'static> {
     textarea
 }
 
-/// Our styled spans, as one ratatui line.
-fn one_line(spans: &[Span]) -> Line<'static> {
-    Line::from(
-        spans
-            .iter()
-            .map(|s| RSpan::styled(s.text.clone(), style_of(s.style)))
-            .collect::<Vec<_>>(),
-    )
-}
-
 /// Wrap styled spans into the terminal lines they need at `width` columns.
 ///
 /// Both halves of the front end need this, for the same reason: nothing here may
@@ -1694,6 +1687,24 @@ mod tests {
         let top = origin(&mut screen).y;
         assert_eq!(row(&screen, top + 1), format!("  + {}", "x".repeat(16)));
         assert_eq!(row(&screen, top + 2), "x".repeat(14));
+    }
+
+    #[test]
+    fn the_gate_is_drawn_whole_however_long_the_call_is() {
+        // The question is what the answer is about: a command clipped by the
+        // width leaves nothing to decide with.
+        let mut screen = screen_for_test(20, 20);
+        screen.state.question = Some(Cell::approval(
+            "Bash",
+            r#"{"command":"rm -rf /tmp/aaaaaaaaaaaaaaaaaaaa"}"#,
+        ));
+        screen.draw().unwrap();
+        let drawn = all_rows(&screen).join("");
+        assert!(drawn.contains("aaaa"), "the call is there: {drawn}");
+        assert!(
+            drawn.contains("run it? [y/N]"),
+            "and so is the question: {drawn}"
+        );
     }
 
     #[test]
