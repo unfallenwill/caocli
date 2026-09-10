@@ -375,6 +375,27 @@ struct State {
     /// an increment of it -- with the alternate screen there is no scrollback to
     /// hand finished lines to, and the terminal keeps no copy of its own.
     transcript: Vec<Cell>,
+    /// The transcript's cells laid out at [`State::laid_width`], one entry per
+    /// cell and in the same order. A cell is never laid out twice for one width:
+    /// the cells are the session's and do not change once they are pushed, so
+    /// what a draw has to wrap is only what has arrived since the last one.
+    /// Everything else -- how long the transcript is, which lines a window shows
+    /// -- is derived from this rather than from the cells again.
+    ///
+    /// `laid.len()` is how many cells are laid and the transcript may have more
+    /// waiting: a prefix, never a different list.
+    laid: Vec<Vec<Line<'static>>>,
+    /// The width `laid` was laid at, or `None` when nothing is laid out. Every
+    /// line is wrapped to a width, so a different one invalidates all of it.
+    laid_width: Option<usize>,
+    /// How many cells have been laid out here, over the life of this state.
+    ///
+    /// Nothing on the screen can show this: a draw that re-wrapped the whole
+    /// session would draw the same picture. It is what a test has to read to pin
+    /// the layout to being done once per cell rather than once per draw, and it
+    /// is per state because the tests run side by side.
+    #[cfg(test)]
+    laid_cells: usize,
     /// Which part of the transcript is on screen.
     scroll: Scroll,
     /// What the last draw saw: how long the transcript was, and how many rows of
@@ -497,6 +518,10 @@ impl Default for State {
         Self {
             status: Status::default(),
             transcript: Vec::new(),
+            laid: Vec::new(),
+            laid_width: None,
+            #[cfg(test)]
+            laid_cells: 0,
             scroll: Scroll::default(),
             drawn_lines: 0,
             drawn_rows: 0,
@@ -518,20 +543,102 @@ impl Default for State {
 }
 
 impl State {
-    /// The whole transcript as lines, in draw order: the session's finished
-    /// cells, then the block still streaming, then a pending question.
-    fn lines(&self, width: usize) -> Vec<Line<'static>> {
-        let mut lines = cell_lines(&self.transcript, width);
-        if let Some((style, text)) = &self.live {
-            lines.extend(wrapped_lines(&[Span::new(*style, text.clone())], width));
+    /// Lay the transcript out at `width`, keeping what is already laid.
+    ///
+    /// Only the cells that are not laid yet are wrapped, which for a running turn
+    /// is the one block that has just closed. The alternative is wrapping the
+    /// whole session for every fragment that arrives, and a session is as long as
+    /// the conversation has been.
+    fn ensure_laid(&mut self, width: usize) {
+        // A different width is a different wrapping of every line there is.
+        if self.laid_width != Some(width) {
+            self.laid.clear();
+            self.laid_width = Some(width);
         }
-        if let Some(question) = &self.question {
-            // Wrapped like everything else. The question is what the answer is
-            // about, and the call in it can be a long command: one that is
-            // clipped gives the user nothing to decide with.
-            lines.extend(wrapped_lines(&question.spans(), width));
+        // Never more cells than the transcript has. Only a test can take one away,
+        // and lines of a cell that is gone are worse than laying one out twice.
+        self.laid.truncate(self.transcript.len());
+        let from = self.laid.len();
+        for cell in &self.transcript[from..] {
+            #[cfg(test)]
+            {
+                self.laid_cells += 1;
+            }
+            self.laid.push(cell_lines(cell, width));
         }
-        lines
+    }
+
+    /// The rows the laid cells take: what a window over the transcript is measured
+    /// in. A count rather than a copy of the lines, so the part of a long session
+    /// that is off the top costs a draw nothing.
+    fn laid_rows(&self) -> usize {
+        self.laid.iter().map(Vec::len).sum()
+    }
+
+    /// The rows `[first, last)`, at the width the cells were laid at.
+    ///
+    /// Only the cells that overlap the window are touched, and of those only the
+    /// lines inside it. `live` and `question` come after the cells, in that order:
+    /// they are the two blocks that are not laid out with them, because they
+    /// change with every fragment and every keystroke.
+    fn window_lines(
+        &self,
+        first: usize,
+        last: usize,
+        live: &[Line<'static>],
+        question: &[Line<'static>],
+    ) -> Vec<Line<'static>> {
+        let mut out = Vec::with_capacity(last.saturating_sub(first));
+        let mut at = 0;
+        for segment in self.laid.iter().map(Vec::as_slice).chain([live, question]) {
+            if at >= last {
+                break;
+            }
+            let end = at + segment.len();
+            if end > first {
+                let lo = first.saturating_sub(at);
+                let hi = (last - at).min(segment.len());
+                out.extend_from_slice(&segment[lo..hi]);
+            }
+            at = end;
+        }
+        out
+    }
+
+    /// The block still being streamed, wrapped, or nothing when no turn is writing
+    /// one.
+    fn live_lines(&self, width: usize) -> Vec<Line<'static>> {
+        match &self.live {
+            Some((style, text)) => wrapped_lines(&[Span::new(*style, text.clone())], width),
+            None => Vec::new(),
+        }
+    }
+
+    /// The question standing over the box, wrapped, or nothing when none is open.
+    ///
+    /// The question is what the answer is about, and the call in it can be a long
+    /// command: one that is clipped gives the user nothing to decide with.
+    fn question_lines(&self, width: usize) -> Vec<Line<'static>> {
+        match &self.question {
+            Some(question) => wrapped_lines(&question.spans(), width),
+            None => Vec::new(),
+        }
+    }
+
+    /// The whole transcript as lines, in draw order: the session's finished cells,
+    /// then the block still streaming, then a pending question.
+    ///
+    /// A draw wants the window, not the whole of it, but a test that asks what the
+    /// transcript says has to be able to read all of it -- and it reads it through
+    /// the same pieces the draw uses, which is what keeps the two from being two
+    /// renderers.
+    #[cfg(test)]
+    fn lines(&mut self, width: usize) -> Vec<Line<'static>> {
+        self.ensure_laid(width);
+        let live = self.live_lines(width);
+        let question = self.question_lines(width);
+        let total = self.laid_rows() + live.len() + question.len();
+        self.window_lines(0, total, &live, &question)
     }
 
     /// The first transcript line to draw: a window on the end, or the one the
@@ -1523,7 +1630,13 @@ impl<B: Backend> Screen<B> {
             let queued = queue.height() as u16;
             let rows = screen_rows(area, input, queued);
             self.state.reset_box_scroll(input);
-            let lines = self.state.lines(width);
+            // What the transcript has to show, in the three pieces it is made of:
+            // the cells that are laid out and kept, then the block still being
+            // written, then a question if one is open.
+            self.state.ensure_laid(width);
+            let live = self.state.live_lines(width);
+            let question = self.state.question_lines(width);
+            let total = self.state.laid_rows() + live.len() + question.len();
             // The rows the transcript really has: the layout's answer, not a copy
             // of its arithmetic.
             let room = rows[0].height as usize;
@@ -1532,13 +1645,13 @@ impl<B: Backend> Screen<B> {
             // box's end of the transcript with it.
             let picker = self.state.picker_lines();
             let first = if picker.is_empty() {
-                self.state.window(lines.len(), room)
+                self.state.window(total, room)
             } else {
                 self.state.follow();
-                lines.len().saturating_sub(room)
+                total.saturating_sub(room)
             };
-            let last = (first + room).min(lines.len());
-            let transcript = Text::from(lines[first..last].to_vec());
+            let last = (first + room).min(total);
+            let transcript = Text::from(self.state.window_lines(first, last, &live, &question));
             let status = self.state.status_line(width);
             let cursor = self.state.textarea.screen_cursor();
 
@@ -1588,34 +1701,34 @@ fn input_box() -> TextArea<'static> {
     textarea
 }
 
-/// The lines cells occupy at `width`.
+/// The lines one cell occupies at `width`.
 ///
 /// One function, because the transcript on screen, the window over it and the
 /// session log folded back into cells are three places the same cells are laid
 /// out, and a session that reads differently in any of them is a session that was
 /// not really one transcript.
-fn cell_lines(cells: &[Cell], width: usize) -> Vec<Line<'static>> {
-    cells
-        .iter()
-        .flat_map(|cell| {
-            let fill = fill_of(cell);
-            wrapped_lines(&cell.spans(), width)
-                .into_iter()
-                .map(move |mut line| {
-                    if let Some(style) = fill {
-                        // A style on the line itself would not do it: a paragraph
-                        // renders a line by writing its styled graphemes and leaving
-                        // the columns past the text alone, so the ground would stop
-                        // where the words stop and read as a highlight rather than
-                        // as a block. The blanks are written out instead.
-                        let used = line.width();
-                        if used < width {
-                            line.spans
-                                .push(RSpan::styled(" ".repeat(width - used), style));
-                        }
-                    }
-                    line
-                })
+///
+/// One cell at a time, because a cell is what a draw can keep: it is the unit the
+/// session's output arrives in and it does not change once it is pushed, so it is
+/// also the unit [`State`] lays out and remembers.
+fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
+    let fill = fill_of(cell);
+    wrapped_lines(&cell.spans(), width)
+        .into_iter()
+        .map(|mut line| {
+            if let Some(style) = fill {
+                // A style on the line itself would not do it: a paragraph
+                // renders a line by writing its styled graphemes and leaving
+                // the columns past the text alone, so the ground would stop
+                // where the words stop and read as a highlight rather than
+                // as a block. The blanks are written out instead.
+                let used = line.width();
+                if used < width {
+                    line.spans
+                        .push(RSpan::styled(" ".repeat(width - used), style));
+                }
+            }
+            line
         })
         .collect()
 }
@@ -3190,6 +3303,69 @@ mod tests {
         assert_eq!(row(&screen, 0), "two", "the last line of the transcript");
         assert!(row(&screen, 1).starts_with('─'), "then the box");
         assert!(row(&screen, 4).contains("cache"), "and the status line");
+    }
+
+    #[test]
+    fn a_draw_lays_out_only_what_arrived_since_the_last_one() {
+        // What is pinned here is invisible on the screen -- a draw that wrapped
+        // the whole session would draw the same picture -- and it is the whole
+        // point of the layout being kept: a session is as long as the
+        // conversation has been, and a fragment arrives many times a second.
+        let mut screen = screen_for_test(40, 20);
+        screen.state.transcript.push(Cell::Content("one".into()));
+        screen.state.transcript.push(Cell::Content("two".into()));
+        screen.state.laid_cells = 0;
+        screen.draw().unwrap();
+        assert_eq!(screen.state.laid_cells, 2, "both of them, once");
+        screen.draw().unwrap();
+        assert_eq!(screen.state.laid_cells, 2, "and not again");
+
+        // A fragment of a running turn is not a cell yet: the block it is writing
+        // is wrapped as it is drawn, and it becomes a cell -- one to lay out --
+        // when it closes.
+        screen.state.apply(Notice::Content("three".into()));
+        screen.draw().unwrap();
+        assert_eq!(screen.state.laid_cells, 2, "still the two cells");
+        screen.state.apply(Notice::FinishTurn);
+        screen.draw().unwrap();
+        assert_eq!(screen.state.laid_cells, 3, "the block it left behind");
+
+        // A resize re-lays the whole transcript: every line was wrapped to a
+        // width, so a new width is a new layout of every cell there is.
+        screen.terminal.backend_mut().resize(30, 20);
+        screen.draw().unwrap();
+        assert_eq!(
+            screen.state.laid_cells, 6,
+            "all three again, at the new width"
+        );
+    }
+
+    #[test]
+    fn a_window_is_the_same_lines_as_the_transcript_it_is_a_window_on() {
+        // Keeping the layout is a way of getting the same lines, not a second way
+        // of deciding them: what the window hands the painter has to be the lines
+        // the same cells wrap to at the width they were laid at.
+        let mut screen = screen_for_test(24, 12);
+        for i in 0..20 {
+            screen
+                .state
+                .transcript
+                .push(Cell::Content(format!("line {i}")));
+        }
+        screen.draw().unwrap();
+        let width = 24;
+        let whole: Vec<Line> = screen
+            .state
+            .transcript
+            .iter()
+            .flat_map(|cell| cell_lines(cell, width))
+            .collect();
+        assert_eq!(screen.state.lines(width), whole, "the whole transcript");
+        assert_eq!(
+            screen.state.window_lines(3, 9, &[], &[]),
+            whole[3..9].to_vec(),
+            "and a window in the middle of one cell"
+        );
     }
 
     #[test]
