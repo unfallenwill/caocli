@@ -34,22 +34,71 @@ pub struct Agent {
 /// immediately.
 /// The output lifetime is bound to `&mut self` — the `Fn` family cannot express
 /// "the return value borrows the receiver".
-trait Interrupt {
+pub trait Interrupt {
     fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>>;
 }
 
 /// The real SIGINT listener. It subscribes to tokio's watch at construction time
 /// (no poll needed), so a signal arriving at any moment from the start of the
 /// turn to its end cannot be lost to a "no listener" gap.
-struct Sigint(
+pub struct Sigint(
     #[cfg(unix)] tokio::signal::unix::Signal,
     #[cfg(not(unix))] tokio::signal::windows::CtrlC,
 );
+
+impl Sigint {
+    /// Subscribe to SIGINT. The caller constructs one per turn, before the first
+    /// await point, so no signal can arrive before the subscription exists.
+    pub fn new() -> Result<Self> {
+        #[cfg(unix)]
+        let listener = Self(tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::interrupt(),
+        )?);
+        #[cfg(not(unix))]
+        let listener = Self(tokio::signal::windows::ctrl_c()?);
+        Ok(listener)
+    }
+}
 
 impl Interrupt for Sigint {
     fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
         Box::pin(async {
             self.0.recv().await;
+        })
+    }
+}
+
+/// The approval gate's answer source: the Input channel that pairs with the
+/// Notice a `Ui` sends when it asks. A Notice never returns data, so the answer
+/// comes back through a channel of its own -- this is that channel.
+///
+/// Like `Interrupt` it is a trait rather than a closure so that a front end
+/// owning the terminal can take the answer from its own event loop, and so the
+/// output lifetime can be bound to `&mut self`.
+pub trait Approve {
+    fn ask(&mut self, call: &ToolCall) -> Pin<Box<dyn Future<Output = bool> + '_>>;
+}
+
+/// One line of stdin per question, denial by default: the plain front end's
+/// answer source.
+pub struct StdinApproval;
+
+impl Approve for StdinApproval {
+    fn ask(&mut self, _call: &ToolCall) -> Pin<Box<dyn Future<Output = bool> + '_>> {
+        Box::pin(async {
+            // The blocking read is wrapped in spawn_blocking: the global stdin
+            // buffer is shared across calls, so surplus type-ahead is not lost.
+            // (Cost: on cancellation a blocked thread lingers and swallows the
+            // first line typed afterwards -- a known trade-off.)
+            tokio::task::spawn_blocking(|| {
+                let mut line = String::new();
+                let read = std::io::stdin().read_line(&mut line);
+                let line = line.trim();
+                read.map(|n| n > 0).unwrap_or(false)
+                    && (line.eq_ignore_ascii_case("y") || line.starts_with('y'))
+            })
+            .await
+            .unwrap_or(false)
         })
     }
 }
@@ -112,41 +161,18 @@ impl Agent {
     /// the cache stats recorded by `usage()` never reach the instance that
     /// already drew the bar.
     ///
-    /// Exactly one SIGINT listener is created per turn: tokio's signal
-    /// notifications ride on a watch, so if a listener were created inside each
-    /// `select`, a SIGINT arriving in the gap between two `select`s would be
-    /// broadcast away before the new listener subscribed and would be lost
-    /// forever (measured in the pty smoke test, a millisecond-scale window).
-    pub async fn turn(&mut self, input: &str, ui: &mut impl Ui) -> Result<()> {
-        #[cfg(unix)]
-        let mut sigint = Sigint(tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::interrupt(),
-        )?);
-        #[cfg(not(unix))]
-        let mut sigint = Sigint(tokio::signal::windows::ctrl_c()?);
-        self.turn_with(input, ui, &mut sigint, |_call| async {
-            // Approval answer (an Input event): one line of stdin, denial by
-            // default.
-            // The blocking read is wrapped in spawn_blocking: the global stdin
-            // buffer is shared across calls, so surplus type-ahead is not lost.
-            // (Cost: on cancellation a blocked thread lingers and swallows the
-            // first line typed afterwards — a known trade-off.)
-            tokio::task::spawn_blocking(|| {
-                let mut line = String::new();
-                let read = std::io::stdin().read_line(&mut line);
-                let line = line.trim();
-                read.map(|n| n > 0).unwrap_or(false)
-                    && (line.eq_ignore_ascii_case("y") || line.starts_with('y'))
-            })
-            .await
-            .unwrap_or(false)
-        })
-        .await
-    }
-
-    /// The interpreter loop for one turn; `interrupt` is the source of an
-    /// out-of-band Command (Ctrl-C): every await point races against it (biased:
-    /// if the effect finishes first its result is kept).
+    /// Exactly one interrupt listener is subscribed per turn, and the caller
+    /// subscribes it before calling this: tokio's signal notifications ride on a
+    /// watch, so if a listener were created inside each `select`, a SIGINT
+    /// arriving in the gap between two `select`s would be broadcast away before
+    /// the new listener subscribed and would be lost forever (measured in the
+    /// pty smoke test, a millisecond-scale window). The caller owning the
+    /// subscription also keeps the interpreter independent of how a cancel
+    /// arrives: `Sigint` is only one possible source.
+    ///
+    /// `interrupt` is the source of an out-of-band Command (Ctrl-C): every await
+    /// point races against it (biased: if the effect finishes first its result is
+    /// kept).
     /// When it fires, the current effect is dropped — the stream disconnects and
     /// the Bash child process is killed by kill_on_drop; the calls that were
     /// declared but not answered are persisted with CANCELLED_RESULT to close the
@@ -154,17 +180,18 @@ impl Agent {
     /// from a valid prefix.
     /// Cancellation is handled in the interpreter layer and never enters
     /// `next_action` (it is out-of-band and every state is reachable).
-    async fn turn_with<A, FutA>(
+    ///
+    /// `approve` answers the approval gate. Both are supplied by the caller
+    /// rather than built here because both depend on which front end is running:
+    /// a front end that owns the terminal in raw mode leaves no SIGINT to listen
+    /// for, so it answers both channels from its own event loop.
+    pub async fn turn(
         &mut self,
         input: &str,
         ui: &mut impl Ui,
         interrupt: &mut dyn Interrupt,
-        mut approve: A,
-    ) -> Result<()>
-    where
-        A: FnMut(&ToolCall) -> FutA,
-        FutA: Future<Output = bool>,
-    {
+        approve: &mut dyn Approve,
+    ) -> Result<()> {
         self.session.append_message(&Message::user(input))?;
         let mut cancelled = false;
         // Interpreter loop: each beat asks the machine for a decision (an Action
@@ -214,7 +241,7 @@ impl Agent {
                         ui.approval_requested(&call.function.name, &call.function.arguments);
                         let approved = tokio::select! {
                             biased;
-                            ok = approve(&call) => ok,
+                            ok = approve.ask(&call) => ok,
                             _ = interrupt.wait() => { cancelled = true; false }
                         };
                         if cancelled {
@@ -315,6 +342,32 @@ mod tests {
             self.0
                 .pop_front()
                 .unwrap_or_else(|| Box::pin(std::future::pending()))
+        }
+    }
+
+    /// Test double: never cancels. For tests that are not about cancellation.
+    struct Silent;
+    impl Interrupt for Silent {
+        fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// Test double: answers every approval the same way.
+    struct Answer(bool);
+    impl Approve for Answer {
+        fn ask(&mut self, _call: &ToolCall) -> Pin<Box<dyn Future<Output = bool> + '_>> {
+            let verdict = self.0;
+            Box::pin(async move { verdict })
+        }
+    }
+
+    /// Test double: never answers, which leaves the approval gate open so that a
+    /// cancellation has something to race against.
+    struct NoAnswer;
+    impl Approve for NoAnswer {
+        fn ask(&mut self, _call: &ToolCall) -> Pin<Box<dyn Future<Output = bool> + '_>> {
+            Box::pin(std::future::pending())
         }
     }
 
@@ -454,7 +507,12 @@ mod tests {
         let mut agent = test_agent(&server, &dir);
         let mut ui = Renderer::new();
         agent
-            .turn("use a tool to leave a marker", &mut ui)
+            .turn(
+                "use a tool to leave a marker",
+                &mut ui,
+                &mut Silent,
+                &mut Answer(false),
+            )
             .await
             .unwrap();
 
@@ -546,7 +604,10 @@ mod tests {
         let dir = tmpdir();
         let mut agent = test_agent(&server, &dir);
         let mut ui = Renderer::new();
-        agent.turn("run two commands", &mut ui).await.unwrap();
+        agent
+            .turn("run two commands", &mut ui, &mut Silent, &mut Answer(false))
+            .await
+            .unwrap();
 
         let msgs = &agent.session.messages;
         assert_eq!(
@@ -591,9 +652,12 @@ mod tests {
         // the first cancellation point (the pump select) fires immediately
         let mut interrupt = Immediate;
         agent
-            .turn_with("original instruction", &mut ui, &mut interrupt, |_| {
-                std::future::ready(true)
-            })
+            .turn(
+                "original instruction",
+                &mut ui,
+                &mut interrupt,
+                &mut Answer(true),
+            )
             .await
             .unwrap();
         assert_eq!(agent.session.messages.len(), 1);
@@ -631,9 +695,12 @@ mod tests {
         queue.push_back(Box::pin(async {}));
         let mut interrupt = Steps(queue);
         agent
-            .turn_with("run two slow commands", &mut ui, &mut interrupt, |_| {
-                std::future::ready(true)
-            })
+            .turn(
+                "run two slow commands",
+                &mut ui,
+                &mut interrupt,
+                &mut Answer(true),
+            )
             .await
             .unwrap();
 
@@ -732,11 +799,11 @@ mod tests {
         agent.confirm_tools = true;
         let mut ui = Renderer::new();
         agent
-            .turn_with(
+            .turn(
                 "run the forbidden command",
                 &mut ui,
                 &mut Steps(Default::default()),
-                |_| std::future::ready(false),
+                &mut Answer(false),
             )
             .await
             .unwrap();
@@ -784,9 +851,7 @@ mod tests {
         queue.push_back(Box::pin(async {}));
         let mut interrupt = Steps(queue);
         agent
-            .turn_with("run it", &mut ui, &mut interrupt, |_| {
-                std::future::pending()
-            })
+            .turn("run it", &mut ui, &mut interrupt, &mut NoAnswer)
             .await
             .unwrap();
         let msgs = &agent.session.messages;
@@ -821,11 +886,11 @@ mod tests {
         agent.max_tool_steps = 2;
         let mut ui = Renderer::new();
         agent
-            .turn_with(
+            .turn(
                 "run three commands",
                 &mut ui,
                 &mut Steps(Default::default()),
-                |_| std::future::ready(true),
+                &mut Answer(true),
             )
             .await
             .unwrap();
@@ -867,7 +932,10 @@ mod tests {
         let dir = tmpdir();
         let mut agent = test_agent(&server, &dir);
         let mut ui = Renderer::new();
-        agent.turn("write a file", &mut ui).await.unwrap();
+        agent
+            .turn("write a file", &mut ui, &mut Silent, &mut Answer(false))
+            .await
+            .unwrap();
 
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "written by mock");
         let tool_msg = &agent.session.messages[2];
@@ -901,7 +969,10 @@ mod tests {
         let dir = tmpdir();
         let mut agent = test_agent(&server, &dir);
         let mut ui = Renderer::new();
-        let err = agent.turn("hi", &mut ui).await.unwrap_err();
+        let err = agent
+            .turn("hi", &mut ui, &mut Silent, &mut Answer(false))
+            .await
+            .unwrap_err();
         let s = format!("{err:#}");
         assert!(
             s.contains("400"),
@@ -926,7 +997,10 @@ mod tests {
         let dir = tmpdir();
         let mut agent = test_agent(&server, &dir);
         let mut ui = Renderer::new();
-        let err = agent.turn("hi", &mut ui).await.unwrap_err();
+        let err = agent
+            .turn("hi", &mut ui, &mut Silent, &mut Answer(false))
+            .await
+            .unwrap_err();
         assert!(format!("{err:#}").contains("failed to parse SSE chunk"));
         std::fs::remove_dir_all(&dir).unwrap();
     }

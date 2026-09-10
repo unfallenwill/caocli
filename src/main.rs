@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers};
 
-use crate::agent::Agent;
+use crate::agent::{Agent, Sigint, StdinApproval};
 use crate::api::Client;
 use crate::cli::Cli;
 use crate::session::{Session, SessionMeta};
@@ -149,7 +149,14 @@ async fn run(cli: Cli) -> Result<()> {
                 .map(|e| format!(" · effort {e}"))
                 .unwrap_or_default()
         ));
-        if let Err(e) = agent.turn(prompt, &mut ui).await {
+        // One interrupt listener per turn, subscribed before the turn's first
+        // await point (see Agent::turn).
+        let mut interrupt = Sigint::new()?;
+        let mut approve = StdinApproval;
+        if let Err(e) = agent
+            .turn(prompt, &mut ui, &mut interrupt, &mut approve)
+            .await
+        {
             ui.error(&format!("{e:#}"));
             std::process::exit(1);
         }
@@ -236,7 +243,14 @@ async fn run(cli: Cli) -> Result<()> {
                         ui.info("unknown command; /help lists the available commands")
                     }
                     _ => {
-                        if let Err(e) = agent.turn(line, &mut ui).await {
+                        // One interrupt listener per turn, subscribed before
+                        // the turn's first await point (see Agent::turn).
+                        let mut interrupt = Sigint::new()?;
+                        let mut approve = StdinApproval;
+                        if let Err(e) = agent
+                            .turn(line, &mut ui, &mut interrupt, &mut approve)
+                            .await
+                        {
                             ui.error(&format!("{e:#}"));
                         }
                     }
