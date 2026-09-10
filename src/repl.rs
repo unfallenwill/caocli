@@ -10,6 +10,7 @@ use anyhow::Result;
 use crate::agent::{Agent, Approve, Interrupt};
 use crate::api::Client;
 use crate::config;
+use crate::provider;
 use crate::session::{self, Session};
 use crate::ui::Front;
 use crate::ui::text::{padded, width};
@@ -114,7 +115,7 @@ fn bind_to_session(agent: &mut Agent) -> Result<()> {
     if id == agent.provider().id {
         return Ok(());
     }
-    let provider = config::provider(&id)?;
+    let provider = provider::provider(&id)?;
     let api = Client::new(config::api_key(&provider)?, provider.url.to_string())?;
     agent.bind(provider, api);
     Ok(())
@@ -134,7 +135,7 @@ fn argument(line: &str) -> &str {
 /// The key is asked for as a secret: it is not echoed, not put in the
 /// transcript, not written to the session log, and not remembered as history.
 async fn login(agent: &mut Agent, ui: &mut dyn Front, provider_id: &str) {
-    let provider = match config::provider(provider_id) {
+    let provider = match provider::provider(provider_id) {
         Ok(provider) => provider,
         Err(e) => return ui.error(&format!("{e:#}")),
     };
@@ -172,7 +173,7 @@ async fn login(agent: &mut Agent, ui: &mut dyn Front, provider_id: &str) {
 /// it is served by when the model names one. A bare model id stays with the
 /// provider the session already runs on.
 fn choose_model(agent: &mut Agent, ui: &mut dyn Front, spec: &str) {
-    let (provider, model) = match config::model_spec(spec, agent.provider().id) {
+    let (provider, model) = match provider::model_spec(spec, agent.provider().id) {
         Ok(choice) => choice,
         Err(e) => return ui.error(&format!("{e:#}")),
     };
@@ -434,7 +435,7 @@ mod tests {
             },
         )
         .unwrap();
-        Agent::new(api, session, crate::config::provider(provider).unwrap())
+        Agent::new(api, session, crate::provider::provider(provider).unwrap())
     }
 
     async fn submit(

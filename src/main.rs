@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod history;
 mod machine;
+mod provider;
 mod repl;
 mod session;
 mod tools;
@@ -34,10 +35,10 @@ fn main() -> Result<()> {
 /// Meta for a new session: the provider is the one this run selected, and the
 /// model comes from `--model` — which may name a provider of its own as
 /// `<provider>/<modelid>` — otherwise it is that provider's default.
-fn fresh_meta(cli: &Cli, provider: config::Provider) -> Result<SessionMeta> {
+fn fresh_meta(cli: &Cli, start: provider::Provider) -> Result<SessionMeta> {
     let (provider, model) = match &cli.model {
-        Some(spec) => config::model_spec(spec, provider.id)?,
-        None => (provider, provider.default_model().to_string()),
+        Some(spec) => provider::model_spec(spec, start.id)?,
+        None => (start, start.default_model().to_string()),
     };
     Ok(SessionMeta {
         provider: Some(provider.id.to_string()),
@@ -52,12 +53,16 @@ fn fresh_meta(cli: &Cli, provider: config::Provider) -> Result<SessionMeta> {
 /// When resuming a session: parameters given explicitly on the command line
 /// override the meta, while those not given keep the value stored in the session.
 /// Returning true means the meta changed (a meta line must be appended).
-fn apply_overrides(meta: &mut SessionMeta, cli: &Cli, fallback: config::Provider) -> Result<bool> {
+fn apply_overrides(
+    meta: &mut SessionMeta,
+    cli: &Cli,
+    fallback: provider::Provider,
+) -> Result<bool> {
     let mut changed = false;
     // The provider a bare model id belongs to: the session's own, if it names
     // one, and this run's choice otherwise.
     let current = match meta.provider.as_deref() {
-        Some(id) => config::provider(id)?,
+        Some(id) => provider::provider(id)?,
         None => fallback,
     };
     match (&cli.provider, &cli.model) {
@@ -66,7 +71,7 @@ fn apply_overrides(meta: &mut SessionMeta, cli: &Cli, fallback: config::Provider
         // bare id stays where it was.
         (_, Some(spec)) => {
             let id = cli.provider.as_deref().unwrap_or(current.id);
-            let (chosen, model) = config::model_spec(spec, id)?;
+            let (chosen, model) = provider::model_spec(spec, id)?;
             if meta.provider.as_deref() != Some(chosen.id) {
                 meta.provider = Some(chosen.id.to_string());
                 changed = true;
@@ -79,7 +84,7 @@ fn apply_overrides(meta: &mut SessionMeta, cli: &Cli, fallback: config::Provider
         // An explicit provider switch without a model: follow that provider's
         // default model, so the old model name is not sent to the new backend.
         (Some(id), None) => {
-            let chosen = config::provider(id)?;
+            let chosen = provider::provider(id)?;
             if meta.provider.as_deref() != Some(chosen.id) || meta.model != chosen.default_model() {
                 meta.provider = Some(chosen.id.to_string());
                 meta.model = chosen.default_model().to_string();
@@ -142,7 +147,11 @@ async fn run(cli: Cli) -> Result<()> {
     // The provider this run starts from: --provider, or the default. It settles
     // the endpoint of a new session and of one whose provider is not recorded;
     // `--model <provider>/<model>` and a resumed session's own meta name one too.
-    let start = config::provider(cli.provider.as_deref().unwrap_or(config::DEFAULT_PROVIDER))?;
+    let start = provider::provider(
+        cli.provider
+            .as_deref()
+            .unwrap_or(provider::DEFAULT_PROVIDER),
+    )?;
 
     // Session resolution priority: --resume > --continue > create new
     let mut session = if let Some(id) = &cli.resume {
@@ -164,7 +173,7 @@ async fn run(cli: Cli) -> Result<()> {
     // The provider this session runs on: the one its meta names, or this run's
     // choice for a session written before providers were recorded.
     let provider = match session.meta.provider.as_deref() {
-        Some(id) => config::provider(id)?,
+        Some(id) => provider::provider(id)?,
         None => start,
     };
 
@@ -326,7 +335,7 @@ mod tests {
         // existing session; the value stored in the session has to be kept.
         let mut meta = meta_of("deepseek", "deepseek-v4-pro");
         meta.reasoning_effort = Some("low".into());
-        assert!(!apply_overrides(&mut meta, &cli(&[]), config::DEEPSEEK).unwrap());
+        assert!(!apply_overrides(&mut meta, &cli(&[]), provider::DEEPSEEK).unwrap());
         assert_eq!(meta.model, "deepseek-v4-pro");
         assert_eq!(meta.reasoning_effort.as_deref(), Some("low"));
     }
@@ -336,7 +345,7 @@ mod tests {
         // A resumed session runs where it ran before, whatever this run's
         // `--provider` default is: the meta is what the session is.
         let mut meta = meta_of("zai-coding-cn", "glm-5.3");
-        assert!(!apply_overrides(&mut meta, &cli(&[]), config::DEEPSEEK).unwrap());
+        assert!(!apply_overrides(&mut meta, &cli(&[]), provider::DEEPSEEK).unwrap());
         assert_eq!(meta.provider.as_deref(), Some("zai-coding-cn"));
         assert_eq!(meta.model, "glm-5.3");
     }
@@ -349,7 +358,7 @@ mod tests {
             apply_overrides(
                 &mut meta,
                 &cli(&["--model", "deepseek-v4-pro"]),
-                config::DEEPSEEK
+                provider::DEEPSEEK
             )
             .unwrap()
         );
@@ -367,7 +376,7 @@ mod tests {
             apply_overrides(
                 &mut meta,
                 &cli(&["--model", "zai-coding-cn/glm-5.3"]),
-                config::DEEPSEEK
+                provider::DEEPSEEK
             )
             .unwrap()
         );
@@ -379,7 +388,7 @@ mod tests {
     fn a_bare_model_stays_with_the_sessions_provider() {
         let mut meta = meta_of("zai-coding-cn", "glm-5.3-flash");
         assert!(
-            apply_overrides(&mut meta, &cli(&["--model", "glm-4.6"]), config::DEEPSEEK).unwrap()
+            apply_overrides(&mut meta, &cli(&["--model", "glm-4.6"]), provider::DEEPSEEK).unwrap()
         );
         assert_eq!(meta.provider.as_deref(), Some("zai-coding-cn"));
         assert_eq!(meta.model, "glm-4.6");
@@ -394,7 +403,7 @@ mod tests {
             model: "deepseek-v4-pro".into(),
             reasoning_effort: None,
         };
-        assert!(!apply_overrides(&mut meta, &cli(&[]), config::ZAI_CODING_CN).unwrap());
+        assert!(!apply_overrides(&mut meta, &cli(&[]), provider::ZAI_CODING_CN).unwrap());
         assert_eq!(meta.provider, None, "nothing is invented for it");
         assert_eq!(meta.model, "deepseek-v4-pro");
     }
@@ -406,7 +415,7 @@ mod tests {
             apply_overrides(
                 &mut meta,
                 &cli(&["--provider", "zai-coding-cn"]),
-                config::DEEPSEEK
+                provider::DEEPSEEK
             )
             .unwrap()
         );
@@ -419,7 +428,7 @@ mod tests {
             apply_overrides(
                 &mut meta2,
                 &cli(&["--provider", "zai-coding-cn", "--model", "glm-4.6"]),
-                config::DEEPSEEK
+                provider::DEEPSEEK
             )
             .unwrap()
         );
@@ -436,7 +445,7 @@ mod tests {
             !apply_overrides(
                 &mut meta,
                 &cli(&["--provider", "zai-coding-cn"]),
-                config::DEEPSEEK
+                provider::DEEPSEEK
             )
             .unwrap()
         );
@@ -446,7 +455,7 @@ mod tests {
             apply_overrides(
                 &mut meta2,
                 &cli(&["--provider", "zai-coding-cn"]),
-                config::DEEPSEEK
+                provider::DEEPSEEK
             )
             .unwrap()
         );
@@ -456,7 +465,7 @@ mod tests {
     #[test]
     fn an_unknown_model_provider_is_rejected_before_anything_runs() {
         let mut meta = meta_of("deepseek", "deepseek-flash");
-        let err = apply_overrides(&mut meta, &cli(&["--model", "nope/x"]), config::DEEPSEEK)
+        let err = apply_overrides(&mut meta, &cli(&["--model", "nope/x"]), provider::DEEPSEEK)
             .unwrap_err()
             .to_string();
         assert!(err.contains("unknown provider"), "{err}");
@@ -466,18 +475,22 @@ mod tests {
     fn effort_overrides_stored_value() {
         let mut meta = meta_of("deepseek", "deepseek-v4-flash");
         meta.reasoning_effort = Some("high".into());
-        assert!(apply_overrides(&mut meta, &cli(&["--effort", "low"]), config::DEEPSEEK).unwrap());
+        assert!(
+            apply_overrides(&mut meta, &cli(&["--effort", "low"]), provider::DEEPSEEK).unwrap()
+        );
         assert_eq!(meta.reasoning_effort.as_deref(), Some("low"));
 
         // an identical value does not trigger a write
-        assert!(!apply_overrides(&mut meta, &cli(&["--effort", "low"]), config::DEEPSEEK).unwrap());
+        assert!(
+            !apply_overrides(&mut meta, &cli(&["--effort", "low"]), provider::DEEPSEEK).unwrap()
+        );
     }
 
     #[test]
     fn fresh_meta_defaults() {
-        let meta = fresh_meta(&cli(&[]), config::DEEPSEEK).unwrap();
+        let meta = fresh_meta(&cli(&[]), provider::DEEPSEEK).unwrap();
         assert_eq!(meta.provider.as_deref(), Some("deepseek"));
-        assert_eq!(meta.model, config::DEEPSEEK.default_model());
+        assert_eq!(meta.model, provider::DEEPSEEK.default_model());
         assert_eq!(
             meta.reasoning_effort.as_deref(),
             Some(config::DEFAULT_EFFORT)
@@ -486,7 +499,7 @@ mod tests {
 
     #[test]
     fn fresh_meta_uses_provider_default_model() {
-        let meta = fresh_meta(&cli(&[]), config::ZAI_CODING_CN).unwrap();
+        let meta = fresh_meta(&cli(&[]), provider::ZAI_CODING_CN).unwrap();
         assert_eq!(meta.provider.as_deref(), Some("zai-coding-cn"));
         assert_eq!(meta.model, "glm-5.3-flash");
     }
@@ -495,7 +508,7 @@ mod tests {
     fn fresh_meta_carries_model_and_effort() {
         let meta = fresh_meta(
             &cli(&["--model", "deepseek-v4-pro", "--effort", "max"]),
-            config::DEEPSEEK,
+            provider::DEEPSEEK,
         )
         .unwrap();
         assert_eq!(meta.model, "deepseek-v4-pro");
@@ -506,7 +519,7 @@ mod tests {
     fn fresh_meta_takes_the_provider_a_qualified_model_names() {
         let meta = fresh_meta(
             &cli(&["--model", "zai-coding-cn/glm-5.3"]),
-            config::DEEPSEEK,
+            provider::DEEPSEEK,
         )
         .unwrap();
         assert_eq!(meta.provider.as_deref(), Some("zai-coding-cn"));

@@ -5,8 +5,9 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use crate::api::Client;
-use crate::config::{self, DEFAULT_EFFORT};
+use crate::config::DEFAULT_EFFORT;
 use crate::machine::{self, Action};
+use crate::provider;
 use crate::session::Session;
 use crate::tools;
 use crate::types::{ChatRequest, Message, Thinking, ToolCall, TurnAccumulator, Usage};
@@ -23,7 +24,7 @@ pub struct Agent {
     /// The provider the client is bound to. The endpoint, the key and the
     /// answer ceiling all come from it, and the model is named by it: the
     /// status line reads `<provider>/<modelid>` from here.
-    provider: config::Provider,
+    provider: provider::Provider,
     /// Ceiling on one answer, in tokens: the provider preset's value, sent as
     /// `max_tokens` on every request.
     max_tokens: u32,
@@ -112,7 +113,7 @@ impl Approve for StdinApproval {
 }
 
 impl Agent {
-    pub fn new(api: Client, session: Session, provider: config::Provider) -> Self {
+    pub fn new(api: Client, session: Session, provider: provider::Provider) -> Self {
         Self {
             api,
             session,
@@ -125,7 +126,7 @@ impl Agent {
     }
 
     /// The provider the machine is talking to.
-    pub fn provider(&self) -> config::Provider {
+    pub fn provider(&self) -> provider::Provider {
         self.provider
     }
 
@@ -138,7 +139,7 @@ impl Agent {
     /// Point the machine at a provider: a client for its endpoint and key, and
     /// the ceiling its preset declares. The session's meta is the caller's to
     /// write -- it is a change to the log, and the interpreter writes the log.
-    pub fn bind(&mut self, provider: config::Provider, api: Client) {
+    pub fn bind(&mut self, provider: provider::Provider, api: Client) {
         self.provider = provider;
         self.max_tokens = provider.max_tokens;
         self.api = api;
@@ -473,7 +474,7 @@ mod tests {
         )
         .unwrap();
         let session = Session::create(dir, test_meta()).unwrap();
-        Agent::new(api, session, config::DEEPSEEK)
+        Agent::new(api, session, provider::DEEPSEEK)
     }
 
     #[test]
@@ -490,9 +491,9 @@ mod tests {
         let mut s = Session::create(&dir, test_meta()).unwrap();
         s.append_message(&Message::user("q1")).unwrap();
         let agent = Agent::new(
-            Client::new("k".into(), config::DEEPSEEK.url.into()).unwrap(),
+            Client::new("k".into(), provider::DEEPSEEK.url.into()).unwrap(),
             s,
-            config::DEEPSEEK,
+            provider::DEEPSEEK,
         );
         let req = agent.build_request();
         assert_eq!(req.messages.len(), 2);
@@ -513,9 +514,9 @@ mod tests {
         s.meta.reasoning_effort = None;
         s.append_message(&Message::user("q1")).unwrap();
         let agent = Agent::new(
-            Client::new("k".into(), config::DEEPSEEK.url.into()).unwrap(),
+            Client::new("k".into(), provider::DEEPSEEK.url.into()).unwrap(),
             s,
-            config::DEEPSEEK,
+            provider::DEEPSEEK,
         );
         let req = agent.build_request();
         assert_eq!(req.reasoning_effort.as_deref(), Some("max"));
