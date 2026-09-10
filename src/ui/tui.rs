@@ -611,15 +611,39 @@ impl State {
             .collect()
     }
 
-    /// Handle a key while a turn is running: only the cancel key does anything,
-    /// because a turn is not the place to start composing the next line.
+    /// Handle a key while a turn is running.
+    ///
+    /// Two things take typing here: the cancel key, always, and the answer to an
+    /// approval question, while the gate is waiting for one. Everything else is
+    /// dropped, because a turn is not the place to start composing the next line.
     fn key_while_working(&mut self, event: Event, cancel: &watch::Sender<bool>) {
-        if let Event::Key(key) = event
+        if let Event::Key(key) = &event
             && key.kind == KeyEventKind::Press
             && key.code == KeyCode::Char('c')
             && key.modifiers.contains(KeyModifiers::CONTROL)
         {
             let _ = cancel.send(true);
+            return;
+        }
+        // Everything below concerns the gate, and there is no gate open for the
+        // rest of a turn.
+        if self.reply.is_none() {
+            return;
+        }
+        // Enter submits the answer whether or not anything was typed: a blank
+        // line denies, which is the rule the plain front end reads from stdin.
+        let answering = matches!(
+            &event,
+            Event::Key(key)
+                if key.kind == KeyEventKind::Press
+                    && key.code == KeyCode::Enter
+                    && key.modifiers == KeyModifiers::NONE
+        );
+        if answering {
+            self.close_question();
+        } else {
+            // Backspace, a paste, a letter: all of it is the answer being typed.
+            self.key(event);
         }
     }
 
@@ -637,6 +661,10 @@ impl State {
     fn open_question(&mut self, reply: oneshot::Sender<bool>) {
         self.reply = Some(reply);
         self.working = true;
+        // The box is where the answer goes, so it says so rather than inviting
+        // the next message: nothing else can be typed while a turn runs.
+        self.textarea
+            .set_placeholder_text("y to allow · anything else denies");
     }
 
     /// Answer the open question from what the user submitted, if anything. A line
@@ -1609,6 +1637,45 @@ mod tests {
         let mut n = Notifier { tx };
         n.content_delta("hi");
         assert!(matches!(rx.try_recv(), Ok(Notice::Content(s)) if s == "hi"));
+    }
+
+    #[test]
+    fn the_gate_is_answered_by_typing_at_it_while_the_turn_runs() {
+        // The answer is typed during a turn, when every other key is dropped, so
+        // this is the one path that has to let it through: an answer that never
+        // arrives leaves the turn waiting on a question nobody can see.
+        let mut state = State::default();
+        let (cancel, _cancelled) = watch::channel(false);
+        let (reply, answer) = oneshot::channel();
+        state.open_question(reply);
+        state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Char('y'))), &cancel);
+        assert_eq!(state.textarea.lines(), ["y"], "it went into the box");
+        state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Enter)), &cancel);
+        assert_eq!(answer.blocking_recv(), Ok(true));
+        assert!(state.reply.is_none(), "the gate is closed again");
+    }
+
+    #[test]
+    fn a_blank_answer_to_the_gate_denies() {
+        let mut state = State::default();
+        let (cancel, _cancelled) = watch::channel(false);
+        let (reply, answer) = oneshot::channel();
+        state.open_question(reply);
+        state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Enter)), &cancel);
+        assert_eq!(answer.blocking_recv(), Ok(false));
+    }
+
+    #[test]
+    fn keys_are_dropped_while_a_turn_runs_and_no_gate_is_open() {
+        let mut state = State::default();
+        let (cancel, cancelled) = watch::channel(false);
+        state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Char('h'))), &cancel);
+        assert!(state.textarea.is_empty(), "not the place for the next line");
+        state.key_while_working(
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            &cancel,
+        );
+        assert!(*cancelled.borrow(), "the cancel key is the exception");
     }
 
     #[test]
