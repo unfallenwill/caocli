@@ -315,6 +315,22 @@ impl Drop for EchoOff {
     }
 }
 
+/// Where termios does not exist there is nothing to silence and nothing to
+/// restore. The value still exists, so the asker stays one code on every
+/// platform: the answer is read the same way, and what the terminal keeps
+/// showing while it is typed is the price of a key on a machine without a
+/// termios -- the same decline-and-still-work the plain front end accepts
+/// everywhere else it cannot take the terminal's full cooperation.
+#[cfg(not(unix))]
+struct EchoOff;
+
+#[cfg(not(unix))]
+impl EchoOff {
+    fn new() -> Option<Self> {
+        Some(Self)
+    }
+}
+
 /// Streaming renderer. Thinking and body text are two independent render blocks:
 /// - thinking is dim, body text is the normal color
 /// - blocks are separated by a newline; switching from thinking to body adds an
