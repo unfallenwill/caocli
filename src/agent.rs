@@ -518,9 +518,10 @@ mod tests {
 
         // usage must reach the renderer held by the caller, otherwise the status
         // bar's cache stats never update
+        let cache = ui.stats();
         assert_eq!(
-            ui.stats(),
-            crate::ui::CacheStats { hit: 12, miss: 18 },
+            (cache.hit, cache.miss),
+            (12, 18),
             "hit/miss from both sub-requests should accumulate into the same renderer"
         );
 

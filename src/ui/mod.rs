@@ -1,4 +1,5 @@
 mod cell;
+mod status;
 mod text;
 
 use std::io::{IsTerminal, Write};
@@ -6,53 +7,9 @@ use std::io::{IsTerminal, Write};
 use crate::types::{Message, Usage};
 
 use cell::{Cell, Style};
+use status::Status;
 
 const RESET: &str = "\x1b[0m";
-
-/// Session-level cache statistics (for the status bar). Accumulates the hit/miss
-/// of every sub-request within this process.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct CacheStats {
-    pub hit: u64,
-    pub miss: u64,
-}
-
-impl CacheStats {
-    pub fn record(&mut self, u: &Usage) {
-        // Normalization: DeepSeek's flat fields and GLM's nested details both
-        // converge in Usage::cache(). When a provider does not report caching,
-        // nothing is recorded, so "unknown" is never displayed as 0% hit.
-        if let Some(c) = u.cache() {
-            self.hit += c.hit;
-            self.miss += c.miss;
-        }
-    }
-
-    /// Hit rate as a percentage; None while there is no data yet.
-    pub fn hit_rate(&self) -> Option<f64> {
-        let total = self.hit + self.miss;
-        (total > 0).then(|| self.hit as f64 * 100.0 / total as f64)
-    }
-
-    /// Status segments, most significant first: the hit rate, then the raw
-    /// counts. A provider that reports no cache usage yields a single
-    /// "unknown" segment, so it is never displayed as 0% hit.
-    fn segments(&self) -> Vec<String> {
-        match self.hit_rate() {
-            Some(rate) => vec![
-                format!("cache {rate:.1}%"),
-                format!("hit {} · miss {}", self.hit, self.miss),
-            ],
-            None => vec!["cache —".to_string()],
-        }
-    }
-
-    /// Full status text (without the left padding).
-    #[cfg(test)]
-    pub fn label(&self) -> String {
-        self.segments().join(" · ")
-    }
-}
 
 /// Terminal size (rows, cols). None on non-unix or when the ioctl fails.
 #[cfg(unix)]
@@ -221,10 +178,8 @@ pub struct Renderer {
     /// previous cell is kept: it is all the spacing rule needs, and the
     /// transcript itself lives in the session log.
     prev_was_block: bool,
-    stats: CacheStats,
-    /// Model id shown in the status bar's left segment (updated when a session is
-    /// created or switched).
-    model: Option<String>,
+    /// What the status bar reports: the model and the session's cache statistics.
+    status: Status,
     bar: Option<StatusBar>,
 }
 
@@ -236,8 +191,7 @@ impl Renderer {
             color,
             live: None,
             prev_was_block: false,
-            stats: CacheStats::default(),
-            model: None,
+            status: Status::default(),
             bar: None,
         }
     }
@@ -250,8 +204,7 @@ impl Renderer {
             color,
             live: None,
             prev_was_block: false,
-            stats: CacheStats::default(),
-            model: None,
+            status: Status::default(),
             bar: None,
         };
         (r, buf)
@@ -294,59 +247,32 @@ impl Renderer {
     fn redraw_status_bar(&mut self) {
         let Some(bar) = self.bar else { return };
         let width = bar.width();
-        // Walk from the richest join down to the shortest. A candidate that
-        // fits ends the walk; if none fits, the walk leaves the shortest one,
-        // which gets clipped below rather than leaving the bar blank.
-        let parts = self.status_parts();
-        let mut label = String::new();
-        for n in (1..=parts.len()).rev() {
-            label = parts[..n].join(" · ");
-            if text::width(&label) <= width {
-                break;
-            }
-        }
+        // The status picks the richest segment combination that fits: a narrow
+        // bar loses detail by whole segments rather than by clipping, and only
+        // an over-long shortest segment is clipped below.
+        let label = self.status.line(width);
         let visible = text::truncate(&label, width);
         let painted = self.paint(Style::Dim, visible);
         bar.render(self.out.as_mut(), visible, &painted);
     }
 
-    /// Status segments, most significant first: the model, then the cache
-    /// statistics. This is the order a narrow bar drops them in.
-    fn status_parts(&self) -> Vec<String> {
-        let mut parts = Vec::new();
-        if let Some(m) = &self.model
-            && !m.is_empty()
-        {
-            parts.push(m.clone());
-        }
-        parts.extend(self.stats.segments());
-        parts
-    }
-
-    /// Status bar text: every segment joined. This is what a bar wide enough
-    /// for everything displays.
-    #[cfg(test)]
-    fn status_label(&self) -> String {
-        self.status_parts().join(" · ")
-    }
-
     /// Set the model id shown in the status bar (called when a session is created
     /// or switched, since it follows the session meta).
     pub fn set_model(&mut self, model: &str) {
-        self.model = Some(model.to_owned());
+        self.status.set_model(model);
         self.redraw_status_bar();
     }
 
     /// Cache statistics accumulated for the current session (the status bar's data
     /// source). Read by tests only.
     #[cfg(test)]
-    pub fn stats(&self) -> CacheStats {
-        self.stats
+    pub fn stats(&self) -> status::CacheStats {
+        self.status.stats()
     }
 
     /// Clear the cache statistics when switching sessions.
     pub fn reset_stats(&mut self) {
-        self.stats = CacheStats::default();
+        self.status.reset_stats();
         self.redraw_status_bar();
     }
 
@@ -482,7 +408,7 @@ impl Ui for Renderer {
 
     fn usage(&mut self, u: &Usage) {
         self.paint_cell(&Cell::Usage(u.clone()));
-        self.stats.record(u);
+        self.status.record(u);
         self.redraw_status_bar();
     }
 }
@@ -505,6 +431,7 @@ impl Write for SharedBuf {
 mod tests {
     use super::*;
     use crate::types::Role;
+    use status::CacheStats;
 
     #[test]
     fn reasoning_then_content_are_separate_blocks() {
@@ -788,44 +715,6 @@ mod tests {
     }
 
     #[test]
-    fn cache_stats_accumulate_and_label() {
-        let mut s = CacheStats::default();
-        assert_eq!(s.hit_rate(), None);
-        assert_eq!(s.label(), "cache —");
-        s.record(&usage_fixture(6, 4));
-        s.record(&usage_fixture(32378, 457));
-        assert_eq!((s.hit, s.miss), (32384, 461));
-        assert!((s.hit_rate().unwrap() - 98.6).abs() < 0.05, "{s:?}");
-        assert_eq!(s.label(), "cache 98.6% · hit 32384 · miss 461");
-    }
-
-    #[test]
-    fn cache_stats_read_glm_nested_details() {
-        // GLM shape: only prompt_tokens_details.cached_tokens is given, so miss
-        // has to be derived.
-        let mut s = CacheStats::default();
-        s.record(&Usage {
-            prompt_tokens: 1200,
-            completion_tokens: 300,
-            total_tokens: 1500,
-            prompt_tokens_details: Some(crate::types::PromptTokensDetails { cached_tokens: 800 }),
-            ..Default::default()
-        });
-        assert_eq!((s.hit, s.miss), (800, 400));
-        assert_eq!(s.label(), "cache 66.7% · hit 800 · miss 400");
-    }
-
-    #[test]
-    fn cache_stats_ignore_provider_without_cache_reporting() {
-        let mut s = CacheStats::default();
-        s.record(&Usage {
-            prompt_tokens: 100,
-            ..Default::default()
-        });
-        assert_eq!(s.label(), "cache —");
-    }
-
-    #[test]
     fn status_bar_from_size_guards() {
         assert_eq!(StatusBar::from_size(None), None);
         assert_eq!(StatusBar::from_size(Some((2, 80))), None); // too few rows
@@ -893,24 +782,6 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_render_truncates_to_width() {
-        let bar = StatusBar { rows: 10, cols: 20 }; // width = 19
-        let (mut r, buf) = Renderer::with_buffer(false);
-        let label = CacheStats {
-            hit: 32384,
-            miss: 461,
-        }
-        .label();
-        let visible = text::truncate(&label, bar.width());
-        bar.render(r.out.as_mut(), visible, visible);
-        let s = buf_of(&buf);
-        assert!(
-            s.contains("\x1b[10;1H\x1b[2Kcache 98.6% · hit 3\x1b8"),
-            "{s:?}"
-        );
-    }
-
-    #[test]
     fn apply_status_bar_transitions() {
         let a = StatusBar { rows: 10, cols: 40 };
         let b = StatusBar { rows: 12, cols: 50 };
@@ -965,27 +836,7 @@ mod tests {
         r.reset_stats();
         let tail = &buf_of(&buf)[s.len()..];
         assert!(tail.contains("cache —\x1b8"), "{tail:?}");
-        assert_eq!(r.stats, CacheStats::default());
-    }
-
-    #[test]
-    fn status_label_prepends_model_when_set() {
-        let (mut r, _buf) = Renderer::with_buffer(false);
-        assert_eq!(r.status_label(), "cache —");
-        r.set_model("deepseek-v4-flash");
-        assert_eq!(r.status_label(), "deepseek-v4-flash · cache —");
-        r.usage(&usage_fixture(6, 4));
-        assert_eq!(
-            r.status_label(),
-            "deepseek-v4-flash · cache 60.0% · hit 6 · miss 4"
-        );
-    }
-
-    #[test]
-    fn empty_model_falls_back_to_cache_only_label() {
-        let (mut r, _buf) = Renderer::with_buffer(false);
-        r.set_model("");
-        assert_eq!(r.status_label(), "cache —");
+        assert_eq!(r.stats(), CacheStats::default());
     }
 
     /// The status bar line the renderer draws at the given terminal width, with
