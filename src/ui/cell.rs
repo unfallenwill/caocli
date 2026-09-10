@@ -160,6 +160,23 @@ impl Gutter {
     }
 }
 
+/// The marker a line of the user's own carries, in the transcript and in the box
+/// while the same line is still being typed.
+///
+/// One marker in one column in both places, which is what makes a line read the same
+/// either side of the moment it is submitted: the box draws this itself rather than
+/// carrying it in the placeholder, so it does not move when the typing starts and
+/// does not go away when the hint does.
+pub const USER_MARKER: &str = "› ";
+
+/// The columns every gutter takes.
+///
+/// The gutters below are written out rather than built from this, so that each one
+/// reads as what it is; the tests pin them all back to it, and the box -- which has to
+/// start a draft in the same column the transcript starts a line -- asks for it rather
+/// than for a number of its own.
+pub const MARKER_COLUMNS: usize = 2;
+
 impl Cell {
     /// A tool call, with the argument summary derived from the raw arguments.
     pub fn tool_call(name: &str, args: &str) -> Self {
@@ -189,7 +206,7 @@ impl Cell {
         match self {
             // The one cell on the left edge.
             Cell::Content(_) => None,
-            Cell::User(_) => Some(Gutter::new("› ", "  ", Style::Dim)),
+            Cell::User(_) => Some(Gutter::new(USER_MARKER, "  ", Style::Dim)),
             // The thinking keeps its rule on every line: it is what makes a long
             // think read as one asided block rather than as a run of loose text. The
             // rule is painted in the thinking's own style, not a second one: it is
@@ -829,5 +846,14 @@ mod tests {
             widths.all(|width| width == first),
             "the markers are not all one width"
         );
+        assert_eq!(first, MARKER_COLUMNS, "and this is the width they all are");
+    }
+
+    /// The box draws the user's marker itself, from this constant, so a line being
+    /// typed is marked in the column the same line is marked in once it is submitted.
+    #[test]
+    fn the_user_marker_is_one_marker_wide() {
+        assert_eq!(Cell::User("x".into()).gutter().unwrap().head, USER_MARKER);
+        assert_eq!(text::width(USER_MARKER), MARKER_COLUMNS);
     }
 }

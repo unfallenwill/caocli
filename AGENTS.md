@@ -104,6 +104,13 @@ that talks to a network API and drives an interactive terminal.
   can run their eye down column zero and find what the model said rather than what it
   did. A new kind of cell has to choose a marker, and the ones in use are a short
   vocabulary: `›` the user, `▸` a call about to run, `┆` thinking, `·` a result.
+- **The input box is part of the same grid.** It draws the user's marker itself, from
+  `cell::USER_MARKER`, and the editor is rendered into a field inset by
+  `cell::MARKER_COLUMNS` — so a line being typed sits in the column the same line will
+  sit in once it is submitted, and neither the marker nor that column may be carried in
+  a placeholder string instead. The box's rules are drawn by the front end for the same
+  reason: a block on the editor would be inset with it and the rules would stop short of
+  the edges the transcript is read against.
 - **Ctrl-C during a turn is an out-of-band Command (graceful cancel), not a process
   kill**: the current effect is dropped (stream disconnected, child process
   `kill_on_drop`), unanswered calls are persisted with a deterministic cancellation

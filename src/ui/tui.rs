@@ -60,6 +60,11 @@ const BOX_ROWS: u16 = 3;
 /// starts in the column the transcript's own user lines start in.
 const BOX_BORDERS: Borders = Borders::TOP.union(Borders::BOTTOM);
 
+/// The columns the box's marker takes, which is the same two the transcript's user
+/// lines take: the draft is written where the same line will be written once it is
+/// submitted, so submitting moves nothing on the screen.
+const BOX_GUTTER: u16 = cell::MARKER_COLUMNS as u16;
+
 /// The rows the input box takes when it holds `lines` lines of text: one row each
 /// -- a line added with Ctrl-J is a line the box has to show -- plus the two
 /// borders.
@@ -118,10 +123,14 @@ const QUEUE_ROWS: usize = 3;
 /// message, it is the one to run when this turn ends -- and the turn itself can
 /// be stopped, which is worth saying, since a key that stops work is no good to
 /// a reader who cannot find it.
-const QUEUE_PLACEHOLDER: &str = "›  the turn is running · Enter queues · Ctrl-C stops";
+const QUEUE_PLACEHOLDER: &str = "the turn is running · Enter queues · Ctrl-C stops";
 
 /// What the box says while nothing runs.
-const IDLE_PLACEHOLDER: &str = "›  type a message · /help for commands";
+///
+/// Neither it nor the queue line carries the box's marker: the marker is the
+/// box's own, drawn in the column before this text whatever the text says, so a
+/// placeholder cannot displace it and typing cannot take it away.
+const IDLE_PLACEHOLDER: &str = "type a message · /help for commands";
 
 /// What the box says while the approval gate is open. The box is where the answer
 /// goes, so it says so rather than inviting the next message.
@@ -814,19 +823,26 @@ impl State {
         (super::text::width(&count) <= width).then_some(count)
     }
 
-    /// Put the working indicator on the box's block, or take it off. Called
-    /// every draw, unconditionally: the box's editor is replaced whole on some
-    /// inputs (a submitted line, a cleared one), and a remembered title would
-    /// then sit on a block the editor no longer has. Rebuilding a block per
-    /// draw is one small struct; the revision, not this, is what paces redraws.
-    fn set_activity_border(&mut self, width: usize) {
+    /// The box's rules: the two lines that close it in, and the working indicator
+    /// the top of them carries while a turn runs.
+    ///
+    /// The rules are the front end's to draw rather than the editor's, and that is
+    /// what buys the draft its column: a block on the editor is rendered into the
+    /// area the editor is rendered into, so insetting the editor to clear the
+    /// marker would pull both rules in with it and leave the box two columns short
+    /// of the edges the transcript is read against.
+    ///
+    /// Built per draw, which costs one small struct: the title is a clock and a
+    /// spinner, so there is nothing here worth remembering, and nothing that can go
+    /// stale when the editor is replaced whole by a submitted or a cleared line.
+    fn box_rule(&self, width: usize) -> Block<'static> {
         let mut block = Block::default()
             .borders(BOX_BORDERS)
             .border_style(RStyle::new().add_modifier(Modifier::DIM));
         if let Some(title) = self.activity_title(width.saturating_sub(2)) {
             block = block.title_top(Line::styled(title, style_of(Style::Dim)).right_aligned());
         }
-        self.textarea.set_block(block);
+        block
     }
 
     /// The indicator's heartbeat: bump the revision when the frame the spinner
@@ -1759,9 +1775,6 @@ impl<B: Backend> Screen<B> {
             let queued = queue.height() as u16;
             let rows = screen_rows(area, input, queued);
             self.state.reset_box_scroll(input);
-            // The working indicator lives on the box's top border: put there
-            // before the box renders, taken off the same way.
-            self.state.set_activity_border(rows[2].width as usize);
             // What the transcript has to show, in the three pieces it is made of:
             // the cells that are laid out and kept, then the block still being
             // written, then a question if one is open.
@@ -1786,6 +1799,12 @@ impl<B: Backend> Screen<B> {
             let transcript = Text::from(self.state.window_lines(first, last, &live, &question));
             let status = self.state.status_line(width);
             let cursor = self.state.textarea.screen_cursor();
+            // The box's rules, its marker, and the columns the draft is written in
+            // between them. Its marker is the box's own rather than a character of
+            // the draft or of the placeholder, so it is drawn whether the box holds
+            // a line, a hint or nothing at all -- and typing cannot take it away,
+            // which is what the marker inside the placeholder did.
+            let field = box_field(rows[2]);
 
             frame.render_widget(Paragraph::new(transcript), rows[0]);
             if !picker.is_empty() {
@@ -1802,8 +1821,13 @@ impl<B: Backend> Screen<B> {
                 frame.render_widget(Paragraph::new(Text::from(picker)), over);
             }
             frame.render_widget(Paragraph::new(queue), rows[1]);
-            frame.render_widget(&self.state.textarea, rows[2]);
-            place_cursor(frame, rows[2], cursor);
+            frame.render_widget(self.state.box_rule(rows[2].width as usize), rows[2]);
+            frame.render_widget(
+                Paragraph::new(Line::styled(cell::USER_MARKER, style_of(Style::Dim))),
+                box_marker(rows[2]),
+            );
+            frame.render_widget(&self.state.textarea, field);
+            place_cursor(frame, field, cursor);
             frame.render_widget(Paragraph::new(status), rows[3]);
         })?;
         Ok(drawn.area)
@@ -1819,18 +1843,55 @@ impl<B: Backend> Screen<B> {
     }
 }
 
-/// The input box: an editor ruled off above and below. Enter submits and Ctrl-J
-/// inserts a newline, matching the plain prompt's keys.
+/// The input box's editor. Enter submits and Ctrl-J inserts a newline, matching
+/// the plain prompt's keys.
+///
+/// It carries no block of its own: the rules are drawn by the front end, so that
+/// the draft can start past the marker while the rules still run the width of the
+/// screen.
+///
+/// A placeholder is drawn one column right of where the draft starts, and that is the
+/// editor's and not this: an empty box has no cursor cell of its own to draw, so the
+/// widget puts one at the head of the placeholder's first line, and the hint follows
+/// it. The hint is not the draft -- nothing is being typed while it is up -- so the
+/// column it starts in is not one anything can be compared against.
 fn input_box() -> TextArea<'static> {
     let mut textarea = TextArea::default();
-    textarea.set_block(
-        Block::default()
-            .borders(BOX_BORDERS)
-            .border_style(RStyle::new().add_modifier(Modifier::DIM)),
-    );
     textarea.set_placeholder_text(IDLE_PLACEHOLDER);
     textarea.set_cursor_line_style(RStyle::new());
     textarea
+}
+
+/// The columns inside the box's rules that the draft is written in: the whole
+/// width less the marker's columns.
+///
+/// This is the area the editor is rendered into, and with no block of its own the
+/// area it is given is also the area its cursor is reported against -- so the two
+/// have to be worked out the same way, which is what this being one function is
+/// for.
+fn box_field(area: Rect) -> Rect {
+    let inner = Block::default().borders(BOX_BORDERS).inner(area);
+    Rect {
+        x: inner.x + BOX_GUTTER,
+        width: inner.width.saturating_sub(BOX_GUTTER),
+        ..inner
+    }
+}
+
+/// The box's marker: the same one a user line carries in the transcript, in the
+/// same column, so that what is being typed and what was said line up.
+///
+/// One row tall and over the first row the draft has, rather than centred or
+/// repeated: the transcript sets a user line's marker against its first line, and
+/// a box that moved its marker as the draft grew would be a box that moved under
+/// the reader's eye.
+fn box_marker(area: Rect) -> Rect {
+    let inner = Block::default().borders(BOX_BORDERS).inner(area);
+    Rect {
+        width: BOX_GUTTER.min(inner.width),
+        height: inner.height.min(1),
+        ..inner
+    }
 }
 
 /// The lines one cell occupies at `width`.
@@ -1976,14 +2037,15 @@ fn wrapped_lines(spans: &[Span], width: usize) -> Vec<Line<'static>> {
 /// Translate the input box's own cursor into a position on the screen, so the
 /// terminal's caret sits where the next character will go.
 ///
-/// The box reports its cursor relative to the area inside its borders, which is
-/// the same inner area the widget renders into -- so the borders it is asked
-/// about have to be the box's own.
-fn place_cursor(frame: &mut Frame, area: Rect, cursor: ScreenCursor) {
-    let inner = Block::default().borders(BOX_BORDERS).inner(area);
-    let x = inner.x + cursor.col as u16;
-    let y = inner.y + cursor.row as u16;
-    if x < inner.right() && y < inner.bottom() {
+/// The box reports its cursor relative to the area it is rendered into, which --
+/// with no block of its own -- is the field [`box_field`] cuts out. So this is
+/// handed the rect the editor was rendered into rather than working out an area of
+/// its own: a second attempt at the same arithmetic is a caret in a column the
+/// character after it will not be in.
+fn place_cursor(frame: &mut Frame, field: Rect, cursor: ScreenCursor) {
+    let x = field.x + cursor.col as u16;
+    let y = field.y + cursor.row as u16;
+    if x < field.right() && y < field.bottom() {
         frame.set_cursor_position((x, y));
     }
 }
@@ -2447,13 +2509,9 @@ mod tests {
 
     /// The same, for a test that already holds the drawn rows.
     fn unset(drawn: &str) -> String {
-        // Skipped by character and not by column: every marker is one column, which is
-        // the whole reason the gutters are one width. The width is asked of a cell
-        // rather than written down, since one gutter answers for all of them.
-        let gutter = Cell::Notice(String::new())
-            .gutter()
-            .expect("a notice is set in");
-        drawn.chars().skip(gutter.width()).collect()
+        // Skipped by character and not by column: every marker is one column, which
+        // is the whole reason the gutters are one width.
+        drawn.chars().skip(cell::MARKER_COLUMNS).collect()
     }
 
     /// Where the drawn area is. A full screen starts at the origin, and a test
@@ -2663,7 +2721,7 @@ mod tests {
             .position(|r| r.starts_with('─'))
             .expect("the box is drawn");
         for (i, letter) in letters[..kept].iter().enumerate() {
-            let drawn = row(&screen, (top + i) as u16);
+            let drawn = body(&screen, (top + i) as u16);
             assert!(drawn.starts_with(*letter), "{drawn:?}");
         }
         assert!(
@@ -3519,6 +3577,30 @@ mod tests {
         assert_eq!(box_rows(1, 20), BOX_ROWS);
         assert_eq!(box_rows(2, 20), 4);
         assert_eq!(box_rows(6, 20), 8);
+    }
+
+    #[test]
+    fn the_box_is_drawn_on_a_terminal_with_no_room_to_draw_it_in() {
+        // The field and the marker are cut out of the box's own area, and both of
+        // them take columns from it. A terminal narrower than the gutter, or shorter
+        // than the two rules, leaves neither with anything -- and a draw is the one
+        // thing that cannot be allowed to fail there, since it is the draw that has
+        // to put the smaller screen on the screen.
+        for (width, height) in [(1, 1), (1, 3), (2, 2), (3, 3), (80, 2), (80, 1)] {
+            let mut screen = screen_for_test(width, height);
+            screen.draw().unwrap_or_else(|e| {
+                panic!("{width}x{height} would not draw: {e:?}");
+            });
+        }
+        // And the field is asked for what is there rather than for what it wants:
+        // a negative width is not a rect.
+        let area = Rect::new(0, 0, 80, 3);
+        let field = box_field(area);
+        assert_eq!(field.x, BOX_GUTTER);
+        assert_eq!(field.width, 80 - BOX_GUTTER);
+        assert_eq!(field.height, 1, "between the rules");
+        assert_eq!(box_field(Rect::new(0, 0, 1, 3)).width, 0);
+        assert_eq!(box_field(Rect::new(0, 0, 1, 1)).height, 0);
     }
 
     #[test]

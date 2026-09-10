@@ -636,6 +636,18 @@ def main() -> int:
             if len(grown) != len(empty) + 1 or not any("alpha" in row for row in grown):
                 print(f"  ✗ Ctrl-J did not grow the box: {grown}")
                 ok = False
+            # And the draft is set in where the same line will be set in once it is
+            # submitted: the marker on the first row, the columns past it on the rows
+            # after, which is what the transcript does with the line this becomes. The
+            # marker is the box's own rather than a character of the draft, so it is
+            # there whether the box holds a line, a hint or nothing at all -- and it
+            # does not move when the typing starts.
+            if grown[1] != "› alpha":
+                print(f"  ✗ the box does not set its first row in: {grown}")
+                ok = False
+            if grown[2] != "  beta":
+                print(f"  ✗ a second draft row came back to the edge: {grown}")
+                ok = False
             # ... and the cursor is on the line that key added, with the text it
             # was typed after: a grown box the cursor is not drawn in would be no
             # better than the one-row box it replaced.
