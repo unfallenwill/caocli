@@ -6,6 +6,7 @@
 //! that is resumed looks exactly like the one that was watched live.
 
 use crate::image::{self, Note};
+use crate::tools::ask::Question;
 use crate::types::{Message, Role, Usage};
 
 use std::time::Duration;
@@ -125,6 +126,14 @@ pub enum Cell {
         hint: String,
         diff: Vec<DiffLine>,
     },
+    /// The question tool's call: what is being asked, and what there is to
+    /// choose from.
+    ///
+    /// A cell of its own rather than a [`Cell::ToolCall`] carrying the raw
+    /// arguments, because these are the words the user has to read -- and because
+    /// they are read back from the call's own arguments, so a resumed session
+    /// shows the questions exactly as the live one did.
+    Question(Vec<Question>),
     /// A tool result. Only a summary is ever rendered, never the full text.
     ToolResult(String),
     /// A dim informational line.
@@ -208,7 +217,18 @@ impl Cell {
     }
 
     /// A tool call, with the argument summary derived from the raw arguments.
+    ///
+    /// The question tool is the one call whose arguments are what is shown: its
+    /// cell is the questions themselves, because a clipped copy of the wire
+    /// format is not something a person can answer. An unreadable call falls back
+    /// to the raw line -- the interpreter answers it with the parse failure, and
+    /// the transcript shows what it was that could not be read.
     pub fn tool_call(name: &str, args: &str) -> Self {
+        if name == crate::tools::ask::ASK_NAME
+            && let Ok(questions) = crate::tools::ask::parse(args)
+        {
+            return Cell::Question(questions);
+        }
         Cell::ToolCall {
             name: name.to_owned(),
             hint: hint(args),
@@ -241,7 +261,7 @@ impl Cell {
             // rule is painted in the thinking's own style, not a second one: it is
             // part of the block, and one block is one style run.
             Cell::Reasoning(_) => Some(Gutter::new("┆ ", "┆ ", Style::Reasoning)),
-            Cell::ToolCall { .. } | Cell::Approval { .. } => {
+            Cell::ToolCall { .. } | Cell::Approval { .. } | Cell::Question(_) => {
                 Some(Gutter::new("▸ ", "  ", Style::Yellow))
             }
             Cell::ToolResult(_) => Some(Gutter::new("· ", "  ", Style::Dim)),
@@ -302,6 +322,7 @@ impl Cell {
                 Style::Yellow,
                 format!("{name} {hint} — run it? [y/N] "),
             )],
+            Cell::Question(questions) => question_spans(questions),
         }
     }
 
@@ -317,7 +338,7 @@ impl Cell {
             Cell::Reasoning(_) | Cell::Content(_) => prev_is_text_block,
             // A tool call is announced on a line of its own, and a replayed user
             // line is set off from whatever preceded it.
-            Cell::ToolCall { .. } | Cell::User { .. } => true,
+            Cell::ToolCall { .. } | Cell::User { .. } | Cell::Question(_) => true,
             _ => false,
         }
     }
@@ -464,6 +485,45 @@ fn image_line(image: &Note) -> String {
 
 /// One-line summary of a tool result: its first line and how much text came
 /// back.
+/// The question tool's cell: what is being asked, and what there is to choose
+/// from.
+///
+/// One block per question, in the order they were asked, with the options
+/// numbered: the number is what a front end reading a typed answer matches, and
+/// what the panel's own keys jump to. The numbers and the descriptions are dim
+/// because the label is what the answer is made of; the question itself is
+/// painted like the call it is, since that is what it is.
+fn question_spans(questions: &[Question]) -> Vec<Span> {
+    let mut spans = Vec::new();
+    for (i, question) in questions.iter().enumerate() {
+        let lead = if i == 0 { "" } else { "\n\n" };
+        let heading = if question.header.is_empty() {
+            question.question.clone()
+        } else {
+            format!("{}: {}", question.header, question.question)
+        };
+        spans.push(Span::new(Style::Yellow, format!("{lead}{heading}")));
+        if question.multi_select {
+            spans.push(Span::new(Style::Dim, " · choose any"));
+        }
+        if question.options.is_empty() {
+            spans.push(Span::new(Style::Dim, "\n  answer in your own words"));
+            continue;
+        }
+        for (n, option) in question.options.iter().enumerate() {
+            spans.push(Span::new(Style::Dim, format!("\n  {}. ", n + 1)));
+            spans.push(Span::new(Style::Plain, option.label.clone()));
+            if !option.description.is_empty() {
+                spans.push(Span::new(Style::Dim, format!(" — {}", option.description)));
+            }
+        }
+    }
+    spans
+}
+
+/// The summary shown for a tool result: its first line and how much there is of
+/// it. A result is often a screenful of a file or a command's output, and what the
+/// transcript is for is the shape of the turn, not the contents of every result.
 fn summary(result: &str) -> String {
     format!(
         "{} · {} bytes",
@@ -909,6 +969,87 @@ mod tests {
         assert!(from_messages(&[]).is_empty());
     }
 
+    /// The question tool's cell is read back out of the call's own arguments, so
+    /// a resumed session shows the questions exactly as the live one did -- the
+    /// options and all, which is what a reader needs to make sense of the answer
+    /// line that follows.
+    #[test]
+    fn replay_of_a_question_call_is_the_questions_again() {
+        let args =
+            r#"{"questions":[{"id":"auth","question":"Which auth?","options":[{"label":"JWT"}]}]}"#;
+        let cells = from_messages(&[
+            assistant(None, None, Some(vec![call("AskUserQuestion", args)])),
+            Message::tool("call_1", "auth: JWT"),
+        ]);
+        assert_eq!(
+            cells,
+            vec![
+                Cell::tool_call("AskUserQuestion", args),
+                Cell::ToolResult("auth: JWT".into()),
+            ]
+        );
+        assert!(matches!(cells[0], Cell::Question(_)));
+    }
+
+    #[test]
+    fn the_question_tool_shows_its_questions_and_not_its_arguments() {
+        let cell = Cell::tool_call(
+            "AskUserQuestion",
+            &serde_json::json!({"questions": [{
+                "id": "auth",
+                "header": "Auth",
+                "question": "Which auth should we use?",
+                "options": [
+                    {"label": "JWT", "description": "one token for the API"},
+                    {"label": "Session cookie"}
+                ],
+                "multi_select": true
+            }]})
+            .to_string(),
+        );
+        let Cell::Question(questions) = &cell else {
+            panic!("the questions are the cell, not {cell:?}");
+        };
+        assert_eq!(questions.len(), 1);
+        assert_eq!(
+            cell.spans(),
+            vec![
+                Span::new(Style::Yellow, "Auth: Which auth should we use?"),
+                Span::new(Style::Dim, " · choose any"),
+                Span::new(Style::Dim, "\n  1. "),
+                Span::new(Style::Plain, "JWT"),
+                Span::new(Style::Dim, " — one token for the API"),
+                // An option the model gave no description for is its label
+                // alone: no separator with nothing behind it.
+                Span::new(Style::Dim, "\n  2. "),
+                Span::new(Style::Plain, "Session cookie"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_question_with_nothing_to_pick_from_says_so() {
+        let cell = Cell::tool_call(
+            "AskUserQuestion",
+            r#"{"questions":[{"id":"a","question":"Which?"}]}"#,
+        );
+        assert_eq!(
+            cell.spans(),
+            vec![
+                Span::new(Style::Yellow, "Which?"),
+                Span::new(Style::Dim, "\n  answer in your own words"),
+            ]
+        );
+    }
+
+    #[test]
+    fn arguments_the_question_tool_cannot_read_are_still_a_call() {
+        // The interpreter answers this one with the parse failure; the transcript
+        // shows the line that could not be read.
+        let cell = Cell::tool_call("AskUserQuestion", r#"{"questions":"nonsense"}"#);
+        assert!(matches!(cell, Cell::ToolCall { .. }), "was {cell:?}");
+    }
+
     #[test]
     fn styles_map_to_their_escape_sequences() {
         assert_eq!(Style::Plain.code(), "");
@@ -931,6 +1072,10 @@ mod tests {
             Cell::Reasoning("hmm".into()),
             Cell::Content("answer".into()),
             Cell::tool_call("Bash", r#"{"command":"ls"}"#),
+            Cell::tool_call(
+                "AskUserQuestion",
+                r#"{"questions":[{"id":"a","question":"Which?"}]}"#,
+            ),
             Cell::ToolResult("ok".into()),
             Cell::Notice("noted".into()),
             Cell::Failure("broken".into()),

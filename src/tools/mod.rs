@@ -1,3 +1,4 @@
+pub mod ask;
 mod fs;
 mod shell;
 
@@ -6,6 +7,10 @@ use crate::types::ToolDef;
 /// Name of the read-only tool referenced by the approval gate policy (never
 /// needs to ask the user).
 pub const READ_NAME: &str = fs::READ_NAME;
+
+/// Name of the one tool whose result is a person's answer rather than the
+/// machine's: the interpreter recognizes it before dispatching anything.
+pub const ASK_NAME: &str = ask::ASK_NAME;
 
 /// Cap on tool output sent back to the model (bytes).
 pub const MAX_OUTPUT: usize = 10 * 1024;
@@ -21,23 +26,34 @@ pub fn definitions() -> Vec<ToolDef> {
         fs::read_definition(),
         fs::edit_definition(),
         fs::write_definition(),
+        ask::definition(),
     ]
 }
 
 /// Dispatch by name. Never returns Err: every failure (unknown tool, bad
 /// arguments, IO error) is passed back to the model as tool result text and the
 /// model decides what to do next.
+///
+/// The question tool is answered rather than dispatched: its result is what a
+/// person chose, and only a front end has one. The interpreter asks there before
+/// anything reaches this function; the arm below is the answer a call that
+/// somehow arrives here anyway gets -- text the model can correct itself from,
+/// never a panic and never a question nobody can answer.
 pub async fn execute(name: &str, args_json: &str) -> String {
     match name {
         shell::NAME => shell::execute(args_json).await,
         fs::READ_NAME => fs::read(args_json),
         fs::EDIT_NAME => fs::edit(args_json),
         fs::WRITE_NAME => fs::write(args_json),
+        ask::ASK_NAME => {
+            format!("error: {ASK_NAME} is answered by the front end and cannot be executed here")
+        }
         other => format!(
-            "error: unknown tool {other:?}. Available tools: Bash, {}, {}, {}",
+            "error: unknown tool {other:?}. Available tools: Bash, {}, {}, {}, {}",
             fs::READ_NAME,
             fs::EDIT_NAME,
-            fs::WRITE_NAME
+            fs::WRITE_NAME,
+            ASK_NAME
         ),
     }
 }
@@ -87,7 +103,10 @@ mod tests {
     #[test]
     fn definitions_are_stable_and_named() {
         let names: Vec<String> = definitions().into_iter().map(|d| d.function.name).collect();
-        assert_eq!(names, vec!["Bash", "Read", "Edit", "Write"]);
+        assert_eq!(
+            names,
+            vec!["Bash", "Read", "Edit", "Write", "AskUserQuestion"]
+        );
     }
 
     #[tokio::test]
@@ -95,6 +114,20 @@ mod tests {
         let out = execute("Delete", "{}").await;
         assert!(out.contains("unknown tool"));
         assert!(out.contains("Bash"));
+    }
+
+    /// The question tool never reaches the dispatch: asking is the interpreter's
+    /// and the front end's. A call that arrives here anyway is answered with
+    /// text, so that the tool result window closes and the model can carry on.
+    #[tokio::test]
+    async fn the_question_tool_is_not_executed_here() {
+        let out = execute(
+            "AskUserQuestion",
+            r#"{"questions":[{"id":"a","question":"q"}]}"#,
+        )
+        .await;
+        assert!(out.starts_with("error: "), "was {out:?}");
+        assert!(out.contains("answered by the front end"));
     }
 
     #[tokio::test]
