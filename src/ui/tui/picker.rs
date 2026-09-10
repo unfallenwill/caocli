@@ -67,6 +67,8 @@ pub(super) enum Choosing {
     Provider,
     /// A model to switch to: `/model`'s menu.
     Model,
+    /// A reasoning effort tier to switch to: `/effort`'s menu.
+    Effort,
 }
 
 impl Choosing {
@@ -79,6 +81,7 @@ impl Choosing {
             Choosing::Session => "/resume",
             Choosing::Provider => "/login",
             Choosing::Model => "/model",
+            Choosing::Effort => "/effort",
         }
     }
 

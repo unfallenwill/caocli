@@ -219,9 +219,9 @@ pub async fn run(
 /// The menus the front end can offer where the plain front end can only print.
 ///
 /// `/resume` with nothing to resume is a request for the list rather than a
-/// command to run; `/login` and `/model` are commands whose argument is a row
-/// of a menu. The chosen row is submitted as the very line the plain prompt
-/// would have been given, so the switching itself is unchanged.
+/// command to run; `/login`, `/model` and `/effort` are commands whose argument
+/// is a row of a menu. The chosen row is submitted as the very line the plain
+/// prompt would have been given, so the switching itself is unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Menu {
     /// The sessions there are to switch to.
@@ -230,6 +230,8 @@ enum Menu {
     Login,
     /// The models the session can switch to.
     Model,
+    /// The reasoning effort tiers the provider in use accepts.
+    Effort,
 }
 
 /// The command a line names whose answer is a menu rather than a turn.
@@ -238,6 +240,7 @@ fn menu_for(line: &str) -> Option<Menu> {
         "/resume" => Some(Menu::Sessions),
         "/login" => Some(Menu::Login),
         "/model" => Some(Menu::Model),
+        "/effort" => Some(Menu::Effort),
         _ => None,
     }
 }
@@ -259,6 +262,10 @@ fn offer_menu(
         Menu::Model => Ok(screen.state.open_choices(
             Choosing::Model,
             choice_rows(config::model_menu(&agent.model_label())),
+        )),
+        Menu::Effort => Ok(screen.state.open_choices(
+            Choosing::Effort,
+            choice_rows(config::effort_menu(&agent.provider(), agent.effort_label())),
         )),
     }
 }

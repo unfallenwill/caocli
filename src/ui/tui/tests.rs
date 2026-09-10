@@ -2407,9 +2407,9 @@ fn a_line_being_typed_is_held_aside_while_a_secret_is_open() {
 
 #[test]
 fn a_provider_or_model_row_is_submitted_as_the_line_it_stands_for() {
-    // The pickers `/login` and `/model` open: the row is the argument, and
-    // the command that takes it is the one the plain prompt would be given,
-    // so choosing is implemented once for both front ends.
+    // The pickers `/login`, `/model` and `/effort` open: the row is the
+    // argument, and the command that takes it is the one the plain prompt would
+    // be given, so choosing is implemented once for both front ends.
     let mut state = State::default();
     assert!(state.open_choices(
         Choosing::Provider,
@@ -2440,6 +2440,17 @@ fn a_provider_or_model_row_is_submitted_as_the_line_it_stands_for() {
     ));
     assert!(state.choose());
     assert_eq!(state.textarea.lines(), ["/model zai-coding-cn/glm-5.3"]);
+
+    assert!(state.open_choices(
+        Choosing::Effort,
+        named_rows(vec![("max".into(), "current".into())])
+    ));
+    assert!(state.choose());
+    assert_eq!(
+        state.textarea.lines(),
+        ["/effort max"],
+        "a tier is named by itself"
+    );
 }
 
 #[test]
@@ -2624,6 +2635,7 @@ fn a_menu_command_names_its_menu() {
     assert_eq!(menu_for("/resume"), Some(Menu::Sessions));
     assert_eq!(menu_for(" /login "), Some(Menu::Login));
     assert_eq!(menu_for("/model"), Some(Menu::Model));
+    assert_eq!(menu_for("/effort"), Some(Menu::Effort));
 }
 
 #[test]
@@ -2633,4 +2645,5 @@ fn anything_else_runs_as_a_turn_and_not_as_a_menu() {
     // A menu command with an argument already has what it needs.
     assert_eq!(menu_for("/resume abc123"), None);
     assert_eq!(menu_for("/model glm-4.6"), None);
+    assert_eq!(menu_for("/effort low"), None);
 }
