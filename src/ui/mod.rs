@@ -1,7 +1,10 @@
 mod cell;
+mod contract;
 mod status;
 pub(crate) mod text;
 pub mod tui;
+
+pub use contract::{Front, Ui};
 
 use std::future::Future;
 use std::io::{IsTerminal, Write};
@@ -197,70 +200,6 @@ impl Block {
             Block::Content => Cell::Content(String::new()),
         }
     }
-}
-
-/// The machine → UI notification vocabulary (the Notice channel).
-/// Discipline: notifications only, never returning data back; implementations
-/// must not block, and a failed terminal write counts as fatal.
-/// The machine (agent) depends only on this trait, not on a concrete renderer;
-/// the only in-process implementation is [`Renderer`].
-pub trait Ui {
-    /// A thinking fragment (arrives before the body text).
-    fn reasoning_delta(&mut self, s: &str);
-    /// A body-text fragment.
-    fn content_delta(&mut self, s: &str);
-    /// One streaming round is over; blocks are reset.
-    fn finish_turn(&mut self);
-    /// A tool is starting: echo the tool name and an argument summary.
-    fn tool_start(&mut self, name: &str, args: &str);
-    /// A tool result summary.
-    fn tool_result(&mut self, result: &str);
-    /// Token usage for a sub-request, with the wall time the stream took (also
-    /// accumulates session-level cache stats). The duration is what a
-    /// tokens-per-second figure is computed from; a front end that shows none
-    /// ignores it.
-    fn usage(&mut self, u: &Usage, stream: Duration);
-    /// The turn was cancelled by the user (Ctrl-C): close the streaming block and
-    /// print an interruption notice.
-    fn interrupted(&mut self);
-    /// Approval gate question: echo the tool and an argument summary and prompt
-    /// y/N (the answer is read through the Input channel, not through this trait —
-    /// a Notice never returns data).
-    fn approval_requested(&mut self, name: &str, args: &str);
-}
-
-/// What a front end offers the *application*, as opposed to [`Ui`], which is what
-/// the *machine* sends.
-///
-/// The two are kept apart on purpose: `Ui` is the machine's notification
-/// vocabulary and stays that, while this is the handful of operations the
-/// submitted-line handling needs from whichever front end is running -- the
-/// plain renderer, or the interactive one that owns the terminal.
-pub trait Front: Ui {
-    /// Draw a resumed session's history.
-    fn replay(&mut self, messages: &[Message]);
-    /// A dim informational line.
-    fn info(&mut self, s: &str);
-    /// A failure. The plain front end writes it to the error stream so it
-    /// survives a redirected stdout; an interactive one has to place it in its
-    /// own output, which is why this takes `&mut self`.
-    fn error(&mut self, s: &str);
-    /// Adopt the model id the status line reports.
-    fn set_model(&mut self, model: &str);
-    /// Adopt the reasoning effort tier the status line reports.
-    fn set_effort(&mut self, effort: &str);
-    /// Clear the session's cache statistics.
-    fn reset_stats(&mut self);
-    /// Ask for a secret: `prompt` says what it is for, and the answer is the
-    /// text typed in reply. `None` means nothing was entered — a cancellation,
-    /// an end of input, or a front end that has gone away.
-    ///
-    /// A question rather than a line to submit, because an answer that reached
-    /// the session log or the transcript would no longer be a secret. The
-    /// interactive front end draws the prompt and takes the answer in its box
-    /// with the text hidden; the plain one writes the prompt and reads a line
-    /// from its own input with the terminal's echo off.
-    fn ask_secret(&mut self, prompt: &str) -> Pin<Box<dyn Future<Output = Option<String>> + '_>>;
 }
 
 /// One line of stdin, read on a blocking task: the terminal's own line editing is
