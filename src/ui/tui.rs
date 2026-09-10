@@ -83,6 +83,12 @@ fn seconds(elapsed: Duration) -> String {
     format!("{}.{}s", tenths / 10, tenths % 10)
 }
 
+/// The thinking block's ground and foreground, by their numbers in ANSI's
+/// 256-colour palette. The same pair the plain front end writes as an escape
+/// sequence; here as numbers because ratatui takes colours rather than sequences.
+const REASONING_GROUND: u8 = 236;
+const REASONING_FOREGROUND: u8 = 245;
+
 /// The least room the session summary is worth showing in. Below this it is
 /// dropped rather than clipped to a stub.
 const MIN_STATUS_COLUMNS: usize = 12;
@@ -435,7 +441,7 @@ impl State {
     fn apply(&mut self, notice: Notice) {
         self.revision += 1;
         match notice {
-            Notice::Reasoning(text) => self.stream(Style::Dim, &text),
+            Notice::Reasoning(text) => self.stream(Style::Reasoning, &text),
             Notice::Content(text) => self.stream(Style::Plain, &text),
             Notice::FinishTurn => self.end_block(),
             Notice::ToolStart { name, args } => {
@@ -493,7 +499,7 @@ impl State {
     fn end_block(&mut self) {
         if let Some((style, text)) = self.live.take() {
             let cell = match style {
-                Style::Dim => Cell::Reasoning(text),
+                Style::Reasoning => Cell::Reasoning(text),
                 _ => Cell::Content(text),
             };
             self.pending.push(cell);
@@ -1312,8 +1318,36 @@ fn input_box() -> TextArea<'static> {
 fn cell_lines(cells: &[Cell], width: usize) -> Vec<Line<'static>> {
     cells
         .iter()
-        .flat_map(|c| wrapped_lines(&c.spans(), width))
+        .flat_map(|cell| {
+            let fill = fill_of(cell);
+            wrapped_lines(&cell.spans(), width)
+                .into_iter()
+                .map(move |mut line| {
+                    if let Some(style) = fill {
+                        // A style on the line itself would not do it: a paragraph
+                        // renders a line by writing its styled graphemes and leaving
+                        // the columns past the text alone, so the ground would stop
+                        // where the words stop and read as a highlight rather than
+                        // as a block. The blanks are written out instead.
+                        let used = line.width();
+                        if used < width {
+                            line.spans
+                                .push(RSpan::styled(" ".repeat(width - used), style));
+                        }
+                    }
+                    line
+                })
+        })
         .collect()
+}
+
+/// The style a cell's whole width is painted in, for the cells that read as blocks
+/// rather than as lines of text.
+fn fill_of(cell: &Cell) -> Option<RStyle> {
+    match cell {
+        Cell::Reasoning(_) => Some(style_of(Style::Reasoning)),
+        _ => None,
+    }
 }
 
 fn wrapped_lines(spans: &[Span], width: usize) -> Vec<Line<'static>> {
@@ -1407,6 +1441,12 @@ fn style_of(style: Style) -> RStyle {
     match style {
         Style::Plain => RStyle::new(),
         Style::Dim => RStyle::new().add_modifier(Modifier::DIM),
+        // The same dark ground and light foreground the plain front end writes, so
+        // the thinking reads the same way in both. Indexed colours rather than
+        // RGB: a terminal that has 256 of them is the one this is drawn for.
+        Style::Reasoning => RStyle::new()
+            .fg(Color::Indexed(REASONING_FOREGROUND))
+            .bg(Color::Indexed(REASONING_GROUND)),
         Style::Yellow => RStyle::new().fg(Color::Yellow),
         Style::Green => RStyle::new().fg(Color::Green),
         Style::Red => RStyle::new().fg(Color::Red),
@@ -1966,6 +2006,39 @@ mod tests {
         let top = origin(&mut screen).y;
         assert_eq!(row(&screen, top + 1), format!("  + {}", "x".repeat(16)));
         assert_eq!(row(&screen, top + 2), "x".repeat(14));
+    }
+
+    #[test]
+    fn thinking_is_drawn_as_a_block_that_reaches_the_edge() {
+        // Its own ground, painted across the whole row rather than under the
+        // characters only: a block that stops where the text stops does not read as
+        // a block, and the answer below it must not be caught by it.
+        let mut screen = screen_for_test(40, 20);
+        screen.state.pending.push(Cell::Reasoning("hmm".into()));
+        screen.state.pending.push(Cell::Content("answer".into()));
+        screen.draw().unwrap();
+        let top = origin(&mut screen).y;
+        let buf = screen.terminal.backend().buffer();
+        assert_eq!(row(&screen, top), "hmm");
+        assert_eq!(buf[(0, top)].bg, Color::Indexed(REASONING_GROUND));
+        assert_eq!(buf[(3, top)].bg, Color::Indexed(REASONING_GROUND));
+        assert_eq!(
+            buf[(39, top)].bg,
+            Color::Indexed(REASONING_GROUND),
+            "all the way to the edge"
+        );
+        assert_eq!(
+            buf[(0, top)].fg,
+            Color::Indexed(REASONING_FOREGROUND),
+            "and readable on it"
+        );
+        assert_eq!(row(&screen, top + 1), "answer");
+        assert_eq!(
+            buf[(0, top + 1)].bg,
+            Color::Reset,
+            "the answer keeps its own"
+        );
+        assert_eq!(buf[(39, top + 1)].bg, Color::Reset);
     }
 
     #[test]

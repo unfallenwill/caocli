@@ -114,9 +114,12 @@ enum Block {
 
 impl Block {
     /// The style the whole block is written in.
+    ///
+    /// The same styles the cells use, which is what keeps a streamed block and the
+    /// cell replay builds out of the same text painted identically.
     fn style(self) -> Style {
         match self {
-            Block::Reasoning => Style::Dim,
+            Block::Reasoning => Style::Reasoning,
             Block::Content => Style::Plain,
         }
     }
@@ -471,7 +474,7 @@ mod tests {
         r.finish_turn();
         assert_eq!(
             String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-            "\x1b[2mthinking...\x1b[0m\n\nanswer\x1b[0m\n"
+            "\x1b[38;5;245;48;5;236mthinking...\x1b[0m\n\nanswer\x1b[0m\n"
         );
     }
 
@@ -483,7 +486,7 @@ mod tests {
         r.finish_turn();
         assert_eq!(
             String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-            "partial\x1b[0m\n\n\x1b[2mmore thinking\x1b[0m\n"
+            "partial\x1b[0m\n\n\x1b[38;5;245;48;5;236mmore thinking\x1b[0m\n"
         );
     }
 
@@ -517,7 +520,7 @@ mod tests {
         r.finish_turn();
         assert_eq!(
             String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-            "\x1b[2mhmm\x1b[0m\n"
+            "\x1b[38;5;245;48;5;236mhmm\x1b[0m\n"
         );
     }
 
@@ -531,7 +534,7 @@ mod tests {
         r.finish_turn();
         assert_eq!(
             String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-            "\x1b[2mab\x1b[0m\n\nxy\x1b[0m\n"
+            "\x1b[38;5;245;48;5;236mab\x1b[0m\n\nxy\x1b[0m\n"
         );
     }
 
@@ -573,8 +576,8 @@ mod tests {
         let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(s.contains("\x1b[2m› \x1b[0mtake a look"), "{s}");
         assert!(
-            s.contains("\x1b[2mlet me think\x1b[0m"),
-            "thinking is gray: {s}"
+            s.contains("\x1b[38;5;245;48;5;236mlet me think\x1b[0m"),
+            "thinking has a ground of its own: {s}"
         );
         assert!(s.contains("running it"), "{s}");
         assert!(s.contains("▸ Bash ls -la"), "tool calls are yellow: {s}");

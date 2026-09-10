@@ -84,6 +84,7 @@ def seed_session(home: str) -> str:
                 "t": "msg",
                 "message": {
                     "role": "assistant",
+                    "reasoning_content": "weighing the change",
                     "tool_calls": [
                         {
                             "id": "call_1",
@@ -309,6 +310,12 @@ def main() -> int:
             # anything that is running now.
             ok &= term.expect("  - one", 15)
             ok &= term.expect("  + two", 15)
+            # The thinking of that turn is drawn as a block with a ground of its
+            # own, not as faint text: this is the terminal being told to paint one.
+            ok &= term.expect("weighing the change", 15)
+            if b"48;5;236" not in term.raw:
+                print("  ✗ the thinking block has no ground")
+                ok = False
             if term.queries == 0:
                 print("  ✗ the viewport never asked where the cursor was")
                 ok = False

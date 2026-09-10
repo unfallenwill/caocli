@@ -15,8 +15,18 @@ use super::text;
 pub enum Style {
     /// Unstyled text: body text.
     Plain,
-    /// Secondary text: thinking, tool results, notices.
+    /// Secondary text: tool results, notices.
     Dim,
+    /// The thinking behind an answer.
+    ///
+    /// Its own style rather than `Dim`, because faint text is not a distinction
+    /// every terminal makes -- SGR 2 is ignored by some, and on those a reader
+    /// cannot tell thinking from an answer -- while a ground is.
+    ///
+    /// Only the line-drawing front end fills that ground across the width: it has
+    /// the row in hand and redraws it, where the plain one writes a line as it
+    /// arrives and has nothing to paint the blanks with afterwards.
+    Reasoning,
     /// Attention text: tool calls, interruptions.
     Yellow,
     /// Text a change adds.
@@ -27,10 +37,16 @@ pub enum Style {
 
 impl Style {
     /// The escape sequence that opens this style.
+    ///
+    /// [`Style::Reasoning`] sets a foreground as well as a ground, and that is
+    /// deliberate: a fixed dark ground under the terminal's own foreground is
+    /// unreadable on a light theme, so the pair is chosen together rather than
+    /// inherited.
     pub fn code(self) -> &'static str {
         match self {
             Style::Plain => "",
             Style::Dim => "\x1b[2m",
+            Style::Reasoning => "\x1b[38;5;245;48;5;236m",
             Style::Yellow => "\x1b[33m",
             Style::Green => "\x1b[32m",
             Style::Red => "\x1b[31m",
@@ -130,7 +146,7 @@ impl Cell {
                 Span::new(Style::Dim, "› "),
                 Span::new(Style::Plain, text.as_str()),
             ],
-            Cell::Reasoning(text) => vec![Span::new(Style::Dim, text.as_str())],
+            Cell::Reasoning(text) => vec![Span::new(Style::Reasoning, text.as_str())],
             Cell::Content(text) => vec![Span::new(Style::Plain, text.as_str())],
             Cell::ToolCall { name, hint, diff } => {
                 let mut spans = vec![Span::new(Style::Yellow, format!("▸ {name} {hint}"))];
@@ -596,6 +612,9 @@ mod tests {
     fn styles_map_to_their_escape_sequences() {
         assert_eq!(Style::Plain.code(), "");
         assert_eq!(Style::Dim.code(), "\x1b[2m");
+        // A ground as well as a weight: faint text is a distinction some terminals
+        // ignore, and the ground is the one they cannot.
+        assert_eq!(Style::Reasoning.code(), "\x1b[38;5;245;48;5;236m");
         assert_eq!(Style::Yellow.code(), "\x1b[33m");
         assert_eq!(Style::Red.code(), "\x1b[31m");
     }
