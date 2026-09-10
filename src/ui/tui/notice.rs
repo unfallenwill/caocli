@@ -139,3 +139,124 @@ pub(super) fn drain<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> Vec<T> {
     }
     drained
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::time::Duration;
+
+    use crate::types::Usage;
+
+    #[test]
+    fn every_ui_call_becomes_the_notice_it_names() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut notifier = Notifier { tx };
+        notifier.reasoning_delta("think");
+        notifier.content_delta("say");
+        notifier.finish_turn();
+        notifier.tool_start("Bash", "{}");
+        notifier.tool_result("done");
+        notifier.usage(&Usage::default(), Duration::from_secs(1));
+        notifier.interrupted();
+        notifier.info("note");
+        notifier.error("bad");
+        notifier.set_model("glm-4.6");
+        notifier.reset_stats();
+        let expected = [
+            Notice::Reasoning("think".into()),
+            Notice::Content("say".into()),
+            Notice::FinishTurn,
+            Notice::ToolStart {
+                name: "Bash".into(),
+                args: "{}".into(),
+            },
+            Notice::ToolResult("done".into()),
+            Notice::Usage(Usage::default(), Duration::from_secs(1)),
+            Notice::Interrupted,
+            Notice::Info("note".into()),
+            Notice::Error("bad".into()),
+            Notice::SetModel("glm-4.6".into()),
+            Notice::ResetStats,
+        ];
+        for notice in expected {
+            let got = rx.try_recv().expect("every call sends its notice");
+            assert_eq!(format!("{got:?}"), format!("{notice:?}"), "in order");
+        }
+        assert!(rx.try_recv().is_err(), "and nothing more");
+    }
+
+    #[test]
+    fn approval_requested_sends_the_call_for_the_gate_to_show() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut notifier = Notifier { tx };
+        notifier.approval_requested("Bash", r#"{"command":"ls"}"#);
+        match rx.try_recv().expect("the gate's question arrives") {
+            Notice::Approval { name, args } => {
+                assert_eq!(name, "Bash");
+                assert_eq!(args, r#"{"command":"ls"}"#);
+            }
+            other => panic!("an approval, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_secret_is_asked_by_notice_and_answered_by_its_own_channel() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut notifier = Notifier { tx };
+        let ask = notifier.ask_secret("the API key");
+        match rx.try_recv().expect("the question arrives as a notice") {
+            Notice::Secret { prompt, reply } => {
+                assert_eq!(prompt, "the API key");
+                reply.send(Some("sk-test".into())).expect("an answer");
+            }
+            other => panic!("a secret, not {other:?}"),
+        }
+        assert_eq!(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(ask)
+                .as_deref(),
+            Some("sk-test")
+        );
+    }
+
+    #[test]
+    fn a_secret_asked_of_a_gone_front_end_is_a_cancellation() {
+        // The receiver is dropped unread, so the notice dies with its reply
+        // handle: the answer can never come.
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let mut notifier = Notifier { tx };
+        let ask = notifier.ask_secret("the API key");
+        assert_eq!(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(ask),
+            None
+        );
+    }
+
+    #[test]
+    fn sending_to_a_gone_front_end_is_not_an_error() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let mut notifier = Notifier { tx };
+        notifier.info("anything");
+        notifier.finish_turn();
+    }
+
+    #[test]
+    fn a_drained_channel_leaves_nothing_behind() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(Notice::FinishTurn).expect("send");
+        tx.send(Notice::Interrupted).expect("send");
+        let drained = drain(&mut rx);
+        assert_eq!(drained.len(), 2);
+        assert!(drain(&mut rx).is_empty(), "and the channel is empty");
+    }
+}
