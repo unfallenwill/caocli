@@ -386,7 +386,7 @@ impl State {
         self.remember(line);
         if !line.starts_with('/') {
             self.revision += 1;
-            self.transcript.push(Cell::User(line.to_owned()));
+            self.transcript.push(Cell::user(line));
         }
         // What was just asked is what the user wants to watch, so the transcript
         // goes back to its end whether or not that line becomes a cell.

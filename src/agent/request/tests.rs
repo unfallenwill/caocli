@@ -34,7 +34,7 @@ fn build_request_prepends_system_and_keeps_history_order() {
     let request = build_request(&provider::DEEPSEEK, &test_meta(), &history);
     assert_eq!(request.messages.len(), 2);
     assert_eq!(request.messages[0].role, Role::System);
-    assert_eq!(request.messages[0].content.as_deref(), Some(SYSTEM_PROMPT));
+    assert_eq!(request.messages[0].text().as_deref(), Some(SYSTEM_PROMPT));
     assert_eq!(request.messages[1], Message::user("q1"));
     assert_eq!(request.tools.as_ref().unwrap()[0].function.name, "Bash");
     assert_eq!(request.tool_choice.as_deref(), Some("auto"));

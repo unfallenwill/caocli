@@ -370,6 +370,21 @@ fn replay_renders_history_compactly_with_colors() {
 }
 
 #[test]
+fn replay_shows_an_attached_image_beside_the_line_it_came_with() {
+    let (mut r, buf) = with_buffer(true);
+    r.replay(&[Message::user_with_images(
+        "what is this?",
+        vec!["data:image/png;base64,Zm9vYmFy".into()],
+    )]);
+    let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(s.contains("\x1b[2m› \x1b[0mwhat is this?"), "{s}");
+    // The image is a line of the same cell: set in the columns the words are in,
+    // and never its bytes, which go to the backend and stay in the log.
+    assert!(s.contains("\x1b[2m\n  [image png · 6 bytes]\x1b[0m"), "{s}");
+    assert!(!s.contains("Zm9vYmFy"), "the bytes are not shown: {s}");
+}
+
+#[test]
 fn replay_empty_history_emits_only_blank_line() {
     let (mut r, buf) = with_buffer(false);
     r.replay(&[]);
@@ -384,7 +399,7 @@ fn replay_skips_empty_assistant_fields() {
     let (mut r, buf) = with_buffer(false);
     r.replay(&[Message {
         role: Role::Assistant,
-        content: Some(String::new()),
+        content: Some("".into()),
         reasoning_content: Some(String::new()),
         tool_calls: None,
         tool_call_id: None,

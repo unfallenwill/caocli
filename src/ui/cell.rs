@@ -5,6 +5,7 @@
 //! replay both produce cells and hand them to the same painter, so a session
 //! that is resumed looks exactly like the one that was watched live.
 
+use crate::image::{self, Note};
 use crate::types::{Message, Role, Usage};
 
 use std::time::Duration;
@@ -100,10 +101,20 @@ pub enum DiffKind {
 /// One unit of transcript output.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cell {
-    /// A user line. Only the plain front end leaves these to replay: its line
-    /// editor echoes what was typed itself, while the front end that owns the
-    /// screen has to place the line in the transcript it owns.
-    User(String),
+    /// A user line, and the images that came with it.
+    ///
+    /// A line typed at the prompt is echoed by the front end that read it -- the
+    /// plain one's line editor writes what was typed, the one that owns the
+    /// screen places it in its transcript. A line carrying an image is never
+    /// typed: `/image` builds the message, and the cell for it comes from the
+    /// same replay a resumed session goes through, so the two read alike.
+    User {
+        text: String,
+        /// One line each, under the text: what a reader needs is that there was
+        /// an image and which one, never the bytes, which are in the session log
+        /// and go to the backend.
+        images: Vec<Note>,
+    },
     /// A thinking block.
     Reasoning(String),
     /// A body-text block.
@@ -187,6 +198,15 @@ pub const USER_MARKER: &str = "› ";
 pub const MARKER_COLUMNS: usize = 2;
 
 impl Cell {
+    /// A user line with nothing attached to it: the shape every line but an
+    /// image's is.
+    pub fn user(text: impl Into<String>) -> Self {
+        Cell::User {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
     /// A tool call, with the argument summary derived from the raw arguments.
     pub fn tool_call(name: &str, args: &str) -> Self {
         Cell::ToolCall {
@@ -215,7 +235,7 @@ impl Cell {
         match self {
             // The one cell on the left edge.
             Cell::Content(_) => None,
-            Cell::User(_) => Some(Gutter::new(USER_MARKER, "  ", Style::Dim)),
+            Cell::User { .. } => Some(Gutter::new(USER_MARKER, "  ", Style::Dim)),
             // The thinking keeps its rule on every line: it is what makes a long
             // think read as one asided block rather than as a run of loose text. The
             // rule is painted in the thinking's own style, not a second one: it is
@@ -236,7 +256,24 @@ impl Cell {
     /// in, the separating blank line, or the line ending the painter adds.
     pub fn spans(&self) -> Vec<Span> {
         match self {
-            Cell::User(text) => vec![Span::new(Style::Plain, text.as_str())],
+            Cell::User { text, images } => {
+                let mut spans = Vec::with_capacity(images.len() + 1);
+                if !text.is_empty() {
+                    spans.push(Span::new(Style::Plain, text.as_str()));
+                }
+                // An image is a line of the same cell, set in under the words it
+                // came with: dim, like the rest of what is about the message
+                // rather than being it. With no words it is the cell's first
+                // line, and there is nothing to break away from.
+                for image in images {
+                    let lead = if spans.is_empty() { "" } else { "\n" };
+                    spans.push(Span::new(
+                        Style::Dim,
+                        format!("{lead}{}", image_line(image)),
+                    ));
+                }
+                spans
+            }
             Cell::Reasoning(text) => vec![Span::new(Style::Reasoning, text.as_str())],
             Cell::Content(text) => vec![Span::new(Style::Plain, text.as_str())],
             Cell::ToolCall { name, hint, diff } => {
@@ -280,7 +317,7 @@ impl Cell {
             Cell::Reasoning(_) | Cell::Content(_) => prev_is_text_block,
             // A tool call is announced on a line of its own, and a replayed user
             // line is set off from whatever preceded it.
-            Cell::ToolCall { .. } | Cell::User(_) => true,
+            Cell::ToolCall { .. } | Cell::User { .. } => true,
             _ => false,
         }
     }
@@ -308,7 +345,16 @@ pub fn from_messages(messages: &[Message]) -> Vec<Cell> {
         match m.role {
             Role::User => {
                 if let Some(c) = &m.content {
-                    cells.push(Cell::User(c.clone()));
+                    // The images are read back out of the message itself: it is
+                    // all a resumed session has, and all it shows.
+                    cells.push(Cell::User {
+                        text: c.text(),
+                        images: c
+                            .images()
+                            .iter()
+                            .filter_map(|url| image::note(url))
+                            .collect(),
+                    });
                 }
             }
             Role::Assistant => {
@@ -317,10 +363,10 @@ pub fn from_messages(messages: &[Message]) -> Vec<Cell> {
                 {
                     cells.push(Cell::Reasoning(r.clone()));
                 }
-                if let Some(c) = &m.content
-                    && !c.is_empty()
+                if let Some(text) = m.text()
+                    && !text.is_empty()
                 {
-                    cells.push(Cell::Content(c.clone()));
+                    cells.push(Cell::Content(text));
                 }
                 for call in m.tool_calls.iter().flatten() {
                     cells.push(Cell::tool_call(
@@ -330,8 +376,8 @@ pub fn from_messages(messages: &[Message]) -> Vec<Cell> {
                 }
             }
             Role::Tool => {
-                if let Some(c) = &m.content {
-                    cells.push(Cell::ToolResult(c.clone()));
+                if let Some(text) = m.text() {
+                    cells.push(Cell::ToolResult(text));
                 }
             }
             // The system prompt is a compile-time constant and is never part of
@@ -410,6 +456,12 @@ fn diff_lines(name: &str, args: &str) -> Vec<DiffLine> {
     lines
 }
 
+/// The line an attached image contributes to the user's cell: what it is and how
+/// much of it there is, which is as much as the message says.
+fn image_line(image: &Note) -> String {
+    format!("[image {} · {} bytes]", image.format, image.bytes)
+}
+
 /// One-line summary of a tool result: its first line and how much text came
 /// back.
 fn summary(result: &str) -> String {
@@ -454,7 +506,7 @@ mod tests {
     ) -> Message {
         Message {
             role: Role::Assistant,
-            content: content.map(str::to_owned),
+            content: content.map(Into::into),
             reasoning_content: reasoning.map(str::to_owned),
             tool_calls: calls,
             tool_call_id: None,
@@ -489,7 +541,7 @@ mod tests {
     fn gap_is_declared_by_the_non_block_cells() {
         let call = Cell::tool_call("Bash", "{}");
         assert!(call.gap_after(false), "a tool call gets its own line");
-        assert!(Cell::User("hi".into()).gap_after(false));
+        assert!(Cell::user("hi").gap_after(false));
         assert!(!Cell::Interrupted.gap_after(true));
         assert!(!Cell::Notice("n".into()).gap_after(false));
         assert!(!Cell::ToolResult("r".into()).gap_after(false));
@@ -507,12 +559,81 @@ mod tests {
         // The marker is the gutter's, not the text's, so the body is the line as it
         // was said: a front end that writes the gutter itself cannot end up with a
         // second copy of the marker inside the text it is marking.
-        let cell = Cell::User("hello".into());
+        let cell = Cell::user("hello");
         assert_eq!(cell.spans(), vec![Span::new(Style::Plain, "hello")]);
         let gutter = cell.gutter().expect("a user line is set in");
         assert_eq!(gutter.head, "› ");
         assert_eq!(gutter.rest, "  ", "and it wraps to the column it opened in");
         assert_eq!(gutter.style, Style::Dim);
+    }
+
+    #[test]
+    fn an_attached_image_is_a_line_of_the_users_own_cell() {
+        let cell = Cell::User {
+            text: "what is this?".into(),
+            images: vec![Note {
+                format: "png".into(),
+                bytes: 49152,
+            }],
+        };
+        assert_eq!(
+            cell.spans(),
+            vec![
+                Span::new(Style::Plain, "what is this?"),
+                // A line of the same cell, dim, and the cell's own break: the
+                // layer that wraps sets it in the columns the words are in.
+                Span::new(Style::Dim, "\n[image png · 49152 bytes]"),
+            ]
+        );
+        // One cell, so the spacing rule sees one thing to set off.
+        assert!(cell.gap_after(false));
+        assert!(!cell.is_text_block());
+    }
+
+    #[test]
+    fn a_message_that_is_only_images_has_no_empty_first_line() {
+        let cell = Cell::User {
+            text: String::new(),
+            images: vec![
+                Note {
+                    format: "jpeg".into(),
+                    bytes: 3,
+                },
+                Note {
+                    format: "webp".into(),
+                    bytes: 4,
+                },
+            ],
+        };
+        assert_eq!(
+            cell.spans(),
+            vec![
+                Span::new(Style::Dim, "[image jpeg · 3 bytes]"),
+                Span::new(Style::Dim, "\n[image webp · 4 bytes]"),
+            ]
+        );
+    }
+
+    #[test]
+    fn replay_reads_the_users_images_out_of_the_message() {
+        let message = Message::user_with_images(
+            "what is this?",
+            vec!["data:image/png;base64,Zm9vYmFy".into()],
+        );
+        assert_eq!(
+            from_messages(&[message]),
+            vec![Cell::User {
+                text: "what is this?".into(),
+                images: vec![Note {
+                    format: "png".into(),
+                    bytes: 6,
+                }],
+            }]
+        );
+        // A part the transcript cannot read contributes no line rather than a
+        // made-up one; the bytes still go to the backend.
+        let foreign = Message::user_with_images("hi", vec!["https://example.com/cat.png".into()]);
+        assert_eq!(from_messages(&[foreign]), vec![Cell::user("hi")]);
     }
 
     #[test]
@@ -770,7 +891,7 @@ mod tests {
         assert_eq!(
             cells,
             vec![
-                Cell::User("take a look".into()),
+                Cell::user("take a look"),
                 Cell::Reasoning("let me think".into()),
                 Cell::Content("running it".into()),
                 Cell::tool_call("Bash", r#"{"command":"ls -la"}"#),
@@ -806,7 +927,7 @@ mod tests {
     /// One of every kind of cell, so a rule about cells can be asked of all of them.
     fn one_of_each() -> Vec<Cell> {
         vec![
-            Cell::User("hi".into()),
+            Cell::user("hi"),
             Cell::Reasoning("hmm".into()),
             Cell::Content("answer".into()),
             Cell::tool_call("Bash", r#"{"command":"ls"}"#),
@@ -865,7 +986,7 @@ mod tests {
     /// typed is marked in the column the same line is marked in once it is submitted.
     #[test]
     fn the_user_marker_is_one_marker_wide() {
-        assert_eq!(Cell::User("x".into()).gutter().unwrap().head, USER_MARKER);
+        assert_eq!(Cell::user("x").gutter().unwrap().head, USER_MARKER);
         assert_eq!(text::width(USER_MARKER), MARKER_COLUMNS);
     }
 }

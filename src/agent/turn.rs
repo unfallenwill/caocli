@@ -95,7 +95,24 @@ struct Turn<'a> {
 }
 
 impl Agent {
-    /// One conversational turn: may contain several sub-requests (the model keeps
+    /// One conversational turn about a line the user typed. Every turn is this
+    /// or [`Agent::turn_message`], which is this with the message built by the
+    /// caller instead.
+    pub async fn turn(
+        &mut self,
+        input: &str,
+        ui: &mut dyn Ui,
+        cancel: &mut dyn Cancel,
+        approve: &mut dyn Approve,
+    ) -> Result<()> {
+        self.turn_message(Message::user(input), ui, cancel, approve)
+            .await
+    }
+
+    /// One conversational turn whose user message the caller built: a line with
+    /// an image attached is one, and its bytes are in the message itself.
+    ///
+    /// May contain several sub-requests (the model keeps
     /// going after calling tools, until finish_reason=stop).
     /// The renderer is held by the caller and passed in: the status bar and the
     /// streaming output must go through the same `Ui` implementation, otherwise
@@ -123,14 +140,14 @@ impl Agent {
     /// rather than built here because both depend on which front end is running:
     /// a front end that owns the terminal in raw mode leaves no SIGINT to listen
     /// for, so it answers both channels from its own event loop.
-    pub async fn turn(
+    pub async fn turn_message(
         &mut self,
-        input: &str,
+        message: Message,
         ui: &mut dyn Ui,
         cancel: &mut dyn Cancel,
         approve: &mut dyn Approve,
     ) -> Result<()> {
-        self.session.append_message(&Message::user(input))?;
+        self.session.append_message(&message)?;
         let steps_left = self.max_tool_steps;
         let mut turn = Turn {
             agent: self,

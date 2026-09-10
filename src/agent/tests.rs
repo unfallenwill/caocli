@@ -165,15 +165,9 @@ async fn mock_full_tool_loop_replays_reasoning_content() {
     assert_eq!(tool_msg.role, Role::Tool);
     assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call_mock_1"));
     // Bash really ran
-    assert!(
-        tool_msg
-            .content
-            .as_deref()
-            .unwrap()
-            .contains("caocli-mock-marker")
-    );
+    assert!(tool_msg.text().unwrap().contains("caocli-mock-marker"));
     assert_eq!(
-        agent.session.messages[3].content.as_deref(),
+        agent.session.messages[3].text().as_deref(),
         Some("Done executing.")
     );
 
@@ -246,8 +240,8 @@ async fn mock_multi_call_loop_executes_all_before_next_request() {
     );
     assert_eq!(msgs[2].tool_call_id.as_deref(), Some("call_m1"));
     assert_eq!(msgs[3].tool_call_id.as_deref(), Some("call_m2"));
-    assert!(msgs[2].content.as_deref().unwrap().contains("one"));
-    assert!(msgs[3].content.as_deref().unwrap().contains("two"));
+    assert!(msgs[2].text().as_deref().unwrap().contains("one"));
+    assert!(msgs[3].text().as_deref().unwrap().contains("two"));
 
     // In the second sub-request's history both results must already be present
     let reqs = server.received_requests().await.unwrap();
@@ -337,12 +331,12 @@ async fn cancel_during_tool_marks_remaining_calls_cancelled() {
     assert_eq!(msgs[2].tool_call_id.as_deref(), Some("call_c1"));
     assert_eq!(msgs[3].tool_call_id.as_deref(), Some("call_c2"));
     assert_eq!(
-        msgs[2].content.as_deref(),
+        msgs[2].text().as_deref(),
         Some(machine::Marker::Cancelled.text()),
         "a call interrupted while executing is marked cancelled too"
     );
     assert_eq!(
-        msgs[3].content.as_deref(),
+        msgs[3].text().as_deref(),
         Some(machine::Marker::Cancelled.text())
     );
     // the window is closed: the history is valid, so the next turn's decision
@@ -402,7 +396,7 @@ async fn a_tool_result_is_not_mistaken_for_a_cancellation() {
 
     let msgs = &agent.session.messages;
     assert_eq!(
-        msgs[2].content.as_deref(),
+        msgs[2].text().as_deref(),
         Some(machine::Marker::Cancelled.text()),
         "the tool really returned the marker text"
     );
@@ -412,7 +406,7 @@ async fn a_tool_result_is_not_mistaken_for_a_cancellation() {
         "the turn went back to the model instead of ending as cancelled: {msgs:?}"
     );
     assert_eq!(
-        msgs[3].content.as_deref(),
+        msgs[3].text().as_deref(),
         Some("the file holds the marker text")
     );
     assert!(machine::is_request_valid(msgs));
@@ -463,10 +457,10 @@ async fn the_step_budget_is_spent_again_by_the_next_turn() {
     }
 
     let msgs = &agent.session.messages;
-    let results: Vec<&str> = msgs
+    let results: Vec<String> = msgs
         .iter()
         .filter(|m| m.role == Role::Tool)
-        .filter_map(|m| m.content.as_deref())
+        .filter_map(|m| m.text())
         .collect();
     assert_eq!(results.len(), 2, "each turn ran exactly one call");
     assert!(
@@ -475,7 +469,7 @@ async fn the_step_budget_is_spent_again_by_the_next_turn() {
     );
     assert!(results[0].contains("budget-one") && results[1].contains("budget-two"));
     assert_eq!(
-        msgs.last().and_then(|m| m.content.as_deref()),
+        msgs.last().and_then(|m| m.text()).as_deref(),
         Some("second done"),
         "the second turn ran to the model's answer"
     );
@@ -522,20 +516,14 @@ async fn approval_denied_commits_denial_marker() {
         "user / assistant / denial marker / closing assistant"
     );
     assert_eq!(
-        msgs[2].content.as_deref(),
+        msgs[2].text().as_deref(),
         Some(machine::Marker::Denied.text())
     );
     assert!(machine::is_request_valid(msgs));
     // the window is closed and the denial went back to the model: the closing
     // assistant proves the model digested the denial
     assert_eq!(msgs[3].role, Role::Assistant);
-    assert!(
-        msgs[3]
-            .content
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Skipped")
-    );
+    assert!(msgs[3].text().unwrap_or_default().contains("Skipped"));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -564,7 +552,7 @@ async fn cancel_during_approval_wait_commits_cancelled() {
     let msgs = &agent.session.messages;
     assert_eq!(msgs.len(), 3);
     assert_eq!(
-        msgs[2].content.as_deref(),
+        msgs[2].text().as_deref(),
         Some(machine::Marker::Cancelled.text())
     );
     assert!(machine::is_request_valid(msgs));
@@ -607,7 +595,7 @@ async fn step_limit_aborts_with_deterministic_markers() {
     let msgs = &agent.session.messages;
     assert_eq!(msgs.len(), 5, "user / assistant(3 calls) / tool×3");
     assert_eq!(
-        msgs[4].content.as_deref(),
+        msgs[4].text().as_deref(),
         Some(machine::Marker::StepLimit.text()),
         "the third call gets the marker instead of executing because the cap is reached"
     );
@@ -654,7 +642,7 @@ async fn mock_write_tool_creates_file() {
 
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "written by mock");
     let tool_msg = &agent.session.messages[2];
-    assert!(tool_msg.content.as_deref().unwrap().starts_with("ok:"));
+    assert!(tool_msg.text().as_deref().unwrap().starts_with("ok:"));
 
     let reqs = server.received_requests().await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&reqs[1].body).unwrap();

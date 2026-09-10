@@ -193,6 +193,21 @@ mod tests {
     }
 
     #[test]
+    fn a_replayed_message_reaches_the_screen_through_the_loop() {
+        // The front end that owns the screen does not paint: it hands the
+        // messages to the loop, which folds them into the transcript the way a
+        // resumed session's are folded. A message that became no notice is a
+        // message a command such as `/image` built and nobody ever saw.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut notifier = Notifier { tx };
+        notifier.replay(&[Message::user("hi")]);
+        match rx.try_recv().expect("the message arrives") {
+            Notice::Replay(messages) => assert_eq!(messages, vec![Message::user("hi")]),
+            other => panic!("a replay, not {other:?}"),
+        }
+    }
+
+    #[test]
     fn approval_requested_sends_the_call_for_the_gate_to_show() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut notifier = Notifier { tx };

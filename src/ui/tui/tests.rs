@@ -689,6 +689,30 @@ fn thinking_is_set_in_behind_a_rule_of_its_own() {
 }
 
 #[test]
+fn an_attached_image_is_drawn_under_the_line_it_came_with() {
+    // The image is a line of the user's own cell and not a cell of its own: the
+    // marker opens the cell for the words, and the image continues in the same
+    // columns rather than back at the left edge the answer is read down.
+    let mut screen = screen_for_test(40, 20);
+    screen.state.transcript.push(Cell::User {
+        text: "what is this?".into(),
+        images: vec![crate::image::Note {
+            format: "png".into(),
+            bytes: 6,
+        }],
+    });
+    screen
+        .state
+        .transcript
+        .push(Cell::Content("a picture".into()));
+    screen.draw().unwrap();
+    let top = origin(&mut screen).y;
+    assert_eq!(row(&screen, top), "› what is this?");
+    assert_eq!(row(&screen, top + 1), "  [image png · 6 bytes]");
+    assert_eq!(row(&screen, top + 2), "a picture");
+}
+
+#[test]
 fn a_wrapped_think_keeps_the_rule_on_every_line() {
     // A continuation line that came back to the left edge would be a line that
     // reads as an answer, in the middle of a block that is not one.
@@ -2098,10 +2122,7 @@ fn what_the_user_says_becomes_part_of_the_transcript() {
     // when it was looked at.
     let mut state = State::default();
     state.submit("look at src/main.rs");
-    assert_eq!(
-        state.transcript,
-        vec![Cell::User("look at src/main.rs".into())]
-    );
+    assert_eq!(state.transcript, vec![Cell::user("look at src/main.rs")]);
     assert_eq!(state.history, vec!["look at src/main.rs"]);
 }
 
@@ -2571,7 +2592,7 @@ fn zz_visual_review_dump() {
     screen
         .state
         .transcript
-        .push(Cell::User("why is the build slow?".into()));
+        .push(Cell::user("why is the build slow?"));
     screen.state.transcript.push(Cell::Reasoning(
         "The user asks about build time. I should look at the Cargo profile and maybe check if there are heavy dependencies. Let me start by reading Cargo.toml and then check the target directory size.".into(),
     ));

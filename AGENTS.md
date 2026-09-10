@@ -191,6 +191,11 @@ determines cost and latency:
   descriptions, parameter descriptions) changes the prefix and causes a full cache
   miss — only do it deliberately.
 - Any change that "optimizes the history" equals a full cache miss.
+- An **attached image is part of the message**: it is stored as the `data:` URL the
+  request carried and replayed with it. Reading the file again, or re-encoding the
+  bytes, is a different string and so a full cache miss — and the file may not even
+  be there any more. Nothing about an image may be re-derived from disk; what the
+  message says about itself is also all the transcript may show.
 - Verify with the per-turn hit/miss token counts; do not go by feel.
 
 ## Backend API hard constraints (must read before changing request construction)

@@ -3,13 +3,14 @@
 //! The commands and the session handling do not depend on how the line was
 //! typed, so they live here rather than inside either front end.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
 use crate::agent::Agent;
 use crate::api::Client;
 use crate::config;
+use crate::image;
 use crate::provider;
 use crate::session::{self, Session};
 use crate::ui::Front;
@@ -74,6 +75,9 @@ pub async fn handle(
         }
         _ if line.starts_with("/effort ") => {
             choose_effort(agent, ui, argument(line));
+        }
+        _ if line == "/image" || line.starts_with("/image ") => {
+            send_image(agent, ui, argument(line), cancel, approve).await;
         }
         _ if line.starts_with("/resume ") => {
             let id = line.trim_start_matches("/resume ").trim();
@@ -231,6 +235,61 @@ fn choose_effort(agent: &mut Agent, ui: &mut dyn Front, tier: &str) {
     ui.info(&format!("effort {tier}"));
 }
 
+/// `/image <path> [text]`: one turn about a picture.
+///
+/// The image is read now and carried in the message itself, so what the session
+/// holds is what the backend was sent, byte for byte, and a resumed session sends
+/// the same bytes again rather than going back to a file that may have changed or
+/// gone. Which is also why the message is shown the way a resume shows it: the
+/// line that was typed is a command, and what the session holds is this message.
+async fn send_image(
+    agent: &mut Agent,
+    ui: &mut dyn Front,
+    argument: &str,
+    cancel: &mut dyn Cancel,
+    approve: &mut dyn Approve,
+) {
+    let (path, text) = match image_argument(argument) {
+        Ok(parts) => parts,
+        Err(usage) => return ui.info(&usage),
+    };
+    let message = match image::user_message(&text, std::slice::from_ref(&path)) {
+        Ok(message) => message,
+        Err(e) => return ui.error(&format!("{e:#}")),
+    };
+    ui.replay(std::slice::from_ref(&message));
+    if let Err(e) = agent.turn_message(message, ui, cancel, approve).await {
+        ui.error(&format!("{e:#}"));
+    }
+}
+
+/// The path and the text of an `/image` line.
+///
+/// The path is one token, and a path with spaces in it -- a screenshot's name
+/// often has them -- may be quoted with `"` or `'`. Everything after the path is
+/// what was asked about the picture, and is empty when the picture is all there
+/// was.
+fn image_argument(argument: &str) -> Result<(PathBuf, String), String> {
+    let argument = argument.trim();
+    if argument.is_empty() {
+        return Err("usage: /image <path> [text]".into());
+    }
+    let (path, text) = match argument.strip_prefix(['"', '\'']) {
+        Some(rest) => {
+            let quote = &argument[..1];
+            match rest.split_once(quote) {
+                Some((path, text)) => (path, text),
+                None => return Err(format!("unterminated quote in {argument:?}")),
+            }
+        }
+        None => match argument.split_once(char::is_whitespace) {
+            Some((path, text)) => (path, text),
+            None => (argument, ""),
+        },
+    };
+    Ok((PathBuf::from(path), text.trim().to_owned()))
+}
+
 /// The `/login` menu as text, for the front end that cannot offer a list to pick
 /// from. Built from the preset table, so a provider cannot be logged into
 /// without being listed here.
@@ -329,6 +388,10 @@ pub const COMMANDS: &[Command] = &[
         description: "switch the reasoning effort tier",
     },
     Command {
+        name: "/image",
+        description: "ask about an image: <path> [text]",
+    },
+    Command {
         name: "/exit",
         description: "quit",
     },
@@ -387,7 +450,7 @@ mod tests {
     struct Recording {
         info: Vec<String>,
         errors: Vec<String>,
-        replayed: usize,
+        replayed: Vec<Message>,
         model: Option<String>,
         effort: Option<String>,
         resets: usize,
@@ -412,7 +475,7 @@ mod tests {
 
     impl Front for Recording {
         fn replay(&mut self, messages: &[Message]) {
-            self.replayed = messages.len();
+            self.replayed = messages.to_vec();
         }
         fn info(&mut self, s: &str) {
             self.info.push(s.to_owned());
@@ -588,9 +651,9 @@ mod tests {
         );
         assert_eq!(agent.session.id, id);
         assert!(
-            ui.replayed >= 1,
+            !ui.replayed.is_empty(),
             "the resumed history was replayed: {}",
-            ui.replayed
+            ui.replayed.len()
         );
         // The model is reported by the provider the resumed session names, and
         // the error says which key is missing to run it (the test has none).
@@ -672,10 +735,152 @@ mod tests {
                 .session
                 .messages
                 .iter()
-                .any(|m| m.content.as_deref() == Some("hello there")),
+                .any(|m| m.text().as_deref() == Some("hello there")),
             "the user line was persisted before the attempt"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file whose bytes are a PNG's: what `/image` reads.
+    fn png(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13],
+        )
+        .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn image_asks_about_a_picture_in_one_turn() {
+        let dir = tmpdir("image");
+        let mut agent = agent_in(&dir, "m");
+        let mut ui = Recording::default();
+        let path = png(&dir, "shot.png");
+        assert_eq!(
+            submit(
+                &mut agent,
+                &mut ui,
+                &dir,
+                &format!("/image {} what is this?", path.display())
+            )
+            .await,
+            Outcome::Continue
+        );
+        // The picture went into the session as a message of its own: the text
+        // asked about it, then the image itself.
+        let sent = &agent.session.messages[0];
+        assert_eq!(sent.role, crate::types::Role::User);
+        assert_eq!(sent.text().as_deref(), Some("what is this?"));
+        let images = sent.content.as_ref().unwrap().images();
+        assert_eq!(images.len(), 1);
+        assert!(images[0].starts_with("data:image/png;base64,"));
+        // The line is shown the way a resume shows it: the command is not part of
+        // the session, and the message is.
+        assert_eq!(ui.replayed.len(), 1);
+        assert_eq!(ui.replayed[0], *sent);
+        // The turn ran: the backend is unreachable in this test, and that failure
+        // is reported rather than fatal.
+        assert_eq!(ui.errors.len(), 1, "{:?}", ui.errors);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_without_a_path_says_how_to_use_it_and_sends_nothing() {
+        let dir = tmpdir("image-empty");
+        let mut agent = agent_in(&dir, "m");
+        let mut ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/image").await;
+        assert_eq!(ui.info, vec!["usage: /image <path> [text]"]);
+        assert!(ui.errors.is_empty(), "{:?}", ui.errors);
+        assert!(agent.session.messages.is_empty(), "no message was made");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_that_cannot_be_read_is_an_error_and_not_a_turn() {
+        let dir = tmpdir("image-missing");
+        let mut agent = agent_in(&dir, "m");
+        let mut ui = Recording::default();
+        let missing = dir.join("nope.png");
+        submit(
+            &mut agent,
+            &mut ui,
+            &dir,
+            &format!("/image {}", missing.display()),
+        )
+        .await;
+        assert_eq!(ui.errors.len(), 1, "{:?}", ui.errors);
+        assert!(ui.errors[0].contains("nope.png"), "{:?}", ui.errors);
+        assert!(agent.session.messages.is_empty(), "nothing was sent");
+        assert!(ui.replayed.is_empty(), "and nothing was shown");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_takes_a_quoted_path_with_spaces_in_it() {
+        let dir = tmpdir("image-quoted");
+        let mut agent = agent_in(&dir, "m");
+        let mut ui = Recording::default();
+        let path = png(&dir, "my shot.png");
+        submit(
+            &mut agent,
+            &mut ui,
+            &dir,
+            &format!("/image \"{}\" look", path.display()),
+        )
+        .await;
+        assert_eq!(agent.session.messages.len(), 1, "{:?}", ui.errors);
+        let sent = &agent.session.messages[0];
+        assert_eq!(sent.text().as_deref(), Some("look"));
+        assert_eq!(
+            sent.content.as_ref().unwrap().images().len(),
+            1,
+            "the quoted path was read whole, spaces and all"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_with_an_unterminated_quote_is_refused_before_anything_is_read() {
+        let dir = tmpdir("image-unterminated");
+        let mut agent = agent_in(&dir, "m");
+        let mut ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/image \"oops/shot.png").await;
+        assert_eq!(ui.errors.len(), 0, "{:?}", ui.errors);
+        assert!(ui.info[0].contains("unterminated quote"), "{:?}", ui.info);
+        assert!(agent.session.messages.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn image_argument_splits_the_path_from_what_was_asked() {
+        assert_eq!(
+            image_argument("/tmp/shot.png").unwrap(),
+            (std::path::PathBuf::from("/tmp/shot.png"), String::new())
+        );
+        assert_eq!(
+            image_argument("/tmp/shot.png  what is this? ").unwrap(),
+            (
+                std::path::PathBuf::from("/tmp/shot.png"),
+                "what is this?".to_owned()
+            )
+        );
+        // A path with spaces is read up to its closing quote, either kind.
+        assert_eq!(
+            image_argument("\"/tmp/my shot.png\" and this?").unwrap(),
+            (
+                std::path::PathBuf::from("/tmp/my shot.png"),
+                "and this?".to_owned()
+            )
+        );
+        assert_eq!(
+            image_argument("'/tmp/my shot.png'").unwrap(),
+            (std::path::PathBuf::from("/tmp/my shot.png"), String::new())
+        );
+        assert!(image_argument("   ").unwrap_err().contains("usage"));
+        assert!(image_argument("\"unclosed").unwrap_err().contains("quote"));
     }
 
     #[test]

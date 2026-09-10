@@ -271,7 +271,7 @@ mod tests {
     fn assistant(calls: Vec<ToolCall>) -> Message {
         Message {
             role: Role::Assistant,
-            content: Some(String::new()),
+            content: Some("".into()),
             reasoning_content: None,
             tool_calls: (!calls.is_empty()).then_some(calls),
             tool_call_id: None,
@@ -391,7 +391,7 @@ mod tests {
         assert_eq!(msgs[2].tool_call_id.as_deref(), Some("a"));
         assert_eq!(msgs[3].tool_call_id.as_deref(), Some("b"));
         assert_eq!(
-            msgs[2].content.as_deref(),
+            msgs[2].text().as_deref(),
             Some(Marker::Interrupted.text()),
             "the synthesized text must be byte-for-byte deterministic (prefix cache depends on it)"
         );

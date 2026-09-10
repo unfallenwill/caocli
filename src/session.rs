@@ -329,7 +329,14 @@ fn summarize(path: &Path) -> Result<SessionInfo> {
                 if message.role == Role::User
                     && let Some(c) = &message.content
                 {
-                    preview = c.chars().take(40).collect();
+                    let text = c.text();
+                    // A message that is only an image has no text to preview,
+                    // and an empty column says less than saying what it is.
+                    preview = if text.is_empty() {
+                        "[image]".to_owned()
+                    } else {
+                        text.chars().take(40).collect()
+                    };
                 }
                 count += 1;
             }
@@ -410,6 +417,51 @@ mod tests {
     }
 
     #[test]
+    fn an_attached_image_survives_the_log_byte_for_byte() {
+        // The image is in the message and nowhere else: what a resumed session
+        // sends to the backend is what was sent the first time, which is what
+        // keeps the prefix cache matching.
+        let dir = tmpdir();
+        let mut s = Session::create(&dir, test_meta()).unwrap();
+        let sent = Message::user_with_images(
+            "what is this?",
+            vec!["data:image/png;base64,Zm9vYmFy".into()],
+        );
+        s.append_message(&sent).unwrap();
+        let path = s.path.clone();
+        drop(s);
+        let loaded = load_when_released(&path);
+        assert_eq!(loaded.messages, vec![sent.clone()]);
+        let line = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            line.contains(r#""image_url":{"url":"data:image/png;base64,Zm9vYmFy"}"#),
+            "the bytes are in the log itself: {line}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_message_that_is_only_an_image_previews_as_one() {
+        let dir = tmpdir();
+        let mut s = Session::create(&dir, test_meta()).unwrap();
+        s.append_message(&Message::user_with_images(
+            "",
+            vec!["data:image/png;base64,Zm9v".into()],
+        ))
+        .unwrap();
+        let path = s.path.clone();
+        drop(s);
+        let infos = list(&dir).unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(
+            infos[0].preview, "[image]",
+            "an empty column says less than saying what was sent"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        drop(path);
+    }
+
+    #[test]
     fn the_header_names_the_provider_the_model_belongs_to() {
         let dir = tmpdir();
         let s = Session::create(&dir, test_meta()).unwrap();
@@ -473,7 +525,7 @@ mod tests {
         s.append_message(&Message::user("q")).unwrap();
         s.append_message(&crate::types::Message {
             role: Role::Assistant,
-            content: Some(String::new()),
+            content: Some("".into()),
             reasoning_content: None,
             tool_calls: Some(vec![
                 crate::types::ToolCall {
@@ -510,7 +562,7 @@ mod tests {
         );
         assert_eq!(msgs[3].tool_call_id.as_deref(), Some("call_2"));
         assert_eq!(
-            msgs[3].content.as_deref(),
+            msgs[3].text().as_deref(),
             Some(crate::machine::Marker::Interrupted.text())
         );
         // the file was not rewritten: still header + 4 message lines

@@ -7,9 +7,10 @@ A minimal terminal coding agent in Rust, backed by an OpenAI-compatible
 `/chat/completions` API: DeepSeek by default, Z.AI's GLM coding endpoint via
 `--provider zai-coding-cn`. It streams the model's thinking (`reasoning_content`) in
 dim gray, then runs a tool loop over four tools: `Bash`, `Read`, `Edit`,
-and `Write`. Sessions are append-only JSONL logs under `~/.caocli/sessions/`,
-resumable across runs and replayed byte-for-byte so the backend's prefix
-cache keeps hitting.
+and `Write`. Both backends see images, which are attached with `/image` and
+travel inside the message itself. Sessions are append-only JSONL
+logs under `~/.caocli/sessions/`, resumable across runs and replayed
+byte-for-byte so the backend's prefix cache keeps hitting.
 
 ## Requirements
 
@@ -44,6 +45,7 @@ place for a key to hide in.
 | `/login` | Choose a provider and store its API key. The list shows each provider by *name* (`DeepSeek`, `Z.AI Coding CN`); the plain prompt prints the id beside it, since that is what `/login <id>` takes |
 | `/model` | Choose a model, named `<provider id>/<modelid>` (`deepseek/deepseek-v4-pro`, `zai-coding-cn/glm-5.3`); it switches the model and, when the name carries another provider, the backend with it |
 | `/effort` | Choose the reasoning effort tier — the list is the provider in use's own (`low`, `high`, `max`), with the one in effect marked; the choice is stored in the session, so a resume keeps it |
+| `/image <path> [text]` | Ask about a picture: the image is read and sent with the text that follows the path (none is fine). A path with spaces in it may be quoted with `"` or `'` |
 | `/exit`, `/quit`, `/q` | Quit |
 
 `/login` asks for the key as a question rather than as a line: the prompt is
@@ -180,6 +182,32 @@ a scroll region, so output scrolls above it — the trade-off is that lines
 scrolled out of the region do not enter the terminal's scrollback buffer.
 Stats reset when you switch sessions (`/new`, `/resume`) or models
 (`/model`), and the bar is restored on exit.
+
+### Images
+
+Both backends take images. `/image <path> [text]` is one turn about a picture:
+the file is read, and the message that goes to the model is the text followed by
+the image. With no text the picture is all there is — the model describes it, and
+the questions that follow are ordinary lines, because the image stays in the
+history and the model can look at it again.
+
+```
+› what does this error say?
+  [image png · 48213 bytes]
+
+┆ Let me read the screenshot.
+The dialog says ...
+```
+
+The transcript names the format and the size, never the path or the bytes: what a
+message says about itself is what a resumed session can show, and the path is not
+part of what was sent. PNG, JPEG, WebP and GIF are recognized **by their bytes**,
+not by the file's extension, and at most 10 MiB may be attached.
+
+An attached image is carried in the message itself as a `data:` URL, so the
+session log is the whole of it: a resumed session replays the same bytes it sent
+the first time — the prefix cache goes on matching — and follow-up questions work
+even if the file has since been moved or changed.
 
 ### Providers
 

@@ -61,6 +61,95 @@ pub struct ToolCall {
     pub function: ToolCallFunction,
 }
 
+/// One part of a message's content: a run of text, or an image. Only the fields
+/// a part is using are written.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContentPart {
+    pub r#type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<ImageUrl>,
+}
+
+impl ContentPart {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            r#type: "text".into(),
+            text: Some(text.into()),
+            image_url: None,
+        }
+    }
+
+    pub fn image(url: impl Into<String>) -> Self {
+        Self {
+            r#type: "image_url".into(),
+            text: None,
+            image_url: Some(ImageUrl { url: url.into() }),
+        }
+    }
+}
+
+/// Where an image part reads its image. An attached image is a `data:` URL
+/// carrying the bytes themselves: nothing outside the message has to be
+/// reachable for it to be sent again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageUrl {
+    pub url: String,
+}
+
+/// Message content: a plain string, or the array of parts that carries images.
+///
+/// Untagged, and the string tried first, so a stored text message is read and
+/// written back as the very string it was: history is replayed byte-for-byte,
+/// and a message that went out as `"hi"` must not come back as
+/// `[{"type":"text","text":"hi"}]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Content {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl Content {
+    /// The message's text, whichever shape it is in: the string itself, or the
+    /// text parts it carries.
+    pub fn text(&self) -> String {
+        match self {
+            Content::Text(text) => text.clone(),
+            Content::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| p.text.as_deref())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+
+    /// The images the message carries, as the data URLs they are sent as.
+    pub fn images(&self) -> Vec<&str> {
+        match self {
+            Content::Text(_) => Vec::new(),
+            Content::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| p.image_url.as_ref())
+                .map(|image| image.url.as_str())
+                .collect(),
+        }
+    }
+}
+
+impl From<&str> for Content {
+    fn from(text: &str) -> Self {
+        Content::Text(text.to_owned())
+    }
+}
+
+impl From<String> for Content {
+    fn from(text: String) -> Self {
+        Content::Text(text)
+    }
+}
+
 /// Message. Field names match the API exactly:
 /// - assistant: content / reasoning_content / tool_calls (a request carrying
 ///   tools must send reasoning_content back; missing it means a 400)
@@ -69,7 +158,7 @@ pub struct ToolCall {
 pub struct Message {
     pub role: Role,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<Content>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -82,24 +171,51 @@ impl Message {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: Role::System,
-            content: Some(content.into()),
+            content: Some(Content::Text(content.into())),
             ..Default::default()
         }
     }
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: Role::User,
-            content: Some(content.into()),
+            content: Some(Content::Text(content.into())),
             ..Default::default()
         }
     }
     pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: Role::Tool,
-            content: Some(content.into()),
+            content: Some(Content::Text(content.into())),
             tool_call_id: Some(tool_call_id.into()),
             ..Default::default()
         }
+    }
+
+    /// A user message with images attached: what the user said, and the images
+    /// it is about, in the parts form a request carries images in. A message
+    /// with nothing attached stays the string it has always been.
+    pub fn user_with_images(text: impl Into<String>, images: Vec<String>) -> Self {
+        let text = text.into();
+        if images.is_empty() {
+            return Self::user(text);
+        }
+        let mut parts = Vec::with_capacity(images.len() + 1);
+        // What was asked comes first, then what it points at.
+        if !text.is_empty() {
+            parts.push(ContentPart::text(text));
+        }
+        parts.extend(images.into_iter().map(ContentPart::image));
+        Self {
+            role: Role::User,
+            content: Some(Content::Parts(parts)),
+            ..Default::default()
+        }
+    }
+
+    /// The message's text, whichever shape its content is in; `None` when it
+    /// carries none at all (an assistant message that only called tools).
+    pub fn text(&self) -> Option<String> {
+        self.content.as_ref().map(Content::text)
     }
 }
 
@@ -302,7 +418,7 @@ impl TurnAccumulator {
         };
         Message {
             role: Role::Assistant,
-            content: Some(self.content),
+            content: Some(Content::Text(self.content)),
             reasoning_content: if self.reasoning_content.is_empty() {
                 None
             } else {
@@ -345,6 +461,78 @@ mod tests {
         let msg = Message::user("hi");
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(json, r#"{"role":"user","content":"hi"}"#);
+    }
+
+    #[test]
+    fn a_text_content_is_written_back_as_the_string_it_was() {
+        // The prefix cache matches on bytes: a message that went out as a string
+        // must not come back from the log as the parts form of the same thing.
+        let stored = r#"{"role":"user","content":"hi"}"#;
+        let msg: Message = serde_json::from_str(stored).unwrap();
+        assert_eq!(msg.content, Some(Content::Text("hi".into())));
+        assert_eq!(serde_json::to_string(&msg).unwrap(), stored);
+    }
+
+    #[test]
+    fn an_image_message_round_trips_as_parts() {
+        let msg = Message::user_with_images(
+            "what is this?",
+            vec!["data:image/png;base64,Zm9vYmFy".into()],
+        );
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"role":"user","content":[{"type":"text","text":"what is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,Zm9vYmFy"}}]}"#
+        );
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, msg);
+        assert_eq!(back.text().as_deref(), Some("what is this?"));
+        assert_eq!(back.content.as_ref().unwrap().images().len(), 1);
+    }
+
+    #[test]
+    fn an_image_message_with_no_text_carries_no_empty_text_part() {
+        let msg = Message::user_with_images("", vec!["data:image/png;base64,Zm9v".into()]);
+        let json = serde_json::to_value(&msg).unwrap();
+        let parts = json["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1, "the image is all there is: {parts:?}");
+        assert_eq!(parts[0]["type"], "image_url");
+    }
+
+    #[test]
+    fn a_message_with_nothing_attached_is_the_plain_string_it_was() {
+        assert_eq!(
+            Message::user_with_images("hi", Vec::new()),
+            Message::user("hi"),
+            "a message with no image must not become an empty parts array, \
+             which the backend rejects"
+        );
+        assert_eq!(
+            Message::user_with_images("hi", Vec::new())
+                .text()
+                .as_deref(),
+            Some("hi")
+        );
+    }
+
+    #[test]
+    fn content_text_joins_more_than_one_text_part() {
+        let content = Content::Parts(vec![
+            ContentPart::image("data:image/png;base64,Zm9v"),
+            ContentPart::text("first"),
+            ContentPart::text("second"),
+        ]);
+        assert_eq!(content.text(), "first\nsecond");
+    }
+
+    #[test]
+    fn a_message_with_no_content_has_no_text() {
+        let msg = Message {
+            role: Role::Assistant,
+            ..Default::default()
+        };
+        assert_eq!(msg.text(), None);
+        assert_eq!(Message::user("").text().as_deref(), Some(""));
     }
 
     #[test]
@@ -403,7 +591,7 @@ mod tests {
             }]),
         ));
         let msg = acc.finish();
-        assert_eq!(msg.content.as_deref(), Some("9.11 vs 9.8"));
+        assert_eq!(msg.text().as_deref(), Some("9.11 vs 9.8"));
         assert_eq!(msg.reasoning_content.as_deref(), Some("let me compare."));
         let tcs = msg.tool_calls.unwrap();
         assert_eq!(tcs.len(), 1);
