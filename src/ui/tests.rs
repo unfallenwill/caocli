@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::time::Duration;
 
+use super::banner::banner_at;
 use super::cell::Style;
 use super::status_bar::StatusBar;
 use super::terminal::{Echo, Terminal};
