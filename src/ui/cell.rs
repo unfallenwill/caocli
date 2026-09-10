@@ -7,6 +7,8 @@
 
 use crate::types::{Message, Role, Usage};
 
+use std::time::Duration;
+
 use super::text;
 
 /// A text style, held as data. Whether it becomes an escape sequence is decided
@@ -113,8 +115,8 @@ pub enum Cell {
     Failure(String),
     /// The turn was cancelled.
     Interrupted,
-    /// Token usage for one sub-request.
-    Usage(Usage),
+    /// Token usage for one sub-request, with the wall time the stream took.
+    Usage { usage: Usage, stream: Duration },
     /// The approval gate's question. It deliberately does not end its line: the
     /// answer is typed on the same one.
     Approval { name: String, hint: String },
@@ -165,7 +167,9 @@ impl Cell {
             Cell::Notice(text) => vec![Span::new(Style::Dim, text.as_str())],
             Cell::Failure(text) => vec![Span::new(Style::Red, format!("error: {text}"))],
             Cell::Interrupted => vec![Span::new(Style::Yellow, "⏹ interrupted (Ctrl-C)")],
-            Cell::Usage(u) => vec![Span::new(Style::Dim, usage_line(u))],
+            Cell::Usage { usage, stream } => {
+                vec![Span::new(Style::Dim, usage_line(usage, *stream))]
+            }
             Cell::Approval { name, hint } => vec![Span::new(
                 Style::Yellow,
                 format!("▸ {name} {hint} — run it? [y/N] "),
@@ -326,15 +330,25 @@ fn summary(result: &str) -> String {
 }
 
 /// The per-sub-request usage line.
-fn usage_line(u: &Usage) -> String {
+///
+/// The stream's wall time turns the reported completion tokens into a tokens-per-
+/// second figure, appended when it is worth showing: a stream must have run at
+/// least a second (below that the quotient is noise the test suite would pin at
+/// absurd heights) and must have produced tokens at all.
+fn usage_line(u: &Usage, stream: Duration) -> String {
     let cache = match u.cache() {
         Some(c) => format!("hit {}/miss {}", c.hit, c.miss),
         None => "cache —".to_string(),
     };
-    format!(
+    let mut line = format!(
         "tokens: in {}/{} ({cache}) · out {}",
         u.prompt_tokens, u.total_tokens, u.completion_tokens
-    )
+    );
+    if u.completion_tokens > 0 && stream >= Duration::from_secs(1) {
+        let per_second = u.completion_tokens as f64 / stream.as_secs_f64();
+        line.push_str(&format!(" · {} token/s", per_second.round() as u64));
+    }
+    line
 }
 
 #[cfg(test)]
@@ -559,14 +573,22 @@ mod tests {
             ..Usage::default()
         };
         // no cache fields recognized: an unknown rate is never shown as 0%
-        let spans = Cell::Usage(u.clone()).spans();
+        let spans = Cell::Usage {
+            usage: u.clone(),
+            stream: Duration::ZERO,
+        }
+        .spans();
         assert_eq!(
             spans,
             vec![Span::new(Style::Dim, "tokens: in 20/28 (cache —) · out 8")]
         );
         u.prompt_cache_hit_tokens = 12;
         u.prompt_cache_miss_tokens = 8;
-        let spans = Cell::Usage(u).spans();
+        let spans = Cell::Usage {
+            usage: u,
+            stream: Duration::ZERO,
+        }
+        .spans();
         assert_eq!(
             spans,
             vec![Span::new(
@@ -574,6 +596,59 @@ mod tests {
                 "tokens: in 20/28 (hit 12/miss 8) · out 8"
             )]
         );
+    }
+
+    #[test]
+    fn a_stream_that_ran_a_second_reports_its_speed() {
+        let u = Usage {
+            prompt_tokens: 20,
+            total_tokens: 532,
+            completion_tokens: 512,
+            ..Usage::default()
+        };
+        // 512 tokens over 1.25 s rounds to 410
+        let spans = Cell::Usage {
+            usage: u,
+            stream: Duration::from_millis(1250),
+        }
+        .spans();
+        assert_eq!(
+            spans,
+            vec![Span::new(
+                Style::Dim,
+                "tokens: in 20/532 (cache —) · out 512 · 410 token/s"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_fast_or_tokenless_stream_reports_no_speed() {
+        let u = Usage {
+            prompt_tokens: 20,
+            total_tokens: 532,
+            completion_tokens: 512,
+            ..Usage::default()
+        };
+        // under a second the quotient is noise, not a speed
+        let spans = Cell::Usage {
+            usage: u.clone(),
+            stream: Duration::from_millis(999),
+        }
+        .spans();
+        assert_eq!(spans[0].text, "tokens: in 20/532 (cache —) · out 512");
+        // nothing streamed: no tokens to divide by
+        let u = Usage {
+            prompt_tokens: 20,
+            total_tokens: 20,
+            completion_tokens: 0,
+            ..Usage::default()
+        };
+        let spans = Cell::Usage {
+            usage: u,
+            stream: Duration::from_secs(9),
+        }
+        .spans();
+        assert_eq!(spans[0].text, "tokens: in 20/20 (cache —) · out 0");
     }
 
     #[test]

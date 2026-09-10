@@ -2,6 +2,7 @@ use anyhow::Result;
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::{Duration, Instant};
 
 use crate::api::Client;
 use crate::config::{self, DEFAULT_EFFORT};
@@ -239,10 +240,10 @@ impl Agent {
                         _ = interrupt.wait() => None,
                     };
                     match done {
-                        Some((msg, usage)) => {
+                        Some((msg, usage, stream_time)) => {
                             self.session.append_message(&msg)?;
                             if let Some(u) = usage {
-                                ui.usage(&u);
+                                ui.usage(&u, stream_time);
                             }
                         }
                         None => cancelled = true,
@@ -329,8 +330,17 @@ impl Agent {
     /// delta) and aggregate a complete assistant message.
     /// Errors propagate upward; at that point the assistant message has not been
     /// persisted, so the session stays at a valid prefix.
-    async fn pump(&self, req: &ChatRequest, ui: &mut dyn Ui) -> Result<(Message, Option<Usage>)> {
+    async fn pump(
+        &self,
+        req: &ChatRequest,
+        ui: &mut dyn Ui,
+    ) -> Result<(Message, Option<Usage>, Duration)> {
         let mut stream = self.api.stream_chat(req).await?;
+        // The wall time the stream took, first chunk to last: what a
+        // tokens-per-second figure divides the reported completion tokens by.
+        // Connection setup is not counted -- the speed of a stream is the speed
+        // of the tokens, not of the handshake.
+        let started = Instant::now();
         let mut acc = TurnAccumulator::default();
         let mut usage: Option<Usage> = None;
         while let Some(chunk) = stream.next_chunk().await? {
@@ -349,7 +359,7 @@ impl Agent {
             }
         }
         ui.finish_turn();
-        Ok((acc.finish(), usage))
+        Ok((acc.finish(), usage, started.elapsed()))
     }
 }
 

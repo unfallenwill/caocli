@@ -22,7 +22,7 @@ use std::io::{self, Stdout};
 use std::path::Path;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::backend::{Backend, CrosstermBackend};
@@ -121,8 +121,10 @@ const REASONING_FOREGROUND: u8 = 245;
 const QUEUE_ROWS: usize = 3;
 
 /// What the box says while a turn runs: the line being typed is not this turn's
-/// message, it is the one to run when this turn ends.
-const QUEUE_PLACEHOLDER: &str = "›  the turn is running · Enter queues this line";
+/// message, it is the one to run when this turn ends -- and the turn itself can
+/// be stopped, which is worth saying, since a key that stops work is no good to
+/// a reader who cannot find it.
+const QUEUE_PLACEHOLDER: &str = "›  the turn is running · Enter queues · Ctrl-C stops";
 
 /// What the box says while nothing runs.
 const IDLE_PLACEHOLDER: &str = "›  type a message · /help for commands";
@@ -144,6 +146,28 @@ const SECRET_MASK: char = '•';
 /// transcript, so it has to leave the transcript somewhere to live.
 const PICKER_ROWS: usize = 6;
 
+// ------------------------------------------------------------- activity ---
+
+/// The frames the working spinner cycles through while a turn runs, one per
+/// [`SPINNER_MS`]. Braille raising-dots: the convention terminal spinners have
+/// settled on, and narrow enough to sit inside a border without crowding it.
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// How long one spinner frame holds, in milliseconds. Twelve-ish frames a
+/// second: fast enough to read as motion, slow enough that a frame is one
+/// redraw and no more.
+const SPINNER_MS: u128 = 80;
+
+/// The live speed estimate appears once the turn has run this many seconds:
+/// before that the cumulative average swings too much to be worth reading.
+const SPEED_AFTER_SECS: u64 = 3;
+
+/// The characters-per-token ratio the estimate starts on, before the first
+/// usage notice of the session has measured the real one. English prose runs
+/// about four characters to the token; CJK lands near one. Both are approximations,
+/// which is why the estimate carries a tilde.
+const BLIND_CHARS_PER_TOKEN: f64 = 4.0;
+
 // ---------------------------------------------------------------- notices ---
 
 /// One thing the machine or the application tells the front end.
@@ -162,7 +186,7 @@ enum Notice {
         args: String,
     },
     ToolResult(String),
-    Usage(Usage),
+    Usage(Usage, Duration),
     Interrupted,
     Approval {
         name: String,
@@ -218,8 +242,8 @@ impl Ui for Notifier {
     fn tool_result(&mut self, result: &str) {
         self.send(Notice::ToolResult(result.to_owned()));
     }
-    fn usage(&mut self, u: &Usage) {
-        self.send(Notice::Usage(u.clone()));
+    fn usage(&mut self, u: &Usage, stream: Duration) {
+        self.send(Notice::Usage(u.clone(), stream));
     }
     fn interrupted(&mut self) {
         self.send(Notice::Interrupted);
@@ -436,6 +460,24 @@ struct State {
     /// Whether a turn is running: what the box's placeholder and the queue's
     /// behaviour both hang on.
     turn_running: bool,
+    /// When the running turn began. None between turns; what the border's
+    /// working indicator counts up from.
+    turn_started: Option<Instant>,
+    /// Characters streamed this turn, reasoning and content both: the numerator
+    /// of the live tokens-per-second estimate.
+    streamed_chars: usize,
+    /// Characters streamed since the last usage notice. With that notice's
+    /// completion tokens it measures the characters-per-token ratio this
+    /// provider and model actually produce, which is what keeps the estimate
+    /// honest after the first sub-request.
+    chars_since_usage: usize,
+    /// Characters per token, as last measured, or [`BLIND_CHARS_PER_TOKEN`]
+    /// before the first measurement. Session-level: it survives the turn that
+    /// taught it.
+    chars_per_token: f64,
+    /// The indicator title the last tick saw, so a tick bumps the revision only
+    /// when the border would show something new.
+    ticked_activity: Option<String>,
     /// Bumped by everything that changes what the screen should show, so a draw
     /// can be skipped when nothing has.
     revision: u64,
@@ -537,6 +579,11 @@ impl Default for State {
             browsing: None,
             draft: String::new(),
             turn_running: false,
+            turn_started: None,
+            streamed_chars: 0,
+            chars_since_usage: 0,
+            chars_per_token: BLIND_CHARS_PER_TOKEN,
+            ticked_activity: None,
             revision: 0,
         }
     }
@@ -721,6 +768,9 @@ impl State {
     fn begin_turn(&mut self) {
         self.revision += 1;
         self.turn_running = true;
+        self.turn_started = Some(Instant::now());
+        self.streamed_chars = 0;
+        self.chars_since_usage = 0;
         self.refresh_placeholder();
     }
 
@@ -728,7 +778,68 @@ impl State {
     fn end_turn(&mut self) {
         self.revision += 1;
         self.turn_running = false;
+        self.turn_started = None;
         self.refresh_placeholder();
+    }
+
+    /// The working indicator the input box's top border carries while a turn
+    /// runs: a spinner, the seconds it has run, and — once the turn has lasted
+    /// long enough for the average to settle — an estimated tokens-per-second.
+    ///
+    /// None when there is nothing to say: no turn, or a question standing over
+    /// the box (the gate's own words own that border's neighbourhood), or a
+    /// border too narrow even for the spinner and the count. A narrow border
+    /// drops the estimate whole first and hides the indicator entirely second —
+    /// never a clipped number, the same rule the status line keeps to.
+    fn activity_title(&self, width: usize) -> Option<String> {
+        if self.reply.is_some() {
+            return None;
+        }
+        let elapsed = self.turn_started?.elapsed();
+        let frame = SPINNER[(elapsed.as_millis() / SPINNER_MS) as usize % SPINNER.len()];
+        let count = format!("{frame} {}s", elapsed.as_secs());
+        let mut title = count.clone();
+        if elapsed.as_secs() >= SPEED_AFTER_SECS && self.streamed_chars > 0 {
+            // The measured ratio turns characters into tokens; the tilde keeps
+            // the estimate honest about being one.
+            let per_second =
+                self.streamed_chars as f64 / self.chars_per_token / elapsed.as_secs_f64();
+            let per_second = per_second.round().max(1.0) as u64;
+            title = format!("{count} · ~{per_second} token/s");
+        }
+        if super::text::width(&title) <= width {
+            return Some(title);
+        }
+        (super::text::width(&count) <= width).then_some(count)
+    }
+
+    /// Put the working indicator on the box's block, or take it off. Called
+    /// every draw, unconditionally: the box's editor is replaced whole on some
+    /// inputs (a submitted line, a cleared one), and a remembered title would
+    /// then sit on a block the editor no longer has. Rebuilding a block per
+    /// draw is one small struct; the revision, not this, is what paces redraws.
+    fn set_activity_border(&mut self, width: usize) {
+        let mut block = Block::default()
+            .borders(BOX_BORDERS)
+            .border_style(RStyle::new().add_modifier(Modifier::DIM));
+        if let Some(title) = self.activity_title(width.saturating_sub(2)) {
+            block = block.title_top(Line::styled(title, style_of(Style::Dim)).right_aligned());
+        }
+        self.textarea.set_block(block);
+    }
+
+    /// The indicator's heartbeat: bump the revision when the frame the spinner
+    /// shows or the second the clock reads has changed, so the border keeps
+    /// moving while nothing else arrives and no redraw is spent when it has
+    /// nothing new to show.
+    fn tick_activity(&mut self) {
+        let Some(title) = self.activity_title(usize::MAX) else {
+            return;
+        };
+        if Some(&title) != self.ticked_activity.as_ref() {
+            self.ticked_activity = Some(title);
+            self.revision += 1;
+        }
     }
 
     /// Fold one notice into the state.
@@ -746,7 +857,18 @@ impl State {
                 self.end_block();
                 self.transcript.push(Cell::ToolResult(result));
             }
-            Notice::Usage(u) => self.status.record(&u),
+            Notice::Usage(u, _stream) => {
+                self.status.record(&u);
+                // Calibrate the live speed estimate: the characters streamed
+                // since the last notice are now known to have been this many
+                // tokens. A sub-request that streamed nothing (a bare tool-call
+                // round) measures nothing and leaves the ratio standing.
+                if self.chars_since_usage > 0 && u.completion_tokens > 0 {
+                    self.chars_per_token =
+                        self.chars_since_usage as f64 / u.completion_tokens as f64;
+                }
+                self.chars_since_usage = 0;
+            }
             Notice::Interrupted => {
                 self.end_block();
                 self.transcript.push(Cell::Interrupted);
@@ -778,9 +900,14 @@ impl State {
     }
 
     /// Append a text fragment. A fragment in a style other than the open block's
-    /// ends that block and opens a new one -- the same rule the plain front end
+    /// ends that block and opens a new block -- the same rule the plain front end
     /// applies, because the style *is* the block's identity.
     fn stream(&mut self, style: Style, text: &str) {
+        // Both counters: what the border's speed estimate divides by the clock,
+        // and what the next usage notice calibrates the ratio against.
+        let chars = text.chars().count();
+        self.streamed_chars += chars;
+        self.chars_since_usage += chars;
         match &mut self.live {
             Some((open, buffer)) if *open == style => buffer.push_str(text),
             _ => {
@@ -1634,6 +1761,9 @@ impl<B: Backend> Screen<B> {
             let queued = queue.height() as u16;
             let rows = screen_rows(area, input, queued);
             self.state.reset_box_scroll(input);
+            // The working indicator lives on the box's top border: put there
+            // before the box renders, taken off the same way.
+            self.state.set_activity_border(rows[2].width as usize);
             // What the transcript has to show, in the three pieces it is made of:
             // the cells that are laid out and kept, then the block still being
             // written, then a question if one is open.
@@ -2006,6 +2136,7 @@ pub async fn run(
                     for reply in drain(&mut asked) {
                         screen.state.open_question(reply);
                     }
+                    screen.state.tick_activity();
                     screen.draw_if_changed()?;
                     tokio::select! {
                         outcome = &mut turn => break outcome,
@@ -2118,14 +2249,17 @@ mod tests {
     fn status_notices_reach_the_status_line() {
         let mut screen = State::default();
         screen.apply(Notice::SetModel("m-1".into()));
-        screen.apply(Notice::Usage(Usage {
-            prompt_tokens: 6,
-            total_tokens: 10,
-            completion_tokens: 4,
-            prompt_cache_hit_tokens: 6,
-            prompt_cache_miss_tokens: 4,
-            prompt_tokens_details: None,
-        }));
+        screen.apply(Notice::Usage(
+            Usage {
+                prompt_tokens: 6,
+                total_tokens: 10,
+                completion_tokens: 4,
+                prompt_cache_hit_tokens: 6,
+                prompt_cache_miss_tokens: 4,
+                prompt_tokens_details: None,
+            },
+            Duration::ZERO,
+        ));
         assert_eq!(
             screen.status.full_line(),
             "m-1 · cache 60.0% · hit 6 · miss 4"
@@ -2530,11 +2664,14 @@ mod tests {
         // transcript's cells, not the status line's.
         let mut screen = screen_for_test(60, 20);
         screen.state.status.set_model("m-1");
-        screen.state.apply(Notice::Usage(Usage {
-            prompt_cache_hit_tokens: 6,
-            prompt_cache_miss_tokens: 4,
-            ..Usage::default()
-        }));
+        screen.state.apply(Notice::Usage(
+            Usage {
+                prompt_cache_hit_tokens: 6,
+                prompt_cache_miss_tokens: 4,
+                ..Usage::default()
+            },
+            Duration::ZERO,
+        ));
         screen.draw().unwrap();
         let last = screen.terminal.backend().buffer().area.height - 1;
         assert_eq!(row(&screen, last), "m-1 · cache 60.0% · hit 6 · miss 4");
@@ -2884,6 +3021,103 @@ mod tests {
             ],
             "one cell per turn, not one for the two of them"
         );
+    }
+
+    // ------------------------------------------------------------ activity ---
+
+    /// A state with a turn running, its clock and its stream pre-loaded.
+    fn working(elapsed: Duration, chars: usize, chars_per_token: f64) -> State {
+        State {
+            turn_running: true,
+            turn_started: Some(Instant::now() - elapsed),
+            streamed_chars: chars,
+            chars_since_usage: chars,
+            chars_per_token,
+            ..State::default()
+        }
+    }
+
+    #[test]
+    fn the_working_border_spins_counts_and_estimates() {
+        // 12 345 ms in: frame 154 % 10 = 4, the fifth glyph; 4 000 characters at
+        // a measured four to the token over 12.3 s rounds to 81 a second.
+        let s = working(Duration::from_millis(12_345), 4000, 4.0);
+        assert_eq!(s.activity_title(60), Some("⠼ 12s · ~81 token/s".to_owned()));
+    }
+
+    #[test]
+    fn the_estimate_waits_for_the_average_to_settle() {
+        // 2 040 ms: frame 25, off a frame boundary so the clock's second read
+        // cannot tip it
+        let s = working(Duration::from_millis(2_040), 4000, 4.0);
+        assert_eq!(s.activity_title(60), Some("⠴ 2s".to_owned()));
+    }
+
+    #[test]
+    fn a_silent_turn_estimates_nothing() {
+        let s = working(Duration::from_millis(30_040), 0, 4.0);
+        assert_eq!(s.activity_title(60), Some("⠴ 30s".to_owned()));
+    }
+
+    #[test]
+    fn a_narrow_border_drops_the_estimate_then_hides_the_indicator() {
+        let s = working(Duration::from_millis(12_345), 4000, 4.0);
+        let full = s.activity_title(usize::MAX).unwrap();
+        let count = "⠼ 12s".to_owned();
+        // one column short of the whole thing, the estimate goes whole
+        assert_eq!(
+            s.activity_title(crate::ui::text::width(&full) - 1),
+            Some(count.clone())
+        );
+        // one column short of the count, nothing at all: a clipped spinner is
+        // not an indicator
+        assert_eq!(s.activity_title(crate::ui::text::width(&count) - 1), None);
+    }
+
+    #[test]
+    fn calibration_learns_from_a_usage_notice() {
+        let mut s = State {
+            turn_running: true,
+            turn_started: Some(Instant::now()),
+            ..State::default()
+        };
+        s.stream(Style::Reasoning, &"x".repeat(800));
+        s.apply(Notice::Usage(
+            Usage {
+                completion_tokens: 200,
+                ..Usage::default()
+            },
+            Duration::ZERO,
+        ));
+        assert_eq!(s.chars_per_token, 4.0);
+        // the counter is spent on the measurement: the next ratio starts clean
+        assert_eq!(s.chars_since_usage, 0);
+    }
+
+    #[test]
+    fn a_question_takes_the_border_title_back() {
+        let mut s = working(Duration::from_secs(12), 4000, 4.0);
+        let (tx, _rx) = oneshot::channel();
+        s.open_question(tx);
+        assert_eq!(s.activity_title(60), None);
+    }
+
+    #[test]
+    fn the_border_shows_the_working_turn_and_then_does_not() {
+        let mut screen = screen_for_test(60, 20);
+        screen.state.begin_turn();
+        screen.state.turn_started = Some(Instant::now() - Duration::from_secs(12));
+        screen.state.streamed_chars = 4000;
+        screen.state.chars_per_token = 4.0;
+        screen.draw().unwrap();
+        // the box's top border: the status line's row, the box's three, and no
+        // queue above it
+        let top = 20 - 1 - BOX_ROWS;
+        let line = row(&screen, top);
+        assert!(line.contains("token/s"), "{line:?}");
+        screen.state.end_turn();
+        screen.draw().unwrap();
+        assert!(!row(&screen, top).contains("token/s"));
     }
 
     fn press(state: &mut State, code: KeyCode) -> Submitted {

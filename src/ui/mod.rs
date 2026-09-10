@@ -6,6 +6,7 @@ pub mod tui;
 use std::future::Future;
 use std::io::{IsTerminal, Write};
 use std::pin::Pin;
+use std::time::Duration;
 
 use crate::types::{Message, Usage};
 
@@ -152,8 +153,11 @@ pub trait Ui {
     fn tool_start(&mut self, name: &str, args: &str);
     /// A tool result summary.
     fn tool_result(&mut self, result: &str);
-    /// Token usage for a sub-request (also accumulates session-level cache stats).
-    fn usage(&mut self, u: &Usage);
+    /// Token usage for a sub-request, with the wall time the stream took (also
+    /// accumulates session-level cache stats). The duration is what a
+    /// tokens-per-second figure is computed from; a front end that shows none
+    /// ignores it.
+    fn usage(&mut self, u: &Usage, stream: Duration);
     /// The turn was cancelled by the user (Ctrl-C): close the streaming block and
     /// print an interruption notice.
     fn interrupted(&mut self);
@@ -522,8 +526,11 @@ impl Ui for Renderer {
         self.paint_cell(&Cell::approval(name, args));
     }
 
-    fn usage(&mut self, u: &Usage) {
-        self.paint_cell(&Cell::Usage(u.clone()));
+    fn usage(&mut self, u: &Usage, stream: Duration) {
+        self.paint_cell(&Cell::Usage {
+            usage: u.clone(),
+            stream,
+        });
         self.status.record(u);
         self.redraw_status_bar();
     }
@@ -780,14 +787,17 @@ mod tests {
     #[test]
     fn usage_and_info_render_dims() {
         let (mut r, buf) = Renderer::with_buffer(false);
-        r.usage(&Usage {
-            prompt_tokens: 10,
-            completion_tokens: 5,
-            total_tokens: 15,
-            prompt_cache_hit_tokens: 6,
-            prompt_cache_miss_tokens: 4,
-            ..Default::default()
-        });
+        r.usage(
+            &Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                prompt_cache_hit_tokens: 6,
+                prompt_cache_miss_tokens: 4,
+                ..Default::default()
+            },
+            Duration::ZERO,
+        );
         r.info("session abc");
         let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(s.contains("tokens: in 10/15 (hit 6/miss 4) · out 5"), "{s}");
@@ -939,8 +949,8 @@ mod tests {
         let bar = StatusBar { rows: 10, cols: 60 };
         let (mut r, buf) = Renderer::with_buffer(false);
         r.apply_status_bar(Some(bar));
-        r.usage(&usage_fixture(6, 4));
-        r.usage(&usage_fixture(12, 8));
+        r.usage(&usage_fixture(6, 4), Duration::ZERO);
+        r.usage(&usage_fixture(12, 8), Duration::ZERO);
         let s = buf_of(&buf);
         assert!(
             s.contains("tokens: in 10/10 (hit 6/miss 4) · out 0"),
@@ -960,7 +970,7 @@ mod tests {
     fn bar_line(cols: u16, model: &str) -> String {
         let (mut r, buf) = Renderer::with_buffer(false);
         r.set_model(model);
-        r.usage(&usage_fixture(6, 4));
+        r.usage(&usage_fixture(6, 4), Duration::ZERO);
         // The bar is attached last, so the redraw it triggers is the first one
         // that has anything to draw.
         r.apply_status_bar(Some(StatusBar { rows: 10, cols }));
@@ -1020,7 +1030,7 @@ mod tests {
         let (mut r, buf) = Renderer::with_buffer(false);
         r.apply_status_bar(Some(bar));
         r.set_model("deepseek-v4-flash");
-        r.usage(&usage_fixture(6, 4));
+        r.usage(&usage_fixture(6, 4), Duration::ZERO);
         let s = buf_of(&buf);
         assert!(
             s.contains("deepseek-v4-flash · cache 60.0% · hit 6 · miss 4"),

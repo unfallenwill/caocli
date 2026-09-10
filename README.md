@@ -109,8 +109,8 @@ ok: package.name = caocli (312 bytes)
 
 › run the tests and fix what fails
 › and bump the version
-──────────────────────────────────────────────────────────────────────────
-›  the turn is running · Enter queues this line
+─────────────────────────────────────────⠸ 12s · ~38 token/s
+›  the turn is running · Enter queues · Ctrl-C stops
 ──────────────────────────────────────────────────────────────────────────
 zai-coding-cn/glm-5.3 · cache 95.3% · hit 846912 · miss 41538
 ```
@@ -120,6 +120,15 @@ zai-coding-cn/glm-5.3 · cache 95.3% · hit 846912 · miss 41538
   opens with the defaults (`cache 0.0% · hit 0 · miss 0`) and the counts move
   as the provider reports usage; what a turn is doing is the transcript's to
   say, not the status line's.
+- **While a turn runs, the box's top border says so**: a spinner and the seconds
+  it has run, and — once the turn has lasted long enough for an average to mean
+  anything — an estimated `~N token/s`. Estimated, because the provider reports
+  tokens only at the end of a sub-request; the characters-to-tokens ratio the
+  estimate runs on is one this session has measured from its own earlier
+  sub-requests. A narrow border drops the estimate whole before it hides the
+  indicator, and a question standing over the box (the approval gate) takes the
+  border back. The exact figure lands where records belong: the plain front end
+  appends `N token/s` to each usage line it prints.
 - **A line typed while a turn runs is queued, not dropped.** The box takes the
   next line as usual — Enter puts it after the current turn, drawn dimmed at the
   foot of the transcript while it waits, and the box's placeholder says so. When

@@ -356,7 +356,7 @@ mod tests {
         fn finish_turn(&mut self) {}
         fn tool_start(&mut self, _name: &str, _args: &str) {}
         fn tool_result(&mut self, _result: &str) {}
-        fn usage(&mut self, _u: &Usage) {}
+        fn usage(&mut self, _u: &Usage, _stream: std::time::Duration) {}
         fn interrupted(&mut self) {}
         fn approval_requested(&mut self, _name: &str, _args: &str) {}
     }
