@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 
 use crate::types::{Message, Role};
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
 // ============================================================================
 // 会话存储：JSONL append-only。
 // 第一行 header；每条消息一行 msg；meta 变更追加 meta 行（后行覆盖前行）。
@@ -62,6 +65,23 @@ fn write_line<T: Serialize>(file: &mut std::fs::File, value: &T) -> Result<()> {
     Ok(())
 }
 
+/// 单写者强制：对会话文件取独占 flock（非阻塞，持有着直到进程退出）。
+/// 两个进程同时追加同一会话会交错出无法自愈的非法历史
+/// （野 tool 结果），这里在入口处直接拒绝。
+#[cfg(unix)]
+fn lock_exclusive(file: &std::fs::File, path: &Path) -> Result<()> {
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        bail!("会话 {} 正在被另一个进程使用（单写者约束）", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn lock_exclusive(_file: &std::fs::File, _path: &Path) -> Result<()> {
+    Ok(())
+}
+
 impl Session {
     pub fn create(dir: &Path, meta: SessionMeta) -> Result<Self> {
         let base = Local::now().format("%Y%m%d-%H%M%S").to_string();
@@ -86,6 +106,7 @@ impl Session {
                 meta: meta.clone(),
             }),
         )?;
+        lock_exclusive(&file, &path)?;
         Ok(Self {
             id,
             path,
@@ -144,6 +165,7 @@ impl Session {
             .append(true)
             .open(path)
             .with_context(|| format!("打开会话文件（追加模式）失败: {}", path.display()))?;
+        lock_exclusive(&file, path)?;
         Ok(Self {
             id,
             path: path.to_path_buf(),
@@ -283,9 +305,11 @@ mod tests {
         s.append_message(&Message::tool("call_1", "file.txt"))
             .unwrap();
 
-        let loaded = Session::load(&s.path).unwrap();
-        assert_eq!(loaded.id, s.id);
-        assert_eq!(loaded.meta, test_meta());
+        let path = s.path.clone();
+        let id = s.id.clone();
+        drop(s); // flock 由存活的 Session 持有，重载前先释放
+        let loaded = Session::load(&path).unwrap();
+        assert_eq!(loaded.id, id);
         assert_eq!(loaded.messages.len(), 3);
         assert_eq!(
             loaded.messages[1].reasoning_content.as_deref(),
@@ -309,7 +333,9 @@ mod tests {
             .unwrap();
         drop(f);
 
-        let loaded = Session::load(&s.path).unwrap();
+        let path = s.path.clone();
+        drop(s);
+        let loaded = Session::load(&path).unwrap();
         assert_eq!(loaded.messages.len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -349,7 +375,9 @@ mod tests {
         s.append_message(&Message::tool("call_1", "ok")).unwrap();
         s.append_message(&Message::user("下一问")).unwrap();
 
-        let loaded = Session::load(&s.path).unwrap();
+        let path = s.path.clone();
+        drop(s);
+        let loaded = Session::load(&path).unwrap();
         let msgs = &loaded.messages;
         assert_eq!(msgs.len(), 5, "补插一条 call_2 的占位结果");
         assert_eq!(msgs[3].tool_call_id.as_deref(), Some("call_2"));
@@ -358,13 +386,33 @@ mod tests {
             Some(crate::machine::INTERRUPTED_RESULT)
         );
         // 文件没有被重写：仍是 header + 4 行消息
-        let raw = std::fs::read_to_string(&s.path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
         assert_eq!(raw.lines().count(), 5);
         // 修复后的历史对决策函数合法：可以直接发请求
         assert_eq!(
             crate::machine::next_action(msgs),
             Some(crate::machine::Action::CallModel)
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 单写者强制：持锁的 Session 存活期间，第二个句柄 load 必须被拒。
+    #[test]
+    fn load_rejects_while_another_process_holds_the_lock() {
+        let dir = tmpdir();
+        let s = Session::create(&dir, test_meta()).unwrap();
+        // Session 未实现 Debug，用 match 取出错误
+        let err = match Session::load(&s.path) {
+            Err(e) => e,
+            Ok(_) => panic!("持锁期间 load 必须失败"),
+        };
+        assert!(
+            format!("{err:#}").contains("单写者约束"),
+            "错误信息应说明单写者约束: {err:#}"
+        );
+        let path = s.path.clone();
+        drop(s); // 释放锁（进程退出时也会自动释放）
+        assert!(Session::load(&path).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -377,7 +425,9 @@ mod tests {
             reasoning_effort: Some("max".into()),
         })
         .unwrap();
-        let loaded = Session::load(&s.path).unwrap();
+        let path = s.path.clone();
+        drop(s);
+        let loaded = Session::load(&path).unwrap();
         assert_eq!(loaded.meta.model, "deepseek-v4-pro");
         assert_eq!(loaded.meta.reasoning_effort.as_deref(), Some("max"));
         std::fs::remove_dir_all(&dir).unwrap();
