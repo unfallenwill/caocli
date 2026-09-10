@@ -161,8 +161,8 @@ const TIPS: [&str; 7] = [
     "/help lists every command",
 ];
 
-/// How many command rows the picker shows at once. It draws over the bottom of
-/// the live area, so it has to leave the transcript somewhere to live.
+/// How many command rows the picker shows at once. It draws over the bottom of the
+/// transcript, so it has to leave the transcript somewhere to live.
 const PICKER_ROWS: usize = 6;
 
 /// The columns the name gets before the detail starts. Wide enough for a session
@@ -314,11 +314,10 @@ const TICK: Duration = Duration::from_millis(8);
 /// Read a key if one is waiting, without blocking for longer than a tick.
 ///
 /// This is deliberately *not* a reader thread, and that is the whole reason the
-/// loop is shaped the way it is: an inline viewport issues a cursor-position
-/// query to place itself and again on every commit, and that query reads from the
-/// same handle. A background reader parked in `event::read` steals the answer, and
-/// the query then times out -- measured, and intermittent, which is exactly what a
-/// stolen read looks like.
+/// loop is shaped the way it is: a reader parked in `event::read` would own the
+/// handle, and a turn running in this one would then be waiting on a thread that
+/// nothing else can wake. A read that never returns is a front end that never
+/// redraws.
 fn poll_key(timeout: Duration) -> io::Result<Option<Event>> {
     if crossterm::event::poll(timeout)? {
         Ok(Some(crossterm::event::read()?))
@@ -1163,7 +1162,7 @@ impl Scroll {
     }
 }
 
-/// The viewport: a terminal, and the state it shows.
+/// The screen: a terminal, and the state it shows.
 ///
 /// Generic over the backend so that what it draws can be asserted on. The
 /// terminal-touching half of this front end is exactly the half nothing else can
@@ -1228,12 +1227,13 @@ impl Drop for Tty {
     }
 }
 
-/// What the viewport would show, as a value that can be compared.
+/// What the screen would show, as a value that can be compared.
 ///
 /// Equal keys mean a redraw cannot change a pixel, so it is skipped. The
 /// revision covers everything the state knows about itself; the tick covers what
-/// moves without the state changing, which is the turn's own clock; the size is
-/// there because the viewport is laid out from it. Reading the size is an
+/// moves without the state changing, which is the spinner's clock while a turn
+/// runs and the tip line's while none does; the size is there because the rows are
+/// laid out from it. Reading the size is an
 /// `ioctl`, not a round trip to the terminal, so it is cheap enough to be part
 /// of a check that runs on every tick of the loop.
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -1281,7 +1281,7 @@ impl Screen<CrosstermBackend<Stdout>> {
 }
 
 impl<B: Backend> Screen<B> {
-    /// What the viewport would show right now.
+    /// What the screen would show right now.
     fn view_key(&self, now: Instant) -> Result<ViewKey, B::Error> {
         let size = self.terminal.size()?;
         Ok(ViewKey {
@@ -1292,11 +1292,12 @@ impl<B: Backend> Screen<B> {
         })
     }
 
-    /// Repaint, unless the viewport already shows this.
+    /// Repaint, unless the screen already shows this.
     ///
     /// The loop wakes on a tick to stay responsive to the keyboard, and most of
-    /// those ticks have nothing new to show: a turn spends its time waiting, and
-    /// repainting an unchanged viewport would be a full-screen write every tick.
+    /// those ticks have nothing new to show: a turn spends its time waiting to be
+    /// told something, and repainting an unchanged screen would be a whole-screen
+    /// write every tick.
     fn draw_if_changed(&mut self) -> Result<(), B::Error> {
         let now = Instant::now();
         let key = self.view_key(now)?;
@@ -1310,7 +1311,7 @@ impl<B: Backend> Screen<B> {
         Ok(())
     }
 
-    /// Draw the viewport as of now, for tests that do not care about the clock.
+    /// Draw the screen as of now, for tests that do not care about the clock.
     #[cfg(test)]
     fn draw(&mut self) -> Result<(), B::Error> {
         self.draw_at(Instant::now())
@@ -1395,8 +1396,8 @@ fn input_box() -> TextArea<'static> {
 
 /// The lines cells occupy at `width`.
 ///
-/// One function, because the live area, the scrollback it is committed into and
-/// the scroll view that reads it back are three places the same cells are laid
+/// One function, because the transcript on screen, the window over it and the
+/// session log folded back into cells are three places the same cells are laid
 /// out, and a session that reads differently in any of them is a session that was
 /// not really one transcript.
 fn cell_lines(cells: &[Cell], width: usize) -> Vec<Line<'static>> {
@@ -1437,8 +1438,8 @@ fn fill_of(cell: &Cell) -> Option<RStyle> {
 /// Wrap styled spans into the terminal lines they need at `width` columns.
 ///
 /// Both halves of the front end need this, for the same reason: nothing here may
-/// be left to the terminal's own soft wrapping. The live area is a fixed-height
-/// region, so an unwrapped line would push the pinned rows out of the viewport,
+/// be left to the terminal's own soft wrapping. The transcript is a region of a
+/// fixed width, so an unwrapped line would be cut off at the edge,
 /// and `insert_before` renders into a fixed-width buffer, where an over-long line
 /// is silently cut off -- unlike the plain front end, where the terminal wraps
 /// and nothing is lost.
@@ -1564,12 +1565,11 @@ enum Submitted {
 /// Run the interactive front end until the user leaves.
 ///
 /// `banner` and `history` are what the plain front end prints before its first
-/// prompt; here they go into scrollback first, so a resumed session reads the
-/// same way either way.
-/// Returns `Ok(false)` when this terminal cannot host the viewport, which is the
-/// caller's signal to fall back to the plain front end rather than to fail: an
-/// inline viewport has to be told where the cursor is, and not every terminal
-/// answers. `Ok(true)` means the front end ran and the session is over.
+/// prompt; here they are the first thing in the transcript, so a resumed session
+/// reads the same way either way.
+/// Returns `Ok(false)` when the terminal will not take raw mode and the alternate
+/// screen, which is the caller's signal to fall back to the plain front end rather
+/// than to fail. `Ok(true)` means the front end ran and the session is over.
 pub async fn run(
     agent: &mut Agent,
     sdir: &Path,
@@ -1939,15 +1939,14 @@ mod tests {
             .to_owned()
     }
 
-    /// Where the viewport was placed. Its origin is not asserted on: an inline
-    /// viewport sits at the cursor it found, which on a real terminal is the
-    /// bottom of the screen and in an in-memory backend is the top.
+    /// Where the drawn area is. A full screen starts at the origin, and a test
+    /// asks rather than assumes: the frame is what says where the rows are.
     fn origin(screen: &mut Screen<ratatui::backend::TestBackend>) -> Rect {
         screen.terminal.get_frame().area()
     }
 
     /// Every row of the screen, so a test can ask whether something was drawn
-    /// without pinning down where the viewport happened to be.
+    /// without pinning down which row it landed on.
     fn all_rows(screen: &Screen<ratatui::backend::TestBackend>) -> Vec<String> {
         let height = screen.terminal.backend().buffer().area.height;
         (0..height).map(|y| row(screen, y)).collect()
@@ -2803,7 +2802,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unchanged_viewport_is_not_drawn_again() {
+    fn an_unchanged_screen_is_not_drawn_again() {
         let frames = std::rc::Rc::new(std::cell::Cell::new(0));
         let backend = Counting {
             inner: ratatui::backend::TestBackend::new(40, 20),
