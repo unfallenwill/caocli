@@ -8,11 +8,12 @@
 //!   history and yields an [`Action`]; the interpreter (`Agent::turn`) executes it
 //!   and writes the result back into the log. The machine never awaits IO.
 //! - **Callbacks receive notifications only, never return data**: `ui::Ui` is the
-//!   machine's Notice channel. The two questions that *do* need an answer — the
-//!   user's cancel and the gate's verdict — are answered through channels of their
-//!   own (`ui::Cancel`, `ui::Approve`) and read by the interpreter, which decides
-//!   what to run, never what comes next: a denial reaches the decision function the
-//!   way every other result does, as a tool result in the log.
+//!   machine's Notice channel. The three questions that *do* need an answer — the
+//!   user's cancel, the gate's verdict and the question tool's answer — are
+//!   answered through channels of their own (`ui::Cancel`, `ui::Approve`,
+//!   `ui::Ask`) and read by the interpreter, which decides what to run, never what
+//!   comes next: a denial or an answer reaches the decision function the way every
+//!   other result does, as a tool result in the log.
 //! - **State = a fold of the log**: `Session` is the only persistent state and can
 //!   be rebuilt at any time via `Session::load`; a second source of truth is not
 //!   allowed to exist in memory.
@@ -22,7 +23,7 @@
 //! | Input | landed (implicit) | UserLine (the `turn` argument), Delta (SSE stream), ToolFinished (execute return value) |
 //! | Command | partially landed | Cancel has landed (Ctrl-C during a turn; out-of-band, handled in the interpreter layer, never enters `next_action`); New / Resume / Exit have not |
 //! | Notice | landed | the seven methods of `ui::Ui` |
-//! | Effect | landed, in the interpreter | one per [`Action`], run by `agent::turn`: a sub-request, one tool call (the step budget, then the gate, then the tool), and the cleanup a cancelled turn owes the log. The interpreter's own vocabulary (`Step`, `Ran`, `Gate`) describes what it did, never what to do next — the decision stays here |
+//! | Effect | landed, in the interpreter | one per [`Action`], run by `agent::turn`: a sub-request, one tool call (the step budget, then the gate, then the tool — or, for the question tool, the user's answer instead of the tool), and the cleanup a cancelled turn owes the log. The interpreter's own vocabulary (`Step`, `Ran`, `Gate`) describes what it did, never what to do next — the decision stays here |
 
 use std::collections::HashSet;
 
@@ -112,6 +113,10 @@ pub enum Marker {
     Denied,
     /// Persisted for the calls still open when the turn hit [`MAX_TOOL_STEPS`].
     StepLimit,
+    /// Persisted for a question the user did not answer: they dismissed it, or
+    /// there was nobody there to ask. The model can ask again, ask differently,
+    /// or go on without an answer.
+    Unanswered,
 }
 
 impl Marker {
@@ -123,6 +128,7 @@ impl Marker {
             Marker::Cancelled => "error: cancelled by user before a result was recorded",
             Marker::Denied => "error: the user declined this tool call",
             Marker::StepLimit => "error: tool step limit reached; turn aborted",
+            Marker::Unanswered => "error: the user did not answer the question",
         }
     }
 }
@@ -379,6 +385,10 @@ mod tests {
         assert_eq!(
             Marker::StepLimit.text(),
             "error: tool step limit reached; turn aborted"
+        );
+        assert_eq!(
+            Marker::Unanswered.text(),
+            "error: the user did not answer the question"
         );
     }
 

@@ -30,14 +30,16 @@ use crate::config;
 use crate::history;
 use crate::repl;
 use crate::session;
+use crate::tools::ask::{Answer, Question};
 use crate::types::{Message, ToolCall};
-use crate::ui::{Approve, Cancel, Verdict};
+use crate::ui::{Approve, Ask, Cancel, Verdict};
 
 use super::cell::{self, Cell};
 
 mod input;
 mod layout;
 mod notice;
+mod panel;
 mod screen;
 
 use ratatui::backend::CrosstermBackend;
@@ -84,11 +86,11 @@ impl Cancel for CtrlC {
 /// The question goes to the event loop as a reply handle; the next line the user
 /// submits is the answer. Denial is the default, including when the front end has
 /// gone away mid-ask.
-struct Ask {
+struct Gate {
     tx: mpsc::UnboundedSender<oneshot::Sender<Verdict>>,
 }
 
-impl Approve for Ask {
+impl Approve for Gate {
     fn approve(&mut self, _call: &ToolCall) -> Pin<Box<dyn Future<Output = Verdict> + '_>> {
         Box::pin(async move {
             let (reply, answer) = oneshot::channel();
@@ -97,6 +99,45 @@ impl Approve for Ask {
                 return Verdict::Denied;
             }
             answer.await.unwrap_or(Verdict::Denied)
+        })
+    }
+}
+
+/// The question tool, answered from the event loop.
+///
+/// The questions go to the loop as a panel to put up, and the reply handle travels
+/// with them: the answers are not a value this object ever sees, they are what the
+/// panel sends when the last question has been answered. A front end that has gone
+/// away -- the channel closed, or the panel dropped with the turn -- answers
+/// nothing, which is the dismissal the interpreter writes down as a marker.
+struct Questions {
+    tx: mpsc::UnboundedSender<Asked>,
+}
+
+/// What the loop is asked to put on the screen: the questions, and where the
+/// answers go.
+struct Asked {
+    questions: Vec<Question>,
+    reply: oneshot::Sender<Option<Vec<Answer>>>,
+}
+
+impl Ask for Questions {
+    fn ask(
+        &mut self,
+        questions: &[Question],
+    ) -> Pin<Box<dyn Future<Output = Option<Vec<Answer>>> + '_>> {
+        let (reply, answers) = oneshot::channel();
+        let asked = Asked {
+            questions: questions.to_vec(),
+            reply,
+        };
+        Box::pin(async move {
+            if self.tx.send(asked).is_err() {
+                return None;
+            }
+            // A dropped sender is the same answer as a closed channel: nobody
+            // answered, and the model is told so rather than left waiting.
+            answers.await.unwrap_or(None)
         })
     }
 }
@@ -153,12 +194,15 @@ pub async fn run(
     screen.state.transcript.extend(cell::from_messages(history));
 
     let (tx, notices) = mpsc::unbounded_channel();
-    let (ask_tx, asked) = mpsc::unbounded_channel();
+    let (gate_tx, gates) = mpsc::unbounded_channel();
+    let (question_tx, questions) = mpsc::unbounded_channel();
     let mut handle = Notifier { tx };
     let mut channels = Channels {
         notices,
-        asked,
-        ask_tx,
+        gates,
+        gate_tx,
+        questions,
+        question_tx,
     };
 
     let result: anyhow::Result<()> = 'session: loop {
@@ -275,12 +319,15 @@ fn offer_menu(
 
 /// The channels the event loop reads and answers while it runs.
 ///
-/// The machine's notifications arrive on one, the approval questions on
-/// another, and the sender of the second is what the machine holds.
+/// The machine's notifications arrive on one, the gate's questions on another and
+/// the question tool's on a third; the sender of each of the last two is what the
+/// machine holds while it waits.
 struct Channels {
     notices: mpsc::UnboundedReceiver<Notice>,
-    asked: mpsc::UnboundedReceiver<oneshot::Sender<Verdict>>,
-    ask_tx: mpsc::UnboundedSender<oneshot::Sender<Verdict>>,
+    gates: mpsc::UnboundedReceiver<oneshot::Sender<Verdict>>,
+    gate_tx: mpsc::UnboundedSender<oneshot::Sender<Verdict>>,
+    questions: mpsc::UnboundedReceiver<Asked>,
+    question_tx: mpsc::UnboundedSender<Asked>,
 }
 
 /// Draw and wait at the prompt until the user submits a line. `None` says they
@@ -328,10 +375,21 @@ async fn run_turn(
 ) -> anyhow::Result<anyhow::Result<repl::Outcome>> {
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let mut interrupt = CtrlC(cancel_rx);
-    let mut approve = Ask {
-        tx: channels.ask_tx.clone(),
+    let mut approve = Gate {
+        tx: channels.gate_tx.clone(),
     };
-    let turn = repl::handle(agent, handle, sdir, line, &mut interrupt, &mut approve);
+    let mut ask = Questions {
+        tx: channels.question_tx.clone(),
+    };
+    let turn = repl::handle(
+        agent,
+        handle,
+        sdir,
+        line,
+        &mut interrupt,
+        &mut approve,
+        &mut ask,
+    );
     tokio::pin!(turn);
     screen.state.begin_turn(Instant::now());
     let outcome = loop {
@@ -342,8 +400,11 @@ async fn run_turn(
         for notice in drain(&mut channels.notices) {
             screen.state.apply(notice);
         }
-        for reply in drain(&mut channels.asked) {
+        for reply in drain(&mut channels.gates) {
             screen.state.open_question(reply);
+        }
+        for asked in drain(&mut channels.questions) {
+            screen.state.open_panel(asked.questions, asked.reply);
         }
         screen.state.tick_activity(Instant::now());
         screen.draw_if_changed()?;
@@ -358,11 +419,15 @@ async fn run_turn(
     for notice in drain(&mut channels.notices) {
         screen.state.apply(notice);
     }
-    for reply in drain(&mut channels.asked) {
+    for reply in drain(&mut channels.gates) {
         screen.state.open_question(reply);
+    }
+    for asked in drain(&mut channels.questions) {
+        screen.state.open_panel(asked.questions, asked.reply);
     }
     screen.state.end_turn();
     screen.state.close_question();
+    screen.state.close_panel();
     screen.commit();
     Ok(outcome)
 }

@@ -24,7 +24,7 @@ use crate::cli::Cli;
 use crate::session::{Session, SessionMeta};
 use crate::ui::tui;
 use crate::ui::{Front, Renderer};
-use crate::ui::{Sigint, StdinApproval};
+use crate::ui::{Sigint, StdinApproval, StdinQuestions};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -229,8 +229,9 @@ async fn run(cli: Cli) -> Result<()> {
         // await point (see Agent::turn).
         let mut interrupt = Sigint::new()?;
         let mut approve = StdinApproval;
+        let mut ask = StdinQuestions;
         if let Err(e) = agent
-            .turn_message(message, &mut ui, &mut interrupt, &mut approve)
+            .turn_message(message, &mut ui, &mut interrupt, &mut approve, &mut ask)
             .await
         {
             ui.error(&format!("{e:#}"));
@@ -301,6 +302,7 @@ async fn run(cli: Cli) -> Result<()> {
                 // first await point (see Agent::turn).
                 let mut interrupt = Sigint::new()?;
                 let mut approve = StdinApproval;
+                let mut ask = StdinQuestions;
                 let outcome = repl::handle(
                     &mut agent,
                     &mut ui,
@@ -308,6 +310,7 @@ async fn run(cli: Cli) -> Result<()> {
                     line,
                     &mut interrupt,
                     &mut approve,
+                    &mut ask,
                 )
                 .await?;
                 if outcome == repl::Outcome::Exit {

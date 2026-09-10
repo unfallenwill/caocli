@@ -12,6 +12,7 @@ use ratatui::text::Line;
 use ratatui_textarea::{CursorMove, TextArea};
 use tokio::sync::{oneshot, watch};
 
+use super::panel::PANEL_PLACEHOLDER;
 use super::picker::Choosing;
 use crate::history;
 use crate::ui::Verdict;
@@ -423,6 +424,13 @@ impl State {
             let _ = cancel.send(true);
             return;
         }
+        // The panel is up: it takes the keys that choose, and the box takes what
+        // is typed into it. A line is not queued while a question is waiting --
+        // the box belongs to the answer, the same rule the gate keeps.
+        if self.panel_open() {
+            self.panel_key(event);
+            return;
+        }
         // No question is open, so the box is free for the next line. Enter queues
         // it, which is the whole point of typing here. One key is still dropped --
         // Ctrl-D, which leaves the session -- because a turn in flight is not the
@@ -450,6 +458,58 @@ impl State {
         } else {
             // Backspace, a paste, a letter: all of it is the answer being typed.
             self.key(event);
+        }
+    }
+
+    /// Handle a key while the question panel is up.
+    ///
+    /// The panel takes the keys that choose: the arrows and the digits move the
+    /// cursor, space toggles an option for a question that takes several, Enter
+    /// confirms and Esc dismisses the whole call. Everything else is typed into
+    /// the box, which is where an answer in the user's own words goes -- so a
+    /// digit or a space is only the panel's while the box is still empty. Once the
+    /// user is typing, the keyboard is theirs, and a space is a space.
+    pub(super) fn panel_key(&mut self, event: Event) {
+        let Event::Key(key) = event else {
+            // A paste is an answer typed the fast way.
+            self.key(event);
+            return;
+        };
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+        match key {
+            KeyEvent {
+                code: KeyCode::Up, ..
+            } => self.panel_move(-1),
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } => self.panel_move(1),
+            KeyEvent {
+                code: KeyCode::Char(digit @ '1'..='9'),
+                ..
+            } if self.text().is_empty() => {
+                self.panel_jump(digit.to_digit(10).unwrap_or(1) as usize);
+            }
+            KeyEvent {
+                code: KeyCode::Char(' '),
+                ..
+            } if self.text().is_empty() && self.panel_takes_many() => self.panel_toggle(),
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                let typed = self.text();
+                self.panel_confirm(&typed);
+            }
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => self.panel_dismiss(),
+            other => {
+                self.key(Event::Key(other));
+            }
         }
     }
 
@@ -504,6 +564,7 @@ impl State {
         match self.reply {
             Some(Answer::YesNo(_)) => ANSWER_PLACEHOLDER,
             Some(Answer::Secret(_)) => SECRET_PLACEHOLDER,
+            None if self.panel_open() => PANEL_PLACEHOLDER,
             None if self.turn_running => QUEUE_PLACEHOLDER,
             None => IDLE_PLACEHOLDER,
         }

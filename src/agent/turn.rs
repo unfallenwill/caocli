@@ -16,7 +16,7 @@ use crate::machine::{self, Action, Marker};
 use crate::session::Session;
 use crate::tools;
 use crate::types::{Message, ToolCall};
-use crate::ui::{Approve, Cancel, Ui, Verdict};
+use crate::ui::{Approve, Ask, Cancel, Ui, Verdict};
 
 use super::{Agent, Approval};
 
@@ -78,8 +78,8 @@ fn close_open_calls(session: &mut Session, ui: &mut dyn Ui, marker: Marker) -> R
 
 /// The turn in flight: what a beat needs to run, and what it may spend.
 ///
-/// It holds the borrows the caller handed in — the agent, the watcher and the two
-/// answers — so a beat is `turn.beat(action)` rather than a call with six
+/// It holds the borrows the caller handed in — the agent, the watcher and the
+/// three answers — so a beat is `turn.beat(action)` rather than a call with six
 /// arguments, and so the step budget that belongs to the turn cannot be mistaken
 /// for state of the agent's own. Nothing here outlives the turn.
 struct Turn<'a> {
@@ -87,6 +87,7 @@ struct Turn<'a> {
     ui: &'a mut dyn Ui,
     cancel: &'a mut dyn Cancel,
     approve: &'a mut dyn Approve,
+    ask: &'a mut dyn Ask,
     /// Tool steps left. Every `ExecTool` action costs one, including a call the
     /// gate denied: a decision the user had to make is a step spent.
     steps_left: usize,
@@ -104,8 +105,9 @@ impl Agent {
         ui: &mut dyn Ui,
         cancel: &mut dyn Cancel,
         approve: &mut dyn Approve,
+        ask: &mut dyn Ask,
     ) -> Result<()> {
-        self.turn_message(Message::user(input), ui, cancel, approve)
+        self.turn_message(Message::user(input), ui, cancel, approve, ask)
             .await
     }
 
@@ -136,16 +138,18 @@ impl Agent {
     /// Cancellation is handled here and never enters `next_action`: it is
     /// out-of-band, and every state is reachable without it.
     ///
-    /// `approve` answers the approval gate. Both are supplied by the caller
-    /// rather than built here because both depend on which front end is running:
-    /// a front end that owns the terminal in raw mode leaves no SIGINT to listen
-    /// for, so it answers both channels from its own event loop.
+    /// `approve` answers the approval gate and `ask` the question tool. All three
+    /// are supplied by the caller rather than built here because all three depend
+    /// on which front end is running: a front end that owns the terminal in raw
+    /// mode leaves no SIGINT to listen for, so it answers every channel from its
+    /// own event loop.
     pub async fn turn_message(
         &mut self,
         message: Message,
         ui: &mut dyn Ui,
         cancel: &mut dyn Cancel,
         approve: &mut dyn Approve,
+        ask: &mut dyn Ask,
     ) -> Result<()> {
         self.session.append_message(&message)?;
         let steps_left = self.max_tool_steps;
@@ -154,6 +158,7 @@ impl Agent {
             ui,
             cancel,
             approve,
+            ask,
             steps_left,
             cancelled: false,
         };
@@ -200,12 +205,55 @@ impl Turn<'_> {
             return self.out_of_budget(call);
         }
         self.steps_left -= 1;
+        // The one call that is a question: it is put to the user instead of
+        // being dispatched, and never put to the gate. Asking permission to ask
+        // would be asking twice about one thing, and the answer to a question is
+        // not something a y/N can stand in for.
+        if call.function.name == tools::ASK_NAME {
+            return self.question(call).await;
+        }
         match self.gate(call).await? {
             Gate::Cleared => {}
             Gate::Denied => return Ok(Step::Again),
             Gate::Cancelled => return Ok(self.stop()),
         }
         self.run(call).await
+    }
+
+    /// The question tool: the call's arguments are read first, the questions are
+    /// put to the front end, and what the user chose is written back as the
+    /// call's result.
+    ///
+    /// Nothing about this needs the machine to decide anything new: a question is
+    /// one more effect that can end in an answer, a dismissal or a cancel, and
+    /// each of the three lands in the log as the call's own result. An argument
+    /// list that cannot be read is answered with the parse failure -- text, like
+    /// every other tool's failure, for the model to correct.
+    async fn question(&mut self, call: &ToolCall) -> Result<Step> {
+        let questions = match tools::ask::parse(&call.function.arguments) {
+            Ok(questions) => questions,
+            Err(e) => {
+                self.settle(call, &e)?;
+                return Ok(Step::Again);
+            }
+        };
+        match race(self.cancel, self.ask.ask(&questions)).await {
+            Ran::Finished(Some(answers)) => {
+                let text = tools::ask::answer_text(&questions, &answers);
+                self.settle(call, &text)?;
+                Ok(Step::Again)
+            }
+            // Dismissed, or asked of nobody: the model is told so rather than
+            // left waiting for an answer that is not coming.
+            Ran::Finished(None) => {
+                self.answer_with(call, Marker::Unanswered)?;
+                Ok(Step::Again)
+            }
+            Ran::Cancelled => {
+                self.answer_with(call, Marker::Cancelled)?;
+                Ok(self.stop())
+            }
+        }
     }
 
     /// The budget is gone: the call in hand is answered with the marker instead
@@ -243,10 +291,7 @@ impl Turn<'_> {
         let invoked = tools::execute(&call.function.name, &call.function.arguments);
         match race(self.cancel, invoked).await {
             Ran::Finished(tool_output) => {
-                self.ui.tool_result(&tool_output);
-                self.agent
-                    .session
-                    .append_message(&Message::tool(&call.id, tool_output))?;
+                self.settle(call, &tool_output)?;
                 Ok(Step::Again)
             }
             // Dropped mid-flight, so the call has a result after all: the marker
@@ -261,10 +306,17 @@ impl Turn<'_> {
     /// Write `marker` as the result of `call` — in the log and to the front end
     /// — for a call that ends without a tool's own output to report.
     fn answer_with(&mut self, call: &ToolCall, marker: Marker) -> Result<()> {
-        self.ui.tool_result(marker.text());
+        self.settle(call, marker.text())
+    }
+
+    /// Write `text` as the result of `call`, in the log and to the front end: one
+    /// place for the two, so that what a session shows for a call and what the
+    /// model reads for it cannot be different text.
+    fn settle(&mut self, call: &ToolCall, text: &str) -> Result<()> {
+        self.ui.tool_result(text);
         self.agent
             .session
-            .append_message(&Message::tool(&call.id, marker.text()))?;
+            .append_message(&Message::tool(&call.id, text))?;
         Ok(())
     }
 

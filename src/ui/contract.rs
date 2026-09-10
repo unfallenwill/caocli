@@ -1,8 +1,8 @@
 //! The channels between the machine and a front end, and nothing else.
 //!
-//! [`Ui`] is the vocabulary the machine notifies with; [`Cancel`] and
-//! [`Approve`] are the two it asks its questions on; [`Front`] is what handling a
-//! submitted line asks of whichever front end is running. Keeping all of them
+//! [`Ui`] is the vocabulary the machine notifies with; [`Cancel`], [`Approve`]
+//! and [`Ask`] are the three it asks its questions on; [`Front`] is what handling
+//! a submitted line asks of whichever front end is running. Keeping all of them
 //! apart from any implementation is what lets a front end be written against them
 //! alone -- the plain renderer, the one that owns the screen, or a double in a
 //! test -- without depending on how any of them draws.
@@ -11,6 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use crate::tools::ask::{Answer, Question};
 use crate::types::{Message, ToolCall, Usage};
 
 /// The machine → UI notification vocabulary (the Notice channel).
@@ -102,6 +103,25 @@ pub trait Cancel {
 /// output lifetime can be bound to `&mut self`.
 pub trait Approve {
     fn approve(&mut self, call: &ToolCall) -> Pin<Box<dyn Future<Output = Verdict> + '_>>;
+}
+
+/// The question tool's answer source: what the user chose, question by question.
+///
+/// The third question the machine asks, and the only one whose answer is a value
+/// rather than a decision about something the machine proposed: the gate asks
+/// whether to run a call, a cancel asks nothing at all, and this asks the user to
+/// choose. The questions are the tool call's own arguments, already read and
+/// checked, and the answer is what the interpreter writes back as its result --
+/// so a front end never touches the log.
+///
+/// `None` says the question was not answered at all: dismissed, or asked of a
+/// front end with nobody behind it. That is a different thing from an answer with
+/// no labels, which says this one question was left blank.
+pub trait Ask {
+    fn ask(
+        &mut self,
+        questions: &[Question],
+    ) -> Pin<Box<dyn Future<Output = Option<Vec<Answer>>> + '_>>;
 }
 
 /// The approval gate's answer.

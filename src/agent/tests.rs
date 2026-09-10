@@ -11,7 +11,9 @@ use super::*;
 use crate::session::SessionMeta;
 use crate::types::Role;
 use crate::ui::Renderer;
-use crate::ui::doubles::{Answer, CancelAt, CancelNow, NoAnswer, NoCancel};
+use crate::ui::doubles::{
+    Answer, CancelAt, CancelNow, Dismissed, NoAnswer, NoCancel, NoQuestions, Picked,
+};
 use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -134,6 +136,7 @@ async fn mock_full_tool_loop_replays_reasoning_content() {
             &mut ui,
             &mut NoCancel,
             &mut Answer::denies(),
+            &mut NoQuestions,
         )
         .await
         .unwrap();
@@ -228,6 +231,7 @@ async fn mock_multi_call_loop_executes_all_before_next_request() {
             &mut ui,
             &mut NoCancel,
             &mut Answer::denies(),
+            &mut NoQuestions,
         )
         .await
         .unwrap();
@@ -280,6 +284,7 @@ async fn cancel_during_first_stream_keeps_history_at_user() {
             &mut ui,
             &mut cancel,
             &mut Answer::allows(),
+            &mut NoQuestions,
         )
         .await
         .unwrap();
@@ -318,6 +323,7 @@ async fn cancel_during_tool_marks_remaining_calls_cancelled() {
             &mut ui,
             &mut cancel,
             &mut Answer::allows(),
+            &mut NoQuestions,
         )
         .await
         .unwrap();
@@ -390,6 +396,7 @@ async fn a_tool_result_is_not_mistaken_for_a_cancellation() {
             &mut ui,
             &mut NoCancel,
             &mut Answer::allows(),
+            &mut NoQuestions,
         )
         .await
         .unwrap();
@@ -451,7 +458,13 @@ async fn the_step_budget_is_spent_again_by_the_next_turn() {
     let mut ui = Renderer::new();
     for question in ["run one command", "run another"] {
         agent
-            .turn(question, &mut ui, &mut NoCancel, &mut Answer::allows())
+            .turn(
+                question,
+                &mut ui,
+                &mut NoCancel,
+                &mut Answer::allows(),
+                &mut NoQuestions,
+            )
             .await
             .unwrap();
     }
@@ -506,6 +519,7 @@ async fn approval_denied_commits_denial_marker() {
             &mut ui,
             &mut NoCancel,
             &mut Answer::denies(),
+            &mut NoQuestions,
         )
         .await
         .unwrap();
@@ -546,7 +560,13 @@ async fn cancel_during_approval_wait_commits_cancelled() {
     // the stream is left to finish; the second wait point is the tool call
     let mut cancel = CancelAt::on(&[2]);
     agent
-        .turn("run it", &mut ui, &mut cancel, &mut NoAnswer)
+        .turn(
+            "run it",
+            &mut ui,
+            &mut cancel,
+            &mut NoAnswer,
+            &mut NoQuestions,
+        )
         .await
         .unwrap();
     let msgs = &agent.session.messages;
@@ -589,6 +609,7 @@ async fn step_limit_aborts_with_deterministic_markers() {
             &mut ui,
             &mut NoCancel,
             &mut Answer::allows(),
+            &mut NoQuestions,
         )
         .await
         .unwrap();
@@ -636,6 +657,7 @@ async fn mock_write_tool_creates_file() {
             &mut ui,
             &mut NoCancel,
             &mut Answer::denies(),
+            &mut NoQuestions,
         )
         .await
         .unwrap();
@@ -676,7 +698,13 @@ async fn mock_http_error_includes_status_and_body() {
     let mut agent = test_agent(&server, &dir);
     let mut ui = Renderer::new();
     let err = agent
-        .turn("hi", &mut ui, &mut NoCancel, &mut Answer::denies())
+        .turn(
+            "hi",
+            &mut ui,
+            &mut NoCancel,
+            &mut Answer::denies(),
+            &mut NoQuestions,
+        )
         .await
         .unwrap_err();
     let s = format!("{err:#}");
@@ -704,9 +732,221 @@ async fn mock_broken_sse_chunk_fails_with_context() {
     let mut agent = test_agent(&server, &dir);
     let mut ui = Renderer::new();
     let err = agent
-        .turn("hi", &mut ui, &mut NoCancel, &mut Answer::denies())
+        .turn(
+            "hi",
+            &mut ui,
+            &mut NoCancel,
+            &mut Answer::denies(),
+            &mut NoQuestions,
+        )
         .await
         .unwrap_err();
     assert!(format!("{err:#}").contains("failed to parse SSE chunk"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The question tool, end to end: the model asks, the front end answers, and what
+/// the user chose is what the call's result says -- in the log the next request is
+/// built from, and on the screen.
+#[tokio::test]
+async fn mock_question_tool_records_the_users_answer() {
+    let server = MockServer::start().await;
+    let args = json!({"questions": [
+        {"id": "auth", "header": "Auth", "question": "Which auth?",
+         "options": [{"label": "JWT (Recommended)"}, {"label": "Session cookie"}]},
+        {"id": "store", "question": "Where?", "multi_select": true,
+         "options": [{"label": "Postgres"}, {"label": "SQLite"}]}
+    ]})
+    .to_string();
+    let turn1 = [
+        sse(json!({"tool_calls":[{"index":0,"id":"call_q1","type":"function","function":{"name":"AskUserQuestion","arguments":args}}]}), None, None),
+        sse(json!({"content":""}), Some("tool_calls"), None),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    let turn2 = [
+        sse(json!({"content":"Both settled."}), None, None),
+        sse(json!({"content":""}), Some("stop"), None),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    mount_chat(&server, turn1, Some(1)).await;
+    mount_chat(&server, turn2, None).await;
+
+    let dir = tmpdir();
+    let mut agent = test_agent(&server, &dir);
+    let mut ui = Renderer::new();
+    let mut answers = Picked::sets(&[&["JWT (Recommended)"], &["Postgres", "SQLite"]]);
+    agent
+        .turn(
+            "make it work",
+            &mut ui,
+            &mut NoCancel,
+            &mut Answer::denies(),
+            &mut answers,
+        )
+        .await
+        .unwrap();
+
+    let msgs = &agent.session.messages;
+    assert_eq!(
+        msgs[2].text().as_deref(),
+        Some("auth: JWT (Recommended)\nstore: Postgres, SQLite"),
+        "the answer is the call's result, id by id"
+    );
+    assert!(machine::is_request_valid(msgs));
+    // The answer is what the next request carries, byte for byte.
+    let reqs = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&reqs[1].body).unwrap();
+    // The request carries the system prompt first, so the tool result is the
+    // fourth message in it.
+    assert_eq!(
+        body["messages"][3]["content"],
+        json!("auth: JWT (Recommended)\nstore: Postgres, SQLite")
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A question the user dismissed is answered with a marker, not with the option
+/// the cursor happened to be on: the model can ask again, or go on without it.
+#[tokio::test]
+async fn mock_a_dismissed_question_is_a_marker() {
+    let server = MockServer::start().await;
+    let args = json!({"questions": [{"id": "auth", "question": "Which auth?"}]}).to_string();
+    let turn1 = [
+        sse(json!({"tool_calls":[{"index":0,"id":"call_q1","type":"function","function":{"name":"AskUserQuestion","arguments":args}}]}), None, None),
+        sse(json!({"content":""}), Some("tool_calls"), None),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    mount_chat(&server, turn1, None).await;
+
+    let dir = tmpdir();
+    let mut agent = test_agent(&server, &dir);
+    let mut ui = Renderer::new();
+    agent
+        .turn(
+            "make it work",
+            &mut ui,
+            &mut NoCancel,
+            &mut Answer::denies(),
+            &mut Dismissed,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        agent.session.messages[2].text().as_deref(),
+        Some(machine::Marker::Unanswered.text())
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Arguments the tool cannot read are text for the model to correct itself from --
+/// and nobody is asked anything: a question that cannot be read is one nobody can
+/// answer.
+#[tokio::test]
+async fn mock_unreadable_question_arguments_never_reach_the_user() {
+    let server = MockServer::start().await;
+    let turn1 = [
+        sse(json!({"tool_calls":[{"index":0,"id":"call_q1","type":"function","function":{"name":"AskUserQuestion","arguments":"{\"questions\":\"auth\"}"}}]}), None, None),
+        sse(json!({"content":""}), Some("tool_calls"), None),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    mount_chat(&server, turn1, None).await;
+
+    let dir = tmpdir();
+    let mut agent = test_agent(&server, &dir);
+    let mut ui = Renderer::new();
+    agent
+        .turn(
+            "make it work",
+            &mut ui,
+            &mut NoCancel,
+            &mut Answer::denies(),
+            &mut NoQuestions,
+        )
+        .await
+        .unwrap();
+    let result = agent.session.messages[2].text().unwrap().to_owned();
+    assert!(
+        result.starts_with("error: missing required argument questions (array)"),
+        "was {result:?}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A cancel with a question open: the call is closed with the cancellation marker
+/// and the turn ends, so the history is still a valid request prefix.
+#[tokio::test]
+async fn mock_cancelling_while_a_question_is_open_closes_it() {
+    let server = MockServer::start().await;
+    let args = json!({"questions": [{"id": "auth", "question": "Which auth?"}]}).to_string();
+    let turn1 = [
+        sse(json!({"tool_calls":[{"index":0,"id":"call_q1","type":"function","function":{"name":"AskUserQuestion","arguments":args}}]}), None, None),
+        sse(json!({"content":""}), Some("tool_calls"), None),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    mount_chat(&server, turn1, None).await;
+
+    let dir = tmpdir();
+    let mut agent = test_agent(&server, &dir);
+    let mut ui = Renderer::new();
+    // The turn's first wait is the sub-request; the second is the question.
+    let mut cancel = CancelAt::on(&[2]);
+    agent
+        .turn(
+            "make it work",
+            &mut ui,
+            &mut cancel,
+            &mut Answer::denies(),
+            &mut NoQuestions,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        agent.session.messages[2].text().as_deref(),
+        Some(machine::Marker::Cancelled.text())
+    );
+    assert!(machine::is_request_valid(&agent.session.messages));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Asking is not something the approval gate is asked about: with `--ask` on, a
+/// question still reaches the user, because asking permission to ask would be
+/// asking twice about one thing.
+#[tokio::test]
+async fn the_gate_never_stands_in_front_of_a_question() {
+    let server = MockServer::start().await;
+    let args = json!({"questions": [{"id": "auth", "question": "Which auth?"}]}).to_string();
+    let turn1 = [
+        sse(json!({"tool_calls":[{"index":0,"id":"call_q1","type":"function","function":{"name":"AskUserQuestion","arguments":args}}]}), None, None),
+        sse(json!({"content":""}), Some("tool_calls"), None),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    mount_chat(&server, turn1, None).await;
+
+    let dir = tmpdir();
+    let mut agent = test_agent(&server, &dir);
+    agent.approval = Approval::Ask;
+    let mut ui = Renderer::new();
+    agent
+        .turn(
+            "make it work",
+            &mut ui,
+            &mut NoCancel,
+            // A gate that would deny anything it was asked about.
+            &mut Answer::denies(),
+            &mut Picked::labels(&["JWT"]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        agent.session.messages[2].text().as_deref(),
+        Some("auth: JWT"),
+        "the answer is the user's, not a denial"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }

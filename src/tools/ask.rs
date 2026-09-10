@@ -29,6 +29,10 @@ pub const MAX_QUESTIONS: usize = 4;
 /// a choice and become a list to read.
 pub const MAX_OPTIONS: usize = 4;
 
+/// What the result says for a question the user left unanswered. Deterministic
+/// text, like every other thing this tool writes into the log.
+pub const NO_ANSWER: &str = "(no answer)";
+
 /// One option: what the user picks, and the sentence they read while picking.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Choice {
@@ -52,6 +56,15 @@ pub struct Question {
     pub options: Vec<Choice>,
     /// Whether more than one option may be picked.
     pub multi_select: bool,
+}
+
+/// One question's answer: the labels the user picked, in the order they were
+/// offered, or the words they typed when there was nothing to pick from. Empty
+/// when the question was left unanswered.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Answer {
+    pub id: String,
+    pub labels: Vec<String>,
 }
 
 pub fn definition() -> ToolDef {
@@ -240,6 +253,40 @@ fn checked<T>(value: Result<T, String>, path: &str) -> Result<T, String> {
     value.map_err(|e| format!("error: {path}: {e}"))
 }
 
+/// The tool result for a call the user answered: one line per question, in the
+/// order they were asked, as `<id>: <chosen labels>`.
+///
+/// The id is the model's own, so the answer says which question it belongs to
+/// without repeating the words. A question left unanswered says so rather than
+/// being left out: a line that is missing reads as a question that was never
+/// asked, and the model would ask it again. The answer lines are the call's
+/// result, so they are also what a resumed session shows for it.
+pub fn answer_text(questions: &[Question], answers: &[Answer]) -> String {
+    questions
+        .iter()
+        .map(|question| {
+            let chosen = answers
+                .iter()
+                .find(|a| a.id == question.id)
+                .map(|a| a.labels.as_slice())
+                .unwrap_or_default();
+            let text = if chosen.is_empty() {
+                NO_ANSWER.to_owned()
+            } else {
+                // One line per question is what makes the result readable as a
+                // whole, so a label typed over several lines is folded into one.
+                chosen
+                    .iter()
+                    .map(|label| label.replace('\n', " "))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            format!("{}: {text}", question.id)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,5 +465,60 @@ mod tests {
                 .unwrap_err()
                 .starts_with("error: arguments are not valid JSON")
         );
+    }
+
+    #[test]
+    fn the_answer_names_every_question_by_its_id() {
+        let questions = one(json!({"questions": [
+            {"id": "auth", "question": "Which auth?", "multi_select": true},
+            {"id": "store", "question": "Where?"},
+            {"id": "note", "question": "Anything else?"}
+        ]}))
+        .unwrap();
+        let answers = vec![
+            Answer {
+                id: "auth".into(),
+                labels: vec!["JWT".into(), "Session cookie".into()],
+            },
+            Answer {
+                id: "store".into(),
+                labels: vec!["Postgres".into()],
+            },
+            // `note` was left unanswered, and saying so is what keeps the model
+            // from reading a missing line as a question never asked.
+            Answer {
+                id: "note".into(),
+                labels: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            answer_text(&questions, &answers),
+            "auth: JWT, Session cookie\nstore: Postgres\nnote: (no answer)"
+        );
+    }
+
+    #[test]
+    fn an_answer_with_no_question_is_not_lost() {
+        // The front end answers in the order it was asked, but the result is
+        // looked up by id: an answer to a question that is not in this call
+        // cannot be placed, and every question still gets its line.
+        let questions = one(json!({"questions": [{"id": "a", "question": "q"}]})).unwrap();
+        let answers = vec![Answer {
+            id: "b".into(),
+            labels: vec!["x".into()],
+        }];
+        assert_eq!(answer_text(&questions, &answers), "a: (no answer)");
+    }
+
+    #[test]
+    fn a_multi_line_answer_stays_on_one_line() {
+        // Free text is typed by a person and can hold a newline; the result is
+        // read a line per question.
+        let questions = one(json!({"questions": [{"id": "a", "question": "q"}]})).unwrap();
+        let answers = vec![Answer {
+            id: "a".into(),
+            labels: vec!["first\nsecond".into()],
+        }];
+        assert_eq!(answer_text(&questions, &answers), "a: first second");
     }
 }

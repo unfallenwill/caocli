@@ -240,6 +240,7 @@ impl<B: Backend> Screen<B> {
             // back. The picker belongs to the line being typed, so it takes the
             // box's end of the transcript with it.
             let picker = state.picker_lines();
+            let panel = state.panel_lines(width);
             let first = if picker.is_empty() {
                 state.window(total, room)
             } else {
@@ -250,7 +251,11 @@ impl<B: Backend> Screen<B> {
             let transcript = Text::from(state.window_lines(first, last, &live, &question));
 
             frame.render_widget(Paragraph::new(transcript), rows[0]);
-            draw_picker(frame, &picker, rows[0]);
+            draw_over(frame, &picker, rows[0], PICKER_ROWS);
+            // The panel stands over the transcript too, and is given whatever the
+            // transcript has: a question cannot be answered by a reader who
+            // cannot see all of it.
+            draw_over(frame, &panel, rows[0], rows[0].height as usize);
             frame.render_widget(Paragraph::new(queue), rows[1]);
             draw_box(frame, state, rows[2]);
             draw_status(frame, state, rows[3]);
@@ -284,12 +289,14 @@ fn place_cursor(frame: &mut Frame, field: Rect, cursor: ScreenCursor) {
     }
 }
 
-/// The picker, drawn over the bottom of the transcript it stands for.
-fn draw_picker(frame: &mut Frame, picker: &[Line<'static>], transcript: Rect) {
-    if picker.is_empty() {
+/// A list of lines drawn over the bottom of the transcript it stands for: the
+/// picker's menu, and the question tool's panel. `cap` is the most rows it may
+/// take from the transcript, however long the list is.
+fn draw_over(frame: &mut Frame, lines: &[Line<'static>], transcript: Rect, cap: usize) {
+    if lines.is_empty() {
         return;
     }
-    let height = picker.len().min(PICKER_ROWS) as u16;
+    let height = lines.len().min(cap).min(usize::from(transcript.height)) as u16;
     let over = Rect {
         x: transcript.x,
         y: transcript.bottom().saturating_sub(height),
@@ -299,7 +306,7 @@ fn draw_picker(frame: &mut Frame, picker: &[Line<'static>], transcript: Rect) {
     // Cleared first: a shorter list must not leave the tail of a longer one
     // behind it.
     frame.render_widget(Clear, over);
-    frame.render_widget(Paragraph::new(Text::from(picker.to_vec())), over);
+    frame.render_widget(Paragraph::new(Text::from(lines.to_vec())), over);
 }
 
 /// The input box: its rules, its marker, and the columns the draft is written in

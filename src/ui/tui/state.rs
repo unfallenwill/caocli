@@ -23,6 +23,7 @@ use crate::ui::tui::paint::{cell_lines, live_cell};
 
 use super::input::Answer;
 use super::input::input_box;
+use super::panel::Panel;
 use super::picker::Picker;
 
 /// The lines one wheel notch moves the window over the transcript: the step a
@@ -98,6 +99,8 @@ pub(super) struct State {
     pub(super) live: Option<(Style, String)>,
     /// The question standing over the box, while one is open.
     pub(super) question: Option<Cell>,
+    /// The question tool's panel, while the tool is waiting on an answer.
+    pub(super) panel: Option<Panel>,
     /// Where the answer to that question goes, and what kind of answer it is.
     pub(super) reply: Option<Answer>,
     /// The answer being typed.
@@ -161,6 +164,7 @@ impl Default for State {
             drawn_draft: 0,
             live: None,
             question: None,
+            panel: None,
             reply: None,
             textarea: input_box(),
             queued: VecDeque::new(),

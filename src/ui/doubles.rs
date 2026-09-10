@@ -1,5 +1,5 @@
-//! Test doubles for the two channels a front end answers on: the cancel source
-//! and the approval gate.
+//! Test doubles for the channels a front end answers on: the cancel source, the
+//! approval gate and the question tool.
 //!
 //! One fixture rather than a copy per test module: "a front end that never
 //! cancels" is the same three lines however often it is written, and a copy per
@@ -9,9 +9,10 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::tools::ask::{self, Question};
 use crate::types::ToolCall;
 
-use super::contract::{Approve, Cancel, Verdict};
+use super::contract::{Approve, Ask, Cancel, Verdict};
 
 /// A front end that never cancels: for tests that are not about cancellation.
 pub(crate) struct NoCancel;
@@ -100,6 +101,72 @@ pub(crate) struct NoAnswer;
 
 impl Approve for NoAnswer {
     fn approve(&mut self, _call: &ToolCall) -> Pin<Box<dyn Future<Output = Verdict> + '_>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// A front end that answers the question tool: one set of labels per question, in
+/// the order they were asked.
+pub(crate) struct Picked(Vec<Vec<String>>);
+
+impl Picked {
+    /// One answer per question, each of them these labels.
+    pub(crate) fn labels(labels: &[&str]) -> Self {
+        Self(vec![labels.iter().map(|l| (*l).to_owned()).collect()])
+    }
+
+    /// A different set of labels per question, in the order they are asked.
+    pub(crate) fn sets(sets: &[&[&str]]) -> Self {
+        Self(
+            sets.iter()
+                .map(|set| set.iter().map(|l| (*l).to_owned()).collect())
+                .collect(),
+        )
+    }
+}
+
+impl Ask for Picked {
+    fn ask(
+        &mut self,
+        questions: &[Question],
+    ) -> Pin<Box<dyn Future<Output = Option<Vec<ask::Answer>>> + '_>> {
+        // Paired by position and reported by id: the ids are the model's, and a
+        // double does not get to invent them.
+        let answers: Vec<ask::Answer> = questions
+            .iter()
+            .zip(&self.0)
+            .map(|(question, labels)| ask::Answer {
+                id: question.id.clone(),
+                labels: labels.clone(),
+            })
+            .collect();
+        Box::pin(async move { Some(answers) })
+    }
+}
+
+/// A front end that leaves every question unanswered: the user dismissed it, so
+/// the model is told the question was not answered rather than answered with
+/// something nobody chose.
+pub(crate) struct Dismissed;
+
+impl Ask for Dismissed {
+    fn ask(
+        &mut self,
+        _questions: &[Question],
+    ) -> Pin<Box<dyn Future<Output = Option<Vec<ask::Answer>>> + '_>> {
+        Box::pin(async { None })
+    }
+}
+
+/// A front end that never answers a question, which leaves the panel open so that
+/// a cancel has something to race against.
+pub(crate) struct NoQuestions;
+
+impl Ask for NoQuestions {
+    fn ask(
+        &mut self,
+        _questions: &[Question],
+    ) -> Pin<Box<dyn Future<Output = Option<Vec<ask::Answer>>> + '_>> {
         Box::pin(std::future::pending())
     }
 }

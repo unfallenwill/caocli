@@ -15,7 +15,7 @@ use crate::provider;
 use crate::session::{self, Session};
 use crate::ui::Front;
 use crate::ui::text::{padded, width};
-use crate::ui::{Approve, Cancel};
+use crate::ui::{Approve, Ask, Cancel};
 
 /// What a submitted line asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,9 +28,9 @@ pub enum Outcome {
 
 /// Handle one submitted line: a command, or a conversational turn.
 ///
-/// `interrupt` and `approve` only reach the model when the line is a turn; they
+/// The three answer sources only reach the model when the line is a turn; they
 /// are passed through so that a front end choosing when to run the turn also
-/// chooses where its cancel and approval answers come from.
+/// chooses where its cancel, approval and question answers come from.
 pub async fn handle(
     agent: &mut Agent,
     ui: &mut dyn Front,
@@ -38,6 +38,7 @@ pub async fn handle(
     line: &str,
     cancel: &mut dyn Cancel,
     approve: &mut dyn Approve,
+    ask: &mut dyn Ask,
 ) -> Result<Outcome> {
     match line {
         "/exit" | "/quit" | "/q" => return Ok(Outcome::Exit),
@@ -77,7 +78,7 @@ pub async fn handle(
             choose_effort(agent, ui, argument(line));
         }
         _ if line == "/image" || line.starts_with("/image ") => {
-            send_image(agent, ui, argument(line), cancel, approve).await;
+            send_image(agent, ui, argument(line), cancel, approve, ask).await;
         }
         _ if line.starts_with("/resume ") => {
             let id = line.trim_start_matches("/resume ").trim();
@@ -107,7 +108,7 @@ pub async fn handle(
             ui.info("unknown command; /help lists the available commands")
         }
         _ => {
-            if let Err(e) = agent.turn(line, ui, cancel, approve).await {
+            if let Err(e) = agent.turn(line, ui, cancel, approve, ask).await {
                 ui.error(&format!("{e:#}"));
             }
         }
@@ -248,6 +249,7 @@ async fn send_image(
     argument: &str,
     cancel: &mut dyn Cancel,
     approve: &mut dyn Approve,
+    ask: &mut dyn Ask,
 ) {
     let (path, text) = match image_argument(argument) {
         Ok(parts) => parts,
@@ -258,7 +260,7 @@ async fn send_image(
         Err(e) => return ui.error(&format!("{e:#}")),
     };
     ui.replay(std::slice::from_ref(&message));
-    if let Err(e) = agent.turn_message(message, ui, cancel, approve).await {
+    if let Err(e) = agent.turn_message(message, ui, cancel, approve, ask).await {
         ui.error(&format!("{e:#}"));
     }
 }
@@ -442,7 +444,7 @@ mod tests {
     use crate::session::SessionMeta;
     use crate::types::{Message, Usage};
     use crate::ui::Renderer;
-    use crate::ui::doubles::{Answer, NoCancel};
+    use crate::ui::doubles::{Answer, NoCancel, NoQuestions};
 
     /// A front end that records what it was told, so the line handling can be
     /// tested without a terminal.
@@ -539,9 +541,17 @@ mod tests {
         sdir: &std::path::Path,
         line: &str,
     ) -> Outcome {
-        handle(agent, ui, sdir, line, &mut NoCancel, &mut Answer::denies())
-            .await
-            .unwrap()
+        handle(
+            agent,
+            ui,
+            sdir,
+            line,
+            &mut NoCancel,
+            &mut Answer::denies(),
+            &mut NoQuestions,
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]

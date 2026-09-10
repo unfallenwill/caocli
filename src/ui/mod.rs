@@ -31,9 +31,9 @@ mod terminal;
 pub(crate) mod text;
 pub mod tui;
 
-pub use answers::{Sigint, StdinApproval};
+pub use answers::{Sigint, StdinApproval, StdinQuestions};
 pub(crate) use banner::banner;
-pub use contract::{Approve, Cancel, Front, Ui, Verdict};
+pub use contract::{Approve, Ask, Cancel, Front, Ui, Verdict};
 pub use renderer::Renderer;
 
 #[cfg(test)]
