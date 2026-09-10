@@ -69,6 +69,11 @@ that talks to a network API and drives an interactive terminal.
 - **State = a fold of the log**: `Session` is the only persistent state; there is no
   second source of truth in memory, and at any moment it can be rebuilt by
   `Session::load`.
+- **The transcript is cells, and replay is not a second renderer**: every line the UI
+  writes is a cell painted by the same painter, whether it arrives as a live
+  notification or is folded out of the session log when resuming. A resumed session
+  must be laid out exactly like the one that was watched live — adding a notification
+  means adding a cell, never a second formatting path.
 - **Ctrl-C during a turn is an out-of-band Command (graceful cancel), not a process
   kill**: the current effect is dropped (stream disconnected, child process
   `kill_on_drop`), unanswered calls are persisted with a deterministic cancellation
@@ -93,7 +98,10 @@ that talks to a network API and drives an interactive terminal.
   synthesized text must be a constant, otherwise the prefix cache becomes unstable).
 - **Exactly one renderer per process**: streaming output and usage accounting must go
   through the same instance, otherwise counts are lost.
-- Truncating or clipping text must land on a UTF-8 character boundary.
+- Truncating or clipping text must land on a UTF-8 character boundary, and any text
+  measured against a terminal width must be measured in **display columns**, not
+  chars: a CJK ideograph or an emoji is one char but two columns, so char-based
+  arithmetic silently overruns the field it was sizing.
 
 ## Prefix cache (must read before changing request or message construction)
 
