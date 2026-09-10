@@ -100,9 +100,14 @@ ok: package.name = caocli (312 bytes)
   (`model · cache …`).
 - **The transcript is the application's**, not the terminal's scrollback: the
   alternate screen is entered on startup, so nothing drawn here reaches the
-  terminal's own history. `PageUp`/`PageDown` move through the session; a new
-  prompt returns to the end. When a draft spans several lines, the same two
-  keys scroll the box instead.
+  terminal's own history. The wheel and `PageUp`/`PageDown` move through the
+  session — a notch is three lines, a page is a screen; a new prompt returns to
+  the end. When a draft spans several lines, the two keys scroll the box instead.
+  The front end asks the terminal for the mouse so that a notch arrives as a
+  notch, rather than as the `Up` and `Down` a terminal sends in its place — which
+  the box reads as its own history. What that costs is the terminal's own
+  selection: hold `Shift` to select text, as with any full-screen program that
+  takes the mouse.
 - **Ctrl-C** stops a running turn; the model is told it was stopped.
 
 `--no-tui` keeps the plain prompt instead (it is used anyway when stdout is not
