@@ -1,11 +1,12 @@
+mod cell;
 mod text;
 
 use std::io::{IsTerminal, Write};
 
-use crate::types::{Message, Role, Usage};
+use crate::types::{Message, Usage};
 
-const DIM: &str = "\x1b[2m";
-const YELLOW: &str = "\x1b[33m";
+use cell::{Cell, Style};
+
 const RESET: &str = "\x1b[0m";
 
 /// Session-level cache statistics (for the status bar). Accumulates the hit/miss
@@ -143,11 +144,33 @@ impl StatusBar {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Mode {
-    Idle,
+/// A text block being streamed.
+///
+/// Deltas are written as they arrive rather than buffered, so the block is never
+/// held whole: only its kind has to be remembered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Block {
     Reasoning,
     Content,
+}
+
+impl Block {
+    /// The style the whole block is written in.
+    fn style(self) -> Style {
+        match self {
+            Block::Reasoning => Style::Dim,
+            Block::Content => Style::Plain,
+        }
+    }
+
+    /// An empty cell of this kind, used to ask the spacing rule where the block
+    /// belongs without having to duplicate the rule here.
+    fn cell(self) -> Cell {
+        match self {
+            Block::Reasoning => Cell::Reasoning(String::new()),
+            Block::Content => Cell::Content(String::new()),
+        }
+    }
 }
 
 /// The machine → UI notification vocabulary (the Notice channel).
@@ -178,15 +201,26 @@ pub trait Ui {
 }
 
 /// Streaming renderer. Thinking and body text are two independent render blocks:
-/// - thinking is gray (DIM), body text is the normal color
+/// - thinking is dim, body text is the normal color
 /// - blocks are separated by a newline; switching from thinking to body adds an
 ///   extra blank line
 /// - with the NO_COLOR environment variable or when not a TTY no color codes are
 ///   emitted, but the block separation is kept
+///
+/// Everything the renderer writes is a [`Cell`]: the live notifications become
+/// cells as they arrive and replayed history becomes cells up front, so both go
+/// through the same painter and cannot drift apart. Only two things are carried
+/// between calls: the block currently streaming, and whether the cell written
+/// last was a text block (all the spacing rule needs).
 pub struct Renderer {
     out: Box<dyn Write>,
     color: bool,
-    mode: Mode,
+    /// The text block currently being streamed, if any.
+    live: Option<Block>,
+    /// Whether the cell written last was a text block. Only this much of the
+    /// previous cell is kept: it is all the spacing rule needs, and the
+    /// transcript itself lives in the session log.
+    prev_was_block: bool,
     stats: CacheStats,
     /// Model id shown in the status bar's left segment (updated when a session is
     /// created or switched).
@@ -200,7 +234,8 @@ impl Renderer {
         Self {
             out: Box::new(std::io::stdout()),
             color,
-            mode: Mode::Idle,
+            live: None,
+            prev_was_block: false,
             stats: CacheStats::default(),
             model: None,
             bar: None,
@@ -213,7 +248,8 @@ impl Renderer {
         let r = Self {
             out: Box::new(SharedBuf(buf.clone())),
             color,
-            mode: Mode::Idle,
+            live: None,
+            prev_was_block: false,
             stats: CacheStats::default(),
             model: None,
             bar: None,
@@ -270,7 +306,7 @@ impl Renderer {
             }
         }
         let visible = text::truncate(&label, width);
-        let painted = self.paint(DIM, visible);
+        let painted = self.paint(Style::Dim, visible);
         bar.render(self.out.as_mut(), visible, &painted);
     }
 
@@ -327,165 +363,125 @@ impl Renderer {
         let _ = self.out.flush();
     }
 
-    fn paint(&self, code: &str, s: &str) -> String {
-        if self.color {
-            format!("{code}{s}{RESET}")
-        } else {
-            s.to_owned()
-        }
+    /// The escape that opens `style`, empty when colors are off.
+    fn open_style(&self, style: Style) -> &'static str {
+        if self.color { style.code() } else { "" }
     }
 
-    /// End the current block: reset the color + newline; when blank=true add one
-    /// more blank line (block spacing).
-    fn close_block(&mut self, blank: bool) {
-        if self.mode != Mode::Idle {
-            if self.color {
-                self.raw(RESET);
-            }
+    /// The escape that closes a style, empty when colors are off.
+    fn close_style(&self) -> &'static str {
+        if self.color { RESET } else { "" }
+    }
+
+    /// Wrap `s` in `style`. Styles are applied per span, so no call site has to
+    /// know whether colors are enabled.
+    fn paint(&self, style: Style, s: &str) -> String {
+        format!("{}{s}{}", self.open_style(style), self.close_style())
+    }
+
+    /// Write a cell: the blank line separating it from the previous one, its
+    /// spans, then its line ending.
+    fn paint_cell(&mut self, cell: &Cell) {
+        if cell.gap_after(self.prev_was_block) {
             self.raw("\n");
-            if blank {
-                self.raw("\n");
-            }
         }
+        let painted: String = cell
+            .spans()
+            .iter()
+            .map(|s| self.paint(s.style, &s.text))
+            .collect();
+        self.raw(&painted);
+        if cell.ends_line() {
+            self.raw("\n");
+        }
+        self.prev_was_block = cell.is_text_block();
     }
 
-    /// Replay history messages (used when resuming a session), styled consistently
-    /// with live rendering:
-    /// user messages get a `›` prefix, assistant thinking is gray, body text is
-    /// normal, tool calls are yellow, and
-    /// tool messages show only a summary (same as live, without flushing the 10KB
-    /// original text).
-    /// The session file contains no system message (SYSTEM_PROMPT is a compile-time
-    /// constant), so there is nothing to filter.
-    pub fn replay(&mut self, messages: &[Message]) {
-        for m in messages {
-            match m.role {
-                Role::User => {
-                    if let Some(c) = &m.content {
-                        self.raw("\n");
-                        self.raw(&self.paint(DIM, "› "));
-                        self.raw(c);
-                        self.raw("\n");
-                    }
-                }
-                Role::Assistant => {
-                    if let Some(r) = &m.reasoning_content
-                        && !r.is_empty()
-                    {
-                        self.raw(&self.paint(DIM, r));
-                        self.raw("\n");
-                    }
-                    if let Some(c) = &m.content
-                        && !c.is_empty()
-                    {
-                        self.raw(c);
-                        self.raw("\n");
-                    }
-                    for call in m.tool_calls.iter().flatten() {
-                        self.tool_start(&call.function.name, &call.function.arguments);
-                    }
-                }
-                Role::Tool => {
-                    if let Some(c) = &m.content {
-                        self.tool_result(c);
-                    }
-                }
-                Role::System => {}
-            }
+    /// Start streaming a text block: write the separating blank line and open the
+    /// block's style, so the deltas that follow inherit it. A no-op when the
+    /// block is already open, which is what keeps a run of deltas to a single
+    /// style run.
+    fn open_block(&mut self, block: Block) {
+        if self.live == Some(block) {
+            return;
         }
+        self.close_block();
+        if block.cell().gap_after(self.prev_was_block) {
+            self.raw("\n");
+        }
+        self.raw(self.open_style(block.style()));
+        self.live = Some(block);
+    }
+
+    /// End the streaming block: close its style and its line.
+    fn close_block(&mut self) {
+        if self.live.take().is_none() {
+            return;
+        }
+        self.raw(self.close_style());
+        self.raw("\n");
+        self.prev_was_block = true;
+    }
+
+    /// Replay history messages (used when resuming a session).
+    ///
+    /// The messages become the same cells a live turn produces and go through
+    /// the same painter, so a resumed session is laid out exactly like the one
+    /// that was watched live -- including the tool summaries, which are a
+    /// property of the cell and so cannot be forgotten here.
+    pub fn replay(&mut self, messages: &[Message]) {
+        for cell in cell::from_messages(messages) {
+            self.paint_cell(&cell);
+        }
+        // Separate the replayed history from the prompt that follows it.
         self.raw("\n");
     }
 
     pub fn info(&mut self, s: &str) {
-        self.raw(&self.paint(DIM, s));
-        self.raw("\n");
+        self.paint_cell(&Cell::Notice(s.to_owned()));
     }
 
     pub fn error(&self, s: &str) {
-        eprintln!("{}", self.paint("\x1b[31m", s));
+        eprintln!("{}", self.paint(Style::Red, s));
     }
 }
 
 impl Ui for Renderer {
     fn reasoning_delta(&mut self, s: &str) {
-        if self.mode != Mode::Reasoning {
-            self.close_block(self.mode == Mode::Content);
-            if self.color {
-                self.raw(DIM);
-            }
-            self.mode = Mode::Reasoning;
-        }
+        self.open_block(Block::Reasoning);
         self.raw(s);
     }
 
     fn content_delta(&mut self, s: &str) {
-        if self.mode != Mode::Content {
-            self.close_block(self.mode == Mode::Reasoning);
-            self.mode = Mode::Content;
-        }
+        self.open_block(Block::Content);
         self.raw(s);
     }
 
     fn finish_turn(&mut self) {
-        self.close_block(false);
-        self.mode = Mode::Idle;
+        self.close_block();
     }
 
     fn tool_start(&mut self, name: &str, args: &str) {
-        let hint = serde_json::from_str::<serde_json::Value>(args)
-            .ok()
-            .and_then(|v| {
-                v.get("command")
-                    .or_else(|| v.get("file_path"))
-                    .and_then(|c| c.as_str())
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| args.chars().take(80).collect());
-        self.raw(&format!(
-            "\n{}",
-            self.paint(YELLOW, &format!("▸ {name} {hint}"))
-        ));
-        self.raw("\n");
+        self.paint_cell(&Cell::tool_call(name, args));
     }
 
     fn tool_result(&mut self, result: &str) {
-        let exit_line = result.lines().next().unwrap_or("").to_owned();
-        let total = result.len();
-        self.raw(&self.paint(DIM, &format!("{exit_line} · {total} bytes")));
-        self.raw("\n");
+        self.paint_cell(&Cell::ToolResult(result.to_owned()));
     }
 
     fn interrupted(&mut self) {
-        self.close_block(false);
-        self.mode = Mode::Idle;
-        self.raw(&self.paint(YELLOW, "⏹ interrupted (Ctrl-C)"));
-        self.raw("\n");
+        // A block that was still streaming when the turn was cancelled is closed
+        // first, so the notice starts on a line of its own.
+        self.close_block();
+        self.paint_cell(&Cell::Interrupted);
     }
 
     fn approval_requested(&mut self, name: &str, args: &str) {
-        let hint = serde_json::from_str::<serde_json::Value>(args)
-            .ok()
-            .and_then(|v| {
-                v.get("command")
-                    .or_else(|| v.get("file_path"))
-                    .and_then(|c| c.as_str())
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| args.chars().take(80).collect());
-        self.raw(&self.paint(YELLOW, &format!("▸ {name} {hint} — run it? [y/N] ")));
+        self.paint_cell(&Cell::approval(name, args));
     }
 
     fn usage(&mut self, u: &Usage) {
-        let cache = match u.cache() {
-            Some(c) => format!("hit {}/miss {}", c.hit, c.miss),
-            None => "cache —".to_string(),
-        };
-        let s = format!(
-            "tokens: in {}/{} ({cache}) · out {}",
-            u.prompt_tokens, u.total_tokens, u.completion_tokens
-        );
-        self.raw(&self.paint(DIM, &s));
-        self.raw("\n");
+        self.paint_cell(&Cell::Usage(u.clone()));
         self.stats.record(u);
         self.redraw_status_bar();
     }
@@ -508,7 +504,7 @@ impl Write for SharedBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Usage;
+    use crate::types::Role;
 
     #[test]
     fn reasoning_then_content_are_separate_blocks() {
@@ -661,6 +657,49 @@ mod tests {
             String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
             "\n"
         );
+    }
+
+    /// The point of the cell model: a turn is laid out identically whether it is
+    /// watched live or replayed from the log, because both paths paint the same
+    /// cells.
+    ///
+    /// Before the cells existed, `replay` carried its own copy of the layout
+    /// rules and silently disagreed with the live renderer: live put a blank line
+    /// between thinking and the answer, replay did not.
+    #[test]
+    fn live_and_replay_lay_out_a_turn_identically() {
+        use crate::types::{Message, ToolCall, ToolCallFunction};
+
+        // The order the agent drives the renderer in: a streaming round first,
+        // then the tool calls it asked for.
+        let (mut live, live_buf) = Renderer::with_buffer(true);
+        live.reasoning_delta("let me think");
+        live.content_delta("running it");
+        live.finish_turn();
+        live.tool_start("Bash", r#"{"command":"ls -la"}"#);
+        live.tool_result("exit_code: 0\n--- stdout ---\nBODY");
+
+        let (mut replayed, replay_buf) = Renderer::with_buffer(true);
+        replayed.replay(&[
+            Message {
+                role: Role::Assistant,
+                content: Some("running it".into()),
+                reasoning_content: Some("let me think".into()),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".into(),
+                    r#type: "function".into(),
+                    function: ToolCallFunction {
+                        name: "Bash".into(),
+                        arguments: r#"{"command":"ls -la"}"#.into(),
+                    },
+                }]),
+                tool_call_id: None,
+            },
+            Message::tool("call_1", "exit_code: 0\n--- stdout ---\nBODY"),
+        ]);
+
+        // Replay additionally separates the history from the prompt after it.
+        assert_eq!(buf_of(&replay_buf), format!("{}\n", buf_of(&live_buf)));
     }
 
     #[test]
@@ -841,7 +880,7 @@ mod tests {
         let bar = StatusBar { rows: 10, cols: 40 }; // width = 39
         let (mut r, buf) = Renderer::with_buffer(true);
         let label = "cache 98.6% · hit 32384 · miss 461"; // 34 characters
-        let painted = r.paint(DIM, label);
+        let painted = r.paint(Style::Dim, label);
         bar.render(r.out.as_mut(), label, &painted);
         let s = buf_of(&buf);
         // 39 - 34 = 5 spaces of left padding, right aligned
