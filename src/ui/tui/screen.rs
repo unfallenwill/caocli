@@ -15,7 +15,7 @@ use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use ratatui_textarea::ScreenCursor;
 
 use crate::ui::cell::{self, Style};
-use crate::ui::tui::layout::{box_field, box_marker, screen_rows};
+use crate::ui::tui::layout::{box_field, box_marker, screen_rows, todo_rows};
 use crate::ui::tui::paint::style_of;
 use crate::ui::tui::picker::PICKER_ROWS;
 use crate::ui::tui::state::State;
@@ -217,14 +217,21 @@ impl<B: Backend> Screen<B> {
             let state = &mut self.state;
             let area = frame.area();
             let width = area.width as usize;
-            let input = state.input_rows(area.height);
+            // The standing task list is laid out before anything is measured,
+            // because it is the one region whose height depends on its text: a task
+            // is as many rows as its words take. Asked for before the box, which
+            // gives way to it, and before the layout, which is what the rows it
+            // asks for come out of.
+            let todos = Text::from(state.todo_lines(width));
+            let todo = todo_rows(todos.height());
+            let input = state.input_rows(area.height, todo);
             // What is waiting to run, drawn at the bottom of the transcript: the
             // session, then what comes next, then the box, and under the box the
             // session summary. Asked for before the layout, because how many rows
             // it takes is what the transcript gives up.
             let queue = Text::from(state.queue_lines(width));
             let queued = queue.height() as u16;
-            let rows = screen_rows(area, input, queued);
+            let rows = screen_rows(area, todo, input, queued);
             state.reset_box_scroll(input);
             // What the transcript has to show, in the three pieces it is made of:
             // the cells that are laid out and kept, then the block still being
@@ -256,9 +263,10 @@ impl<B: Backend> Screen<B> {
             // transcript has: a question cannot be answered by a reader who
             // cannot see all of it.
             draw_over(frame, &panel, rows[0], rows[0].height as usize);
-            frame.render_widget(Paragraph::new(queue), rows[1]);
-            draw_box(frame, state, rows[2]);
-            draw_status(frame, state, rows[3]);
+            frame.render_widget(Paragraph::new(todos), rows[1]);
+            frame.render_widget(Paragraph::new(queue), rows[2]);
+            draw_box(frame, state, rows[3]);
+            draw_status(frame, state, rows[4]);
         })?;
         Ok(drawn.area)
     }

@@ -15,11 +15,12 @@ use ratatui::text::Line;
 use ratatui::widgets::Block;
 use ratatui_textarea::TextArea;
 
+use crate::tools::todo::{self, Todo};
 use crate::ui::cell::{self, Cell, Style};
 use crate::ui::status::Status;
-use crate::ui::tui::layout::BOX_BORDERS;
+use crate::ui::tui::layout::{self, BOX_BORDERS};
 use crate::ui::tui::notice::Notice;
-use crate::ui::tui::paint::{cell_lines, live_cell};
+use crate::ui::tui::paint::{cell_lines, live_cell, measure, more_line, style_of, wrapped_under};
 
 use super::input::Answer;
 use super::input::input_box;
@@ -184,6 +185,22 @@ impl Default for State {
     }
 }
 
+/// The heading of the standing task list: what the block is, and how far it has
+/// got.
+///
+/// Dim, and marked with the same `·` a note carries: the block is pinned under
+/// the transcript for the whole of a turn, and its one job when nothing has
+/// changed is to not be read. The tasks below it carry the attention.
+///
+/// The count is [`todo::summary`], the same string the cell's head and the model's
+/// result carry, so the three cannot say different things about one list.
+pub(super) fn todo_title(todos: &[Todo]) -> Line<'static> {
+    Line::styled(
+        format!("· todos · {}", todo::summary(todos)),
+        style_of(Style::Dim),
+    )
+}
+
 /// Lay the transcript out at `width`, keeping what is already laid.
 ///
 /// Only the cells that are not laid yet are wrapped, which for a running turn
@@ -272,6 +289,51 @@ impl State {
             Some(question) => cell_lines(question, width),
             None => Vec::new(),
         }
+    }
+
+    /// The standing task list, laid out, or nothing when no call has written one
+    /// or the last one cleared it.
+    ///
+    /// A fold over the transcript and not a copy of it: what is standing is the
+    /// last list a call wrote, which is a cell like any other, so a resumed session
+    /// keeps exactly the list in view that the session watched live had. There is
+    /// nothing here to keep in step with anything, which is the whole reason the
+    /// tool writes the list into the log instead of holding it somewhere.
+    ///
+    /// Each task is wrapped on its own: the block has a fixed number of rows to
+    /// give, and a task long enough to wrap must cost its own rows rather than
+    /// push the tasks behind it out of the block. The tasks drawn are the window
+    /// [`layout::todo_window`] picks, so the task in hand is one of them.
+    pub(super) fn todo_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let Some(todos) = cell::standing_todos(&self.transcript) else {
+            return Vec::new();
+        };
+        let width = measure(width);
+        let room = layout::TODO_ROWS.saturating_sub(layout::TODO_HEADS);
+        let active = todos
+            .iter()
+            .position(|todo| todo.status == todo::Status::InProgress);
+        let window = layout::todo_window(todos.len(), active, room);
+        // The blank row first, so that the block cannot be read as the tail of the
+        // transcript above it, then the title.
+        let mut lines = vec![Line::default(), todo_title(todos)];
+        if window.above > 0 {
+            lines.push(more_line("  ", window.above));
+        }
+        for todo in &todos[window.first..window.last] {
+            // Through the cell's own wrapping, with the task's own gutter: a task
+            // is one row until its words run out of columns, and the rows it then
+            // takes are its own -- the ones behind it keep theirs.
+            lines.extend(wrapped_under(
+                &cell::todo_line_spans(todo),
+                width,
+                cell::todo_gutter(todo),
+            ));
+        }
+        if window.below > 0 {
+            lines.push(more_line("  ", window.below));
+        }
+        lines
     }
 
     /// The whole transcript as lines, in draw order: the session's finished cells,

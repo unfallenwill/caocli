@@ -5,6 +5,7 @@ use super::input::{
 };
 use super::layout::box_rows;
 use super::layout::{BOX_GUTTER, BOX_ROWS, PINNED_ROWS, Window, picker_window};
+use super::layout::{TODO_HEADS, TODO_ROWS, todo_rows, todo_window};
 use super::layout::{box_field, screen_rows};
 use super::notice::Notice;
 use super::notice::Notifier;
@@ -323,6 +324,12 @@ fn wrapping_keeps_each_span_in_its_own_style() {
 }
 
 /// A front end drawing into memory instead of a terminal.
+/// The cell a todo call leaves in the transcript, built the way the transcript
+/// itself builds it: out of the call's own arguments.
+fn written(todos: serde_json::Value) -> Cell {
+    Cell::tool_call("TodoWrite", &todos.to_string())
+}
+
 fn screen_for_test(width: u16, height: u16) -> Screen<ratatui::backend::TestBackend> {
     let backend = ratatui::backend::TestBackend::new(width, height);
     Screen {
@@ -338,7 +345,7 @@ fn screen_for_test(width: u16, height: u16) -> Screen<ratatui::backend::TestBack
 /// answer, asked the same way the screen asks it, so that a test that fills
 /// the transcript fills the rows that are really there.
 fn transcript_rows(height: u16, input: u16, queued: u16) -> u16 {
-    screen_rows(Rect::new(0, 0, 40, height), input, queued)[0].height
+    screen_rows(Rect::new(0, 0, 40, height), 0, input, queued)[0].height
 }
 
 #[test]
@@ -507,6 +514,191 @@ fn a_queued_line_wider_than_the_screen_is_wrapped_not_clipped() {
 }
 
 #[test]
+fn the_standing_list_is_the_last_one_written_and_nothing_when_none_is() {
+    // Nothing has been written: the block takes no rows at all, so a session that
+    // never uses the tool sees exactly the screen it saw before there was one.
+    let mut state = State::default();
+    assert!(state.todo_lines(40).is_empty());
+    assert_eq!(todo_rows(0), 0);
+
+    state.show(written(serde_json::json!({"todos": [
+        {"content": "Add the parse function", "status": "completed"},
+        {"content": "Draw the cell", "status": "in_progress"}
+    ]})));
+    assert_eq!(
+        state
+            .todo_lines(40)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>(),
+        vec![
+            // A blank row first: without it the block reads as the tail of the
+            // transcript, which is the one thing it must not be taken for.
+            "",
+            "· todos · 1/2 done",
+            "✔ Add the parse function",
+            "▸ Draw the cell",
+        ]
+    );
+
+    // The whole list is sent every time, so a later write replaces the earlier
+    // one: what stands is the last list written and not the run of them.
+    state.show(written(serde_json::json!({"todos": []})));
+    assert!(
+        state.todo_lines(40).is_empty(),
+        "a cleared list is not one to keep in view"
+    );
+}
+
+#[test]
+fn a_task_longer_than_the_screen_is_wrapped_not_clipped() {
+    // The block is committed to the screen rather than written to a scrolling
+    // stream, so it is wrapped like everything else that is: a fixed-width path
+    // would cut the end off the one thing the reader is watching for.
+    let mut state = State::default();
+    let long = "x".repeat(50);
+    state.show(written(
+        serde_json::json!({"todos": [{"content": long, "status": "in_progress"}]}),
+    ));
+    let lines: Vec<String> = state.todo_lines(20).iter().map(|l| l.to_string()).collect();
+    assert_eq!(
+        lines.len(),
+        2 + 3,
+        "the two head rows, then 52 columns at 20"
+    );
+    assert!(lines.iter().all(|l| super::super::text::width(l) <= 20));
+    // A wrapped task keeps its own column: only the first row carries the mark,
+    // and the rows it wraps to line up under its words rather than back at the
+    // left edge, where they would read as tasks of their own.
+    assert_eq!(lines[2], format!("▸ {}", "x".repeat(18)));
+    assert_eq!(lines[3], format!("  {}", "x".repeat(18)));
+    assert_eq!(lines[4], format!("  {}", "x".repeat(50 - 36)));
+}
+
+#[test]
+fn the_block_gives_up_its_rows_before_the_box_does() {
+    // Both are pinned. The list is worth rows -- it is what the work is -- but the
+    // box is where the session continues, so the block asks for its budget and the
+    // box comes out of what is left.
+    let mut screen = screen_for_test(40, 24);
+    screen.state.transcript.push(Cell::Content("hello".into()));
+    screen.draw().unwrap();
+    // Nothing pinned: the box sits on the status line, its own three rows.
+    assert_eq!(
+        box_top(&screen),
+        20,
+        "no block, so the transcript runs to it"
+    );
+
+    screen.state.show(written(serde_json::json!({"todos": [
+        {"content": "one"}, {"content": "two"}
+    ]})));
+    screen.draw().unwrap();
+    // The block is drawn whole, in its own rows directly above the box, and the
+    // transcript is the region that gave those rows up.
+    let block: Vec<String> = screen
+        .state
+        .todo_lines(40)
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
+    assert_eq!(block.len(), 4, "the blank row, the title, and two tasks");
+    let at = box_top(&screen) - block.len() as u16;
+    for (i, line) in block.iter().enumerate() {
+        assert_eq!(&row(&screen, at + i as u16), line, "row {i} of the block");
+    }
+    assert_eq!(row(&screen, at), "", "the blank row that sets it off");
+    assert_eq!(row(&screen, at + 1), "\u{b7} todos \u{b7} 0/2 done");
+    assert_eq!(row(&screen, at + 2), "\u{2610} one");
+    assert_eq!(row(&screen, at + 3), "\u{2610} two");
+
+    // A draft long enough to want the whole screen gives way to the block: the box
+    // is the one of the two that can be bounded without losing the session, so the
+    // block keeps every row it asked for. The block moves up with the box -- both
+    // are pinned to the bottom -- which is what "directly above it" means.
+    type_in(&mut screen.state, "one");
+    for _ in 0..12 {
+        screen.state.key(ctrl_j());
+        type_in(&mut screen.state, "more");
+    }
+    screen.draw().unwrap();
+    let tall = box_top(&screen);
+    assert!(tall < at, "the taller box pushed the block up, to {tall}");
+    for (i, line) in block.iter().enumerate() {
+        let y = tall - block.len() as u16 + i as u16;
+        assert_eq!(&row(&screen, y), line, "the block still stands, row {i}");
+    }
+}
+
+/// The row the input box's top rule is drawn on, or the height when no rule was
+/// drawn at all.
+fn box_top(screen: &Screen<ratatui::backend::TestBackend>) -> u16 {
+    let height = screen.terminal.backend().buffer().area.height;
+    (0..height)
+        .find(|y| row(screen, *y).starts_with('\u{2500}'))
+        .unwrap_or(height)
+}
+
+#[test]
+fn the_block_budgets_its_own_ends_before_its_tasks() {
+    // The cap is in rows and the head is spent first, so a budget that was all head
+    // would leave no room for the tasks the budget exists for. Tied to the constant
+    // at compile time, because the arithmetic below only works out while it holds.
+    const { assert!(TODO_HEADS < TODO_ROWS) };
+    assert_eq!(todo_rows(usize::MAX), TODO_ROWS as u16, "capped");
+    assert_eq!(todo_rows(TODO_ROWS - 1), (TODO_ROWS - 1) as u16);
+}
+
+/// The standing block's window: the task in hand is the one row it cannot lose,
+/// and the counts are what give way when there is no room for them -- the picker's
+/// bargain, for the same reason.
+#[test]
+fn the_todo_window_keeps_the_task_in_hand_on_the_screen() {
+    for total in 1..14usize {
+        for active in [None].into_iter().chain((0..total).map(Some)) {
+            for room in 1..=6usize {
+                let got = todo_window(total, active, room);
+                let what = format!("{total} tasks, in hand {active:?}, room {room}");
+                let drawn = got.last - got.first;
+                // What is actually spent: the rows of the run, plus a row for each
+                // count that is drawn. A count that would not fit is not drawn, and
+                // then nothing is claimed -- which is the one case a cut window says
+                // nothing about what it left out.
+                let counted = usize::from(got.above > 0) + usize::from(got.below > 0);
+                assert!(drawn >= 1, "{what}: something is drawn");
+                assert!(got.last <= total, "{what}: past the end");
+                assert!(drawn + counted <= room, "{what}: rows drawn");
+                if counted > 0 {
+                    assert_eq!(
+                        (got.above, got.below),
+                        (got.first, total - got.last),
+                        "{what}: what the counts say"
+                    );
+                }
+                // The row that cannot give way: with a task in hand it is drawn, as
+                // long as the run it must sit in is not the whole list.
+                if let Some(at) = active.filter(|_| total > room) {
+                    assert!(got.first <= at && at < got.last, "{what}: in hand");
+                }
+                if total <= room {
+                    // A list with room to spare is never cut and never counted.
+                    assert_eq!(
+                        (got.first, got.last, got.above, got.below),
+                        (0, total, 0, 0),
+                        "{what}: a list with room to spare"
+                    );
+                } else {
+                    assert!(got.last - got.first < total, "{what}: a cut list");
+                }
+                if active.is_none() && total > room {
+                    assert_eq!(got.first, 0, "{what}: no task in hand shows the plan");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn ctrl_j_makes_the_box_a_line_taller() {
     // The box is the draft's shape: the line Ctrl-J adds has a row to be typed
     // on, and the transcript gives one up for it.
@@ -561,7 +753,7 @@ fn a_draft_that_has_lost_lines_is_drawn_from_its_first_one() {
     // hide the top of what is left -- the editor would otherwise draw from
     // the row it remembered and leave the rest of the box blank.
     let height = 12;
-    let shows = usize::from(box_rows(usize::MAX, height)) - 2;
+    let shows = usize::from(box_rows(usize::MAX, height, 0)) - 2;
     let (draft, kept) = (shows + 4, shows - 2);
     let letters: Vec<char> = "abcdefghijklmnopqrstuvwxyz".chars().take(draft).collect();
     let mut screen = screen_for_test(40, height);
@@ -1722,7 +1914,7 @@ fn the_transcript_gets_the_rows_the_pinned_region_leaves() {
     // arithmetic instead would be scrolling against a row that was never
     // drawn.
     let transcript = |height: u16, input: u16, queued: u16| {
-        screen_rows(Rect::new(0, 0, 80, height), input, queued)[0].height
+        screen_rows(Rect::new(0, 0, 80, height), 0, input, queued)[0].height
     };
     assert_eq!(
         transcript(24, BOX_ROWS, 0),
@@ -1746,10 +1938,10 @@ fn the_transcript_gets_the_rows_the_pinned_region_leaves() {
 fn the_box_grows_with_the_lines_in_it() {
     // One row per line, borders on top and bottom -- and Ctrl-J is what puts
     // lines in it, so this is the arithmetic that makes that key visible.
-    assert_eq!(box_rows(0, 20), BOX_ROWS, "empty is still a box");
-    assert_eq!(box_rows(1, 20), BOX_ROWS);
-    assert_eq!(box_rows(2, 20), 4);
-    assert_eq!(box_rows(6, 20), 8);
+    assert_eq!(box_rows(0, 20, 0), BOX_ROWS, "empty is still a box");
+    assert_eq!(box_rows(1, 20, 0), BOX_ROWS);
+    assert_eq!(box_rows(2, 20, 0), 4);
+    assert_eq!(box_rows(6, 20, 0), 8);
 }
 
 #[test]
@@ -1841,9 +2033,9 @@ fn a_box_taller_than_the_screen_gives_way_to_the_transcript() {
     // transcript: past that the box scrolls inside itself.
     let height = 12;
     let most = height - PINNED_ROWS - 1;
-    assert_eq!(box_rows(100, height), most);
+    assert_eq!(box_rows(100, height, 0), most);
     assert_eq!(
-        screen_rows(Rect::new(0, 0, 80, height), box_rows(100, height), 0)[0].height,
+        screen_rows(Rect::new(0, 0, 80, height), 0, box_rows(100, height, 0), 0)[0].height,
         1
     );
     // And a terminal too short for the box, the status line and a transcript
@@ -1853,22 +2045,30 @@ fn a_box_taller_than_the_screen_gives_way_to_the_transcript() {
     // is nothing -- which is how the transcript ends up windowed against a row
     // nobody drew.
     assert_eq!(
-        screen_rows(Rect::new(0, 0, 80, 2), BOX_ROWS, 0)
+        screen_rows(Rect::new(0, 0, 80, 2), 0, BOX_ROWS, 0)
             .iter()
             .map(|r| r.height)
             .collect::<Vec<_>>(),
-        vec![0, 0, 1, 1],
+        vec![0, 0, 0, 1, 1],
         "what the layout does with a request it cannot grant"
     );
-    assert_eq!(box_rows(100, 2), 0, "so the box asks for nothing instead");
     assert_eq!(
-        screen_rows(Rect::new(0, 0, 80, 2), box_rows(100, 2), 0)[0].height,
+        box_rows(100, 2, 0),
+        0,
+        "so the box asks for nothing instead"
+    );
+    assert_eq!(
+        screen_rows(Rect::new(0, 0, 80, 2), 0, box_rows(100, 2, 0), 0)[0].height,
         1,
         "and the transcript gets the row the box no longer holds"
     );
-    assert_eq!(box_rows(100, 3), 1, "a box with one row is the next line");
     assert_eq!(
-        screen_rows(Rect::new(0, 0, 80, 3), box_rows(100, 3), 0)[0].height,
+        box_rows(100, 3, 0),
+        1,
+        "a box with one row is the next line"
+    );
+    assert_eq!(
+        screen_rows(Rect::new(0, 0, 80, 3), 0, box_rows(100, 3, 0), 0)[0].height,
         1,
         "and the transcript keeps its row"
     );
@@ -1887,11 +2087,11 @@ fn a_cramped_screen_windows_the_rows_the_layout_gave_it() {
         screen.state.transcript.push(Cell::Content("two".into()));
         screen.draw().unwrap();
         let area = origin(&mut screen);
-        let input = screen.state.input_rows(height);
+        let input = screen.state.input_rows(height, 0);
         let queued = screen.state.queue_lines(40).len() as u16;
         assert_eq!(
             screen.state.drawn_rows,
-            screen_rows(area, input, queued)[0].height as usize,
+            screen_rows(area, 0, input, queued)[0].height as usize,
             "a {height}-row terminal"
         );
     }

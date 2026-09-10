@@ -510,21 +510,27 @@ fn todo_spans(todos: &[Todo]) -> Vec<Span> {
         Style::Yellow,
         format!("{} {}", crate::tools::TODO_NAME, todo::summary(todos)),
     )];
-    spans.extend(todo_item_spans(todos));
+    // The tasks are lines of this one block, so the mark is written in front of
+    // each of them rather than set in a gutter of its own: the block already
+    // carries the cell's gutter, and a second one inside it would be columns the
+    // list does not have to spend.
+    for todo in todos {
+        spans.push(Span::new(
+            todo_style(todo.status),
+            format!("\n{}", todo_head(todo.status)),
+        ));
+        spans.extend(todo_line_spans(todo));
+    }
     spans
 }
 
-/// The mark that opens a task's line: the three states a reader scans the column
-/// for.
-///
-/// One mark and one column each, so that the words of every task start in the
-/// same column whatever state it is in -- which is the whole of how a list of
-/// twenty lines is read at a glance.
-fn todo_mark(status: Status) -> &'static str {
+/// What opens a task's line: the mark, and the blank that sets its words apart
+/// from it.
+fn todo_head(status: Status) -> &'static str {
     match status {
-        Status::Pending => "☐",
-        Status::InProgress => "▸",
-        Status::Completed => "✔",
+        Status::Pending => "☐ ",
+        Status::InProgress => "▸ ",
+        Status::Completed => "✔ ",
     }
 }
 
@@ -541,21 +547,43 @@ fn todo_style(status: Status) -> Style {
     }
 }
 
-/// One line per task, in the order the model wrote them.
+/// The columns a task's row opens in, and what its wrapped rows open in: the mark
+/// and a blank, then two blanks under them.
 ///
-/// Shared by the transcript's cell and the block the screen keeps in view, so
-/// that the same list cannot be drawn two different ways depending on where it
-/// is being read.
-pub fn todo_item_spans(todos: &[Todo]) -> Vec<Span> {
-    todos
-        .iter()
-        .map(|todo| {
-            Span::new(
-                todo_style(todo.status),
-                format!("\n{} {}", todo_mark(todo.status), todo.content),
-            )
-        })
-        .collect()
+/// The same [`Gutter`] a cell carries, for a row that is not a cell. A task, not a
+/// list: a task long enough to wrap must keep its own left edge, or its second row
+/// comes back to column zero and reads as a task of its own.
+pub fn todo_gutter(todo: &Todo) -> Gutter {
+    Gutter {
+        head: todo_head(todo.status),
+        rest: "  ",
+        style: todo_style(todo.status),
+    }
+}
+
+/// One task's words, without the mark they are set after: what the cell's line and
+/// the standing block's row are both made of.
+pub fn todo_line_spans(todo: &Todo) -> Vec<Span> {
+    vec![Span::new(todo_style(todo.status), todo.content.clone())]
+}
+
+/// The list a transcript leaves standing: the last one a call wrote, which is the
+/// one that is still true.
+///
+/// A fold over the cells rather than a second piece of state to keep in step --
+/// and the same fold a resumed session goes through, since replay produces the
+/// same cells, so a session read back from the log keeps exactly the list in view
+/// that the session watched live had.
+///
+/// `None` when no call has written a list, and when the last one written cleared
+/// it: an empty list is how a list is taken down, and a list that has been taken
+/// down is not one to keep in view.
+pub fn standing_todos(cells: &[Cell]) -> Option<&[Todo]> {
+    let todos = cells.iter().rev().find_map(|cell| match cell {
+        Cell::Todo(todos) => Some(todos.as_slice()),
+        _ => None,
+    })?;
+    (!todos.is_empty()).then_some(todos)
 }
 
 /// One-line summary of a tool result: its first line and how much text came
@@ -1166,11 +1194,15 @@ mod tests {
             vec![
                 // The head is the same string the model was answered with.
                 Span::new(Style::Yellow, "TodoWrite 1/3 done"),
-                Span::new(Style::Dim, "\n✔ Add the parse function"),
-                Span::new(Style::Yellow, "\n▸ Draw the cell"),
+                // A task is its mark and its words, both in the style of its state.
+                Span::new(Style::Dim, "\n✔ "),
+                Span::new(Style::Dim, "Add the parse function"),
+                Span::new(Style::Yellow, "\n▸ "),
+                Span::new(Style::Yellow, "Draw the cell"),
                 // Not started yet is plain: it is the list's reading matter, not a
                 // note about the list.
-                Span::new(Style::Plain, "\n☐ Run the gates"),
+                Span::new(Style::Plain, "\n☐ "),
+                Span::new(Style::Plain, "Run the gates"),
             ]
         );
     }
@@ -1184,19 +1216,32 @@ mod tests {
         );
     }
 
-    /// Every mark takes one column, and the three states are told apart by them.
+    /// Every mark takes one column and the three states are told apart by them.
     ///
     /// The column is the point: a mark that measured two would push its own line's
     /// words out of the column every other task's words are in, and the column of
-    /// words is the only thing that makes a list of twenty lines scannable.
+    /// words is the only thing that makes a list of twenty lines scannable. The
+    /// gutter's two columns are pinned to the rest of the vocabulary's, so that a
+    /// task's wrapped rows continue where its own words are rather than a column
+    /// either side of them.
     #[test]
     fn every_task_mark_is_one_column_and_the_states_are_distinct() {
-        let marks = [Status::Pending, Status::InProgress, Status::Completed].map(todo_mark);
-        for mark in marks {
-            assert_eq!(text::width(mark), 1, "{mark:?} takes one column");
+        let heads = [Status::Pending, Status::InProgress, Status::Completed].map(todo_head);
+        for head in heads {
+            assert_eq!(text::width(head.trim_end()), 1, "{head:?} takes one column");
+            assert_eq!(text::width(head), MARKER_COLUMNS, "{head:?} and its blank");
         }
-        let states: std::collections::HashSet<&str> = marks.into_iter().collect();
+        let states: std::collections::HashSet<&str> =
+            heads.map(str::trim_end).into_iter().collect();
         assert_eq!(states.len(), 3, "the three states read differently");
+        for status in [Status::Pending, Status::InProgress, Status::Completed] {
+            let gutter = todo_gutter(&Todo {
+                content: "x".into(),
+                status,
+            });
+            assert_eq!(gutter.width(), MARKER_COLUMNS);
+            assert_eq!(text::width(gutter.rest), MARKER_COLUMNS);
+        }
     }
 
     #[test]
@@ -1205,6 +1250,61 @@ mod tests {
         // call that could not be read rather than a list nobody wrote.
         let cell = Cell::tool_call("TodoWrite", r#"{"todos":"a plan"}"#);
         assert!(matches!(cell, Cell::ToolCall { .. }), "was {cell:?}");
+    }
+
+    fn written(todos: serde_json::Value) -> Cell {
+        Cell::tool_call("TodoWrite", &todos.to_string())
+    }
+
+    /// The list that stands is a fold of the transcript -- the last list a call
+    /// wrote, which is the one still true. There is no second copy of it to keep
+    /// in step, which is the whole reason the tool writes into the log instead of
+    /// holding the list anywhere.
+    #[test]
+    fn the_list_that_stands_is_the_last_one_written() {
+        let cells = vec![
+            Cell::Content("thinking about it".into()),
+            written(serde_json::json!({"todos": [{"content": "a"}]})),
+            Cell::ToolResult("todo list updated (0/1 done)".into()),
+            // The second write replaces the first rather than following it: what
+            // the model sends is the whole list, not a change to it.
+            written(serde_json::json!({"todos": [
+                {"content": "a", "status": "completed"},
+                {"content": "b", "status": "in_progress"}
+            ]})),
+        ];
+        let standing = standing_todos(&cells).expect("a list was written");
+        assert_eq!(standing.len(), 2);
+        assert_eq!(standing[1].content, "b");
+        assert_eq!(standing[1].status, Status::InProgress);
+    }
+
+    #[test]
+    fn a_list_that_was_cleared_is_not_one_to_keep_in_view() {
+        // An empty list is how a list is taken down, and the screen has to stop
+        // pinning it: a block that outlived the work it described is a block the
+        // reader learns to ignore.
+        let cleared = vec![
+            written(serde_json::json!({"todos": [{"content": "a"}]})),
+            written(serde_json::json!({"todos": []})),
+        ];
+        assert_eq!(standing_todos(&cleared), None);
+        // And no list at all is the same answer: nothing to pin.
+        assert_eq!(standing_todos(&[Cell::Content("just talk".into())]), None);
+        assert_eq!(standing_todos(&[]), None);
+    }
+
+    /// A call that could not be read is a [`Cell::ToolCall`] and not a list, so the
+    /// fold steps over it: the list that stands is still the last one that was
+    /// actually written.
+    #[test]
+    fn a_call_that_could_not_be_read_leaves_the_standing_list_alone() {
+        let cells = vec![
+            written(serde_json::json!({"todos": [{"content": "a"}]})),
+            Cell::tool_call("TodoWrite", r#"{"todos":"a plan"}"#),
+        ];
+        let standing = standing_todos(&cells).expect("the first write still stands");
+        assert_eq!(standing.len(), 1);
     }
 
     #[test]

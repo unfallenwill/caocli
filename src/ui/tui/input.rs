@@ -261,8 +261,13 @@ impl State {
     /// How many rows the box needs on a terminal `height` rows tall: one per line
     /// of the draft, so that Ctrl-J -- the key that makes the draft multi-line --
     /// makes room for the line it adds.
-    pub(super) fn input_rows(&self, height: u16) -> u16 {
-        box_rows(self.textarea.lines().len(), height)
+    ///
+    /// `todos` is what the standing task list above it is taking: the pinned
+    /// regions are served before the draft is, because a box that cannot be typed
+    /// in is a session that cannot continue and a box that is short by a row
+    /// still can be.
+    pub(super) fn input_rows(&self, height: u16, todos: u16) -> u16 {
+        box_rows(self.textarea.lines().len(), height, todos)
     }
 
     /// Put the box's window back where the draft it now holds wants it, for a box

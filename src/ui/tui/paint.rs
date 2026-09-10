@@ -10,7 +10,7 @@
 use ratatui::style::{Color, Modifier, Style as RStyle};
 use ratatui::text::{Line, Span as RSpan};
 
-use crate::ui::cell::{Cell, Span, Style};
+use crate::ui::cell::{Cell, Gutter, Span, Style};
 use crate::ui::text;
 
 /// The widest a line of the transcript is laid out, however wide the terminal is.
@@ -94,20 +94,7 @@ pub(super) fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
     };
     // Wrapped into what the gutter leaves, so a line of a set-in cell carries as
     // much as a line of the answer rather than two columns more.
-    let mut lines: Vec<Line<'static>> =
-        wrapped_lines(&cell.spans(), width.saturating_sub(gutter.width()))
-            .into_iter()
-            .enumerate()
-            .map(|(i, line)| {
-                // The marker opens the cell, and the lines after it continue in the
-                // same columns: that is what keeps a wrapped block -- and with it the
-                // left edge the whole layout is read down -- on one line.
-                let lead = if i == 0 { gutter.head } else { gutter.rest };
-                let mut spans = vec![RSpan::styled(lead, style_of(gutter.style))];
-                spans.extend(line.spans);
-                Line::from(spans)
-            })
-            .collect();
+    let mut lines = wrapped_under(&cell.spans(), width, gutter);
     // A long think folds to its head and a count. The rule lives in this layer
     // rather than in the cell because it is a budget of the screen, like the
     // wrapping width is: the plain front end has no screen to keep one on, and
@@ -163,6 +150,29 @@ pub(super) fn live_cell(style: Style, text: &str) -> Cell {
 /// Progress is guaranteed even when a single character is wider than the whole
 /// field: the first character is taken regardless, so a narrow terminal degrades
 /// to a clipped wide glyph rather than looping forever.
+/// Wrap `spans` to `width`, opening every line in a gutter's columns: the head
+/// for the first line, the rest for the ones after it.
+///
+/// The rule that keeps a wrapped block on one left edge, and the reason it lives
+/// here rather than in the cell: only the layer that does the wrapping knows where
+/// the lines fall. A cell reaches it through [`cell_lines`], and the standing task
+/// list through it directly -- a block that is pinned is not a cell, but a task
+/// whose wrapped rows came back to column zero would still read as a task of its
+/// own.
+pub(super) fn wrapped_under(spans: &[Span], width: usize, gutter: Gutter) -> Vec<Line<'static>> {
+    wrapped_lines(spans, width.saturating_sub(gutter.width()))
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let lead = if i == 0 { gutter.head } else { gutter.rest };
+            let mut spans = vec![RSpan::styled(lead, style_of(gutter.style))];
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Wrap `spans` into lines, breaking at spaces where it can.
 pub(super) fn wrapped_lines(spans: &[Span], width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut lines: Vec<Line<'static>> = Vec::new();

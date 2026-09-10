@@ -57,11 +57,11 @@ VIEWPORT = "type a message"
 BANNER = "caocli · session"
 STATUS = "cache"
 PICKER = "show this"  # the /help row of the command picker
-# One line of what /help commits. Not the first one: the pinned region takes rows
-# from the bottom, so a long answer has its head off the top of the screen before
-# the last row of it is even drawn -- what is looked for here has to be a line the
-# window can still hold.
-HELP = "Startup flags:"
+# One line of what /help commits. The last one, and not the first: the pinned
+# regions take rows from the bottom -- the standing task list among them -- so a
+# long answer has its head off the top of the screen before the last row of it is
+# even drawn. What is looked for here has to be a line the window can still hold.
+HELP = "--image <path>"
 
 # Live marks: what the box says while a turn runs, and the gate that stands
 # between a tool call and its execution.
@@ -77,6 +77,15 @@ QUEUED_TOKEN = "zqx7"
 # replay half of the same cell a live turn produces; the id and the lines are what
 # the assertions below look for.
 SEED = "20260910-120000"
+
+# The task list the seeded session wrote, and what the two surfaces that show it
+# are looked for by. The head of the transcript's cell and the title of the pinned
+# block are different strings on purpose: the block is drawn under the transcript
+# as well as in it, so a needle that matched both would not say which one was found.
+TODO_DONE = "Draw the change"
+TODO_NOW = "Run the gates"
+CELL_HEAD = "TodoWrite 1/2 done"
+BLOCK_HEAD = "· todos · 1/2 done"
 
 # What `/login` is given below. Nonsense on purpose: it is never sent anywhere,
 # and looking for exactly it is how the checks below know that what they found
@@ -108,16 +117,27 @@ def seed_settings(home: str, key: str) -> None:
 
 
 def seed_session(home: str) -> str:
-    """Write a session that has already made an edit, and return its id.
+    """Write a session that has already made an edit and written a task list, and
+    return its id.
 
     The log format is the one the front end writes: a header, then the messages.
-    The edit is what a live turn would have produced, so what is drawn from it on
-    resume is what would have been drawn when it happened.
+    The edit and the list are what a live turn would have produced, so what is
+    drawn from them on resume is what would have been drawn when it happened --
+    and the standing block is drawn from the same log, which is the point: it is a
+    fold of the transcript and not a second copy of anything.
     """
     directory = os.path.join(home, ".caocli", "sessions")
     os.makedirs(directory, exist_ok=True)
     arguments = json.dumps(
         {"file_path": "a.txt", "old_string": "one", "new_string": "two"}
+    )
+    todos = json.dumps(
+        {
+            "todos": [
+                {"content": TODO_DONE, "status": "completed"},
+                {"content": TODO_NOW, "status": "in_progress"},
+            ]
+        }
     )
     lines = [
         json.dumps(
@@ -159,6 +179,34 @@ def seed_session(home: str) -> str:
             {
                 "t": "msg",
                 "message": {"role": "assistant", "content": "中文宽度测试"},
+            }
+        ),
+        # The list the model keeps for the reader. Resuming has to draw it twice
+        # over: once as the cell that records the call, and once as the block that
+        # stands above the box -- both of them folded out of this one line.
+        json.dumps(
+            {
+                "t": "msg",
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {"name": "TodoWrite", "arguments": todos},
+                        }
+                    ],
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "t": "msg",
+                "message": {
+                    "role": "tool",
+                    "content": "todo list updated (1/2 done)",
+                    "tool_call_id": "call_2",
+                },
             }
         ),
     ]
@@ -651,6 +699,38 @@ def main() -> int:
                 if edges[set_in] != 2:
                     print(f"  ✗ {set_in!r} is not set in: {edges}")
                     ok = False
+            # The task list, drawn twice over out of one line of the log: the cell
+            # that records the call, in the transcript, and the block that stands
+            # above the box. The two are looked for by different heads, because a
+            # needle that matched both would not say which one was found.
+            ok &= term.expect(CELL_HEAD, 15)
+            ok &= term.expect(BLOCK_HEAD, 15)
+            # The block is the rows immediately above the box, and it is drawn from
+            # the log rather than from anything running now: nothing here called a
+            # model, and the last word the log has on the list is what stands.
+            rows = term.screen.lines()
+            rule = next(
+                (y for y in range(len(rows) - 2, 0, -1) if set(rows[y]) == {"─"}), None
+            )
+            block = rows[:rule] if rule else []
+            head = next(
+                (y for y, row in enumerate(block) if row.strip() == BLOCK_HEAD), None
+            )
+            if head is None:
+                print(f"  ✗ the standing list was not drawn: {block[-6:]}")
+                ok = False
+            else:
+                want = [f"✔ {TODO_DONE}", f"▸ {TODO_NOW}"]
+                got = [row.strip() for row in block[head + 1 : head + 3]]
+                if got != want:
+                    print(f"  ✗ the standing list reads {got}, not {want}")
+                    ok = False
+                # And it is pinned: the box cannot have moved it, and the row
+                # between the block and the box is the gap that sets it off from
+                # the transcript above it.
+                if block[head - 1].strip() != "" or block[head + 3] != block[head + 3].strip():
+                    print("  ✗ the block is not set off from the transcript")
+                    ok = False
             # Those characters have to sit together on the screen: a space in the
             # column a wide character covers is what the bug looks like.
             if not term.screen.find("中文宽度测试"):
@@ -736,7 +816,7 @@ def main() -> int:
             # been pushed off the top of it -- and paging back is the only way to
             # see it again, since nothing writes that banner twice.
             ok &= term.idle(2.0, 30)
-            if not term.screen.find("Startup flags"):
+            if not term.screen.find(HELP):
                 print("  ✗ /help did not reach the screen")
                 ok = False
             if term.screen.find(BANNER):
