@@ -101,6 +101,15 @@ def seed_session(home: str) -> str:
                 "message": {"role": "tool", "content": "ok: a.txt", "tool_call_id": "call_1"},
             }
         ),
+        # Non-ASCII on purpose: a wide character is two columns and the terminal
+        # moves past both, so this is the line that shows whether anything is being
+        # written into the column it covers.
+        json.dumps(
+            {
+                "t": "msg",
+                "message": {"role": "assistant", "content": "中文宽度测试"},
+            }
+        ),
     ]
     with open(os.path.join(directory, f"{SEED}.jsonl"), "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -315,6 +324,11 @@ def main() -> int:
             ok &= term.expect("weighing the change", 15)
             if b"48;5;236" not in term.raw:
                 print("  ✗ the thinking block has no ground")
+                ok = False
+            # Those characters have to arrive with nothing between them: a space in
+            # that column is the bug this is here to keep out.
+            if "中文宽度测试".encode() not in term.raw:
+                print("  ✗ wide characters are drawn with a gap after each one")
                 ok = False
             if term.queries == 0:
                 print("  ✗ the viewport never asked where the cursor was")

@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style as RStyle};
 use ratatui::text::{Line, Span as RSpan, Text};
@@ -1266,6 +1267,7 @@ impl<B: Backend> Screen<B> {
             let chunk = chunk.to_vec();
             self.terminal.insert_before(chunk.len() as u16, |buf| {
                 Paragraph::new(Text::from(chunk.clone())).render(buf.area, buf);
+                blank_wide_continuations(buf);
             })?;
         }
         // The insertion moved everything the viewport shows, so what was drawn
@@ -1297,18 +1299,35 @@ fn input_box() -> TextArea<'static> {
     textarea
 }
 
-/// Wrap styled spans into the terminal lines they need at `width` columns.
+/// Leave the columns a wide symbol covers empty.
 ///
-/// Both halves of the front end need this, for the same reason: nothing here may
-/// be left to the terminal's own soft wrapping. The live area is a fixed-height
-/// region, so an unwrapped line would push the pinned rows out of the viewport,
-/// and `insert_before` renders into a fixed-width buffer, where an over-long line
-/// is silently cut off -- unlike the plain front end, where the terminal wraps
-/// and nothing is lost.
-///
-/// Progress is guaranteed even when a single character is wider than the whole
-/// field: the first character is taken regardless, so a narrow terminal degrades
-/// to a clipped wide glyph rather than looping forever.
+/// A terminal draws a two-column character and moves two columns: the second
+/// column belongs to the character, and it advances past it itself. ratatui leaves
+/// the column after a wide grapheme as an ordinary blank cell, which is invisible
+/// as long as only changed cells are written -- but the insertion path that puts a
+/// finished turn into scrollback writes every cell it was handed, so a wide
+/// character came out followed by a space. A line of CJK text therefore reached the
+/// terminal with a gap between every character.
+fn blank_wide_continuations(buf: &mut Buffer) {
+    let area = buf.area;
+    for y in area.top()..area.bottom() {
+        let mut x = area.left();
+        while x < area.right() {
+            // Graphemes are one or two columns wide; the cast is the same one
+            // ratatui makes when it places them.
+            let width = super::text::width(buf[(x, y)].symbol()) as u16;
+            for dx in 1..width {
+                let at = x.saturating_add(dx);
+                if at < area.right() {
+                    buf[(at, y)].set_symbol("");
+                }
+            }
+            // A symbol of no width would otherwise stand still.
+            x += width.max(1);
+        }
+    }
+}
+
 /// The lines cells occupy at `width`.
 ///
 /// One function, because the live area, the scrollback it is committed into and
@@ -1350,6 +1369,18 @@ fn fill_of(cell: &Cell) -> Option<RStyle> {
     }
 }
 
+/// Wrap styled spans into the terminal lines they need at `width` columns.
+///
+/// Both halves of the front end need this, for the same reason: nothing here may
+/// be left to the terminal's own soft wrapping. The live area is a fixed-height
+/// region, so an unwrapped line would push the pinned rows out of the viewport,
+/// and `insert_before` renders into a fixed-width buffer, where an over-long line
+/// is silently cut off -- unlike the plain front end, where the terminal wraps
+/// and nothing is lost.
+///
+/// Progress is guaranteed even when a single character is wider than the whole
+/// field: the first character is taken regardless, so a narrow terminal degrades
+/// to a clipped wide glyph rather than looping forever.
 fn wrapped_lines(spans: &[Span], width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -2006,6 +2037,27 @@ mod tests {
         let top = origin(&mut screen).y;
         assert_eq!(row(&screen, top + 1), format!("  + {}", "x".repeat(16)));
         assert_eq!(row(&screen, top + 2), "x".repeat(14));
+    }
+
+    #[test]
+    fn the_columns_a_wide_symbol_covers_are_left_empty() {
+        // A terminal puts a wide character in its two columns and moves past both.
+        // Anything written into the second one arrives on screen as a space after
+        // the character -- which is what a line of CJK text looked like.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 8, 1));
+        buf.set_string(0, 0, "看一下ab", RStyle::new());
+        blank_wide_continuations(&mut buf);
+        let symbols: Vec<&str> = (0..8).map(|x| buf[(x, 0)].symbol()).collect();
+        assert_eq!(symbols, vec!["看", "", "一", "", "下", "", "a", "b"]);
+    }
+
+    #[test]
+    fn leaving_those_columns_empty_does_not_disturb_the_rest() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 5, 1));
+        buf.set_string(0, 0, "abcde", RStyle::new());
+        blank_wide_continuations(&mut buf);
+        let symbols: Vec<&str> = (0..5).map(|x| buf[(x, 0)].symbol()).collect();
+        assert_eq!(symbols, vec!["a", "b", "c", "d", "e"]);
     }
 
     #[test]
