@@ -181,11 +181,11 @@ async fn run(cli: Cli) -> Result<()> {
     // first request.
     let mut missing_key = None;
     let api = match config::api_key(&provider) {
-        Ok(key) => Client::new(key, provider.url.to_string())?,
+        Ok(key) => Client::for_provider(&provider, key)?,
         Err(e) if cli.prompt.is_some() => return Err(e),
         Err(e) => {
             missing_key = Some(format!("{e:#}"));
-            Client::new(String::new(), provider.url.to_string())?
+            Client::for_provider(&provider, String::new())?
         }
     };
 

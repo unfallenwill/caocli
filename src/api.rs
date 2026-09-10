@@ -3,6 +3,7 @@ use futures_util::StreamExt;
 use std::pin::Pin;
 use std::time::Duration;
 
+use crate::provider::Provider;
 use crate::types::ChatChunk;
 
 // ============================================================================
@@ -29,6 +30,13 @@ impl Client {
             .build()
             .context("failed to build HTTP client")?;
         Ok(Self { http, api_key, url })
+    }
+
+    /// The client for a provider: its endpoint and its key, paired in the one
+    /// place that knows both, so a caller cannot send one provider's key to
+    /// another provider's URL.
+    pub fn for_provider(provider: &Provider, key: String) -> Result<Self> {
+        Self::new(key, provider.url.to_string())
     }
 
     pub async fn stream_chat(&self, req: &crate::types::ChatRequest) -> Result<SseStream> {

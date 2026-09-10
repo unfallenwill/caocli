@@ -116,7 +116,7 @@ fn bind_to_session(agent: &mut Agent) -> Result<()> {
         return Ok(());
     }
     let provider = provider::provider(&id)?;
-    let api = Client::new(config::api_key(&provider)?, provider.url.to_string())?;
+    let api = Client::for_provider(&provider, config::api_key(&provider)?)?;
     agent.bind(provider, api);
     Ok(())
 }
@@ -157,7 +157,7 @@ async fn login(agent: &mut Agent, ui: &mut dyn Front, provider_id: &str) {
     // A key that is only read at startup would leave the next turn failing with
     // no way to see why, so a login for the provider in use is taken up now.
     if agent.provider().id == provider.id {
-        match Client::new(key.to_owned(), provider.url.to_string()) {
+        match Client::for_provider(&provider, key.to_owned()) {
             Ok(api) => agent.bind(provider, api),
             Err(e) => return ui.error(&format!("{e:#}")),
         }
@@ -179,8 +179,7 @@ fn choose_model(agent: &mut Agent, ui: &mut dyn Front, spec: &str) {
     };
     // A model is only usable where there is a key to send it with: storing the
     // choice and failing on the next turn would look like the backend's fault.
-    let api = match config::api_key(&provider)
-        .and_then(|key| Client::new(key, provider.url.to_string()))
+    let api = match config::api_key(&provider).and_then(|key| Client::for_provider(&provider, key))
     {
         Ok(api) => api,
         Err(e) => return ui.error(&format!("{e:#}")),
