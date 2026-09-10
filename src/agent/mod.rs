@@ -141,7 +141,7 @@ impl Agent {
     /// kept).
     /// When it fires, the current effect is dropped — the stream disconnects and
     /// the Bash child process is killed by kill_on_drop; the calls that were
-    /// declared but not answered are persisted with CANCELLED_RESULT to close the
+    /// declared but not answered are persisted with a cancellation marker to close the
     /// window, the history stays is_request_valid, and the next turn continues
     /// from a valid prefix.
     /// Cancellation is handled in the interpreter layer and never enters
@@ -191,17 +191,16 @@ impl Agent {
                     // deterministic marker, so a model that goes haywire in a loop
                     // cannot run forever.
                     if self.tool_steps >= self.max_tool_steps {
-                        ui.tool_result(machine::STEP_LIMIT_RESULT);
-                        self.session.append_message(&Message::tool(
-                            &call.id,
-                            machine::STEP_LIMIT_RESULT.to_string(),
-                        ))?;
-                        self.close_open_calls(ui, machine::STEP_LIMIT_RESULT)?;
+                        let marker = machine::Marker::StepLimit;
+                        ui.tool_result(marker.text());
+                        self.session
+                            .append_message(&Message::tool(&call.id, marker.text()))?;
+                        self.close_open_calls(ui, marker)?;
                         break;
                     }
                     self.tool_steps += 1;
                     // Approval gate: Bash/Edit/Write ask first; a denial closes
-                    // that call with DENIED_RESULT
+                    // that call with the denial marker
                     let mut denied = false;
                     if self.approval == Approval::Ask && call.function.name != tools::READ_NAME {
                         ui.approval_requested(&call.function.name, &call.function.arguments);
@@ -215,10 +214,10 @@ impl Agent {
                         }
                         if verdict == Verdict::Denied {
                             denied = true;
-                            ui.tool_result(machine::DENIED_RESULT);
+                            ui.tool_result(machine::Marker::Denied.text());
                             self.session.append_message(&Message::tool(
                                 &call.id,
-                                machine::DENIED_RESULT.to_string(),
+                                machine::Marker::Denied.text(),
                             ))?;
                         }
                     }
@@ -226,9 +225,9 @@ impl Agent {
                         let out = tokio::select! {
                             biased;
                             out = tools::execute(&call.function.name, &call.function.arguments) => out,
-                            _ = cancel.wait() => machine::CANCELLED_RESULT.to_string(),
+                            _ = cancel.wait() => machine::Marker::Cancelled.text().to_owned(),
                         };
-                        let cancelled_call = out == machine::CANCELLED_RESULT;
+                        let cancelled_call = out == machine::Marker::Cancelled.text();
                         ui.tool_result(&out);
                         self.session.append_message(&Message::tool(&call.id, out))?;
                         if cancelled_call {
@@ -243,7 +242,7 @@ impl Agent {
             }
         }
         if cancelled {
-            self.close_open_calls(ui, machine::CANCELLED_RESULT)?;
+            self.close_open_calls(ui, machine::Marker::Cancelled)?;
             ui.interrupted();
         }
         Ok(())
@@ -253,10 +252,11 @@ impl Agent {
     /// were declared but not answered, closing the window.
     /// Persisted rather than kept in the in-memory view only — the process is
     /// still alive, so the file has to record it faithfully.
-    fn close_open_calls(&mut self, ui: &mut dyn Ui, marker: &str) -> Result<()> {
+    fn close_open_calls(&mut self, ui: &mut dyn Ui, marker: machine::Marker) -> Result<()> {
         for id in machine::open_call_ids(&self.session.messages) {
-            self.session.append_message(&Message::tool(&id, marker))?;
-            ui.tool_result(marker);
+            self.session
+                .append_message(&Message::tool(&id, marker.text()))?;
+            ui.tool_result(marker.text());
         }
         Ok(())
     }
@@ -694,10 +694,13 @@ mod tests {
         assert_eq!(msgs[3].tool_call_id.as_deref(), Some("call_c2"));
         assert_eq!(
             msgs[2].content.as_deref(),
-            Some(machine::CANCELLED_RESULT),
+            Some(machine::Marker::Cancelled.text()),
             "a call interrupted while executing is marked cancelled too"
         );
-        assert_eq!(msgs[3].content.as_deref(), Some(machine::CANCELLED_RESULT));
+        assert_eq!(
+            msgs[3].content.as_deref(),
+            Some(machine::Marker::Cancelled.text())
+        );
         // the window is closed: the history is valid, so the next turn's decision
         // is to send a request rather than resurrect zombie calls
         assert!(machine::is_request_valid(msgs));
@@ -755,7 +758,7 @@ mod tests {
         );
     }
 
-    /// Approval denied: DENIED_RESULT closes that call, the window is valid, and
+    /// Approval denied: the denial marker closes that call, the window is valid, and
     /// the next beat keeps going.
     #[tokio::test]
     async fn approval_denied_commits_denial_marker() {
@@ -793,7 +796,10 @@ mod tests {
             4,
             "user / assistant / denial marker / closing assistant"
         );
-        assert_eq!(msgs[2].content.as_deref(), Some(machine::DENIED_RESULT));
+        assert_eq!(
+            msgs[2].content.as_deref(),
+            Some(machine::Marker::Denied.text())
+        );
         assert!(machine::is_request_valid(msgs));
         // the window is closed and the denial went back to the model: the closing
         // assistant proves the model digested the denial
@@ -836,7 +842,10 @@ mod tests {
             .unwrap();
         let msgs = &agent.session.messages;
         assert_eq!(msgs.len(), 3);
-        assert_eq!(msgs[2].content.as_deref(), Some(machine::CANCELLED_RESULT));
+        assert_eq!(
+            msgs[2].content.as_deref(),
+            Some(machine::Marker::Cancelled.text())
+        );
         assert!(machine::is_request_valid(msgs));
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -878,7 +887,7 @@ mod tests {
         assert_eq!(msgs.len(), 5, "user / assistant(3 calls) / tool×3");
         assert_eq!(
             msgs[4].content.as_deref(),
-            Some(machine::STEP_LIMIT_RESULT),
+            Some(machine::Marker::StepLimit.text()),
             "the third call gets the marker instead of executing because the cap is reached"
         );
         assert!(machine::is_request_valid(msgs));

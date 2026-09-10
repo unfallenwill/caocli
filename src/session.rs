@@ -511,7 +511,7 @@ mod tests {
         assert_eq!(msgs[3].tool_call_id.as_deref(), Some("call_2"));
         assert_eq!(
             msgs[3].content.as_deref(),
-            Some(crate::machine::INTERRUPTED_RESULT)
+            Some(crate::machine::Marker::Interrupted.text())
         );
         // the file was not rewritten: still header + 4 message lines
         let raw = std::fs::read_to_string(&path).unwrap();

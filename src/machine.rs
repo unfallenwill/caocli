@@ -86,30 +86,48 @@ pub fn is_request_valid(messages: &[Message]) -> bool {
     windows_complete(messages) && no_stray_tools(messages)
 }
 
-/// Placeholder result synthesized by crash healing for a tool call that never
-/// executed. Must be a deterministic constant: the same log has to synthesize a
-/// byte-for-byte identical history on every load (prefix cache depends on it).
-pub const INTERRUPTED_RESULT: &str = "error: interrupted before execution; no result was recorded";
+/// A text the interpreter or the load-time heal writes where a tool call has no
+/// result of its own.
+///
+/// The texts are byte-for-byte constants because they are in the log, and the
+/// log is the state: history is replayed as the prefix cache sees it, and a log
+/// that violates the window specification (a call with no result in its window)
+/// is a 400 from the backend. An enum rather than four loose strings: the set is
+/// closed, and a caller that invents its own marker is a caller that can write
+/// an invalid history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Marker {
+    /// Synthesized at load time for a call that never executed — the process
+    /// died between the declaration and its result. In memory only: the file is
+    /// never rewritten.
+    Interrupted,
+    /// Persisted for a call the user cancelled (Ctrl-C). Unlike `Interrupted`
+    /// this one really lands in the file: the process is still alive.
+    Cancelled,
+    /// Persisted for a call the approval gate denied. The model can adjust its
+    /// plan after reading it.
+    Denied,
+    /// Persisted for the calls still open when the turn hit [`MAX_TOOL_STEPS`].
+    StepLimit,
+}
 
-/// Placeholder result persisted for unfinished calls when the user cancels
-/// (Ctrl-C). A deterministic constant, for the same reason. Distinct from
-/// INTERRUPTED_RESULT: that one is synthesized at load time after a crash (it
-/// only enters the in-memory view), whereas this one is really written to the
-/// file on cancellation (the process is still alive, so it must land in the file).
-pub const CANCELLED_RESULT: &str = "error: cancelled by user before a result was recorded";
-
-/// Result persisted for a call denied by the approval gate. A deterministic
-/// constant; the model can adjust its plan after reading it.
-pub const DENIED_RESULT: &str = "error: the user declined this tool call";
+impl Marker {
+    /// The text as it goes into the log. Byte for byte: a changed letter is a
+    /// different history, and a different history is a full cache miss.
+    pub fn text(self) -> &'static str {
+        match self {
+            Marker::Interrupted => "error: interrupted before execution; no result was recorded",
+            Marker::Cancelled => "error: cancelled by user before a result was recorded",
+            Marker::Denied => "error: the user declined this tool call",
+            Marker::StepLimit => "error: tool step limit reached; turn aborted",
+        }
+    }
+}
 
 /// Per-turn tool step cap (every ExecTool action counts as one step, including
 /// denied ones). A product-level termination guarantee: a model that goes
 /// haywire in a loop can burn at most this much.
 pub const MAX_TOOL_STEPS: usize = 500;
-
-/// Result persisted for calls once the step cap is exceeded. A deterministic
-/// constant.
-pub const STEP_LIMIT_RESULT: &str = "error: tool step limit reached; turn aborted";
 
 /// What the next beat should do. The machine's decision exit, obtained by
 /// folding the log.
@@ -165,7 +183,7 @@ pub fn next_action(messages: &[Message]) -> Option<Action> {
 
 /// Ids of calls that were declared but not answered inside their result window
 /// (in declaration order).
-/// The basis for cancellation cleanup: these calls need a CANCELLED_RESULT to
+/// The basis for cancellation cleanup: these calls need a cancellation marker to
 /// close the window, otherwise the next turn resurrects zombie calls (or
 /// constructing the request gets a 400).
 pub fn open_call_ids(messages: &[Message]) -> Vec<String> {
@@ -233,7 +251,7 @@ pub fn heal(messages: &mut Vec<Message>) -> usize {
             // one inside the same window only needs + n. A cumulative
             // insertion count carried across windows must not be mixed in —
             // that would send the second window out of bounds.
-            messages.insert(j + n, Message::tool(id, INTERRUPTED_RESULT));
+            messages.insert(j + n, Message::tool(id, Marker::Interrupted.text()));
         }
         inserted += missing.len();
         // Skip the whole window (including the placeholder results just inserted)
@@ -347,7 +365,7 @@ mod tests {
         assert_eq!(msgs[3].tool_call_id.as_deref(), Some("b"));
         assert_eq!(
             msgs[2].content.as_deref(),
-            Some(INTERRUPTED_RESULT),
+            Some(Marker::Interrupted.text()),
             "the synthesized text must be byte-for-byte deterministic (prefix cache depends on it)"
         );
     }
