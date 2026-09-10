@@ -1,3 +1,5 @@
+mod text;
+
 use std::io::{IsTerminal, Write};
 
 use crate::types::{Message, Role, Usage};
@@ -115,9 +117,10 @@ impl StatusBar {
     /// Right-aligned redraw: save the cursor → clear the line → write padding +
     /// text → restore the cursor.
     /// `visible` is used to compute the width (it carries no color codes), while
-    /// `painted` is what actually gets written.
+    /// `painted` is what actually gets written. The measurement is in columns,
+    /// not chars, so a wide character is charged for both of its columns.
     fn render(&self, out: &mut dyn Write, visible: &str, painted: &str) {
-        let pad = self.width().saturating_sub(visible.chars().count());
+        let pad = self.width().saturating_sub(text::width(visible));
         let _ = write!(
             out,
             "\x1b7\x1b[{};1H\x1b[2K{}{}\x1b8",
@@ -127,15 +130,6 @@ impl StatusBar {
         );
         let _ = out.flush();
     }
-}
-
-/// Truncate by character count, so nothing is ever written past the status bar
-/// width.
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_owned();
-    }
-    s.chars().take(max).collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -249,9 +243,10 @@ impl Renderer {
     /// Redraw the status bar (without re-detecting the size).
     fn redraw_status_bar(&mut self) {
         let Some(bar) = self.bar else { return };
-        let visible = truncate_chars(&self.status_label(), bar.width());
-        let painted = self.paint(DIM, &visible);
-        bar.render(self.out.as_mut(), &visible, &painted);
+        let label = self.status_label();
+        let visible = text::truncate(&label, bar.width());
+        let painted = self.paint(DIM, visible);
+        bar.render(self.out.as_mut(), visible, &painted);
     }
 
     /// Status bar text: `<model> · cache ...`; falls back to pure cache stats when
@@ -772,12 +767,27 @@ mod tests {
         assert_eq!(StatusBar::detect(false), None);
     }
 
+    /// Regression: the bar used to measure its label in chars, so every wide
+    /// character was undercharged by one column and the label spilled past the
+    /// column the bar deliberately leaves free (which is what keeps the write
+    /// from triggering autowrap on the last row).
     #[test]
-    fn truncate_chars_keeps_char_boundaries() {
-        assert_eq!(truncate_chars("abc", 5), "abc");
-        assert_eq!(truncate_chars("abcd", 2), "ab");
-        // the 2-byte "é" is dropped whole, never split in half
-        assert_eq!(truncate_chars("café", 3), "caf");
+    fn status_bar_render_charges_wide_chars_two_columns() {
+        let bar = StatusBar { rows: 10, cols: 20 }; // width = 19
+        let (mut r, buf) = Renderer::with_buffer(false);
+        // two ideographs + space + rocket = 7 columns but only 4 chars
+        let label = "\u{6df1}\u{5ea6} \u{1f680}";
+        assert_eq!(label.chars().count(), 4);
+        assert_eq!(text::width(label), 7);
+        let visible = text::truncate(label, bar.width());
+        bar.render(r.out.as_mut(), visible, visible);
+        let s = buf_of(&buf);
+        // 19 - 7 = 12 columns of padding. Counting chars would have written 15
+        // and pushed the label 3 columns past the right edge.
+        assert!(
+            s.contains(&format!("\x1b[2K{}{label}\x1b8", " ".repeat(12))),
+            "{s:?}"
+        );
     }
 
     #[test]
@@ -812,15 +822,13 @@ mod tests {
     fn status_bar_render_truncates_to_width() {
         let bar = StatusBar { rows: 10, cols: 20 }; // width = 19
         let (mut r, buf) = Renderer::with_buffer(false);
-        let visible = truncate_chars(
-            &CacheStats {
-                hit: 32384,
-                miss: 461,
-            }
-            .label(),
-            bar.width(),
-        );
-        bar.render(r.out.as_mut(), &visible, &visible);
+        let label = CacheStats {
+            hit: 32384,
+            miss: 461,
+        }
+        .label();
+        let visible = text::truncate(&label, bar.width());
+        bar.render(r.out.as_mut(), visible, visible);
         let s = buf_of(&buf);
         assert!(
             s.contains("\x1b[10;1H\x1b[2Kcache 98.6% · hit 3\x1b8"),
