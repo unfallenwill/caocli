@@ -13,7 +13,7 @@ use crate::ui::Ui;
 
 /// 参与请求前缀（KVCache）。禁止注入时间、cwd、随机 id 等任何动态内容，
 /// 否则每个请求的前缀都不同，缓存全 miss。
-pub const SYSTEM_PROMPT: &str = "You are caocli, a terminal coding agent. You can run shell commands on the local machine via the Bash tool. Prefer running commands to gather facts before answering. Keep answers concise. Tool routing: use Read to read a file, Edit to modify an existing file, Write to create or fully rewrite a file, and Bash for everything else (running programs, builds, tests, git, directories, bulk text processing). Prefer absolute paths: each Bash call starts a fresh shell, so cd does not persist.";
+pub const SYSTEM_PROMPT: &str = "You are caocli, a terminal coding agent. Prefer running commands to gather facts before answering. Keep answers concise. Tool routing: use Read to read a file, Edit to modify an existing file, Write to create or fully rewrite a file, and Bash for everything else (running programs, builds, tests, git, directories, bulk text processing). Prefer absolute paths: each Bash call starts a fresh shell, so cd does not persist.";
 
 pub struct Agent {
     api: Client,
