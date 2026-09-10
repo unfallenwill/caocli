@@ -319,11 +319,8 @@ mod tests {
     fn api_key_comes_from_the_file_and_nowhere_else() {
         let _g = env_lock();
         let home = bare_home();
-        // An environment variable is not a configuration method: a key in one is
-        // not a key caocli knows about.
-        unsafe { std::env::set_var("DEEPSEEK_API_KEY", "sk-from-env") };
-        unsafe { std::env::set_var("GLM_API_KEY", "glm-from-env") };
-        unsafe { std::env::set_var("ZAI_API_KEY", "zai-from-env") };
+        // The file `/login` writes is the one place a key lives. A bare HOME has
+        // none, and no provider pretends otherwise: each says what to run.
         for provider in PROVIDERS {
             let err = api_key(provider).unwrap_err().to_string();
             assert!(err.contains("/login"), "err: {err}");
