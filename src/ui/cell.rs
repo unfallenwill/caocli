@@ -7,6 +7,7 @@
 
 use crate::image::{self, Note};
 use crate::tools::ask::Question;
+use crate::tools::todo::{self, Status, Todo};
 use crate::types::{Message, Role, Usage};
 
 use std::time::Duration;
@@ -134,6 +135,14 @@ pub enum Cell {
     /// they are read back from the call's own arguments, so a resumed session
     /// shows the questions exactly as the live one did.
     Question(Vec<Question>),
+    /// The todo tool's call: the plan for the work in hand.
+    ///
+    /// A cell of its own rather than a [`Cell::ToolCall`] carrying the raw
+    /// arguments, for the reason the question tool's is: the list is the thing
+    /// the reader is meant to read, and it is read back from the call's own
+    /// arguments, so a resumed session shows the list exactly as it was written
+    /// and not as a copy of it that has to be kept somewhere.
+    Todo(Vec<Todo>),
     /// A tool result. Only a summary is ever rendered, never the full text.
     ToolResult(String),
     /// A dim informational line.
@@ -220,14 +229,22 @@ impl Cell {
     ///
     /// The question tool is the one call whose arguments are what is shown: its
     /// cell is the questions themselves, because a clipped copy of the wire
-    /// format is not something a person can answer. An unreadable call falls back
-    /// to the raw line -- the interpreter answers it with the parse failure, and
-    /// the transcript shows what it was that could not be read.
+    /// format is not something a person can answer. The todo tool is the other:
+    /// its arguments are a list a person is meant to read, and a reader who has
+    /// to parse the wire format to find the plan has not been shown a plan. An
+    /// unreadable call falls back to the raw line -- the interpreter answers it
+    /// with the parse failure, and the transcript shows what it was that could
+    /// not be read.
     pub fn tool_call(name: &str, args: &str) -> Self {
         if name == crate::tools::ask::ASK_NAME
             && let Ok(questions) = crate::tools::ask::parse(args)
         {
             return Cell::Question(questions);
+        }
+        if name == crate::tools::TODO_NAME
+            && let Ok(todos) = todo::parse(args)
+        {
+            return Cell::Todo(todos);
         }
         Cell::ToolCall {
             name: name.to_owned(),
@@ -261,7 +278,7 @@ impl Cell {
             // rule is painted in the thinking's own style, not a second one: it is
             // part of the block, and one block is one style run.
             Cell::Reasoning(_) => Some(Gutter::new("┆ ", "┆ ", Style::Reasoning)),
-            Cell::ToolCall { .. } | Cell::Approval { .. } | Cell::Question(_) => {
+            Cell::ToolCall { .. } | Cell::Approval { .. } | Cell::Question(_) | Cell::Todo(_) => {
                 Some(Gutter::new("▸ ", "  ", Style::Yellow))
             }
             Cell::ToolResult(_) => Some(Gutter::new("· ", "  ", Style::Dim)),
@@ -323,6 +340,7 @@ impl Cell {
                 format!("{name} {hint} — run it? [y/N] "),
             )],
             Cell::Question(questions) => question_spans(questions),
+            Cell::Todo(todos) => todo_spans(todos),
         }
     }
 
@@ -338,7 +356,7 @@ impl Cell {
             Cell::Reasoning(_) | Cell::Content(_) => prev_is_text_block,
             // A tool call is announced on a line of its own, and a replayed user
             // line is set off from whatever preceded it.
-            Cell::ToolCall { .. } | Cell::User { .. } | Cell::Question(_) => true,
+            Cell::ToolCall { .. } | Cell::User { .. } | Cell::Question(_) | Cell::Todo(_) => true,
             _ => false,
         }
     }
@@ -481,6 +499,63 @@ fn diff_lines(name: &str, args: &str) -> Vec<DiffLine> {
 /// much of it there is, which is as much as the message says.
 fn image_line(image: &Note) -> String {
     format!("[image {} · {} bytes]", image.format, image.bytes)
+}
+
+/// The todo tool's cell: how far the list has got, then the list.
+///
+/// The head is the same line the model is answered with, so what the reader is
+/// shown and what the model was told cannot disagree about the same list.
+fn todo_spans(todos: &[Todo]) -> Vec<Span> {
+    let mut spans = vec![Span::new(
+        Style::Yellow,
+        format!("{} {}", crate::tools::TODO_NAME, todo::summary(todos)),
+    )];
+    spans.extend(todo_item_spans(todos));
+    spans
+}
+
+/// The mark that opens a task's line: the three states a reader scans the column
+/// for.
+///
+/// One mark and one column each, so that the words of every task start in the
+/// same column whatever state it is in -- which is the whole of how a list of
+/// twenty lines is read at a glance.
+fn todo_mark(status: Status) -> &'static str {
+    match status {
+        Status::Pending => "☐",
+        Status::InProgress => "▸",
+        Status::Completed => "✔",
+    }
+}
+
+/// What a task's line is painted in.
+///
+/// The task in hand is the one painted with attention and the finished ones are
+/// faded; what is not started yet is left plain, because it is the list's own
+/// reading matter rather than a note about the list.
+fn todo_style(status: Status) -> Style {
+    match status {
+        Status::Pending => Style::Plain,
+        Status::InProgress => Style::Yellow,
+        Status::Completed => Style::Dim,
+    }
+}
+
+/// One line per task, in the order the model wrote them.
+///
+/// Shared by the transcript's cell and the block the screen keeps in view, so
+/// that the same list cannot be drawn two different ways depending on where it
+/// is being read.
+pub fn todo_item_spans(todos: &[Todo]) -> Vec<Span> {
+    todos
+        .iter()
+        .map(|todo| {
+            Span::new(
+                todo_style(todo.status),
+                format!("\n{} {}", todo_mark(todo.status), todo.content),
+            )
+        })
+        .collect()
 }
 
 /// One-line summary of a tool result: its first line and how much text came
@@ -1050,6 +1125,88 @@ mod tests {
         assert!(matches!(cell, Cell::ToolCall { .. }), "was {cell:?}");
     }
 
+    /// The todo tool's cell is read back out of the call's own arguments, so a
+    /// resumed session shows the list exactly as it was written -- which is also
+    /// what lets the list be a fold of the log rather than a second thing to keep
+    /// in step with it.
+    #[test]
+    fn replay_of_a_todo_call_is_the_same_list() {
+        let args = r#"{"todos":[{"content":"Run the gates","status":"in_progress"}]}"#;
+        let cells = from_messages(&[
+            assistant(None, None, Some(vec![call("TodoWrite", args)])),
+            Message::tool("call_1", "todo list updated (0/1 done)"),
+        ]);
+        assert_eq!(
+            cells,
+            vec![
+                Cell::tool_call("TodoWrite", args),
+                Cell::ToolResult("todo list updated (0/1 done)".into()),
+            ]
+        );
+        assert!(matches!(cells[0], Cell::Todo(_)));
+    }
+
+    #[test]
+    fn the_todo_tool_shows_the_list_and_not_its_arguments() {
+        let cell = Cell::tool_call(
+            "TodoWrite",
+            &serde_json::json!({"todos": [
+                {"content": "Add the parse function", "status": "completed"},
+                {"content": "Draw the cell", "status": "in_progress"},
+                {"content": "Run the gates"}
+            ]})
+            .to_string(),
+        );
+        let Cell::Todo(todos) = &cell else {
+            panic!("the list is the cell, not {cell:?}");
+        };
+        assert_eq!(todos.len(), 3);
+        assert_eq!(
+            cell.spans(),
+            vec![
+                // The head is the same string the model was answered with.
+                Span::new(Style::Yellow, "TodoWrite 1/3 done"),
+                Span::new(Style::Dim, "\n✔ Add the parse function"),
+                Span::new(Style::Yellow, "\n▸ Draw the cell"),
+                // Not started yet is plain: it is the list's reading matter, not a
+                // note about the list.
+                Span::new(Style::Plain, "\n☐ Run the gates"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cleared_list_is_a_cell_with_nothing_under_it() {
+        let cell = Cell::tool_call("TodoWrite", r#"{"todos":[]}"#);
+        assert_eq!(
+            cell.spans(),
+            vec![Span::new(Style::Yellow, "TodoWrite list cleared")]
+        );
+    }
+
+    /// Every mark takes one column, and the three states are told apart by them.
+    ///
+    /// The column is the point: a mark that measured two would push its own line's
+    /// words out of the column every other task's words are in, and the column of
+    /// words is the only thing that makes a list of twenty lines scannable.
+    #[test]
+    fn every_task_mark_is_one_column_and_the_states_are_distinct() {
+        let marks = [Status::Pending, Status::InProgress, Status::Completed].map(todo_mark);
+        for mark in marks {
+            assert_eq!(text::width(mark), 1, "{mark:?} takes one column");
+        }
+        let states: std::collections::HashSet<&str> = marks.into_iter().collect();
+        assert_eq!(states.len(), 3, "the three states read differently");
+    }
+
+    #[test]
+    fn arguments_the_todo_tool_cannot_read_are_still_a_call() {
+        // The model is answered with the parse failure; the transcript shows the
+        // call that could not be read rather than a list nobody wrote.
+        let cell = Cell::tool_call("TodoWrite", r#"{"todos":"a plan"}"#);
+        assert!(matches!(cell, Cell::ToolCall { .. }), "was {cell:?}");
+    }
+
     #[test]
     fn styles_map_to_their_escape_sequences() {
         assert_eq!(Style::Plain.code(), "");
@@ -1076,6 +1233,7 @@ mod tests {
                 "AskUserQuestion",
                 r#"{"questions":[{"id":"a","question":"Which?"}]}"#,
             ),
+            Cell::tool_call("TodoWrite", r#"{"todos":[{"content":"Run the gates"}]}"#),
             Cell::ToolResult("ok".into()),
             Cell::Notice("noted".into()),
             Cell::Failure("broken".into()),
