@@ -21,12 +21,13 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style as RStyle};
 use ratatui::text::{Line, Span as RSpan, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use ratatui_textarea::{ScreenCursor, TextArea};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::agent::{Agent, Approve, Interrupt};
+use crate::history;
 use crate::repl;
 use crate::types::{Message, ToolCall, Usage};
 use crate::ui::Front;
@@ -45,6 +46,10 @@ const PINNED_ROWS: u16 = 1 + 3;
 
 /// The whole inline viewport.
 const VIEWPORT_ROWS: u16 = LIVE_ROWS + PINNED_ROWS;
+
+/// How many command rows the picker shows at once. It draws over the bottom of
+/// the live area, so it has to leave the transcript somewhere to live.
+const PICKER_ROWS: usize = 6;
 
 /// How many lines one commit may push into scrollback at a time. Asking a
 /// terminal to scroll further than it has rows is not something it can do, so a
@@ -241,6 +246,22 @@ struct State {
     textarea: TextArea<'static>,
     /// Whether a turn is running, which the status line reports.
     working: bool,
+    /// The command picker, while what is in the box is a command still being
+    /// named.
+    picker: Option<Picker>,
+    /// Submitted lines, oldest first.
+    history: Vec<String>,
+    /// Where the user is browsing the history from, if they are.
+    browsing: Option<usize>,
+    /// What was in the box before browsing started, so that stepping past the
+    /// newest entry gives it back.
+    draft: String,
+}
+
+/// The command picker: what matched, and which one is highlighted.
+struct Picker {
+    matches: Vec<&'static repl::Command>,
+    selected: usize,
 }
 
 impl Default for State {
@@ -253,6 +274,10 @@ impl Default for State {
             reply: None,
             textarea: input_box(),
             working: false,
+            picker: None,
+            history: Vec::new(),
+            browsing: None,
+            draft: String::new(),
         }
     }
 }
@@ -410,11 +435,180 @@ impl State {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } if self.textarea.is_empty() => Submitted::Exit,
+            // Up and Down mean the picker while it is open and the history
+            // otherwise: the picker is only open while a command is being named,
+            // so the two never compete for the same keystroke.
+            KeyEvent {
+                code: KeyCode::Up, ..
+            } => {
+                self.up();
+                Submitted::Nothing
+            }
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } => {
+                self.down();
+                Submitted::Nothing
+            }
+            KeyEvent {
+                code: KeyCode::Tab, ..
+            } => {
+                self.complete();
+                Submitted::Nothing
+            }
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => {
+                self.picker = None;
+                Submitted::Nothing
+            }
             _ => {
                 self.textarea.input(Event::Key(key));
+                self.refresh_picker();
                 Submitted::Nothing
             }
         }
+    }
+
+    /// What is in the box.
+    fn text(&self) -> String {
+        self.textarea.lines().join("\n")
+    }
+
+    /// Replace what is in the box, leaving the cursor after it.
+    fn set_text(&mut self, text: &str) {
+        let mut box_ = input_box();
+        if !text.is_empty() {
+            box_.insert_str(text);
+        }
+        self.textarea = box_;
+    }
+
+    /// Recompute what the picker offers for what is in the box, keeping the
+    /// highlight on the same command while it is still among the matches.
+    fn refresh_picker(&mut self) {
+        let matches = repl::completions(&self.text());
+        if matches.is_empty() {
+            self.picker = None;
+            return;
+        }
+        let previous = self
+            .picker
+            .as_ref()
+            .and_then(|p| p.matches.get(p.selected))
+            .map(|c| c.name);
+        let selected = previous
+            .and_then(|name| matches.iter().position(|c| c.name == name))
+            .unwrap_or(0);
+        self.picker = Some(Picker { matches, selected });
+    }
+
+    /// Up: the previous command, or the previous line typed.
+    fn up(&mut self) {
+        if let Some(picker) = &mut self.picker {
+            let last = picker.matches.len() - 1;
+            picker.selected = if picker.selected == 0 {
+                last
+            } else {
+                picker.selected - 1
+            };
+            return;
+        }
+        self.browse(-1);
+    }
+
+    /// Down: the next command, or the next line typed.
+    fn down(&mut self) {
+        if let Some(picker) = &mut self.picker {
+            picker.selected = (picker.selected + 1) % picker.matches.len();
+            return;
+        }
+        self.browse(1);
+    }
+
+    /// Step through the history. `-1` is older and `+1` newer; stepping past the
+    /// newest entry returns what was being typed before browsing started.
+    ///
+    /// Browsing closes the picker: a recalled line may well be a command, and
+    /// letting the picker open would take the very keys being used to browse.
+    fn browse(&mut self, step: isize) {
+        if self.history.is_empty() {
+            return;
+        }
+        let next = match self.browsing {
+            None if step < 0 => {
+                self.draft = self.text();
+                Some(self.history.len() - 1)
+            }
+            // Already showing the draft, and there is nothing newer to show.
+            None => None,
+            Some(0) if step < 0 => Some(0),
+            Some(at) if step > 0 && at + 1 >= self.history.len() => None,
+            Some(at) => Some(at.checked_add_signed(step).unwrap_or(at)),
+        };
+        self.browsing = next;
+        let text = match next {
+            Some(at) => self.history[at].clone(),
+            None => std::mem::take(&mut self.draft),
+        };
+        self.picker = None;
+        self.set_text(&text);
+    }
+
+    /// Tab: put the highlighted command in the box without running it, since an
+    /// argument may still be wanted.
+    fn complete(&mut self) {
+        let Some(picker) = self.picker.take() else {
+            return;
+        };
+        let Some(command) = picker.matches.get(picker.selected) else {
+            return;
+        };
+        self.set_text(command.name);
+    }
+
+    /// Record a submitted line. Repeating the previous one is not recorded
+    /// again: it is noise when stepping back through the history.
+    fn remember(&mut self, line: &str) {
+        if line.is_empty() || self.history.last().is_some_and(|last| last == line) {
+            return;
+        }
+        self.history.push(line.to_owned());
+        let excess = self.history.len().saturating_sub(history::MAX_ENTRIES);
+        if excess > 0 {
+            self.history.drain(..excess);
+        }
+    }
+
+    /// The picker as it is drawn: one row per command, the highlighted one
+    /// reversed.
+    fn picker_lines(&self) -> Vec<Line<'static>> {
+        let Some(picker) = &self.picker else {
+            return Vec::new();
+        };
+        picker
+            .matches
+            .iter()
+            .enumerate()
+            .map(|(i, command)| {
+                let selected = i == picker.selected;
+                let name = if selected {
+                    RStyle::new().add_modifier(Modifier::REVERSED)
+                } else {
+                    RStyle::new()
+                };
+                let description = if selected {
+                    RStyle::new().add_modifier(Modifier::REVERSED)
+                } else {
+                    RStyle::new().add_modifier(Modifier::DIM)
+                };
+                Line::from(vec![
+                    RSpan::styled(format!(" {:<10}", command.name), name),
+                    RSpan::styled(format!(" {}", command.description), description),
+                ])
+            })
+            .collect()
     }
 
     /// Handle a key while a turn is running: only the cancel key does anything,
@@ -431,8 +625,11 @@ impl State {
 
     /// Take the submitted line out of the box, leaving it empty for the next one.
     fn take_line(&mut self) -> String {
-        let line = self.textarea.lines().join("\n");
+        let line = self.text();
         self.textarea = input_box();
+        self.picker = None;
+        self.browsing = None;
+        self.draft.clear();
         line
     }
 
@@ -537,6 +734,9 @@ impl<B: Backend> Screen<B> {
         let live = Text::from(lines);
         let status = self.state.status_line(width);
         let cursor = self.state.textarea.screen_cursor();
+        // The picker draws over the bottom of the live area rather than beside
+        // it: it belongs to the line being typed, which is what it sits above.
+        let picker = self.state.picker_lines();
 
         self.terminal.draw(|frame| {
             let rows = Layout::vertical([
@@ -546,6 +746,19 @@ impl<B: Backend> Screen<B> {
             ])
             .split(frame.area());
             frame.render_widget(Paragraph::new(live).scroll((scroll, 0)), rows[0]);
+            if !picker.is_empty() {
+                let height = picker.len().min(PICKER_ROWS) as u16;
+                let area = Rect {
+                    x: rows[0].x,
+                    y: rows[0].bottom().saturating_sub(height),
+                    width: rows[0].width,
+                    height,
+                };
+                // Cleared first: a shorter list must not leave the tail of a
+                // longer one behind it.
+                frame.render_widget(Clear, area);
+                frame.render_widget(Paragraph::new(Text::from(picker)), area);
+            }
             frame.render_widget(Paragraph::new(status), rows[1]);
             frame.render_widget(&self.state.textarea, rows[2]);
             place_cursor(frame, rows[2], cursor);
@@ -753,6 +966,8 @@ pub async fn run(
         Ok(screen) => screen,
         Err(_) => return Ok(false),
     };
+    let history_path = crate::config::history_file()?;
+    screen.state.history = history::load(&history_path);
     screen.state.status.set_model(&agent.session.meta.model);
     screen.state.pending.push(Cell::Notice(banner.to_owned()));
     screen.state.pending.extend(cell::from_messages(history));
@@ -784,6 +999,7 @@ pub async fn run(
         if line.is_empty() {
             break Ok(());
         }
+        screen.state.remember(&line);
 
         // A turn: it races against the keyboard, so Ctrl-C can reach it.
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -848,6 +1064,11 @@ pub async fn run(
     };
 
     screen.leave()?;
+    // Written on the way out rather than per line: the file is small, and a
+    // rewrite per keystroke would be work for nothing.
+    if let Err(e) = history::save(&history_path, &screen.state.history) {
+        screen.state.pending.push(Cell::Failure(format!("{e:#}")));
+    }
     result?;
     Ok(true)
 }
@@ -1177,6 +1398,180 @@ mod tests {
         let before = all_rows(&screen);
         screen.commit().unwrap();
         assert_eq!(all_rows(&screen), before);
+    }
+
+    fn press(state: &mut State, code: KeyCode) -> Submitted {
+        state.key(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+    }
+
+    fn type_in(state: &mut State, text: &str) {
+        for c in text.chars() {
+            press(state, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn a_slash_opens_the_picker_and_a_space_closes_it() {
+        let mut screen = State::default();
+        assert!(screen.picker.is_none(), "nothing typed, nothing to offer");
+        type_in(&mut screen, "/res");
+        let picker = screen.picker.as_ref().expect("a command is being named");
+        assert_eq!(
+            picker.matches.iter().map(|c| c.name).collect::<Vec<_>>(),
+            vec!["/resume"]
+        );
+        // A space means the rest is an argument, not part of the name.
+        type_in(&mut screen, " 2026");
+        assert!(screen.picker.is_none());
+    }
+
+    #[test]
+    fn the_highlight_wraps_in_both_directions() {
+        let mut screen = State::default();
+        type_in(&mut screen, "/");
+        let count = screen.picker.as_ref().unwrap().matches.len();
+        assert!(count > 1, "the bare slash offers every command");
+        assert_eq!(screen.picker.as_ref().unwrap().selected, 0);
+        press(&mut screen, KeyCode::Up);
+        assert_eq!(
+            screen.picker.as_ref().unwrap().selected,
+            count - 1,
+            "up from the first reaches the last"
+        );
+        press(&mut screen, KeyCode::Down);
+        assert_eq!(screen.picker.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn tab_puts_the_highlighted_command_in_the_box_without_running_it() {
+        let mut screen = State::default();
+        type_in(&mut screen, "/res");
+        assert!(matches!(
+            press(&mut screen, KeyCode::Tab),
+            Submitted::Nothing
+        ));
+        assert_eq!(screen.text(), "/resume");
+        assert!(screen.picker.is_none(), "it has been chosen");
+        // And it is not submitted: an argument may still be wanted.
+        assert!(!screen.history.iter().any(|h| h == "/resume"));
+    }
+
+    #[test]
+    fn escape_dismisses_the_picker_without_touching_the_line() {
+        let mut screen = State::default();
+        type_in(&mut screen, "/s");
+        press(&mut screen, KeyCode::Esc);
+        assert!(screen.picker.is_none());
+        assert_eq!(screen.text(), "/s", "what was typed is kept");
+    }
+
+    #[test]
+    fn up_and_down_reach_the_history_once_the_picker_is_closed() {
+        // The two never compete: the picker is only open while a command is
+        // being named, and browsing closes it.
+        let mut screen = State::default();
+        screen.remember("first thing");
+        screen.remember("second thing");
+        press(&mut screen, KeyCode::Up);
+        assert_eq!(screen.text(), "second thing", "the most recent first");
+        press(&mut screen, KeyCode::Up);
+        assert_eq!(screen.text(), "first thing");
+        press(&mut screen, KeyCode::Up);
+        assert_eq!(screen.text(), "first thing", "the oldest is the end");
+        press(&mut screen, KeyCode::Down);
+        assert_eq!(screen.text(), "second thing");
+        press(&mut screen, KeyCode::Down);
+        assert_eq!(screen.text(), "", "past the newest is the empty draft");
+    }
+
+    #[test]
+    fn browsing_gives_back_what_was_being_typed() {
+        let mut screen = State::default();
+        screen.remember("old line");
+        type_in(&mut screen, "half a thought");
+        press(&mut screen, KeyCode::Up);
+        assert_eq!(screen.text(), "old line");
+        press(&mut screen, KeyCode::Down);
+        assert_eq!(screen.text(), "half a thought", "the draft came back");
+    }
+
+    #[test]
+    fn browsing_an_empty_history_does_nothing() {
+        let mut screen = State::default();
+        press(&mut screen, KeyCode::Up);
+        assert_eq!(screen.text(), "");
+        assert!(screen.browsing.is_none());
+    }
+
+    #[test]
+    fn a_recalled_command_does_not_open_the_picker() {
+        // It would take the very keys being used to browse.
+        let mut screen = State::default();
+        screen.remember("/help");
+        press(&mut screen, KeyCode::Up);
+        assert_eq!(screen.text(), "/help");
+        assert!(screen.picker.is_none());
+        press(&mut screen, KeyCode::Up);
+        assert_eq!(screen.text(), "/help", "still browsing, not completing");
+    }
+
+    #[test]
+    fn repeating_a_line_is_not_recorded_twice() {
+        let mut screen = State::default();
+        screen.remember("same");
+        screen.remember("same");
+        screen.remember("other");
+        screen.remember("same");
+        assert_eq!(screen.history, vec!["same", "other", "same"]);
+        screen.remember("");
+        assert_eq!(screen.history.len(), 3, "an empty line is not a line");
+    }
+
+    #[test]
+    fn the_history_keeps_only_the_most_recent_entries() {
+        let mut screen = State::default();
+        for i in 0..(history::MAX_ENTRIES + 5) {
+            screen.remember(&format!("line {i}"));
+        }
+        assert_eq!(screen.history.len(), history::MAX_ENTRIES);
+        assert_eq!(screen.history[0], "line 5", "the oldest went first");
+    }
+
+    #[test]
+    fn submitting_empties_the_box_and_the_browsing_state() {
+        let mut screen = State::default();
+        screen.remember("earlier");
+        press(&mut screen, KeyCode::Up);
+        assert_eq!(screen.text(), "earlier");
+        assert_eq!(screen.take_line(), "earlier");
+        assert!(screen.text().is_empty());
+        assert!(screen.browsing.is_none());
+        assert!(screen.draft.is_empty());
+    }
+
+    #[test]
+    fn the_picker_is_drawn_over_the_live_area_with_one_row_highlighted() {
+        let mut screen = screen_for_test(40, 20);
+        type_in(&mut screen.state, "/");
+        screen.draw().unwrap();
+        let rows = all_rows(&screen);
+        let shows = |needle: &str| {
+            let at = rows.iter().position(|r| r.contains(needle));
+            at.expect("the picker was drawn")
+        };
+        let help = shows("/help");
+        let resume = shows("/resume");
+        assert_eq!(resume, help + 3, "the whole list, in table order");
+        // The first entry is highlighted, and only it.
+        let selected = screen
+            .terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .filter(|c| c.modifier.contains(Modifier::REVERSED))
+            .count();
+        assert!(selected > 0, "something is highlighted");
     }
 
     #[test]

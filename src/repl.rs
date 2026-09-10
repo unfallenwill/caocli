@@ -35,7 +35,7 @@ pub async fn handle(
 ) -> Result<Outcome> {
     match line {
         "/exit" | "/quit" | "/q" => return Ok(Outcome::Exit),
-        "/help" => ui.info(HELP),
+        "/help" => ui.info(&help()),
         "/sessions" => {
             for s in session::list(sdir)? {
                 ui.info(&format!(
@@ -82,10 +82,78 @@ pub async fn handle(
     Ok(Outcome::Continue)
 }
 
-/// The `/help` text. It is a notice like any other, so it reaches the screen
-/// through the front end rather than straight to stdout -- which the interactive
-/// front end owns.
-pub const HELP: &str = "Commands:\n  /exit /quit /q   quit\n  /new             start a new session\n  /sessions        list sessions\n  /resume <id>     switch to a specific session\nInput:\n  Enter            submit\n  Ctrl-J           newline (multi-line input)\nStartup flags:\n  -c / --continue  continue the most recent session\n  --resume <id>    resume a specific session\n  --provider deepseek|glm\n  --effort low|high|max --model <id>\n  -p \"prompt\"      run once and exit";
+/// One slash command, as the picker and the help text both need it.
+pub struct Command {
+    pub name: &'static str,
+    /// One line, shown beside the name by the picker.
+    pub description: &'static str,
+}
+
+/// The commands, in the order the picker lists them.
+///
+/// This is the single source: the help text and the completion list are both
+/// built from it, so a command cannot be dispatched but undocumented, or
+/// documented but not dispatched.
+pub const COMMANDS: &[Command] = &[
+    Command {
+        name: "/help",
+        description: "show this",
+    },
+    Command {
+        name: "/new",
+        description: "start a new session",
+    },
+    Command {
+        name: "/sessions",
+        description: "list sessions",
+    },
+    Command {
+        name: "/resume",
+        description: "switch to a session by its id",
+    },
+    Command {
+        name: "/exit",
+        description: "quit",
+    },
+    Command {
+        name: "/quit",
+        description: "quit",
+    },
+    Command {
+        name: "/q",
+        description: "quit",
+    },
+];
+
+/// The commands whose name matches what has been typed so far.
+///
+/// Empty unless the line is a command still being named: once there is a space
+/// the rest is an argument, and an empty line is not a command at all. The
+/// caller gets the same list whether it filters one command or all of them.
+pub fn completions(input: &str) -> Vec<&'static Command> {
+    if !input.starts_with('/') || input.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+    COMMANDS
+        .iter()
+        .filter(|c| c.name.starts_with(input))
+        .collect()
+}
+
+/// The keys the prompt accepts, and the startup flags. Separate from the table
+/// above because these are not commands.
+const INPUT_AND_FLAGS: &str = "Input:\n  Enter            submit\n  Ctrl-J           newline (multi-line input)\n  Tab              complete a command\n  Up / Down        pick a command, or browse history\nStartup flags:\n  -c / --continue  continue the most recent session\n  --resume <id>    resume a specific session\n  --provider deepseek|glm\n  --effort low|high|max --model <id>\n  -p \"prompt\"      run once and exit";
+
+/// The `/help` text, built from the command table so the two cannot drift.
+pub fn help() -> String {
+    let mut out = String::from("Commands:");
+    for c in COMMANDS {
+        out.push_str(&format!("\n  {:<15} {}", c.name, c.description));
+    }
+    out.push('\n');
+    out.push_str(INPUT_AND_FLAGS);
+    out
+}
 
 #[cfg(test)]
 mod tests {
@@ -215,7 +283,7 @@ mod tests {
             submit(&mut agent, &mut ui, &dir, "/help").await,
             Outcome::Continue
         );
-        assert_eq!(ui.info, vec![HELP.to_string()]);
+        assert_eq!(ui.info, vec![help()]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -331,25 +399,36 @@ mod tests {
     }
 
     #[test]
-    fn help_lists_every_command_handle_dispatches() {
-        // A command that is dispatched but undocumented, or documented but not
-        // dispatched, is a defect in either direction.
-        for documented in ["/exit", "/quit", "/q", "/new", "/sessions", "/resume"] {
-            assert!(HELP.contains(documented), "{documented} is undocumented");
+    fn help_lists_every_command() {
+        // Structural now: the help text is built from the table, so this is the
+        // one place that could still drift -- a command in the table that the
+        // help text dropped.
+        let text = help();
+        for command in COMMANDS {
+            assert!(
+                text.contains(command.name),
+                "{} is undocumented",
+                command.name
+            );
+            assert!(
+                text.contains(command.description),
+                "{} has no description",
+                command.name
+            );
         }
     }
 
     #[test]
     fn help_lists_the_startup_flags_and_input_keys() {
         for expected in [
-            "/resume <id>",
             "-c / --continue",
             "--provider deepseek|glm",
             "--effort low|high|max",
             "-p \"prompt\"",
             "Ctrl-J",
+            "Tab",
         ] {
-            assert!(HELP.contains(expected), "missing {expected:?}");
+            assert!(help().contains(expected), "missing {expected:?}");
         }
     }
 
@@ -357,8 +436,39 @@ mod tests {
     fn help_is_a_single_notice() {
         // It reaches the screen through info(), which writes one cell: a trailing
         // newline would show up as a blank row.
-        assert!(!HELP.ends_with('\n'));
-        assert!(HELP.contains('\n'), "the commands are one per line");
+        assert!(!help().ends_with('\n'));
+        assert!(help().contains('\n'), "the commands are one per line");
+    }
+
+    #[test]
+    fn an_empty_line_offers_no_commands() {
+        assert!(completions("").is_empty());
+        assert!(completions("hello").is_empty());
+    }
+
+    #[test]
+    fn a_command_prefix_narrows_to_matching_names() {
+        assert_eq!(names(completions("/res")), vec!["/resume"]);
+        assert_eq!(names(completions("/s")), vec!["/sessions"]);
+        // a bare slash offers everything, in table order
+        assert_eq!(completions("/").len(), COMMANDS.len());
+    }
+
+    #[test]
+    fn a_line_with_an_argument_is_no_longer_a_name() {
+        // "/resume 2026" is the command plus its argument: completing it again
+        // would fight what the user is typing.
+        assert!(completions("/resume 2026").is_empty());
+        assert!(completions("/ ").is_empty());
+    }
+
+    #[test]
+    fn a_command_that_matches_nothing_offers_nothing() {
+        assert!(completions("/nope").is_empty());
+    }
+
+    fn names(commands: Vec<&'static Command>) -> Vec<&'static str> {
+        commands.into_iter().map(|c| c.name).collect()
     }
 
     #[test]

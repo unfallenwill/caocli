@@ -2,6 +2,7 @@ mod agent;
 mod api;
 mod cli;
 mod config;
+mod history;
 mod machine;
 mod repl;
 mod session;
