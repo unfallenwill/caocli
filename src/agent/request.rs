@@ -58,3 +58,6 @@ pub fn build_request(
         ),
     }
 }
+
+#[cfg(test)]
+mod tests;

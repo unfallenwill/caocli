@@ -377,9 +377,9 @@ mod tests {
     use super::*;
     use crate::api::Client;
     use crate::session::SessionMeta;
-    use crate::types::{Message, ToolCall, Usage};
+    use crate::types::{Message, Usage};
     use crate::ui::Renderer;
-    use crate::ui::Verdict;
+    use crate::ui::doubles::{Answer, NoCancel};
 
     /// A front end that records what it was told, so the line handling can be
     /// tested without a terminal.
@@ -439,25 +439,6 @@ mod tests {
         }
     }
 
-    /// Never cancels: no command path below needs a cancel.
-    struct Silent;
-    impl Cancel for Silent {
-        fn wait(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
-            Box::pin(std::future::pending())
-        }
-    }
-
-    /// Never answers: only reached if a tool call gets that far.
-    struct Deny;
-    impl Approve for Deny {
-        fn approve(
-            &mut self,
-            _call: &ToolCall,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Verdict> + '_>> {
-            Box::pin(async { Verdict::Denied })
-        }
-    }
-
     fn tmpdir(tag: &str) -> std::path::PathBuf {
         static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let d = std::env::temp_dir().join(format!(
@@ -495,7 +476,7 @@ mod tests {
         sdir: &std::path::Path,
         line: &str,
     ) -> Outcome {
-        handle(agent, ui, sdir, line, &mut Silent, &mut Deny)
+        handle(agent, ui, sdir, line, &mut NoCancel, &mut Answer::denies())
             .await
             .unwrap()
     }

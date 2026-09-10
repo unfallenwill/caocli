@@ -1,0 +1,123 @@
+//! The request the interpreter sends: the system prompt, the history as stored,
+//! the tools, and the provider's profile — pure in `(provider, meta, history)`.
+//!
+//! This is the file that the prefix cache is about: the same three inputs must
+//! produce the same bytes, which is why one test here freezes the whole request
+//! as a literal.
+
+use crate::provider;
+use crate::session::SessionMeta;
+use crate::types::{Message, Role, ToolCall};
+
+use super::{SYSTEM_PROMPT, build_request};
+
+/// A meta as a session file holds it, with a provider and a stored effort.
+fn test_meta() -> SessionMeta {
+    SessionMeta {
+        provider: Some("deepseek".into()),
+        model: "deepseek-v4-flash".into(),
+        reasoning_effort: Some("high".into()),
+    }
+}
+
+#[test]
+fn system_prompt_is_stable_constant() {
+    // Guard against someone injecting dynamic content into the system prompt
+    // and breaking KVCache in the future
+    assert!(!SYSTEM_PROMPT.contains("now"));
+    assert!(!SYSTEM_PROMPT.contains("cwd"));
+}
+
+#[test]
+fn build_request_prepends_system_and_keeps_history_order() {
+    let history = vec![Message::user("q1")];
+    let request = build_request(&provider::DEEPSEEK, &test_meta(), &history);
+    assert_eq!(request.messages.len(), 2);
+    assert_eq!(request.messages[0].role, Role::System);
+    assert_eq!(request.messages[0].content.as_deref(), Some(SYSTEM_PROMPT));
+    assert_eq!(request.messages[1], Message::user("q1"));
+    assert_eq!(request.tools.as_ref().unwrap()[0].function.name, "Bash");
+    assert_eq!(request.tool_choice.as_deref(), Some("auto"));
+}
+
+#[test]
+fn build_request_defaults_missing_effort_to_max() {
+    // Even when a session's meta has no effort, it must be pinned to the
+    // provider's default rather than left to each backend's own.
+    let mut meta = test_meta();
+    meta.reasoning_effort = None;
+    let request = build_request(&provider::DEEPSEEK, &meta, &[]);
+    assert_eq!(request.reasoning_effort.as_deref(), Some("max"));
+}
+
+/// A history with a closed tool-call window: system, a call, its result, and
+/// a next user line — every message shape the request carries.
+fn freeze_history() -> Vec<Message> {
+    vec![
+        Message::user("freeze"),
+        Message {
+            role: Role::Assistant,
+            content: Some("".into()),
+            reasoning_content: Some("think".into()),
+            tool_calls: Some(vec![ToolCall {
+                id: "call_f1".into(),
+                r#type: "function".into(),
+                function: crate::types::ToolCallFunction {
+                    name: "Bash".into(),
+                    arguments: r#"{"command":"true"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+        },
+        Message::tool("call_f1", "exit_code: 0"),
+        Message::user("again"),
+    ]
+}
+
+/// The request prefix, frozen. The backend's KVCache matches on bytes: any
+/// change to the system prompt, the tool definitions, the field names or a
+/// provider profile changes every request this program sends and voids the
+/// cache of every session that ran before it. Some of those changes are
+/// right and some are accidents — this test turns each one into a decision,
+/// by failing until the literal below is updated with it.
+#[test]
+fn the_request_prefix_is_frozen() {
+    let history = freeze_history();
+    let deepseek = SessionMeta {
+        provider: Some("deepseek".into()),
+        model: "deepseek-flash".into(),
+        reasoning_effort: Some("high".into()),
+    };
+    assert_eq!(
+        serde_json::to_string(&build_request(&provider::DEEPSEEK, &deepseek, &history)).unwrap(),
+        r#"{"model":"deepseek-flash","max_tokens":384000,"messages":[{"role":"system","content":"You are caocli, a coding agent. You and the user share one workspace, and your job is to collaborate with them until their goal is genuinely handled. Keep answers concise. Tool routing: use Read to read a file, Edit to modify an existing file, Write to create or fully rewrite a file, and Bash for everything else (running programs, builds, tests, git, directories, bulk text processing). Prefer absolute paths: each Bash call starts a fresh shell, so cd does not persist."},{"role":"user","content":"freeze"},{"role":"assistant","content":"","reasoning_content":"think","tool_calls":[{"id":"call_f1","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"true\"}"}}]},{"role":"tool","content":"exit_code: 0","tool_call_id":"call_f1"},{"role":"user","content":"again"}],"tools":[{"type":"function","function":{"name":"Bash","description":"Run one bash command on the local machine; returns exit_code, stdout and stderr (returned separately). Every call is a fresh shell: the working directory and environment variables do not persist, so to target a directory write cd /abs/path && ... inside the same command, and prefer absolute paths. Use for: running programs, builds, tests, git, directory operations, bulk text processing. Not for: reading a text file (use Read), modifying an existing file (use Edit), creating or fully rewriting a file (use Write); do not substitute cat/sed -i/tee for them. stdout and stderr are each truncated at 10240 bytes and marked [truncated]; narrow the output yourself with head/tail/grep/wc. Do not run interactive or long-lived commands (vim, top, a bare read, etc.): they block until the 120s timeout kills them and the output is lost.","parameters":{"properties":{"command":{"description":"the bash command to run","type":"string"}},"required":["command"],"type":"object"}}},{"type":"function","function":{"name":"Read","description":"Read the full contents of a text file. Confirm the original text with this tool before modifying a file. UTF-8 text only: a directory raises an error, while a binary file is decoded into garbage without raising one. Output over 10240 bytes is truncated on a byte boundary and reported, and a file over 10MB raises an error; in either case read it in pieces with Bash instead, e.g. sed -n '100,200p'.","parameters":{"properties":{"file_path":{"description":"path of the file to read","type":"string"}},"required":["file_path"],"type":"object"}}},{"type":"function","function":{"name":"Edit","description":"Make an exact string replacement in an existing file (old_string -> new_string). Cannot create a new file; use Write to create one or to rewrite a whole file. old_string must match the file content character for character, including indentation, tab-versus-space differences and line endings — one character off is reported as not found, so use Read to check the original when the indentation is uncertain. old_string must occur exactly once in the file (zero or multiple occurrences is an error); one call replaces one occurrence, so make several calls for several edits. old_string must not be empty; an empty new_string deletes the matched text.","parameters":{"properties":{"file_path":{"description":"path of the file to modify","type":"string"},"new_string":{"description":"the replacement text; an empty string deletes the matched text","type":"string"},"old_string":{"description":"the original text to replace; must occur exactly once in the file","type":"string"}},"required":["file_path","old_string","new_string"],"type":"object"}}},{"type":"function","function":{"name":"Write","description":"Create a file, or overwrite a whole file; missing parent directories are created automatically. An existing file is overwritten completely and unrecoverably, so use Read to check it first; use this only to create a file or rewrite one wholesale, and use Edit for partial changes to an existing file. A content larger than 10MB is rejected.","parameters":{"properties":{"content":{"description":"the full contents to write","type":"string"},"file_path":{"description":"path of the file to write","type":"string"}},"required":["file_path","content"],"type":"object"}}}],"tool_choice":"auto","stream":true,"thinking":{"type":"enabled"},"reasoning_effort":"high"}"#
+    );
+    // The other preset: its own answer ceiling, and the default effort when
+    // the meta carries none (a stored value rides along in `deepseek` above).
+    let zai = SessionMeta {
+        provider: Some("zai-coding-cn".into()),
+        model: "glm-5.3".into(),
+        reasoning_effort: None,
+    };
+    assert_eq!(
+        serde_json::to_string(&build_request(&provider::ZAI_CODING_CN, &zai, &history)).unwrap(),
+        r#"{"model":"glm-5.3","max_tokens":128000,"messages":[{"role":"system","content":"You are caocli, a coding agent. You and the user share one workspace, and your job is to collaborate with them until their goal is genuinely handled. Keep answers concise. Tool routing: use Read to read a file, Edit to modify an existing file, Write to create or fully rewrite a file, and Bash for everything else (running programs, builds, tests, git, directories, bulk text processing). Prefer absolute paths: each Bash call starts a fresh shell, so cd does not persist."},{"role":"user","content":"freeze"},{"role":"assistant","content":"","reasoning_content":"think","tool_calls":[{"id":"call_f1","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"true\"}"}}]},{"role":"tool","content":"exit_code: 0","tool_call_id":"call_f1"},{"role":"user","content":"again"}],"tools":[{"type":"function","function":{"name":"Bash","description":"Run one bash command on the local machine; returns exit_code, stdout and stderr (returned separately). Every call is a fresh shell: the working directory and environment variables do not persist, so to target a directory write cd /abs/path && ... inside the same command, and prefer absolute paths. Use for: running programs, builds, tests, git, directory operations, bulk text processing. Not for: reading a text file (use Read), modifying an existing file (use Edit), creating or fully rewriting a file (use Write); do not substitute cat/sed -i/tee for them. stdout and stderr are each truncated at 10240 bytes and marked [truncated]; narrow the output yourself with head/tail/grep/wc. Do not run interactive or long-lived commands (vim, top, a bare read, etc.): they block until the 120s timeout kills them and the output is lost.","parameters":{"properties":{"command":{"description":"the bash command to run","type":"string"}},"required":["command"],"type":"object"}}},{"type":"function","function":{"name":"Read","description":"Read the full contents of a text file. Confirm the original text with this tool before modifying a file. UTF-8 text only: a directory raises an error, while a binary file is decoded into garbage without raising one. Output over 10240 bytes is truncated on a byte boundary and reported, and a file over 10MB raises an error; in either case read it in pieces with Bash instead, e.g. sed -n '100,200p'.","parameters":{"properties":{"file_path":{"description":"path of the file to read","type":"string"}},"required":["file_path"],"type":"object"}}},{"type":"function","function":{"name":"Edit","description":"Make an exact string replacement in an existing file (old_string -> new_string). Cannot create a new file; use Write to create one or to rewrite a whole file. old_string must match the file content character for character, including indentation, tab-versus-space differences and line endings — one character off is reported as not found, so use Read to check the original when the indentation is uncertain. old_string must occur exactly once in the file (zero or multiple occurrences is an error); one call replaces one occurrence, so make several calls for several edits. old_string must not be empty; an empty new_string deletes the matched text.","parameters":{"properties":{"file_path":{"description":"path of the file to modify","type":"string"},"new_string":{"description":"the replacement text; an empty string deletes the matched text","type":"string"},"old_string":{"description":"the original text to replace; must occur exactly once in the file","type":"string"}},"required":["file_path","old_string","new_string"],"type":"object"}}},{"type":"function","function":{"name":"Write","description":"Create a file, or overwrite a whole file; missing parent directories are created automatically. An existing file is overwritten completely and unrecoverably, so use Read to check it first; use this only to create a file or rewrite one wholesale, and use Edit for partial changes to an existing file. A content larger than 10MB is rejected.","parameters":{"properties":{"content":{"description":"the full contents to write","type":"string"},"file_path":{"description":"path of the file to write","type":"string"}},"required":["file_path","content"],"type":"object"}}}],"tool_choice":"auto","stream":true,"thinking":{"type":"enabled"},"reasoning_effort":"max"}"#
+    );
+}
+
+/// The profile as wire: a provider that does not take the thinking switch
+/// sends no `thinking` field at all, and its own default effort applies when
+/// the meta stores none.
+#[test]
+fn a_provider_that_omits_thinking_sends_no_field() {
+    let mut p = provider::ZAI_CODING_CN;
+    p.send_thinking = false;
+    let meta = SessionMeta {
+        provider: Some("zai-coding-cn".into()),
+        model: "glm-5.3".into(),
+        reasoning_effort: None,
+    };
+    let json = serde_json::to_string(&build_request(&p, &meta, &[])).unwrap();
+    assert!(!json.contains("\"thinking\""), "{json}");
+    assert!(json.contains("\"reasoning_effort\":\"max\""), "{json}");
+}

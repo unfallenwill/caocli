@@ -18,7 +18,7 @@ use super::screen::fullscreen;
 use super::state::SPINNER;
 use super::state::State;
 use super::state::{Scroll, WHEEL_LINES};
-use super::{Menu, menu_for};
+use super::{CtrlC, Menu, menu_for};
 use crate::config;
 use crate::history;
 use crate::session;
@@ -29,7 +29,7 @@ use crate::ui::Verdict;
 use crate::ui::cell::Span;
 use crate::ui::cell::Style;
 use crate::ui::cell::{self, Cell};
-use crate::ui::{Front, Ui};
+use crate::ui::{Cancel, Front, Ui};
 use crossterm::event::Event;
 use crossterm::event::MouseEventKind;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2656,4 +2656,35 @@ fn anything_else_runs_as_a_turn_and_not_as_a_menu() {
     assert_eq!(menu_for("/resume abc123"), None);
     assert_eq!(menu_for("/model glm-4.6"), None);
     assert_eq!(menu_for("/effort low"), None);
+}
+
+/// The cancel source this front end hands the turn is the one it built around
+/// Ctrl-C arriving as a key (raw mode leaves no SIGINT to listen for), and what
+/// it delivers through is a watch. A key that lands between two waits must not
+/// be lost: while a turn runs, this loop is between waits most of the time.
+#[tokio::test]
+async fn a_cancel_between_two_waits_is_not_lost() {
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let mut cancel = CtrlC(cancel_rx);
+
+    // The first wait is polled once and dropped, which is what the end of a
+    // select does with it.
+    let waiting = cancel.wait();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), waiting)
+            .await
+            .is_err(),
+        "nothing was cancelled yet"
+    );
+
+    // The key arrives while nothing is waiting for it.
+    cancel_tx.send(true).unwrap();
+
+    let waiting = cancel.wait();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), waiting)
+            .await
+            .is_ok(),
+        "the cancel must still be seen by the next wait"
+    );
 }

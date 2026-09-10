@@ -22,6 +22,8 @@ mod answers;
 mod banner;
 mod cell;
 mod contract;
+#[cfg(test)]
+pub(crate) mod doubles;
 mod renderer;
 mod status;
 mod status_bar;
