@@ -18,6 +18,7 @@ use super::screen::fullscreen;
 use super::state::SPINNER;
 use super::state::State;
 use super::state::{Scroll, WHEEL_LINES};
+use super::{Menu, menu_for};
 use crate::config;
 use crate::history;
 use crate::session;
@@ -2616,4 +2617,20 @@ fn zz_visual_review_dump() {
         println!("STYLE {y:02} {line}");
         println!("TEXT  {y:02} |{}|", row(&screen, y));
     }
+}
+
+#[test]
+fn a_menu_command_names_its_menu() {
+    assert_eq!(menu_for("/resume"), Some(Menu::Sessions));
+    assert_eq!(menu_for(" /login "), Some(Menu::Login));
+    assert_eq!(menu_for("/model"), Some(Menu::Model));
+}
+
+#[test]
+fn anything_else_runs_as_a_turn_and_not_as_a_menu() {
+    assert_eq!(menu_for("say something"), None);
+    assert_eq!(menu_for("/help"), None);
+    // A menu command with an argument already has what it needs.
+    assert_eq!(menu_for("/resume abc123"), None);
+    assert_eq!(menu_for("/model glm-4.6"), None);
 }

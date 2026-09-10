@@ -222,7 +222,7 @@ pub async fn run(
 /// command to run; `/login` and `/model` are commands whose argument is a row
 /// of a menu. The chosen row is submitted as the very line the plain prompt
 /// would have been given, so the switching itself is unchanged.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Menu {
     /// The sessions there are to switch to.
     Sessions,
