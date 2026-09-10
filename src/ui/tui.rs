@@ -1069,7 +1069,21 @@ impl State {
             KeyEvent {
                 code: KeyCode::Esc, ..
             } => {
-                self.picker = None;
+                // Dismissing the command picker takes its line with it: the line
+                // is the query the list was filtered by, and a lone `/` left
+                // behind glues itself to the next word, which then goes out as
+                // an unknown command instead of as a message. A row list was
+                // asked for in full by a submitted command, so what the box
+                // holds is whatever has been typed since it opened -- a draft,
+                // which dismissing has no claim on.
+                if self
+                    .picker
+                    .take()
+                    .is_some_and(|p| p.kind == Choosing::Command)
+                {
+                    self.textarea = input_box();
+                    self.refresh_placeholder();
+                }
                 Submitted::Nothing
             }
             _ => {
@@ -3286,12 +3300,36 @@ mod tests {
     }
 
     #[test]
-    fn escape_dismisses_the_picker_without_touching_the_line() {
+    fn escape_dismisses_the_command_picker_and_the_line_it_was_filtering() {
         let mut screen = State::default();
         type_in(&mut screen, "/s");
         press(&mut screen, KeyCode::Esc);
         assert!(screen.picker.is_none());
-        assert_eq!(screen.text(), "/s", "what was typed is kept");
+        assert_eq!(
+            screen.text(),
+            "",
+            "the half-typed command goes with the list: a lone `/` left behind \
+             would glue itself to the next word"
+        );
+        assert_eq!(
+            screen.textarea.placeholder_text(),
+            IDLE_PLACEHOLDER,
+            "the box is back to inviting the next message"
+        );
+    }
+
+    #[test]
+    fn escape_while_a_turn_runs_gives_the_queue_line_back() {
+        let mut screen = State::default();
+        screen.begin_turn();
+        type_in(&mut screen, "/s");
+        press(&mut screen, KeyCode::Esc);
+        assert!(screen.picker.is_none());
+        assert_eq!(
+            screen.textarea.placeholder_text(),
+            QUEUE_PLACEHOLDER,
+            "the box still belongs to the turn that is running"
+        );
     }
 
     /// A session as the picker sees it. Its path is never read: the front end is
@@ -3369,6 +3407,12 @@ mod tests {
         assert_eq!(picker.choices.len(), 1);
         press(&mut screen, KeyCode::Esc);
         assert!(screen.picker.is_none(), "escape is how it is dismissed");
+        assert_eq!(
+            screen.text(),
+            "/he",
+            "a row list is not the line's: what was typed since it opened is a \
+             draft, not a query, and dismissing the list has no claim on it"
+        );
     }
 
     #[test]
