@@ -13,7 +13,8 @@ is enough and the test stays offline. Exit code 0 = pass.
 
 With `SMOKE_LIVE=1` and a real key, it goes on to a live turn, which is the only
 way to see the parts that need a model to move: the status line running a clock of
-its own, and the approval gate that asks before a tool runs.
+its own, a line queued behind a running turn and run when it ends, and the
+approval gate that asks before a tool runs.
 """
 
 import codecs
@@ -63,6 +64,11 @@ HELP = "Commands:"  # the first line of what /help commits
 SPINNER = "thinking"
 SPINNER_FRAMES = "·✢✳✶✽✻"
 GATE = "run it? [y/N]"
+
+# The word the queued line asks for and expects back: nonsense, so that what is
+# found on the screen is what was sent and never anything else that happened to
+# be there. It is looked for twice -- as the line, and as the answer to it.
+QUEUED_TOKEN = "zqx7"
 
 # A session with an edit already in it. Resuming it draws the change, which is the
 # replay half of the same cell a live turn produces; the id and the lines are what
@@ -387,10 +393,11 @@ class Terminal:
 
         A running turn repaints the status line on every tick, so a still
         terminal is an idle one -- and this is the signal that says a key can be
-        sent: one pressed during a turn is dropped by design, because a turn is
-        not the place to start composing the next line. A line sent without
-        waiting therefore arrives half-eaten, and the fragment left in the box is
-        what gets submitted.
+        sent: a key pressed during a turn is taken as the next line, so a line
+        sent without waiting arrives half-composed at the prompt and the fragment
+        left in the box is what gets submitted. (It would now be *queued* rather
+        than dropped, which is a different way to be wrong: the assertions below
+        about the prompt would be about a line waiting behind a turn.)
         """
         end = time.time() + timeout
         last = time.time()
@@ -440,7 +447,31 @@ def live(term: "Terminal", home: str) -> bool:
     term.send(f"use the Read tool to read {ROOT}/Cargo.toml\r")
     ok &= term.expect(SPINNER, 15)
     ok &= term.spinner_moved(5)
-    ok &= term.expect("▸ Read", 180)  # the call itself, once the turn gets there
+
+    # A line typed while the turn runs is queued rather than dropped: Enter takes
+    # it out of the box, it is drawn above the status line while it waits, and the
+    # head of the queue runs when the turn ends.
+    #
+    # The queued line is a command, whose answer is the front end's own: `new
+    # session` is proof that it ran, where a model's account of having done
+    # something reads the same whether or not it did. What is asserted first is
+    # the queue's own row -- a line that stayed in the box would be in the box
+    # instead, which is why the row is matched exactly and the box looked at too.
+    term.send("/new\r")
+    if term.until(
+        lambda: any(line.strip() == "› /new" for line in term.screen.lines()), 30
+    ):
+        print("  ✓ the line typed during the turn is drawn in the queue")
+    else:
+        print("  ✗ the line typed during the turn was not queued")
+        ok = False
+    if any("/new" in line for line in term.box_rows()):
+        print("  ✗ the queued line is still sitting in the box")
+        ok = False
+    # The call the turn was asked for, drawn before the queue runs: what is
+    # waiting does not take the turn's place.
+    ok &= term.expect("▸ Read", 180)
+    ok &= term.expect("new session", 180)  # and the queued line ran after it
 
     # The gate: a tool call waits for an answer from the input box, and the
     # answer is a line of text like any other -- the part that cannot be checked
@@ -453,16 +484,45 @@ def live(term: "Terminal", home: str) -> bool:
     # Asked twice, because what is under test is the front end and not the
     # model's willingness to reach for a tool.
     marker = os.path.join(home, "smoke-ran")
+    gated = False
     for attempt in (1, 2):
         term.send(f"Run the shell command `touch {marker}` with the Bash tool, then stop.\r")
         if term.expect(GATE, 120, quiet=attempt > 1):
             term.send("y\r")  # the answer comes out of the box, like any line
-            return ok and term.wait_for_file(marker, 90)
+            gated = term.wait_for_file(marker, 90)
+            break
         print(f"  · no Bash call on attempt {attempt}")
         if not term.quiet(2.0, 60):
             return False
-    print("  ✗ no tool call ever needed approval")
-    return False
+    if not gated:
+        print("  ✗ no tool call ever needed approval")
+        return False
+    ok &= gated
+
+    # Ctrl-C with a line queued behind the turn: the turn stops and the head of
+    # the queue runs. The turn asked for is one that would take a while, and the
+    # cancel key is sent right behind the line -- the model call is in flight, so
+    # the turn cannot have ended on its own, and what is under test is the queue
+    # rather than the model's speed.
+    #
+    # What the queued line was is a prompt, so that running it puts the line in
+    # the transcript: QUEUED_TOKEN is matched twice -- once as the line itself,
+    # once in what the model answers with. A single match would only mean the row
+    # is still waiting in the queue, which is where it was already.
+    term.quiet(2.0, 120)
+    term.send("count from one to a hundred, one number per line\r")
+    ok &= term.expect(SPINNER, 30)
+    term.send(f"say {QUEUED_TOKEN} and nothing else\r")
+    term.send("\x03")
+
+    ok &= term.expect("interrupted (Ctrl-C)", 30)
+    if not term.until(
+        lambda: sum(1 for line in term.screen.lines() if QUEUED_TOKEN in line) >= 2, 180
+    ):
+        print("  ✗ the queued line did not run after the turn was interrupted")
+        return False
+    print("  ✓ the queued line ran after the turn was interrupted")
+    return ok
 
 
 def main() -> int:
@@ -621,7 +681,7 @@ def main() -> int:
             # Leaving: the process ends, and the terminal is handed back -- raw mode
             # off and the alternate screen gone -- rather than left in the state the
             # front end put it in. Sent again while it is not taken, because a key
-            # that arrives during a turn is dropped rather than queued.
+            # that arrives during a turn would be queued behind it instead.
             term.quiet(2.0, 120)
             status = None
             deadline = time.time() + 90
