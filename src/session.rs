@@ -62,6 +62,12 @@ enum Line {
 
 pub struct Session {
     pub id: String,
+    #[allow(dead_code)]
+    // The file this log is appended to. Nothing on the screen reads it any more:
+    // the banner names the session by its id, which is the whole of what the path
+    // said, and `--list` prints the path from the summary it builds itself. It is
+    // kept because a session is its file -- what was written is what it is -- and
+    // the tests that check what was written read it here.
     pub path: PathBuf,
     #[allow(dead_code)]
     // session creation time (epoch seconds), for future list display and export

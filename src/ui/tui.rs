@@ -108,6 +108,79 @@ fn screen_rows(area: Rect, input: u16, queued: u16) -> Rc<[Rect]> {
     .split(area)
 }
 
+/// A window over a list of rows: the run of them it draws, and how many it leaves
+/// behind at each end -- which is also what says whether that end carries a count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Window {
+    /// The run drawn, as the first row and the one after the last.
+    first: usize,
+    last: usize,
+    /// Rows left out above the run, and below it, as the count drawn at that end
+    /// says. Both are zero when there was no room for the counts at all -- the one
+    /// case a cut window is drawn without them.
+    above: usize,
+    below: usize,
+}
+
+/// The window a list of `total` rows is seen through, for a selection at
+/// `selected` and `room` rows to draw it in.
+///
+/// The window follows the selection, so the row being chosen is always one of the
+/// rows drawn: a menu scrolled past its own highlight is a menu that cannot be
+/// answered, because the one row `Enter` is about is the one row the reader cannot
+/// see. The selection sits at the end of the window it last moved into, so the
+/// window moves when the selection leaves it and not before.
+///
+/// A window that is cut says so, which costs a row at each end it is cut at: what
+/// is drawn is the longest run that fits in `room` along with the counts it needs.
+/// A list with room to spare is never counted, and is never cut.
+fn picker_window(total: usize, selected: usize, room: usize) -> Window {
+    let room = room.max(1);
+    let total = total.max(1);
+    let selected = selected.min(total - 1);
+    for shown in (1..=room.min(total)).rev() {
+        // Where the run would sit with the selection at its end, and the furthest
+        // down it can start while still holding the selection. Between them: the
+        // first position whose counts fit is the one drawn, so that a count the
+        // room does not have is given up for a row of the list, which is what the
+        // row would have been spent on anyway.
+        let last = total - shown;
+        for first in selected.saturating_sub(shown - 1)..=last.min(selected) {
+            let end = first + shown;
+            let cut = usize::from(first > 0) + usize::from(end < total);
+            if shown + cut <= room {
+                return Window {
+                    first,
+                    last: end,
+                    above: first,
+                    below: total - end,
+                };
+            }
+        }
+    }
+    // A room too small for a count at each end of a single row -- two rows, with
+    // the selection in the middle of the list. The counts are what give way: the
+    // row `Enter` is about is the one row that cannot.
+    Window {
+        first: selected,
+        last: selected + 1,
+        above: 0,
+        below: 0,
+    }
+}
+
+/// The row that says how many rows a window is not showing, at the end it was cut
+/// at.
+///
+/// A cut window that says nothing is a window that lies about how much there is:
+/// six rows of a menu read as the whole menu, three rows of a queue as the whole
+/// queue. Dim, like everything else that is not the thing being chosen; `lead` is
+/// the marker column the row it stands in for would carry, so that the count lines
+/// up with what it counts.
+fn more_line(lead: &str, n: usize) -> Line<'static> {
+    Line::styled(format!("{lead}… {n} more"), style_of(Style::Dim))
+}
+
 /// The lines one wheel notch moves the window over the transcript: the step a
 /// terminal's own scrollback takes, so a notch here reads like a notch anywhere
 /// else. Not a page -- a notebook's worth of lines per flick of a wheel is a way
@@ -148,6 +221,22 @@ const SECRET_MASK: char = '•';
 /// How many command rows the picker shows at once. It draws over the bottom of the
 /// transcript, so it has to leave the transcript somewhere to live.
 const PICKER_ROWS: usize = 6;
+
+/// The widest a line of the transcript is laid out, however wide the terminal is.
+///
+/// A line of prose is read by running the eye back to its start, and past a certain
+/// width that return trip costs more than the columns it saved: on a 200-column
+/// terminal, an answer set to the full width is a line the reader has to hunt the
+/// start of. 100 columns is about as wide as a line of monospaced text stays
+/// comfortable, and it is wider than the 80-column terminal most of this is read
+/// on -- so the measure only ever shortens a line on the screens that need it.
+const MEASURE: usize = 100;
+
+/// The columns text is laid out in inside a region `width` wide: as wide as the
+/// region, and no wider than [`MEASURE`].
+fn measure(width: usize) -> usize {
+    width.min(MEASURE)
+}
 
 // ------------------------------------------------------------- activity ---
 
@@ -840,7 +929,17 @@ impl State {
             .borders(BOX_BORDERS)
             .border_style(RStyle::new().add_modifier(Modifier::DIM));
         if let Some(title) = self.activity_title(width.saturating_sub(2)) {
-            block = block.title_top(Line::styled(title, style_of(Style::Dim)).right_aligned());
+            // Not dim, unlike the rule it sits on: it is the one thing on this box
+            // that moves, and the only sign that a turn is still running when the
+            // model has gone quiet. A dim indicator on a dim border is the signal
+            // painted out of sight.
+            //
+            // The dim is taken *off* rather than left unset: a title is written on
+            // the border's own cells, and the border's style is patched into them
+            // before the title is, so a title that says nothing about weight is a
+            // dim title. Only a style that removes the modifier can undo that.
+            let lit = RStyle::new().remove_modifier(Modifier::DIM);
+            block = block.title_top(Line::styled(title, lit).right_aligned());
         }
         block
     }
@@ -1340,8 +1439,15 @@ impl State {
         self.follow();
     }
 
-    /// The picker as it is drawn: one row per choice, the highlighted one
-    /// reversed.
+    /// The picker as it is drawn: the rows its window holds, the highlighted one
+    /// reversed, and a count at each end the list is cut off at.
+    ///
+    /// The window follows the selection ([`picker_window`]), so however long the
+    /// menu is, the row `Enter` is about is one of the rows on the screen. It used
+    /// not to be: the rows were drawn from the first choice down, so a menu longer
+    /// than [`PICKER_ROWS`] could be scrolled -- by a key that wraps around, no
+    /// less -- past its own end, and what `Enter` would choose was then not on the
+    /// screen at all.
     fn picker_lines(&self) -> Vec<Line<'static>> {
         let Some(picker) = &self.picker else {
             return Vec::new();
@@ -1355,31 +1461,37 @@ impl State {
             .map(|c| super::text::width(&c.label))
             .max()
             .unwrap_or(0);
-        picker
-            .choices
-            .iter()
-            .enumerate()
-            .map(|(i, choice)| {
-                let selected = i == picker.selected;
-                let name = if selected {
-                    RStyle::new().add_modifier(Modifier::REVERSED)
-                } else {
-                    RStyle::new()
-                };
-                let detail = if selected {
-                    RStyle::new().add_modifier(Modifier::REVERSED)
-                } else {
-                    RStyle::new().add_modifier(Modifier::DIM)
-                };
-                Line::from(vec![
-                    RSpan::styled(
-                        format!(" {}", super::text::padded(&choice.label, width)),
-                        name,
-                    ),
-                    RSpan::styled(format!(" {}", choice.detail), detail),
-                ])
-            })
-            .collect()
+        let row = |i: usize| {
+            let choice = &picker.choices[i];
+            let selected = i == picker.selected;
+            let name = if selected {
+                RStyle::new().add_modifier(Modifier::REVERSED)
+            } else {
+                RStyle::new()
+            };
+            let detail = if selected {
+                RStyle::new().add_modifier(Modifier::REVERSED)
+            } else {
+                RStyle::new().add_modifier(Modifier::DIM)
+            };
+            Line::from(vec![
+                RSpan::styled(
+                    format!(" {}", super::text::padded(&choice.label, width)),
+                    name,
+                ),
+                RSpan::styled(format!(" {}", choice.detail), detail),
+            ])
+        };
+        let window = picker_window(picker.choices.len(), picker.selected, PICKER_ROWS);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if window.above > 0 {
+            lines.push(more_line(" ", window.above));
+        }
+        lines.extend((window.first..window.last).map(row));
+        if window.below > 0 {
+            lines.push(more_line(" ", window.below));
+        }
+        lines
     }
 
     /// Handle a key while a turn is running.
@@ -1463,8 +1575,13 @@ impl State {
     /// like the transcript's own window. Capped at [`QUEUE_ROWS`] rows, so that a
     /// queue longer than that -- more lines, or longer ones -- costs the transcript
     /// those rows and no more. What the end of the window keeps is the newest line,
-    /// which is the one just typed and the one being waited for.
+    /// which is the one just typed and the one being waited for; what it is not
+    /// showing is counted rather than dropped, the rule the picker keeps to as
+    /// well, so that a queue running past the cap does not read as a queue of
+    /// three. The count is drawn on one of the rows the cap allows rather than on
+    /// a row of its own: the cap is what the transcript is paying.
     fn queue_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let width = measure(width);
         let mut lines = Vec::new();
         for line in &self.queued {
             lines.extend(wrapped_lines(
@@ -1472,7 +1589,13 @@ impl State {
                 width,
             ));
         }
-        lines.split_off(lines.len().saturating_sub(QUEUE_ROWS))
+        if lines.len() <= QUEUE_ROWS {
+            return lines;
+        }
+        let hidden = lines.len() - (QUEUE_ROWS - 1);
+        let mut window = vec![more_line("  ", hidden)];
+        window.extend(lines.split_off(hidden));
+        window
     }
 
     /// The placeholder for what the box is for right now: the answer while a
@@ -1864,6 +1987,13 @@ impl<B: Backend> Screen<B> {
 /// the draft can start past the marker while the rules still run the width of the
 /// screen.
 ///
+/// Its cursor cell is left plain. The widget draws one of its own by reversing
+/// whatever is under it, and the terminal's own cursor is put on that same cell by
+/// `place_cursor` -- two carets on one cell, and the visible one is the terminal's:
+/// it is the one that blinks, that a bar-shaped cursor can be told apart in, and
+/// that says where a typed character will land. So the cell is drawn as what it
+/// holds and the cursor is left to the terminal.
+///
 /// A placeholder is drawn one column right of where the draft starts, and that is the
 /// editor's and not this: an empty box has no cursor cell of its own to draw, so the
 /// widget puts one at the head of the placeholder's first line, and the hint follows
@@ -1873,6 +2003,7 @@ fn input_box() -> TextArea<'static> {
     let mut textarea = TextArea::default();
     textarea.set_placeholder_text(IDLE_PLACEHOLDER);
     textarea.set_cursor_line_style(RStyle::new());
+    textarea.set_cursor_style(RStyle::new());
     textarea
 }
 
@@ -1930,6 +2061,9 @@ const THINKING_LINES: usize = 12;
 /// session's output arrives in and it does not change once it is pushed, so it is
 /// also the unit [`State`] lays out and remembers.
 fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
+    // Never wider than the measure, however wide the region is: the gutter is
+    // inside it, so the answer and the machinery around it end in the same column.
+    let width = measure(width);
     let Some(gutter) = cell.gutter() else {
         // The answer: the one cell that starts at the left edge.
         return wrapped_lines(&cell.spans(), width);
@@ -2026,26 +2160,42 @@ fn wrapped_lines(spans: &[Span], width: usize) -> Vec<Line<'static>> {
             };
             let mut piece = piece;
             while !piece.is_empty() {
-                let mut head = super::text::truncate(piece, width - used);
-                if head.is_empty() {
-                    if used == 0 {
-                        // Even alone it does not fit; take it anyway.
-                        let ch = piece.chars().next().expect("piece is not empty");
-                        head = &piece[..ch.len_utf8()];
-                    } else {
+                // Whitespace at the head of a line the width broke is the break, not
+                // text: it is dropped and the line starts with the word after it. A
+                // line that follows an explicit newline keeps its leading whitespace
+                // -- that is the text's own indentation, and it is read.
+                if fresh && ended_by_width {
+                    piece = piece.trim_start_matches(char::is_whitespace);
+                    if piece.is_empty() {
+                        break;
+                    }
+                }
+                let (head, rest, done) = break_line(piece, width - used, width);
+                let (head, rest) = if head.is_empty() {
+                    if used > 0 {
+                        // The line has run out of columns and this text cannot
+                        // start one yet.
                         lines.push(Line::from(std::mem::take(&mut current)));
                         used = 0;
                         fresh = true;
                         ended_by_width = true;
                         continue;
                     }
-                }
+                    // Even alone it does not fit: take the character anyway, and
+                    // cut it where it falls -- there is no space to break at.
+                    let ch = piece.chars().next().expect("piece is not empty");
+                    (&piece[..ch.len_utf8()], &piece[ch.len_utf8()..])
+                } else {
+                    (head, rest)
+                };
                 current.push(RSpan::styled(head.to_owned(), style));
                 used += super::text::width(head);
                 fresh = false;
                 ended_by_width = false;
-                piece = &piece[head.len()..];
-                if used >= width {
+                piece = rest;
+                // A break at a space ends the line there, however many columns it
+                // left unused: the next word belongs on the next line.
+                if done || used >= width {
                     lines.push(Line::from(std::mem::take(&mut current)));
                     used = 0;
                     fresh = true;
@@ -2076,6 +2226,57 @@ fn wrapped_lines(spans: &[Span], width: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// Where a line ends inside `piece`: what stays, what the next line starts with,
+/// and whether the line is finished.
+///
+/// `room` is the columns left in the line being built, `width` the columns a line
+/// has. A break is taken at a space when there is one to take -- after the last
+/// word that fits, or before the word that does not -- so that a wrapped line reads
+/// as a line instead of as two halves of a word. The space a break is taken at is
+/// the break and not text: it is dropped, and the next line starts with the word
+/// after it.
+///
+/// Two cases have no space to break at, and both are cut at the column, which is
+/// the only place a word is ever cut:
+///
+/// - the word is wider than a whole line, so moving it down would waste what is
+///   left of this one without saving the cut -- filling the line first costs a row
+///   fewer, and not one column is lost;
+/// - there is no space in what fits, because it is all one word already.
+///
+/// The flag says whether the line is finished: a break at a space finishes it at
+/// once, while text that fits leaves it open for whatever comes next.
+fn break_line(piece: &str, room: usize, width: usize) -> (&str, &str, bool) {
+    let fits = super::text::truncate(piece, room);
+    if fits.len() == piece.len() {
+        return (fits, "", false);
+    }
+    let after = &piece[fits.len()..];
+    // A space being the first thing that did not fit means the cut is already at a
+    // word boundary: the line ends after the word that fit. The whitespace the break
+    // is taken at is the break and not text, so none of it is carried to the line.
+    let next = after.trim_start_matches(char::is_whitespace);
+    if next.len() < after.len() {
+        return (fits.trim_end_matches(char::is_whitespace), next, true);
+    }
+    // Otherwise the cut landed inside a word, and how wide that word is decides
+    // whether moving it down is worth a row. The word begins on this line and ends
+    // on the next one: it is what is left of it here, plus what did not fit, up to
+    // the space after it.
+    let start = fits.rfind(char::is_whitespace).map_or(0, |at| at + 1);
+    let tail = &after[..after.find(char::is_whitespace).unwrap_or(after.len())];
+    let whole = super::text::width(&fits[start..]) + super::text::width(tail);
+    let cut = fits[..start].trim_end_matches(char::is_whitespace);
+    if whole > width || cut.is_empty() {
+        // Cut where it falls -- and whitespace it fell on is a break like any other,
+        // so none of it is left dangling at the end of the line either.
+        return (fits.trim_end_matches(char::is_whitespace), after, false);
+    }
+    // The word moves down whole: the next line starts at the word itself, which is
+    // this piece from just past the space the break is taken at.
+    (cut, &piece[start..], true)
+}
+
 /// Translate the input box's own cursor into a position on the screen, so the
 /// terminal's caret sits where the next character will go.
 ///
@@ -2103,9 +2304,14 @@ fn style_of(style: Style) -> RStyle {
         // difference in the layout and so one that does not depend on a terminal
         // honoring SGR 2 or on a theme having a readable idea of what dim is.
         Style::Reasoning => RStyle::new().add_modifier(Modifier::DIM),
-        Style::Yellow => RStyle::new().fg(Color::Yellow),
-        Style::Green => RStyle::new().fg(Color::Green),
-        Style::Red => RStyle::new().fg(Color::Red),
+        // Painted styles are bold as well as colored, and bold is the half that
+        // does not depend on the terminal's theme: the color is a palette slot the
+        // theme chose for a background this code cannot see, while the weight reads
+        // on a light background and a dark one alike. See `Style::code` for the
+        // same rule in the plain front end.
+        Style::Yellow => RStyle::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        Style::Green => RStyle::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Style::Red => RStyle::new().fg(Color::Red).add_modifier(Modifier::BOLD),
     }
 }
 
@@ -2439,6 +2645,80 @@ mod tests {
     }
 
     #[test]
+    fn a_line_breaks_at_a_space_and_not_inside_a_word() {
+        // The whole point of the break: a wrapped line reads as two lines instead of
+        // as two halves of a word.
+        let wrapped: Vec<String> = wrap("aaaa bbbb cccc", 10)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        assert_eq!(wrapped, vec!["aaaa bbbb", "cccc"]);
+        // The space it broke at is the break and not a column of the text: no line
+        // begins or ends with one.
+        for width in 1..=20 {
+            for (text, _) in wrap("alpha beta gamma", width) {
+                assert!(!text.starts_with(' '), "{width}: {text:?}");
+                assert!(!text.ends_with(' '), "{width}: {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_word_wider_than_the_line_is_cut_where_it_falls() {
+        // A word that fits no line at all is cut -- and cut on the line it started
+        // on: moving it down would leave the columns before it empty without saving
+        // the cut.
+        let text = format!("aaaa {}", "b".repeat(14));
+        let wrapped: Vec<String> = wrap(&text, 8).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(wrapped, vec!["aaaa bbb", "bbbbbbbb", "bbb"]);
+        assert_eq!(wrapped.concat().replace(' ', ""), text.replace(' ', ""));
+    }
+
+    #[test]
+    fn wrapping_loses_no_column_of_what_is_not_a_break() {
+        // Every width: no line over it, and every character that is not a space the
+        // break was taken at still on the screen, in order.
+        let text = "the quick brown fox jumps over the lazy dog";
+        let letters: String = text.chars().filter(|c| *c != ' ').collect();
+        for width in 1..=24 {
+            let lines = wrap(text, width);
+            assert!(lines.iter().all(|(_, w)| *w <= width), "{width}: {lines:?}");
+            let joined: String = lines.iter().map(|(t, _)| t.as_str()).collect();
+            let kept: String = joined.chars().filter(|c| *c != ' ').collect();
+            assert_eq!(kept, letters, "{width}: {lines:?}");
+        }
+    }
+
+    #[test]
+    fn a_wide_terminal_keeps_a_line_of_text_to_the_measure() {
+        // The region can be wider than a line of text should be. What is laid out is
+        // laid out to the measure, so the far columns of a wide terminal stay empty
+        // and the eye does not have to run the whole way back.
+        let mut screen = screen_for_test(200, 30);
+        screen
+            .state
+            .transcript
+            .push(Cell::Content("word ".repeat(60).trim_end().to_owned()));
+        screen.draw().unwrap();
+        let rows = all_rows(&screen);
+        let transcript = &rows[..transcript_rows(30, BOX_ROWS, 0) as usize];
+        let widest = transcript
+            .iter()
+            .map(|r| super::super::text::width(r.trim_end()))
+            .max()
+            .unwrap();
+        assert!(
+            widest <= MEASURE,
+            "laid out to the measure: {widest} columns"
+        );
+        assert!(widest > MEASURE - 10, "and the measure is used: {widest}");
+        assert!(
+            transcript[0].starts_with("word word"),
+            "the left edge is kept"
+        );
+    }
+
+    #[test]
     fn a_wide_character_is_never_split_across_lines() {
         // Ten ideographs are twenty columns; at eight, each line holds four.
         let text = "\u{6df1}".repeat(10);
@@ -2648,7 +2928,9 @@ mod tests {
     fn the_queue_is_capped_and_keeps_its_end() {
         // A queue longer than its rows is drawn from its end, like the transcript:
         // the line that was just typed is the one being looked for, and the rest
-        // are waiting behind it either way.
+        // are waiting behind it either way. What it is not drawing is counted on
+        // one of the rows the cap allows, so that three rows of a longer queue do
+        // not read as the whole queue.
         let mut state = State::default();
         for i in 0..(QUEUE_ROWS + 2) {
             state.enqueue(format!("line {i}"));
@@ -2660,7 +2942,7 @@ mod tests {
                 .iter()
                 .map(|l| l.to_string())
                 .collect::<Vec<_>>(),
-            vec!["› line 2", "› line 3", "› line 4"]
+            vec!["  … 3 more", "› line 3", "› line 4"]
         );
     }
 
@@ -3289,6 +3571,30 @@ mod tests {
     }
 
     #[test]
+    fn the_working_indicator_is_not_dim_on_a_dim_rule() {
+        // While the model is quiet, the spinner on the box's rule is the only thing
+        // on the screen that moves: it is chrome that has to be seen, so it is the
+        // one thing on the box painted at full strength. A dim indicator on a dim
+        // rule is the signal painted out of sight.
+        let mut screen = screen_for_test(60, 20);
+        screen.state = working(Duration::from_secs(3), 0, 4.0);
+        screen.draw().unwrap();
+        let rule = screen.terminal.backend().buffer().area.height - 1 - 3;
+        let buf = screen.terminal.backend().buffer();
+        let at = (0..buf.area.width)
+            .find(|&x| SPINNER.contains(&buf[(x, rule)].symbol().chars().next().unwrap_or(' ')))
+            .expect("the indicator is drawn on the box's top rule");
+        assert!(
+            !buf[(at, rule)].style().add_modifier.contains(Modifier::DIM),
+            "the indicator is lit"
+        );
+        assert!(
+            buf[(0, rule)].style().add_modifier.contains(Modifier::DIM),
+            "and the rule it sits on is still chrome"
+        );
+    }
+
+    #[test]
     fn calibration_learns_from_a_usage_notice() {
         let mut s = State {
             turn_running: true,
@@ -3672,6 +3978,153 @@ mod tests {
     }
 
     #[test]
+    fn a_window_holds_the_row_it_is_scrolled_to() {
+        // What a window costs the screen: the rows it draws, plus a row for each
+        // count it carries. A window costing more than the room it was given is a
+        // window that eats the rows behind it.
+        let cost =
+            |w: &Window| (w.last - w.first) + usize::from(w.above > 0) + usize::from(w.below > 0);
+        // The longest run of rows that holds the selection and fits the room with
+        // the counts it is cut at, found by looking at every run there is rather
+        // than by the arithmetic the front end uses: the two have to agree.
+        let expected = |total: usize, selected: usize, room: usize| -> Window {
+            let mut best: Option<Window> = None;
+            for shown in 1..=room.min(total) {
+                for first in 0..=total - shown {
+                    let last = first + shown;
+                    if !(first <= selected && selected < last) {
+                        continue;
+                    }
+                    let window = Window {
+                        first,
+                        last,
+                        above: first,
+                        below: total - last,
+                    };
+                    if cost(&window) > room {
+                        continue;
+                    }
+                    // Longer runs win, and runs of a length are looked at left to
+                    // right, so the first one wins: the selection sits at the end
+                    // of the window it moved into.
+                    if best.is_none_or(|b| shown > b.last - b.first) {
+                        best = Some(window);
+                    }
+                }
+            }
+            // No run fits even with no count at all: the selection alone, which is
+            // what the front end falls back to as well.
+            best.unwrap_or(Window {
+                first: selected,
+                last: selected + 1,
+                above: 0,
+                below: 0,
+            })
+        };
+        for total in 1..24usize {
+            for selected in 0..total {
+                for room in 1..=PICKER_ROWS {
+                    let got = picker_window(total, selected, room);
+                    let what = format!("{total} rows, {selected} selected, room {room}");
+                    assert_eq!(got, expected(total, selected, room), "{what}");
+                    assert!(
+                        got.first <= selected && selected < got.last,
+                        "{what}: selection"
+                    );
+                    assert!(got.last <= total, "{what}: past the end");
+                    assert!(cost(&got) <= room, "{what}: rows drawn");
+                    // Either both counts are drawn and they are the truth, or
+                    // neither is: and neither only where they would not fit.
+                    if cost(&got) > got.last - got.first {
+                        assert_eq!(
+                            (got.above, got.below),
+                            (got.first, total - got.last),
+                            "{what}: what the counts say"
+                        );
+                    } else if total > room {
+                        assert!(cost(&got) + 2 > room, "{what}: a cut with no count");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_picker_keeps_its_highlight_on_the_screen() {
+        // The regression: rows were drawn from the first choice down, so a menu
+        // longer than the picker could be scrolled past its own end -- and `Enter`
+        // then chose a row the screen never named. Nine sessions, the ninth
+        // selected: the row under the highlight is the one that has to be drawn.
+        let mut screen = screen_for_test(60, 20);
+        let choices: Vec<Choice> = (0..9)
+            .map(|i| Choice {
+                label: format!("session-{i}"),
+                argument: format!("session-{i}"),
+                detail: format!("{i} messages"),
+            })
+            .collect();
+        screen.state.open_choices(Choosing::Session, choices);
+        for _ in 0..8 {
+            screen.state.down();
+        }
+        screen.draw().unwrap();
+
+        let buf = screen.terminal.backend().buffer();
+        let highlighted: Vec<String> = (0..buf.area.height)
+            .filter(|&y| {
+                (0..buf.area.width).any(|x| buf[(x, y)].modifier.contains(Modifier::REVERSED))
+            })
+            .map(|y| row(&screen, y))
+            .collect();
+        let chosen: Vec<&String> = highlighted
+            .iter()
+            .filter(|r| r.contains("session-"))
+            .collect();
+        assert_eq!(
+            chosen.len(),
+            1,
+            "one picker row is highlighted: {highlighted:?}"
+        );
+        assert!(chosen[0].contains("session-8"), "{:?}", chosen[0]);
+        // And the rows the window is not showing are counted, not dropped: four
+        // of the nine are above it.
+        let drawn = all_rows(&screen);
+        assert!(drawn.iter().any(|r| r.contains("… 4 more")), "{drawn:?}");
+        // The count costs rows, so the block still fits what the transcript can
+        // spare: five rows of menu and the count.
+        assert_eq!(
+            drawn.iter().filter(|r| r.contains("session-")).count(),
+            5,
+            "{drawn:?}"
+        );
+    }
+
+    #[test]
+    fn the_queue_counts_the_rows_it_is_not_showing() {
+        let mut screen = screen_for_test(60, 20);
+        for line in ["/new", "/sessions", "/model"] {
+            screen.state.queued.push_back(line.into());
+        }
+        // A queue with room to spare: every line, and nothing said about rows that
+        // are not there.
+        let drawn = rendered(&screen.state.queue_lines(60));
+        assert_eq!(drawn.len(), 3, "{drawn:?}");
+        assert!(
+            drawn.iter().all(|(text, _)| !text.contains("more")),
+            "{drawn:?}"
+        );
+
+        // One more line than the cap, and the row that does not fit is counted on
+        // one of the rows the cap allows: the queue never costs more than three.
+        screen.state.queued.push_back("/help".into());
+        let drawn = rendered(&screen.state.queue_lines(60));
+        assert_eq!(drawn.len(), QUEUE_ROWS, "{drawn:?}");
+        assert!(drawn[0].0.contains("… 2 more"), "{drawn:?}");
+        assert!(drawn[1].0.contains("/model"), "{drawn:?}");
+        assert!(drawn[2].0.contains("/help"), "{drawn:?}");
+    }
+
+    #[test]
     fn the_picker_is_drawn_over_the_live_area_with_one_row_highlighted() {
         let mut screen = screen_for_test(40, 20);
         type_in(&mut screen.state, "/");
@@ -3732,6 +4185,65 @@ mod tests {
         assert_eq!(box_rows(1, 20), BOX_ROWS);
         assert_eq!(box_rows(2, 20), 4);
         assert_eq!(box_rows(6, 20), 8);
+    }
+
+    #[test]
+    fn the_box_draws_no_caret_of_its_own() {
+        // One caret per screen. The editor drew one by reversing whatever was under
+        // it, and `place_cursor` put the terminal's own on the same cell: two
+        // carets on one cell, and the one that was kept is the terminal's -- it is
+        // the one that blinks, that a bar-shaped cursor can be seen in, and that
+        // says where a typed character lands.
+        let mut screen = screen_for_test(40, 20);
+        screen.draw().unwrap();
+        let last = screen.terminal.backend().buffer().area.height - 1;
+        let buf = screen.terminal.backend().buffer();
+        assert!(
+            !(0..buf.area.height).any(|y| (0..buf.area.width).any(|x| buf[(x, y)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED))),
+            "nothing on an idle screen is reversed"
+        );
+        let cursor = screen.terminal.backend_mut().get_cursor_position().unwrap();
+        assert_eq!(cursor.y, last - 2, "the box's line, between its rules");
+        assert_eq!(cursor.x, BOX_GUTTER, "and the column the draft starts in");
+    }
+
+    #[test]
+    fn a_failure_is_drawn_by_weight_and_not_only_by_color() {
+        // The color of a failure is a palette slot the terminal's theme picked for a
+        // background this code cannot see, and the dark end of a default palette is
+        // chosen for a light one: red at its darkest on black is a line that cannot
+        // be read, on the one line that must be. The weight is what carries it.
+        let mut screen = screen_for_test(40, 20);
+        screen
+            .state
+            .apply(Notice::Error("the backend said 402".into()));
+        screen.state.apply(Notice::ToolStart {
+            name: "Bash".into(),
+            args: r#"{"command":"ls"}"#.into(),
+        });
+        screen.draw().unwrap();
+        let buf = screen.terminal.backend().buffer();
+        let at = |needle: &str| -> (u16, u16) {
+            for y in 0..buf.area.height {
+                let text = row(&screen, y);
+                if let Some(x) = text.find(needle) {
+                    return (x as u16, y);
+                }
+            }
+            panic!("{needle:?} was not drawn");
+        };
+        for needle in ["error:", "Bash"] {
+            let (x, y) = at(needle);
+            let style = buf[(x, y)].style();
+            assert!(
+                style.add_modifier.contains(Modifier::BOLD),
+                "{needle:?} is drawn bold"
+            );
+            assert!(style.fg.is_some(), "{needle:?} keeps its color too");
+        }
     }
 
     #[test]
@@ -4489,5 +5001,85 @@ mod tests {
         let mut screen = State::default();
         screen.key(Event::Paste("pasted\nlines".into()));
         assert_eq!(screen.take_line(), "pasted\nlines");
+    }
+
+    #[test]
+    fn zz_visual_review_dump() {
+        let mut screen = screen_for_test(96, 30);
+        screen.state.status.set_model("deepseek/deepseek-flash");
+        screen.state.show(Cell::Notice(
+            "caocli \u{b7} session 20260910-224129 (12 messages) \u{b7} deepseek/deepseek-flash"
+                .into(),
+        ));
+        screen
+            .state
+            .transcript
+            .push(Cell::User("why is the build slow?".into()));
+        screen.state.transcript.push(Cell::Reasoning(
+            "The user asks about build time. I should look at the Cargo profile and maybe check if there are heavy dependencies. Let me start by reading Cargo.toml and then check the target directory size.".into(),
+        ));
+        screen.state.transcript.push(Cell::Content(
+            "Two things usually dominate: an unoptimized dev profile and relinking every dependency on each edit. Let me look.".into(),
+        ));
+        screen.state.transcript.push(Cell::tool_call(
+            "Bash",
+            r#"{"command":"ls -la target/debug | head -20"}"#,
+        ));
+        screen.state.transcript.push(Cell::ToolResult(
+            "total 4823136\ndrwxr-xr-x 12 user user 4096 ...\n".into(),
+        ));
+        screen.state.transcript.push(Cell::tool_call(
+            "Edit",
+            r#"{"file_path":"Cargo.toml","old_string":"[profile.dev]\ndebug = 2","new_string":"[profile.dev]\ndebug = 0"}"#,
+        ));
+        screen
+            .state
+            .transcript
+            .push(Cell::ToolResult("edited Cargo.toml\n".into()));
+        screen.state.transcript.push(Cell::Content(
+            "Setting `debug = 0` alone is usually worth a third of the link time. The other half is the linker: with `lld` the final link stops being the long pole.".into(),
+        ));
+        screen.state.apply(Notice::Usage(
+            Usage {
+                prompt_tokens: 12480,
+                total_tokens: 12980,
+                completion_tokens: 500,
+                prompt_cache_hit_tokens: 12000,
+                prompt_cache_miss_tokens: 480,
+                prompt_tokens_details: None,
+            },
+            Duration::from_secs(9),
+        ));
+        screen.state.transcript.push(Cell::Failure(
+            "no API key for DeepSeek: run /login deepseek".into(),
+        ));
+        screen.state.transcript.push(Cell::Interrupted);
+        screen
+            .state
+            .transcript
+            .push(Cell::Notice("/help for commands".into()));
+        screen.draw().unwrap();
+        let buf = screen.terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            let mut line = String::new();
+            for x in 0..buf.area.width {
+                let c = &buf[(x, y)];
+                let m = c.style().add_modifier;
+                let tag = if m.contains(Modifier::DIM) {
+                    "d"
+                } else if c.style().fg == Some(Color::Yellow) {
+                    "Y"
+                } else if c.style().fg == Some(Color::Green) {
+                    "G"
+                } else if c.style().fg == Some(Color::Red) {
+                    "R"
+                } else {
+                    " "
+                };
+                line.push_str(tag);
+            }
+            println!("STYLE {y:02} {line}");
+            println!("TEXT  {y:02} |{}|", row(&screen, y));
+        }
     }
 }

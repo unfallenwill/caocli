@@ -43,13 +43,22 @@ impl Style {
     /// [`Style::Reasoning`] shares `Dim`'s sequence on purpose: the two are
     /// different blocks and not different colors. Everything a reader is meant to
     /// tell apart here is told apart by where it sits, not by what it is painted.
+    ///
+    /// The three painted styles are bold as well as colored -- weight over hue.
+    /// The palette slots behind a color belong to the terminal's theme, and the
+    /// dark end of the default palette is chosen for a light background: on a dark
+    /// one, red at its darkest is a line you cannot read, and that is exactly the
+    /// line a failure is written on. A brighter slot would be worse than what it
+    /// replaced on the background it was not chosen for -- bright yellow is
+    /// invisible on white -- while a heavier stroke reads on either. Terminals
+    /// that render intense text in the bright palette get the luminance too.
     pub fn code(self) -> &'static str {
         match self {
             Style::Plain => "",
             Style::Dim | Style::Reasoning => "\x1b[2m",
-            Style::Yellow => "\x1b[33m",
-            Style::Green => "\x1b[32m",
-            Style::Red => "\x1b[31m",
+            Style::Yellow => "\x1b[1;33m",
+            Style::Green => "\x1b[1;32m",
+            Style::Red => "\x1b[1;31m",
         }
     }
 }
@@ -787,8 +796,11 @@ mod tests {
         // tool result by the rule in its gutter, which the terminal cannot lose, not
         // by a color it may or may not honor.
         assert_eq!(Style::Reasoning.code(), "\x1b[2m");
-        assert_eq!(Style::Yellow.code(), "\x1b[33m");
-        assert_eq!(Style::Red.code(), "\x1b[31m");
+        // Painted styles carry the weight as well as the color: the color comes
+        // from a palette the terminal chose for a background this code cannot see.
+        assert_eq!(Style::Yellow.code(), "\x1b[1;33m");
+        assert_eq!(Style::Green.code(), "\x1b[1;32m");
+        assert_eq!(Style::Red.code(), "\x1b[1;31m");
     }
 
     /// One of every kind of cell, so a rule about cells can be asked of all of them.

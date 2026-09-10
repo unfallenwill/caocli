@@ -30,6 +30,68 @@ fn terminal_size() -> Option<(u16, u16)> {
     None
 }
 
+/// The line a session opens with: what this is, which session it is, how much is
+/// in it, and the model it is talking to.
+///
+/// Sized to the terminal it is going into. Whole segments are dropped from the
+/// right when the line does not fit -- the rule the status line keeps to -- so
+/// nothing is ever cut in the middle of a word: a summary that wraps reads as two
+/// half-sentences, and on an 80-column terminal that is exactly what the line
+/// used to do to the session's own path.
+///
+/// The path is not here at all. It is `~/.caocli/sessions/<id>.jsonl`, so it says
+/// nothing the id does not, and it was the longest thing on the line; `--list`
+/// prints it for anyone who wants the file itself.
+pub(crate) fn banner(id: &str, messages: usize, model: &str) -> String {
+    // No terminal, no width to fit: a file or a pipe can hold the whole line.
+    banner_at(id, messages, model, available_columns())
+}
+
+/// The same, measured against a width given rather than one asked for, so that
+/// what it does with an 80-column terminal can be a test.
+fn banner_at(id: &str, messages: usize, model: &str, columns: Option<usize>) -> String {
+    // The segments in the order they are dropped from the right: the hint first
+    // (the box says it too), then the model (the status line has it), then the
+    // count (the id already says which session this is). Each carries the
+    // separator that introduces it, because the count is set off from the session
+    // it counts rather than joined to it the way the top-level segments are.
+    let parts: [(&str, String); 5] = [
+        ("", "caocli".to_owned()),
+        (" · ", format!("session {id}")),
+        (
+            " ",
+            match messages {
+                1 => "(1 message)".to_owned(),
+                n => format!("({n} messages)"),
+            },
+        ),
+        (" · ", model.to_owned()),
+        (" · ", "/help for commands".to_owned()),
+    ];
+    let line = |keep: usize| {
+        parts[..keep]
+            .iter()
+            .map(|(sep, text)| format!("{sep}{text}"))
+            .collect::<String>()
+    };
+    // The longest run of segments that fits, and never fewer than the two that
+    // say what this is and which session it is: a line too short even for those
+    // is left whole for the front end to clip, rather than emptied here.
+    let mut keep = parts.len();
+    if let Some(columns) = columns {
+        while keep > 2 && text::width(&line(keep)) > columns {
+            keep -= 1;
+        }
+    }
+    line(keep)
+}
+
+/// The columns a transcript line has to write in: the terminal's width, less the
+/// columns every line that is not an answer is set in from the left edge.
+fn available_columns() -> Option<usize> {
+    terminal_size().map(|(_, cols)| (cols as usize).saturating_sub(cell::MARKER_COLUMNS))
+}
+
 /// Fixed status bar at the bottom: it occupies the terminal's last line and the
 /// scroll region is restricted to 1..rows-1, so scrolling output cannot push the
 /// bar off the screen.
@@ -609,6 +671,107 @@ mod tests {
     use super::*;
     use crate::types::Role;
     use status::CacheStats;
+
+    /// The whole line, as an 80-column terminal would show it: the terminal it is
+    /// most likely to be read on is the one the old line broke in half.
+    #[test]
+    fn the_banner_fits_the_terminal_it_is_going_into() {
+        let full = "caocli · session 20260910-213122 (12 messages) · deepseek/deepseek-v4-pro · /help for commands";
+        assert_eq!(
+            banner_at("20260910-213122", 12, "deepseek/deepseek-v4-pro", None),
+            full
+        );
+        assert_eq!(
+            banner_at("20260910-213122", 12, "deepseek/deepseek-v4-pro", Some(100)),
+            full,
+            "a wide terminal keeps the hint"
+        );
+        // 80 columns: the hint is the first thing to go -- the box repeats it.
+        assert_eq!(
+            banner_at("20260910-213122", 12, "deepseek/deepseek-v4-pro", Some(80)),
+            "caocli · session 20260910-213122 (12 messages) · deepseek/deepseek-v4-pro"
+        );
+        // Then the model, which the status line has anyway.
+        assert_eq!(
+            banner_at("20260910-213122", 12, "deepseek/deepseek-v4-pro", Some(60)),
+            "caocli · session 20260910-213122 (12 messages)"
+        );
+        // Then the count. Which session this is is the one thing nothing else
+        // says, so the id is the last of the optional ones to go -- and what is
+        // left is what fits a 40-column terminal whole.
+        assert_eq!(
+            banner_at("20260910-213122", 12, "deepseek/deepseek-v4-pro", Some(40)),
+            "caocli · session 20260910-213122"
+        );
+        // Below that, the line comes back whole to be clipped by whoever writes
+        // it: an over-long line reads better than a line with nothing on it.
+        assert_eq!(
+            banner_at("20260910-213122", 12, "deepseek/deepseek-v4-pro", Some(12)),
+            "caocli · session 20260910-213122"
+        );
+    }
+
+    #[test]
+    fn the_banner_counts_one_message_in_the_singular() {
+        let one = banner_at("20260910-213122", 1, "m", Some(80));
+        assert!(one.contains("(1 message)"), "{one:?}");
+        assert!(banner_at("20260910-213122", 2, "m", Some(80)).contains("(2 messages)"));
+        assert!(banner_at("20260910-213122", 0, "m", Some(80)).contains("(0 messages)"));
+    }
+
+    #[test]
+    fn the_banner_is_never_cut_mid_word() {
+        // Every width, not just the round ones: what comes back is always one of
+        // the segment joins -- never a piece of one -- so a word is never cut in
+        // half however narrow the terminal is.
+        let joins = [
+            "caocli · session 20260910-213122",
+            "caocli · session 20260910-213122 (12 messages)",
+            "caocli · session 20260910-213122 (12 messages) · deepseek/deepseek-v4-pro",
+            "caocli · session 20260910-213122 (12 messages) · deepseek/deepseek-v4-pro · /help for commands",
+        ];
+        for columns in 1..=120 {
+            let line = banner_at(
+                "20260910-213122",
+                12,
+                "deepseek/deepseek-v4-pro",
+                Some(columns),
+            );
+            assert!(joins.contains(&line.as_str()), "{columns}: {line:?}");
+            if text::width(&line) > columns {
+                // Only the shortest form may overflow, and only to be clipped by
+                // whoever writes it: an over-long line reads better than none.
+                assert_eq!(line, joins[0], "{columns}: {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_banner_measures_wide_characters_by_column() {
+        // A CJK model id is two columns per glyph, so a budget counted in chars
+        // would let through a segment that does not fit: the ideographs are 8
+        // columns and only 4 characters.
+        let cjk = "\u{6df1}\u{5ea6}\u{6c42}\u{7d22}";
+        let with_model = "caocli · session id (1 message) · \u{6df1}\u{5ea6}\u{6c42}\u{7d22}";
+        assert_eq!(text::width(with_model), 42);
+        assert_eq!(banner_at("id", 1, cjk, Some(42)), with_model);
+        assert_eq!(
+            banner_at("id", 1, cjk, Some(41)),
+            "caocli · session id (1 message)",
+            "one column short of the model: the model goes whole"
+        );
+    }
+
+    #[test]
+    fn the_banner_keeps_everything_when_there_is_no_terminal() {
+        // Output redirected to a file or a pipe: there is no width to fit, and a
+        // file can hold the whole line. (A test's own stdout is a pipe, so this is
+        // also the case the width is really asked for in.)
+        assert_eq!(
+            banner("20260910-213122", 12, "deepseek/deepseek-v4-pro"),
+            "caocli · session 20260910-213122 (12 messages) · deepseek/deepseek-v4-pro · /help for commands"
+        );
+    }
 
     #[test]
     fn reasoning_then_content_are_separate_blocks() {

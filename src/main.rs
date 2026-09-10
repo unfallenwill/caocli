@@ -214,15 +214,15 @@ async fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    // After --continue / --resume, show the source file; the path has diagnostic
-    // value. A key that is missing is said here as well: it is the first thing
-    // the user has to fix, and `/login` is how.
-    let mut banner = format!(
-        "caocli · session {} ({} messages, {}) · {} · /help for commands",
-        agent.session.id,
+    // The session summary: which session this is, how much is in it, and the
+    // model. Built by the front end rather than here, because how much of it fits
+    // is the terminal's answer and not the application's. A key that is missing is
+    // said here as well: it is the first thing the user has to fix, and `/login`
+    // is how.
+    let mut banner = ui::banner(
+        &agent.session.id,
         agent.session.messages.len(),
-        agent.session.path.display(),
-        agent.model_label()
+        &agent.model_label(),
     );
     if let Some(note) = missing_key {
         banner = format!("{note}\n{banner}");
