@@ -4,18 +4,19 @@ use clap::Parser;
 #[command(
     name = "caocli",
     version,
-    about = "Terminal coding agent · DeepSeek / GLM backends · thinking + Bash"
+    about = "Terminal coding agent · DeepSeek / Z.AI backends · thinking + Bash"
 )]
 pub struct Cli {
     /// One-shot mode: run this prompt (including the tool loop), then exit
     #[arg(short = 'p')]
     pub prompt: Option<String>,
 
-    /// Provider: deepseek (default) | glm
+    /// Provider: deepseek (default) | zai-coding-cn
     #[arg(long)]
     pub provider: Option<String>,
 
-    /// Model id (defaults to the provider's default model)
+    /// Model id as <provider>/<modelid> (defaults to the provider's default
+    /// model; a bare id belongs to --provider)
     #[arg(long)]
     pub model: Option<String>,
 

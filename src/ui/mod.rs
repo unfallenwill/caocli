@@ -1,9 +1,11 @@
 mod cell;
 mod status;
-mod text;
+pub(crate) mod text;
 pub mod tui;
 
+use std::future::Future;
 use std::io::{IsTerminal, Write};
+use std::pin::Pin;
 
 use crate::types::{Message, Usage};
 
@@ -181,6 +183,70 @@ pub trait Front: Ui {
     fn set_model(&mut self, model: &str);
     /// Clear the session's cache statistics.
     fn reset_stats(&mut self);
+    /// Ask for a secret: `prompt` says what it is for, and the answer is the
+    /// text typed in reply. `None` means nothing was entered — a cancellation,
+    /// an end of input, or a front end that has gone away.
+    ///
+    /// A question rather than a line to submit, because an answer that reached
+    /// the session log or the transcript would no longer be a secret. The
+    /// interactive front end draws the prompt and takes the answer in its box
+    /// with the text hidden; the plain one writes the prompt and reads a line
+    /// from its own input with the terminal's echo off.
+    fn ask_secret(&mut self, prompt: &str) -> Pin<Box<dyn Future<Output = Option<String>> + '_>>;
+}
+
+/// One line of stdin, read on a blocking task: the terminal's own line editing is
+/// what ends the line, and a runtime worker is not what should be waiting on it.
+/// `None` is an end of input.
+async fn read_answer_line() -> Option<String> {
+    tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(n) if n > 0 => Some(line.trim_end_matches(['\n', '\r']).to_owned()),
+            _ => None,
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Echo off for as long as this value lives, and back on when it is dropped —
+/// including on the early returns, which is the whole reason it is a value and
+/// not a pair of calls. A terminal that will not take the setting (stdin is a
+/// pipe, or there is no terminal at all) leaves nothing to silence, and reading
+/// it is not a failure.
+#[cfg(unix)]
+struct EchoOff {
+    saved: libc::termios,
+}
+
+#[cfg(unix)]
+impl EchoOff {
+    fn new() -> Option<Self> {
+        let fd = libc::STDIN_FILENO;
+        // SAFETY: fd is a valid descriptor and `saved` has the termios layout
+        // the call fills in; a failure leaves both untouched, and it is only
+        // used when a touch is wanted.
+        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
+            return None;
+        }
+        let mut quiet = saved;
+        quiet.c_lflag &= !libc::ECHO;
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
+            return None;
+        }
+        Some(Self { saved })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        // SAFETY: `saved` came from tcgetattr on this same descriptor.
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved) };
+    }
 }
 
 /// Streaming renderer. Thinking and body text are two independent render blocks:
@@ -402,6 +468,23 @@ impl Front for Renderer {
     fn reset_stats(&mut self) {
         self.status.reset_stats();
         self.redraw_status_bar();
+    }
+
+    fn ask_secret(&mut self, prompt: &str) -> Pin<Box<dyn Future<Output = Option<String>> + '_>> {
+        // The echo goes off before the prompt does, not after: the answer can
+        // arrive the moment the question is on the screen, and the only copy of
+        // it that may exist is the one this returns. The prompt itself is
+        // written now rather than awaited -- an answer nobody knows is being
+        // asked for is not an answer -- and the read waits in the future, where
+        // the caller awaits it.
+        let echo = EchoOff::new();
+        let _ = writeln!(self.out, "{}", self.paint(Style::Dim, prompt));
+        let _ = self.out.flush();
+        Box::pin(async move {
+            let answer = read_answer_line().await;
+            drop(echo);
+            answer
+        })
     }
 }
 
@@ -828,7 +911,7 @@ mod tests {
         r.apply_status_bar(Some(a));
         let s = buf_of(&buf);
         assert!(s.contains("\x1b[1;9r"), "{s:?}");
-        assert!(s.contains("cache —"), "{s:?}");
+        assert!(s.contains("cache 0.0% · hit 0 · miss 0"), "{s:?}");
         assert_eq!(r.bar, Some(a));
 
         // (Some, Some(same)): redraw only
@@ -868,7 +951,7 @@ mod tests {
 
         r.reset_stats();
         let tail = &buf_of(&buf)[s.len()..];
-        assert!(tail.contains("cache —\x1b8"), "{tail:?}");
+        assert!(tail.contains("cache 0.0% · hit 0 · miss 0"), "{tail:?}");
         assert_eq!(r.stats(), CacheStats::default());
     }
 
@@ -954,7 +1037,10 @@ mod tests {
         let before = buf_of(&buf).len();
         r.reset_stats();
         let tail = &buf_of(&buf)[before..];
-        assert!(tail.contains("deepseek-v4-pro · cache —"), "{tail:?}");
+        assert!(
+            tail.contains("deepseek-v4-pro · cache 0.0% · hit 0 · miss 0"),
+            "{tail:?}"
+        );
     }
 
     #[test]

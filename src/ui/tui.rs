@@ -21,7 +21,7 @@ use std::future::Future;
 use std::io::{self, Stdout};
 use std::path::Path;
 use std::pin::Pin;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::backend::{Backend, CrosstermBackend};
@@ -34,6 +34,7 @@ use ratatui_textarea::{CursorMove, ScreenCursor, TextArea};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::agent::{Agent, Approve, Interrupt};
+use crate::config;
 use crate::history;
 use crate::repl;
 use crate::session;
@@ -44,22 +45,28 @@ use super::Ui;
 use super::cell::{self, Cell, Span, Style};
 use super::status::Status;
 
-/// Rows the pinned region needs besides the input box: the status line, then the
-/// tip line.
-const PINNED_ROWS: u16 = 1 + 1;
+/// Rows the pinned region needs besides the input box: the status line below it.
+const PINNED_ROWS: u16 = 1;
 
 /// The rows the input box takes when it holds nothing: a border, the empty line,
 /// a border. An empty box is still a box.
 const BOX_ROWS: u16 = 3;
 
+/// The input box's borders: top and bottom only.
+///
+/// The box is a band the width of the screen, so a pair of vertical edges would
+/// be two columns of frame with nothing between them. Without them the draft
+/// starts in the column the transcript's own user lines start in.
+const BOX_BORDERS: Borders = Borders::TOP.union(Borders::BOTTOM);
+
 /// The rows the input box takes when it holds `lines` lines of text: one row each
 /// -- a line added with Ctrl-J is a line the box has to show -- plus the two
 /// borders.
 ///
-/// Capped at what a terminal `height` rows tall can spare once the status line,
-/// the tip line and a row of transcript are accounted for: a draft taller than
-/// the screen scrolls inside the box rather than leaving the screen with nothing
-/// but a box on it.
+/// Capped at what a terminal `height` rows tall can spare once the pinned line
+/// and a row of transcript are accounted for: a draft taller than the
+/// screen scrolls inside the box rather than leaving the screen with nothing but
+/// a box on it.
 fn box_rows(lines: usize, height: u16) -> u16 {
     let wanted = u16::try_from(lines)
         .unwrap_or(u16::MAX)
@@ -83,115 +90,13 @@ fn transcript_rows(height: u16, input: u16, queued: u16) -> u16 {
 /// of losing the place rather than of reading.
 const WHEEL_LINES: isize = 3;
 
-/// The spinner, advanced while work is in progress. One column each, so it can
-/// sit on the working line without moving it.
-const SPINNER: [&str; 6] = ["·", "✢", "✳", "✶", "✽", "✻"];
-
-/// How long each spinner frame is shown. Long enough to read, short enough that
-/// the line looks alive.
-const SPINNER_FRAME: Duration = Duration::from_millis(100);
-
-/// How many spinner frames fit in `elapsed`: the tick a moment belongs to.
-///
-/// Derived from the elapsed time rather than counted, so a redraw that was
-/// skipped cannot leave the spinner behind: the frame is a function of *when*,
-/// not of how many times anything ran. Everything on the working line that moves
-/// on its own -- the frame, the timer -- moves on this tick, so one number
-/// answers both "which frame" and "has anything changed".
-fn spinner_step(elapsed: Duration) -> u64 {
-    elapsed.as_millis() as u64 / SPINNER_FRAME.as_millis().max(1) as u64
-}
-
-/// Which spinner frame belongs to a moment in time.
-fn spinner_frame(elapsed: Duration) -> &'static str {
-    SPINNER[spinner_step(elapsed) as usize % SPINNER.len()]
-}
-
-/// The words a turn is introduced by, one per turn. The machine underneath is the
-/// same every time; the point of the word is that a long wait has something in it
-/// to read.
-const VERBS: [&str; 14] = [
-    "Pondering",
-    "Noodling",
-    "Julienning",
-    "Percolating",
-    "Ruminating",
-    "Simmering",
-    "Whittling",
-    "Mulling",
-    "Sifting",
-    "Tinkering",
-    "Brewing",
-    "Sketching",
-    "Untangling",
-    "Kneading",
-];
-
-/// The word a turn that began at `seed` is introduced by.
-///
-/// The seed is a clock reading rather than a counter, so two turns in a row are
-/// unlikely to be the same word without anything having to remember the last one.
-fn verb_for(seed: u128) -> &'static str {
-    VERBS[(seed as usize) % VERBS.len()]
-}
-
-/// A clock reading that can seed anything wanting one. Nanoseconds, because the
-/// seconds a session runs for are few enough that a coarser reading would repeat.
-fn seed() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default()
-}
-
-/// How long a turn has been running, as the working line shows it: `12m 10s`.
-///
-/// Rounded to the second, because that is the scale a turn is watched at, and
-/// because a division that lands exactly on the spinner's tick is what keeps the
-/// redraw and the text in step.
-fn duration_label(elapsed: Duration) -> String {
-    let secs = elapsed.as_secs();
-    match (secs / 60, secs % 60) {
-        (0, s) => format!("{s}s"),
-        (m, s) => format!("{m}m {s}s"),
-    }
-}
-
 /// The thinking block's ground and foreground, by their numbers in ANSI's
 /// 256-colour palette. The same pair the plain front end writes as an escape
 /// sequence; here as numbers because ratatui takes colours rather than sequences.
 const REASONING_GROUND: u8 = 236;
 const REASONING_FOREGROUND: u8 = 245;
 
-/// The colour the word on the working line is painted in: a warm amber, which is
-/// what separates "something is happening" from the dim text around it.
-const WORKING_FOREGROUND: u8 = 209;
-
-/// The gutter the tip line starts with: the same mark the transcript uses for the
-/// lines that belong to something else, so a tip reads as an aside rather than as
-/// part of the session. Indented by a column, so that it hangs off nothing.
-const TIP_GUTTER: &str = " ⎿  ";
-
-/// How long one tip is shown before the next replaces it. Long enough to read
-/// without reading it twice, which is what makes the row worth its space.
-const TIP_PERIOD: Duration = Duration::from_secs(20);
-
-/// The tips, in the order they come round. One line each, short enough to read at
-/// a glance, and every one of them true: a tip about a key that does nothing is
-/// worse than no tip at all.
-const TIPS: [&str; 9] = [
-    "Tab completes · Up and Down browse what you typed",
-    "Ctrl-J adds a line · Enter sends it",
-    "PageUp and PageDown read back through the session",
-    "Ctrl-C stops a turn, and the model is told",
-    "Type while it works · Enter queues the line for afterwards",
-    "/resume switches session · /new starts one",
-    "Start with --ask to approve a tool before it runs",
-    "/help lists every command",
-    "The wheel reads back too · Shift-drag selects text",
-];
-
-/// How many rows of the queue are drawn above the status line. The queue is what
+/// How many rows of the queue are drawn above the input box. The queue is what
 /// was asked for while a turn ran, and a long one costs the transcript rows it is
 /// capped at: what is worth seeing is that the line arrived.
 const QUEUE_ROWS: usize = 3;
@@ -207,13 +112,18 @@ const IDLE_PLACEHOLDER: &str = "›  type a message · /help for commands";
 /// goes, so it says so rather than inviting the next message.
 const ANSWER_PLACEHOLDER: &str = "y to allow · anything else denies";
 
+/// What the box says while a secret is being asked for. The text is not shown --
+/// the box masks it -- so the line has to say what is expected of it.
+const SECRET_PLACEHOLDER: &str = "type or paste it · Enter saves · empty cancels";
+
+/// What a secret's characters are drawn as. A character and not a blank: the
+/// length of a key is not the key, but a box that shows nothing at all looks
+/// like a box that is not taking anything.
+const SECRET_MASK: char = '•';
+
 /// How many command rows the picker shows at once. It draws over the bottom of the
 /// transcript, so it has to leave the transcript somewhere to live.
 const PICKER_ROWS: usize = 6;
-
-/// The columns the name gets before the detail starts. Wide enough for a session
-/// id, the longest name the picker shows, so both kinds of row line up.
-const PICKER_NAME_COLUMNS: usize = 17;
 
 // ---------------------------------------------------------------- notices ---
 
@@ -228,11 +138,26 @@ enum Notice {
     Reasoning(String),
     Content(String),
     FinishTurn,
-    ToolStart { name: String, args: String },
+    ToolStart {
+        name: String,
+        args: String,
+    },
     ToolResult(String),
     Usage(Usage),
     Interrupted,
-    Approval { name: String, args: String },
+    Approval {
+        name: String,
+        args: String,
+    },
+    /// A question whose answer must not be shown by the box, let alone kept:
+    /// the reply handle travels with the prompt, because there is nothing to
+    /// pair it with here -- the approval gate's answer arrives on a channel of
+    /// its own only because the machine asks for it, and this is asked for by
+    /// the line being handled.
+    Secret {
+        prompt: String,
+        reply: oneshot::Sender<Option<String>>,
+    },
     Replay(Vec<Message>),
     Info(String),
     Error(String),
@@ -304,6 +229,18 @@ impl Front for Notifier {
     fn reset_stats(&mut self) {
         self.send(Notice::ResetStats);
     }
+    fn ask_secret(&mut self, prompt: &str) -> Pin<Box<dyn Future<Output = Option<String>> + '_>> {
+        let (reply, answer) = oneshot::channel();
+        self.send(Notice::Secret {
+            prompt: prompt.to_owned(),
+            reply,
+        });
+        Box::pin(async move {
+            // A front end that has gone away takes the question with it: an
+            // answer that will never come is a cancellation.
+            answer.await.unwrap_or(None)
+        })
+    }
 }
 
 // --------------------------------------------------------------- channels ---
@@ -372,6 +309,31 @@ fn poll_key(timeout: Duration) -> io::Result<Option<Event>> {
     }
 }
 
+/// A menu as the picker draws it: the rows are the application's, the drawing is
+/// this front end's.
+#[cfg(test)]
+fn named_rows(rows: Vec<(String, String)>) -> Vec<Choice> {
+    rows.into_iter()
+        .map(|(label, detail)| Choice {
+            argument: label.clone(),
+            label,
+            detail,
+        })
+        .collect()
+}
+
+/// A menu as the picker draws it: the rows are the application's, the drawing is
+/// this front end's.
+fn choice_rows(rows: Vec<crate::config::Choice>) -> Vec<Choice> {
+    rows.into_iter()
+        .map(|row| Choice {
+            label: row.label,
+            argument: row.argument,
+            detail: row.detail,
+        })
+        .collect()
+}
+
 /// Everything that has arrived on a channel, without waiting for more.
 fn drain<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> Vec<T> {
     let mut drained = Vec::new();
@@ -404,17 +366,13 @@ struct State {
     /// How many lines the box held at the last draw, so that a box that has just
     /// lost lines can be told from one that has not.
     drawn_draft: usize,
-    /// When the front end started, which is the clock the tip line runs on. Its
-    /// own clock rather than the turn's: the tips keep coming round whether or not
-    /// anything is happening.
-    started: Instant,
     /// The text block being streamed, with the style it is drawn in. The style is
     /// the block's identity, so a fragment in the other style opens a new block.
     live: Option<(Style, String)>,
-    /// The approval gate's question, while one is open.
+    /// The question standing over the box, while one is open.
     question: Option<Cell>,
-    /// Where to send the answer to that question.
-    reply: Option<oneshot::Sender<bool>>,
+    /// Where the answer to that question goes, and what kind of answer it is.
+    reply: Option<Answer>,
     /// The answer being typed.
     textarea: TextArea<'static>,
     /// Lines submitted while a turn was running, oldest first. They are not part
@@ -435,35 +393,26 @@ struct State {
     /// What was in the box before browsing started, so that stepping past the
     /// newest entry gives it back.
     draft: String,
-    /// When the current turn started, while one is running. One field answers
-    /// both "is a turn running" and "how long has it been", which are the same
-    /// question asked twice otherwise.
-    turn_started: Option<Instant>,
-    /// What the running turn is doing at this moment.
-    phase: Phase,
-    /// The word the running turn is introduced by, picked when it began.
-    verb: &'static str,
-    /// Output tokens the provider has reported for the running turn, or `None`
-    /// while it has reported none.
-    turn_tokens: Option<u64>,
+    /// Whether a turn is running: what the box's placeholder and the queue's
+    /// behaviour both hang on.
+    turn_running: bool,
     /// Bumped by everything that changes what the screen should show, so a draw
     /// can be skipped when nothing has.
     revision: u64,
 }
 
-/// What a running turn is doing, as far as the working line is concerned.
+/// A question the box is waiting on, and who to give the answer to.
 ///
-/// One field rather than two, because "is a tool running" and "which one" are only
-/// ever asked together, and a turn is in exactly one of these states at a time.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-enum Phase {
-    /// Thinking, or between things: the state a turn opens in.
-    #[default]
-    Thinking,
-    /// The answer itself is being written.
-    Responding,
-    /// A tool is executing.
-    Running(String),
+/// The box is the one place an answer is typed, so the two kinds share it and
+/// are told apart by what they do with what was typed.
+enum Answer {
+    /// The approval gate: a line starting with `y` allows and anything else
+    /// denies, which is the rule the plain front end applies to a line of stdin.
+    YesNo(oneshot::Sender<bool>),
+    /// A secret (an API key): whatever was typed, with the text hidden while it
+    /// is typed, and an empty line for a cancellation. Nothing of it is echoed
+    /// into the transcript, and nothing of it is remembered.
+    Secret(oneshot::Sender<Option<String>>),
 }
 
 /// The picker: what it is offering, and which row is highlighted.
@@ -483,11 +432,44 @@ enum Choosing {
     /// A session to switch to. The list is the whole message and nothing is
     /// half-typed, so Enter takes the highlighted row.
     Session,
+    /// A provider to store a key for: `/login`'s menu, which the plain front end
+    /// can only print.
+    Provider,
+    /// A model to switch to: `/model`'s menu.
+    Model,
 }
 
-/// One row of the picker: what it says, and what it is called.
+impl Choosing {
+    /// The command a chosen row is submitted as: the row becomes the line the
+    /// plain prompt would have been given, so that choosing has one
+    /// implementation rather than one per front end.
+    fn command(self) -> &'static str {
+        match self {
+            Choosing::Command => "",
+            Choosing::Session => "/resume",
+            Choosing::Provider => "/login",
+            Choosing::Model => "/model",
+        }
+    }
+
+    /// Whether the list is the whole message -- a list of things to do rather
+    /// than a name being typed -- and so whether Enter takes the highlighted row
+    /// instead of submitting what is in the box.
+    fn takes_a_row(self) -> bool {
+        self != Choosing::Command
+    }
+}
+
+/// One row of the picker: what it says, what it is called, and what choosing it
+/// means.
 struct Choice {
-    name: String,
+    /// What the row shows.
+    label: String,
+    /// What choosing it submits as the argument of the command the picker is
+    /// offering: the same string as the label, except for a provider, which is
+    /// listed by name and addressed by id.
+    argument: String,
+    /// The dim second column.
     detail: String,
 }
 
@@ -500,7 +482,6 @@ impl Default for State {
             drawn_lines: 0,
             drawn_rows: 0,
             drawn_draft: 0,
-            started: Instant::now(),
             live: None,
             question: None,
             reply: None,
@@ -511,10 +492,7 @@ impl Default for State {
             history: Vec::new(),
             browsing: None,
             draft: String::new(),
-            turn_started: None,
-            phase: Phase::default(),
-            verb: VERBS[0],
-            turn_tokens: None,
+            turn_running: false,
             revision: 0,
         }
     }
@@ -604,114 +582,26 @@ impl State {
         self.scroll.bottom();
     }
 
-    /// The pinned status line: what is running while a turn is, and the session
-    /// summary when nothing is.
+    /// The pinned status line: the session summary, always. What a turn is doing
+    /// is the transcript's to say -- the cells it produces -- and the summary is
+    /// what you read when you are about to type rather than while you wait.
     ///
-    /// The two do not share the line. What a turn is doing is the thing to look at
-    /// while it does it, and the model and cache statistics are what you read when
-    /// you are about to type rather than while you wait.
-    fn status_line(&self, width: usize, now: Instant) -> Line<'static> {
-        match self.working(width, now) {
-            Some(line) => line,
-            // One column is left free so the write cannot trigger autowrap.
-            None => Line::from(self.status.line(width.saturating_sub(1))),
-        }
+    /// One column is left free so the write cannot trigger autowrap.
+    fn status_line(&self, width: usize) -> Line<'static> {
+        Line::from(self.status.line(width.saturating_sub(1)))
     }
 
-    /// The working line, while a turn is running.
-    ///
-    /// The word, how long it has been going, what it has written, and which part of
-    /// the turn it is in -- in that order, because that is the order the question is
-    /// asked in: something is happening, for this long, this much of it, at this.
-    fn working(&self, width: usize, now: Instant) -> Option<Line<'static>> {
-        let elapsed = self.elapsed(now)?;
-        let frame = spinner_frame(elapsed);
-        let spent = duration_label(elapsed);
-        let state = match &self.phase {
-            Phase::Thinking => "thinking".to_owned(),
-            Phase::Responding => "responding".to_owned(),
-            Phase::Running(tool) => format!("running {tool}"),
-        };
-        // The token count is the one segment that can be missing: it is what the
-        // provider reported, and until it reports anything there is nothing to
-        // show but a number this process made up.
-        let tokens = match self.turn_tokens {
-            Some(n) => format!(" \u{b7} \u{2193} {n} tokens"),
-            None => String::new(),
-        };
-        let head = format!("{frame} {}\u{2026}", self.verb);
-        let rest = format!(" ({spent}{tokens} \u{b7} {state})");
-        // One row, which cannot wrap: on a line too narrow for both, the detail goes
-        // and the word stays, since a word on its own still says something is
-        // happening.
-        let head_width = super::text::width(&head);
-        let rest_width = super::text::width(&rest);
-        let detail = if head_width + rest_width < width {
-            rest
-        } else {
-            String::new()
-        };
-        Some(Line::from(vec![
-            RSpan::styled(head, RStyle::new().fg(Color::Indexed(WORKING_FOREGROUND))),
-            RSpan::styled(detail, RStyle::new().add_modifier(Modifier::DIM)),
-        ]))
-    }
-
-    /// How long the current turn has been running, if one is.
-    fn elapsed(&self, now: Instant) -> Option<Duration> {
-        Some(now.saturating_duration_since(self.turn_started?))
-    }
-
-    /// The tip to show at `now`, which is the one the tip clock has come round to.
-    fn tip(&self, now: Instant) -> &'static str {
-        TIPS[self.tip_step(now) as usize % TIPS.len()]
-    }
-
-    /// How many tip periods have passed since the front end started. The clock
-    /// reading the line and the tick that decides whether to redraw are the same
-    /// number, so the tip changes exactly when the screen is repainted for it.
-    fn tip_step(&self, now: Instant) -> u64 {
-        let period = TIP_PERIOD.as_millis().max(1);
-        (now.saturating_duration_since(self.started).as_millis() / period) as u64
-    }
-
-    /// The tip line: the gutter, then the tip.
-    fn tip_line(&self, now: Instant) -> Line<'static> {
-        Line::styled(
-            format!("{TIP_GUTTER}Tip: {}", self.tip(now)),
-            RStyle::new().add_modifier(Modifier::DIM),
-        )
-    }
-
-    /// The moment on the front end's own clock: the spinner's while a turn runs,
-    /// the tip line's while nothing does.
-    ///
-    /// Either way it is one number that says whether anything has moved without
-    /// being told to, and it is part of what decides whether to redraw -- without
-    /// that, a screen left idle would keep showing the tip it opened with.
-    fn tick(&self, now: Instant) -> u64 {
-        match self.elapsed(now) {
-            Some(elapsed) => spinner_step(elapsed),
-            None => self.tip_step(now),
-        }
-    }
-
-    /// A turn is starting: start the clock the status line reads, and pick the word
-    /// it will be introduced by.
-    fn begin_turn(&mut self, now: Instant) {
+    /// A turn is starting.
+    fn begin_turn(&mut self) {
         self.revision += 1;
-        self.turn_started = Some(now);
-        self.verb = verb_for(seed());
-        self.turn_tokens = None;
+        self.turn_running = true;
         self.refresh_placeholder();
     }
 
-    /// The turn is over: stop the clock, and forget what it was doing, which a turn
-    /// can end without ever saying -- an interrupted tool reports no result.
+    /// The turn is over.
     fn end_turn(&mut self) {
         self.revision += 1;
-        self.turn_started = None;
-        self.phase = Phase::default();
+        self.turn_running = false;
         self.refresh_placeholder();
     }
 
@@ -719,33 +609,18 @@ impl State {
     fn apply(&mut self, notice: Notice) {
         self.revision += 1;
         match notice {
-            Notice::Reasoning(text) => {
-                self.phase = Phase::Thinking;
-                self.stream(Style::Reasoning, &text);
-            }
-            Notice::Content(text) => {
-                self.phase = Phase::Responding;
-                self.stream(Style::Plain, &text);
-            }
+            Notice::Reasoning(text) => self.stream(Style::Reasoning, &text),
+            Notice::Content(text) => self.stream(Style::Plain, &text),
             Notice::FinishTurn => self.end_block(),
             Notice::ToolStart { name, args } => {
                 self.end_block();
                 self.transcript.push(Cell::tool_call(&name, &args));
-                // The working line reports the tool by name while it runs, which is
-                // the part of a turn that can take a long time.
-                self.phase = Phase::Running(name);
             }
             Notice::ToolResult(result) => {
                 self.end_block();
                 self.transcript.push(Cell::ToolResult(result));
-                // What follows a result is the model reading it, so the turn is back
-                // to thinking until it says otherwise.
-                self.phase = Phase::Thinking;
             }
-            Notice::Usage(u) => {
-                self.status.record(&u);
-                *self.turn_tokens.get_or_insert(0) += u.completion_tokens;
-            }
+            Notice::Usage(u) => self.status.record(&u),
             Notice::Interrupted => {
                 self.end_block();
                 self.transcript.push(Cell::Interrupted);
@@ -753,6 +628,11 @@ impl State {
             Notice::Approval { name, args } => {
                 self.end_block();
                 self.question = Some(Cell::approval(&name, &args));
+            }
+            Notice::Secret { prompt, reply } => {
+                self.end_block();
+                self.question = Some(Cell::Notice(prompt));
+                self.open_answer(Answer::Secret(reply));
             }
             Notice::Replay(messages) => {
                 self.end_block();
@@ -829,10 +709,10 @@ impl State {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
-                // A list of sessions is a list of things to do rather than a name
-                // being typed, so Enter takes the highlighted row and submits the
-                // line it stands for.
-                if self.choose_session() {
+                // A list of sessions, providers or models is a list of things to
+                // do rather than a name being typed, so Enter takes the
+                // highlighted row and submits the line it stands for.
+                if self.choose() {
                     return Submitted::Line;
                 }
                 if self.textarea.is_empty() {
@@ -911,9 +791,9 @@ impl State {
             KeyEvent {
                 code: KeyCode::Tab, ..
             } => {
-                // Completing a command leaves it in the box; choosing a session
-                // is the whole action, so it submits.
-                if self.choose_session() {
+                // Completing a command leaves it in the box; choosing a row is
+                // the whole action, so it submits.
+                if self.choose() {
                     return Submitted::Line;
                 }
                 self.complete();
@@ -993,13 +873,9 @@ impl State {
     /// Recompute what the picker offers for what is in the box, keeping the
     /// highlight on the same command while it is still among the matches.
     fn refresh_picker(&mut self) {
-        // A session list is not a completion: it was asked for in full, and it
+        // An offered list is not a completion: it was asked for in full, and it
         // stays until it is answered or dismissed, whatever is typed next.
-        if self
-            .picker
-            .as_ref()
-            .is_some_and(|p| p.kind == Choosing::Session)
-        {
+        if self.picker.as_ref().is_some_and(|p| p.kind.takes_a_row()) {
             return;
         }
         let matches = repl::completions(&self.text());
@@ -1011,7 +887,7 @@ impl State {
             .picker
             .as_ref()
             .and_then(|p| p.choices.get(p.selected))
-            .map(|c| c.name.clone());
+            .map(|c| c.argument.clone());
         let selected = previous
             .and_then(|name| matches.iter().position(|c| c.name == name))
             .unwrap_or(0);
@@ -1020,7 +896,8 @@ impl State {
             choices: matches
                 .into_iter()
                 .map(|c| Choice {
-                    name: c.name.to_owned(),
+                    label: c.name.to_owned(),
+                    argument: c.name.to_owned(),
                     detail: c.description.to_owned(),
                 })
                 .collect(),
@@ -1034,40 +911,55 @@ impl State {
     /// The sessions are passed in rather than read here: the terminal is not where
     /// the filesystem is read, and this is the state half of the front end.
     fn open_sessions(&mut self, list: &[session::SessionInfo]) -> bool {
+        self.open_choices(
+            Choosing::Session,
+            list.iter()
+                .map(|s| Choice {
+                    label: s.id.clone(),
+                    argument: s.id.clone(),
+                    detail: format!("{} messages · {}", s.message_count, s.preview),
+                })
+                .collect(),
+        )
+    }
+
+    /// Offer `rows` to choose from, and say whether there was anything to offer.
+    /// The rows are built from [`crate::config`]'s tables -- what exists is the
+    /// application's to know, and how a row is drawn is this front end's.
+    fn open_choices(&mut self, kind: Choosing, rows: Vec<Choice>) -> bool {
         self.revision += 1;
-        if list.is_empty() {
+        if rows.is_empty() {
             self.picker = None;
             return false;
         }
         self.picker = Some(Picker {
-            kind: Choosing::Session,
-            choices: list
-                .iter()
-                .map(|s| Choice {
-                    name: s.id.clone(),
-                    detail: format!("{} messages · {}", s.message_count, s.preview),
-                })
-                .collect(),
+            kind,
+            choices: rows,
             selected: 0,
         });
         true
     }
 
-    /// Take the highlighted row, if the picker is offering sessions. The row
-    /// becomes the line the plain prompt would have been given, so switching has
-    /// one implementation rather than one per front end.
-    fn choose_session(&mut self) -> bool {
+    /// Take the highlighted row. It becomes the line the plain prompt would have
+    /// been given, so choosing has one implementation rather than one per front
+    /// end.
+    fn choose(&mut self) -> bool {
         let Some(picker) = &self.picker else {
             return false;
         };
-        if picker.kind != Choosing::Session {
+        if !picker.kind.takes_a_row() {
             return false;
         }
-        let Some(name) = picker.choices.get(picker.selected).map(|c| c.name.clone()) else {
+        let Some(argument) = picker
+            .choices
+            .get(picker.selected)
+            .map(|c| c.argument.clone())
+        else {
             return false;
         };
+        let line = format!("{} {argument}", picker.kind.command());
         self.picker = None;
-        self.set_text(&format!("/resume {name}"));
+        self.set_text(&line);
         true
     }
 
@@ -1125,13 +1017,14 @@ impl State {
     }
 
     /// Tab: put the highlighted command in the box without running it, since an
-    /// argument may still be wanted.
+    /// argument may still be wanted. Only a command reaches here: the other lists
+    /// are menus, and `Tab` submits a menu's row the way `Enter` does.
     fn complete(&mut self) {
         let Some(picker) = self.picker.take() else {
             return;
         };
         if let Some(choice) = picker.choices.get(picker.selected) {
-            self.set_text(&choice.name);
+            self.set_text(&choice.argument);
         }
     }
 
@@ -1172,6 +1065,15 @@ impl State {
         let Some(picker) = &self.picker else {
             return Vec::new();
         };
+        // As wide as the widest name in this list, so its rows line up without
+        // every menu paying for the widest one there is: a menu of command names
+        // is narrow, one of `<provider id>/<modelid>` is not.
+        let width = picker
+            .choices
+            .iter()
+            .map(|c| super::text::width(&c.label))
+            .max()
+            .unwrap_or(0);
         picker
             .choices
             .iter()
@@ -1189,7 +1091,10 @@ impl State {
                     RStyle::new().add_modifier(Modifier::DIM)
                 };
                 Line::from(vec![
-                    RSpan::styled(format!(" {:<PICKER_NAME_COLUMNS$}", choice.name), name),
+                    RSpan::styled(
+                        format!(" {}", super::text::padded(&choice.label, width)),
+                        name,
+                    ),
                     RSpan::styled(format!(" {}", choice.detail), detail),
                 ])
             })
@@ -1226,8 +1131,8 @@ impl State {
             let _ = cancel.send(true);
             return;
         }
-        // No gate is open, so the box is free for the next line. Enter queues it,
-        // which is the whole point of typing here. One key is still dropped --
+        // No question is open, so the box is free for the next line. Enter queues
+        // it, which is the whole point of typing here. One key is still dropped --
         // Ctrl-D, which leaves the session -- because a turn in flight is not the
         // place to leave from either.
         if self.reply.is_none() {
@@ -1237,10 +1142,10 @@ impl State {
             }
             return;
         }
-        // The gate is open: the box is where the answer goes and nowhere else, so
-        // what is typed is the answer and Enter gives it.
-        // Enter submits it whether or not anything was typed: a blank line denies,
-        // which is the rule the plain front end reads from stdin.
+        // A question is open: the box is where the answer goes and nowhere else,
+        // so what is typed is the answer and Enter gives it. Enter submits it
+        // whether or not anything was typed: a blank line denies, or cancels a
+        // secret, which is the rule the plain front end reads from stdin.
         let answering = matches!(
             &event,
             Event::Key(key)
@@ -1289,15 +1194,15 @@ impl State {
         lines.split_off(lines.len().saturating_sub(QUEUE_ROWS))
     }
 
-    /// The placeholder for what the box is for right now: the answer while the
-    /// gate is open, the queue while a turn runs, the next message otherwise.
+    /// The placeholder for what the box is for right now: the answer while a
+    /// question is open, the queue while a turn runs, the next message
+    /// otherwise.
     fn placeholder(&self) -> &'static str {
-        if self.reply.is_some() {
-            ANSWER_PLACEHOLDER
-        } else if self.turn_started.is_some() {
-            QUEUE_PLACEHOLDER
-        } else {
-            IDLE_PLACEHOLDER
+        match self.reply {
+            Some(Answer::YesNo(_)) => ANSWER_PLACEHOLDER,
+            Some(Answer::Secret(_)) => SECRET_PLACEHOLDER,
+            None if self.turn_running => QUEUE_PLACEHOLDER,
+            None => IDLE_PLACEHOLDER,
         }
     }
 
@@ -1320,24 +1225,43 @@ impl State {
 
     /// The approval gate is asking: remember who to answer.
     fn open_question(&mut self, reply: oneshot::Sender<bool>) {
+        self.open_answer(Answer::YesNo(reply));
+    }
+
+    /// A question is open: take the box for its answer.
+    fn open_answer(&mut self, reply: Answer) {
         self.revision += 1;
+        // A secret is typed on a screen other people can see, so the box shows
+        // dots instead of what is in it. The answer is still what was typed:
+        // this is the drawing, not the text.
+        let secret = matches!(reply, Answer::Secret(_));
         self.reply = Some(reply);
         // A line being composed when the question arrives is held aside: the
         // answer to "run it?" is a `y`, and a sentence that happened to be in the
-        // box is not one. It comes back when the gate closes.
+        // box is not one. It comes back when the question closes.
         self.held_draft = Some(self.text());
         self.textarea = input_box();
+        if secret {
+            self.textarea.set_mask_char(SECRET_MASK);
+        }
         self.refresh_placeholder();
     }
 
-    /// Answer the open question from what the user submitted, if anything. A line
-    /// starting with `y` allows and anything else denies, which is the rule the
-    /// plain front end applies to a line of stdin.
+    /// Answer the open question from what is in the box, if anything. What the
+    /// answer means is the question's: `y` allows a tool call, an empty line
+    /// cancels a secret.
     fn close_question(&mut self) {
         self.revision += 1;
         if let Some(reply) = self.reply.take() {
-            let answer = self.textarea.lines().join("\n").trim().to_lowercase();
-            let _ = reply.send(answer.starts_with('y'));
+            let answer = self.textarea.lines().join("\n").trim().to_owned();
+            match reply {
+                Answer::YesNo(reply) => {
+                    let _ = reply.send(answer.to_lowercase().starts_with('y'));
+                }
+                Answer::Secret(reply) => {
+                    let _ = reply.send((!answer.is_empty()).then_some(answer));
+                }
+            }
             let held = self.held_draft.take().unwrap_or_default();
             self.set_text(&held);
         }
@@ -1408,7 +1332,7 @@ struct Screen<B: Backend> {
 /// Written out rather than taken from crossterm's own `EnableMouseCapture`, which
 /// asks for `?1003` as well. What it also costs is the terminal's own selection:
 /// a terminal that has handed the mouse over keeps it, and gives it back under
-/// `Shift` -- which is why the tip line says so.
+/// `Shift`.
 const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
 const MOUSE_OFF: &str = "\x1b[?1000l\x1b[?1006l";
 
@@ -1466,16 +1390,15 @@ impl Drop for Tty {
 /// What the screen would show, as a value that can be compared.
 ///
 /// Equal keys mean a redraw cannot change a pixel, so it is skipped. The
-/// revision covers everything the state knows about itself; the tick covers what
-/// moves without the state changing, which is the spinner's clock while a turn
-/// runs and the tip line's while none does; the size is there because the rows are
+/// revision covers everything the state knows about itself -- nothing on the
+/// screen moves without the state changing, so it is the whole of what a draw
+/// could differ in besides the size, which is there because the rows are
 /// laid out from it. Reading the size is an
 /// `ioctl`, not a round trip to the terminal, so it is cheap enough to be part
 /// of a check that runs on every tick of the loop.
 #[derive(PartialEq, Eq, Clone, Copy)]
 struct ViewKey {
     revision: u64,
-    tick: u64,
     width: u16,
     height: u16,
 }
@@ -1518,11 +1441,10 @@ impl Screen<CrosstermBackend<Stdout>> {
 
 impl<B: Backend> Screen<B> {
     /// What the screen would show right now.
-    fn view_key(&self, now: Instant) -> Result<ViewKey, B::Error> {
+    fn view_key(&self) -> Result<ViewKey, B::Error> {
         let size = self.terminal.size()?;
         Ok(ViewKey {
             revision: self.state.revision,
-            tick: self.state.tick(now),
             width: size.width,
             height: size.height,
         })
@@ -1535,12 +1457,11 @@ impl<B: Backend> Screen<B> {
     /// told something, and repainting an unchanged screen would be a whole-screen
     /// write every tick.
     fn draw_if_changed(&mut self) -> Result<(), B::Error> {
-        let now = Instant::now();
-        let key = self.view_key(now)?;
+        let key = self.view_key()?;
         if self.drawn == Some(key) {
             return Ok(());
         }
-        self.draw_at(now)?;
+        self.draw_at()?;
         // Only after the draw succeeded: a failed one leaves the screen showing
         // something else, so the next call has to try again.
         self.drawn = Some(key);
@@ -1550,20 +1471,21 @@ impl<B: Backend> Screen<B> {
     /// Draw the screen as of now, for tests that do not care about the clock.
     #[cfg(test)]
     fn draw(&mut self) -> Result<(), B::Error> {
-        self.draw_at(Instant::now())
+        self.draw_at()
     }
 
-    /// Draw the screen: the window on the transcript, the status line, the input
-    /// box. The box is sized for what is in it, so the transcript gives up rows to
-    /// a multi-line draft and takes them back when the line is submitted.
-    fn draw_at(&mut self, now: Instant) -> Result<(), B::Error> {
+    /// Draw the screen: the window on the transcript, the input box, and the
+    /// status line under it. The box is sized for what is in it, so the transcript
+    /// gives up rows to a multi-line draft and takes them back when the line is
+    /// submitted.
+    fn draw_at(&mut self) -> Result<(), B::Error> {
         let size = self.terminal.size()?;
         let width = size.width as usize;
         let input = self.state.input_rows(size.height);
-        // What is waiting to run, drawn between the transcript and the status
-        // line: the session, then what comes next, then how the turn is doing and
-        // what Enter does with what is being typed. Asked for before the layout,
-        // because how many rows it takes is what the transcript gives up.
+        // What is waiting to run, drawn at the bottom of the transcript: the
+        // session, then what comes next, then the box, and under the box the
+        // session summary. Asked for before the layout, because how many rows it
+        // takes is what the transcript gives up.
         let queue = Text::from(self.state.queue_lines(width));
         let queued = queue.height() as u16;
         self.state.reset_box_scroll(input);
@@ -1581,17 +1503,15 @@ impl<B: Backend> Screen<B> {
         };
         let last = (first + rows as usize).min(lines.len());
         let transcript = Text::from(lines[first..last].to_vec());
-        let status = self.state.status_line(width, now);
-        let tip = self.state.tip_line(now);
+        let status = self.state.status_line(width);
         let cursor = self.state.textarea.screen_cursor();
 
         self.terminal.draw(|frame| {
             let rows = Layout::vertical([
                 Constraint::Min(0),
                 Constraint::Length(queued),
-                Constraint::Length(1),
-                Constraint::Length(1),
                 Constraint::Length(input),
+                Constraint::Length(1),
             ])
             .split(frame.area());
             frame.render_widget(Paragraph::new(transcript), rows[0]);
@@ -1609,10 +1529,9 @@ impl<B: Backend> Screen<B> {
                 frame.render_widget(Paragraph::new(Text::from(picker)), area);
             }
             frame.render_widget(Paragraph::new(queue), rows[1]);
-            frame.render_widget(Paragraph::new(status), rows[2]);
-            frame.render_widget(Paragraph::new(tip), rows[3]);
-            frame.render_widget(&self.state.textarea, rows[4]);
-            place_cursor(frame, rows[4], cursor);
+            frame.render_widget(&self.state.textarea, rows[2]);
+            place_cursor(frame, rows[2], cursor);
+            frame.render_widget(Paragraph::new(status), rows[3]);
         })?;
         Ok(())
     }
@@ -1627,13 +1546,13 @@ impl<B: Backend> Screen<B> {
     }
 }
 
-/// The input box: a bordered editor. Enter submits and Ctrl-J inserts a newline,
-/// matching the plain prompt's keys.
+/// The input box: an editor ruled off above and below. Enter submits and Ctrl-J
+/// inserts a newline, matching the plain prompt's keys.
 fn input_box() -> TextArea<'static> {
     let mut textarea = TextArea::default();
     textarea.set_block(
         Block::default()
-            .borders(Borders::ALL)
+            .borders(BOX_BORDERS)
             .border_style(RStyle::new().add_modifier(Modifier::DIM)),
     );
     textarea.set_placeholder_text(IDLE_PLACEHOLDER);
@@ -1769,9 +1688,10 @@ fn wrapped_lines(spans: &[Span], width: usize) -> Vec<Line<'static>> {
 /// terminal's caret sits where the next character will go.
 ///
 /// The box reports its cursor relative to the area inside its borders, which is
-/// the same inner area the widget renders into.
+/// the same inner area the widget renders into -- so the borders it is asked
+/// about have to be the box's own.
 fn place_cursor(frame: &mut Frame, area: Rect, cursor: ScreenCursor) {
-    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let inner = Block::default().borders(BOX_BORDERS).inner(area);
     let x = inner.x + cursor.col as u16;
     let y = inner.y + cursor.row as u16;
     if x < inner.right() && y < inner.bottom() {
@@ -1829,7 +1749,7 @@ pub async fn run(
     };
     let history_path = crate::config::history_file()?;
     screen.state.history = history::load(&history_path);
-    screen.state.status.set_model(&agent.session.meta.model);
+    screen.state.status.set_model(&agent.model_label());
     screen.state.show(Cell::Notice(banner.to_owned()));
     screen.state.transcript.extend(cell::from_messages(history));
 
@@ -1876,6 +1796,23 @@ pub async fn run(
             if line.trim() == "/resume" && screen.state.open_sessions(&session::list(sdir)?) {
                 break;
             }
+            // The other two menus work the same way: the command still needs an
+            // argument, and the front end that can offer the possibilities does.
+            if line.trim() == "/login"
+                && screen
+                    .state
+                    .open_choices(Choosing::Provider, choice_rows(config::provider_choices()))
+            {
+                break;
+            }
+            if line.trim() == "/model"
+                && screen.state.open_choices(
+                    Choosing::Model,
+                    choice_rows(config::model_menu(&agent.model_label())),
+                )
+            {
+                break;
+            }
 
             // A turn: it races against the keyboard, so Ctrl-C can reach it.
             // The block is what bounds the borrow of `line`: it ends with the
@@ -1893,10 +1830,7 @@ pub async fn run(
                     &mut approve,
                 );
                 tokio::pin!(turn);
-                // The clock starts here rather than when the line was submitted:
-                // what the status line reports is the turn, and a turn is what is
-                // being waited for.
-                screen.state.begin_turn(Instant::now());
+                screen.state.begin_turn();
                 let outcome = loop {
                     // Keys are read here, never on another thread: see `poll_key`.
                     if let Some(event) = poll_key(TICK)? {
@@ -2033,7 +1967,10 @@ mod tests {
             "m-1 · cache 60.0% · hit 6 · miss 4"
         );
         screen.apply(Notice::ResetStats);
-        assert_eq!(screen.status.full_line(), "m-1 · cache —");
+        assert_eq!(
+            screen.status.full_line(),
+            "m-1 · cache 0.0% · hit 0 · miss 0"
+        );
     }
 
     #[test]
@@ -2178,16 +2115,6 @@ mod tests {
         }
     }
 
-    /// A state with a turn that has been running for `elapsed`, and the moment it
-    /// is asked about. The clock is the test's to decide, so what the status line
-    /// shows is asserted rather than waited for.
-    fn running_for(elapsed: Duration) -> (State, Instant) {
-        let mut state = State::default();
-        let now = Instant::now();
-        state.begin_turn(now - elapsed);
-        (state, now)
-    }
-
     #[test]
     fn paging_to_either_end_stops_there() {
         let mut view = Scroll::default();
@@ -2224,47 +2151,49 @@ mod tests {
     #[test]
     fn the_pinned_rows_take_the_bottom_of_the_screen() {
         // The shape the pinned region has to keep, whatever the transcript does:
-        // the status line, the tip, then the box, on the last rows of the terminal.
+        // the box, then the status line, on the last rows of the terminal.
         let mut screen = screen_for_test(60, 20);
         screen.state.status.set_model("m-1");
         screen.draw().unwrap();
         let last = screen.terminal.backend().buffer().area.height - 1;
-        assert_eq!(row(&screen, last - 4), "m-1 · cache —");
-        assert_eq!(
-            row(&screen, last - 3),
-            format!("{TIP_GUTTER}Tip: {}", TIPS[0])
+        assert!(row(&screen, last - 3).starts_with('─'), "the box's top");
+        assert!(
+            // The editor puts a space in front of the placeholder, which is where
+            // its cursor would stand.
+            row(&screen, last - 2).ends_with(IDLE_PLACEHOLDER),
+            "its text: {:?}",
+            row(&screen, last - 2)
         );
-        assert!(row(&screen, last - 2).starts_with('┌'), "the box's top");
-        assert!(row(&screen, last - 1).starts_with("│ ›"), "its text");
-        assert!(row(&screen, last).starts_with('└'), "its bottom");
+        assert!(row(&screen, last - 1).starts_with('─'), "its bottom");
+        assert_eq!(row(&screen, last), "m-1 · cache 0.0% · hit 0 · miss 0");
     }
 
     #[test]
-    fn the_queue_is_drawn_above_the_status_line_until_it_is_run() {
+    fn the_queue_is_drawn_above_the_box_until_it_is_run() {
         // What was typed during a turn has to be visible somewhere, or the only
         // proof it arrived is that something happens later. It is drawn as the
-        // user line it is about to become, dimmed to say it has not run, between
-        // the transcript and the status line -- and it takes rows from the
-        // transcript rather than covering it.
+        // user line it is about to become, dimmed to say it has not run, at the
+        // foot of the transcript -- and it takes rows from the transcript rather
+        // than covering it.
         let mut screen = screen_for_test(40, 20);
         screen.state.status.set_model("m-1");
         let last = screen.terminal.backend().buffer().area.height - 1;
         screen.state.enqueue("first".into());
         screen.state.enqueue("second".into());
         screen.draw().unwrap();
-        assert_eq!(row(&screen, last - 6), "› first");
-        assert_eq!(row(&screen, last - 5), "› second");
+        assert_eq!(row(&screen, last - 5), "› first");
+        assert_eq!(row(&screen, last - 4), "› second");
         assert!(
-            screen.terminal.backend().buffer()[(0, last - 6)]
+            screen.terminal.backend().buffer()[(0, last - 5)]
                 .style()
                 .add_modifier
                 .contains(Modifier::DIM),
             "dimmed: it is waiting, not part of the session"
         );
-        // ... and the status line, the tip and the box are where they always are:
-        // the queue is inserted, not drawn over anything.
-        assert_eq!(row(&screen, last - 4), "m-1 · cache —");
-        assert!(row(&screen, last - 2).starts_with('┌'));
+        // ... and the box and the status line are where they always are: the
+        // queue is inserted, not drawn over anything.
+        assert!(row(&screen, last - 3).starts_with('─'), "the box's top");
+        assert_eq!(row(&screen, last), "m-1 · cache 0.0% · hit 0 · miss 0");
 
         // Run one: the queue gives a row back, and what ran is drawn as the
         // transcript's own line -- the same line the queue was showing, in the
@@ -2273,20 +2202,20 @@ mod tests {
         assert_eq!(screen.state.dequeue().as_deref(), Some("first"));
         screen.draw().unwrap();
         assert_eq!(row(&screen, 0), "› first", "the transcript has it now");
-        assert_eq!(row(&screen, last - 6), "", "the row it gave back");
+        assert_eq!(row(&screen, last - 5), "", "the row it gave back");
         assert_eq!(
-            row(&screen, last - 5),
+            row(&screen, last - 4),
             "› second",
             "only what is still waiting is in the queue"
         );
-        assert_eq!(row(&screen, last - 4), "m-1 · cache —");
+        assert_eq!(row(&screen, last), "m-1 · cache 0.0% · hit 0 · miss 0");
         let buf = screen.terminal.backend().buffer();
         assert!(
             !buf[(2, 0)].style().add_modifier.contains(Modifier::DIM),
             "the line that ran reads as the session's, not as something waiting"
         );
         assert!(
-            buf[(2, last - 5)]
+            buf[(2, last - 4)]
                 .style()
                 .add_modifier
                 .contains(Modifier::DIM),
@@ -2341,7 +2270,7 @@ mod tests {
         screen.draw().unwrap();
         let last = screen.terminal.backend().buffer().area.height - 1;
         assert!(
-            row(&screen, last - 2).starts_with('┌'),
+            row(&screen, last - 3).starts_with('─'),
             "one line, three rows"
         );
 
@@ -2349,12 +2278,15 @@ mod tests {
         type_in(&mut screen.state, "second");
         screen.draw().unwrap();
         assert!(
-            row(&screen, last - 3).starts_with('┌'),
+            row(&screen, last - 4).starts_with('─'),
             "two lines, four rows"
         );
-        assert!(row(&screen, last - 2).contains("first"), "the first line");
-        assert!(row(&screen, last - 1).contains("second"), "and the second");
-        assert!(row(&screen, last).starts_with('└'), "the bottom stays put");
+        assert!(row(&screen, last - 3).contains("first"), "the first line");
+        assert!(row(&screen, last - 2).contains("second"), "and the second");
+        assert!(
+            row(&screen, last - 1).starts_with('─'),
+            "the bottom stays put"
+        );
     }
 
     #[test]
@@ -2368,13 +2300,13 @@ mod tests {
         type_in(&mut screen.state, "second");
         screen.draw().unwrap();
         assert!(
-            row(&screen, last - 3).starts_with('┌'),
+            row(&screen, last - 4).starts_with('─'),
             "two lines, four rows"
         );
 
         screen.state.take_line();
         screen.draw().unwrap();
-        assert!(row(&screen, last - 2).starts_with('┌'), "empty, three rows");
+        assert!(row(&screen, last - 3).starts_with('─'), "empty, three rows");
     }
 
     #[test]
@@ -2403,47 +2335,48 @@ mod tests {
         }
         screen.draw().unwrap();
 
+        // The box is ruled off above and below, so its lines are what lies between
+        // the rules: the first line is the row after the top one.
         let top = 1 + all_rows(&screen)
             .iter()
-            .position(|r| r.starts_with('┌'))
+            .position(|r| r.starts_with('─'))
             .expect("the box is drawn");
         for (i, letter) in letters[..kept].iter().enumerate() {
             let drawn = row(&screen, (top + i) as u16);
-            assert!(drawn.starts_with(&format!("│{letter}")), "{drawn:?}");
+            assert!(drawn.starts_with(*letter), "{drawn:?}");
         }
         assert!(
-            row(&screen, (top + kept) as u16).starts_with('└'),
+            row(&screen, (top + kept) as u16).starts_with('─'),
             "and nothing below the last line"
         );
     }
 
     #[test]
-    fn the_status_line_says_what_the_turn_is_doing() {
-        // The line as drawn, not as formatted: the word is painted in its own
-        // colour, and the row is the only place that can be seen.
+    fn the_status_line_is_the_summary_whether_or_not_a_turn_runs() {
+        // The line as drawn, not as formatted: while a turn runs the row is the
+        // same session summary it is at rest, and the turn's own doings are the
+        // transcript's cells, not the status line's.
         let mut screen = screen_for_test(60, 20);
-        let now = Instant::now();
-        screen.state.begin_turn(now);
-        screen.state.verb = "Julienning";
+        screen.state.status.set_model("m-1");
         screen.state.apply(Notice::Usage(Usage {
-            completion_tokens: 259,
+            prompt_cache_hit_tokens: 6,
+            prompt_cache_miss_tokens: 4,
             ..Usage::default()
         }));
+        screen.draw().unwrap();
+        let last = screen.terminal.backend().buffer().area.height - 1;
+        assert_eq!(row(&screen, last), "m-1 · cache 60.0% · hit 6 · miss 4");
+        screen.state.begin_turn();
         screen.state.apply(Notice::ToolStart {
             name: "read_file".into(),
             args: "{}".into(),
         });
-        screen.draw_at(now).unwrap();
-        let pinned = screen.terminal.backend().buffer().area.height - PINNED_ROWS - BOX_ROWS;
+        screen.state.apply(Notice::Content("here it is".into()));
+        screen.draw().unwrap();
         assert_eq!(
-            row(&screen, pinned),
-            "· Julienning… (0s · ↓ 259 tokens · running read_file)"
-        );
-        let buf = screen.terminal.backend().buffer();
-        assert_eq!(
-            buf[(0, pinned)].fg,
-            Color::Indexed(WORKING_FOREGROUND),
-            "the word is the one thing on the line that is not dim"
+            row(&screen, last),
+            "m-1 · cache 60.0% · hit 6 · miss 4",
+            "a running turn does not take the row over"
         );
     }
 
@@ -2817,7 +2750,7 @@ mod tests {
             picker
                 .choices
                 .iter()
-                .map(|c| c.name.as_str())
+                .map(|c| c.label.as_str())
                 .collect::<Vec<_>>(),
             vec!["/resume"]
         );
@@ -2890,7 +2823,7 @@ mod tests {
         let shown: Vec<_> = picker
             .choices
             .iter()
-            .map(|c| (c.name.as_str(), c.detail.as_str()))
+            .map(|c| (c.label.as_str(), c.detail.as_str()))
             .collect();
         assert_eq!(
             shown,
@@ -2964,6 +2897,43 @@ mod tests {
             rows.iter().any(|r| r.contains("20260910-124721")
                 && r.contains("3 messages · what is in this file?")),
             "one row per session: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_provider_menu_reads_by_name_and_a_model_menu_by_id() {
+        // The two menus read differently on purpose: a provider is picked by the
+        // name a person knows it by, a model by the `<provider id>/<modelid>` the
+        // flags, the session and the status line all carry.
+        let mut screen = screen_for_test(70, 20);
+        screen
+            .state
+            .open_choices(Choosing::Provider, choice_rows(config::provider_choices()));
+        screen.draw().unwrap();
+        let rows = all_rows(&screen);
+        assert!(rows.iter().any(|r| r.contains("DeepSeek")), "{rows:?}");
+        assert!(
+            rows.iter().any(|r| r.contains("Z.AI Coding CN")),
+            "{rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("deepseek ")),
+            "the menu does not show what is typed at: {rows:?}"
+        );
+
+        screen.state.open_choices(
+            Choosing::Model,
+            choice_rows(config::model_menu("deepseek/deepseek-flash")),
+        );
+        screen.draw().unwrap();
+        let rows = all_rows(&screen);
+        assert!(
+            rows.iter().any(|r| r.contains("deepseek/deepseek-v4-pro")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("zai-coding-cn/glm-5.3")),
+            "{rows:?}"
         );
     }
 
@@ -3115,206 +3085,6 @@ mod tests {
     }
 
     #[test]
-    fn the_spinner_frame_comes_from_the_clock_not_from_a_counter() {
-        let at = Duration::from_millis;
-        assert_eq!(spinner_frame(at(0)), SPINNER[0]);
-        assert_eq!(spinner_frame(at(99)), SPINNER[0], "still the first frame");
-        assert_eq!(spinner_frame(at(100)), SPINNER[1]);
-        assert_eq!(spinner_frame(at(600)), SPINNER[0], "it comes round");
-        // The same moment is always the same frame, so a redraw that was skipped
-        // cannot leave the spinner behind.
-        assert_eq!(spinner_frame(at(1_234)), spinner_frame(at(1_234)));
-    }
-
-    /// The working line as the screen would read it, styling and all.
-    fn working_line(state: &State, now: Instant) -> String {
-        state
-            .working(80, now)
-            .expect("a turn is running")
-            .to_string()
-    }
-
-    #[test]
-    fn the_working_line_says_what_the_turn_is_doing_and_for_how_long() {
-        let (mut state, now) = running_for(Duration::from_millis(12_300));
-        state.verb = "Julienning";
-        // The frame comes from the clock, so the test reads it from there too.
-        let frame = spinner_frame(Duration::from_millis(12_300));
-        assert_eq!(
-            working_line(&state, now),
-            format!("{frame} Julienning… (12s · thinking)"),
-            "the minutes only appear once there are any"
-        );
-        state.apply(Notice::ToolStart {
-            name: "read_file".into(),
-            args: "{}".into(),
-        });
-        assert_eq!(
-            working_line(&state, now),
-            format!("{frame} Julienning… (12s · running read_file)")
-        );
-        // What follows a result is the model reading it.
-        state.apply(Notice::ToolResult("ok".into()));
-        assert_eq!(
-            working_line(&state, now),
-            format!("{frame} Julienning… (12s · thinking)")
-        );
-        // An answer being written is the third thing a turn can be doing.
-        state.apply(Notice::Content("here it is".into()));
-        assert_eq!(
-            working_line(&state, now),
-            format!("{frame} Julienning… (12s · responding)")
-        );
-    }
-
-    #[test]
-    fn the_working_line_reports_the_tokens_the_provider_counted() {
-        let (mut state, now) = running_for(Duration::from_millis(65_400));
-        state.verb = "Julienning";
-        let frame = spinner_frame(Duration::from_millis(65_400));
-        // Nothing reported yet: no number, rather than one this side made up.
-        assert_eq!(
-            working_line(&state, now),
-            format!("{frame} Julienning… (1m 5s · thinking)")
-        );
-        state.apply(Notice::Usage(Usage {
-            completion_tokens: 259,
-            ..Usage::default()
-        }));
-        assert_eq!(
-            working_line(&state, now),
-            format!("{frame} Julienning… (1m 5s · ↓ 259 tokens · thinking)")
-        );
-        // Every sub-request of the turn goes into the same count.
-        state.apply(Notice::Usage(Usage {
-            completion_tokens: 41,
-            ..Usage::default()
-        }));
-        assert_eq!(
-            working_line(&state, now),
-            format!("{frame} Julienning… (1m 5s · ↓ 300 tokens · thinking)")
-        );
-    }
-
-    #[test]
-    fn a_narrow_working_line_keeps_the_word_and_drops_the_detail() {
-        let (mut state, now) = running_for(Duration::from_millis(1_500));
-        state.verb = "Julienning";
-        state.apply(Notice::Usage(Usage {
-            completion_tokens: 259,
-            ..Usage::default()
-        }));
-        let frame = spinner_frame(Duration::from_millis(1_500));
-        let full = format!("{frame} Julienning… (1s · ↓ 259 tokens · thinking)");
-        assert_eq!(working_line(&state, now), full);
-        assert_eq!(
-            state
-                .working(super::super::text::width(&full), now)
-                .unwrap()
-                .to_string(),
-            format!("{frame} Julienning…"),
-            "a line with no room for both keeps the word, whole"
-        );
-        assert_eq!(
-            state.working(12, now).unwrap().to_string(),
-            format!("{frame} Julienning…"),
-            "and what is left still says something is happening"
-        );
-    }
-
-    #[test]
-    fn the_word_is_picked_when_the_turn_begins() {
-        // One word per turn, out of the clock: the machine underneath is the same
-        // every time, and the word is what makes a long wait readable.
-        let mut state = State::default();
-        state.begin_turn(Instant::now());
-        let picked = state.verb;
-        assert!(VERBS.contains(&picked), "{picked:?} is not one of them");
-        assert_eq!(state.turn_tokens, None, "and the count starts empty");
-        for seed in [0u128, 1, 13, 999_999_999_999, u128::MAX] {
-            assert!(VERBS.contains(&verb_for(seed)));
-        }
-    }
-
-    #[test]
-    fn an_idle_line_is_the_summary_and_nothing_else() {
-        let (state, now) = running_for(Duration::from_millis(50));
-        assert_eq!(
-            state.status_line(40, now).to_string(),
-            format!(
-                "{} {}… (0s · thinking)",
-                spinner_frame(Duration::from_millis(50)),
-                state.verb
-            )
-        );
-        let mut idle = State::default();
-        idle.status.set_model("m");
-        assert_eq!(idle.status_line(40, now).to_string(), "m · cache —");
-        // Narrow enough that the summary loses a segment of its own: with nothing
-        // running, the line is the summary and nothing competes with it.
-        assert_eq!(idle.status_line(9, now).to_string(), "m");
-    }
-
-    #[test]
-    fn the_tick_moves_with_the_spinner_while_a_turn_runs() {
-        let mut state = State::default();
-        let now = Instant::now();
-        state.begin_turn(now);
-        assert_eq!(state.tick(now), 0);
-        assert_eq!(state.tick(now + SPINNER_FRAME), 1, "a frame later");
-        // The same moment is the same tick, which is what lets a redraw be skipped.
-        assert_eq!(state.tick(now + SPINNER_FRAME), 1);
-        state.end_turn();
-        assert_eq!(state.phase, Phase::Thinking, "and stops naming a tool");
-    }
-
-    #[test]
-    fn an_idle_screen_still_has_a_clock_because_the_tip_changes_on_one() {
-        // The tip line comes round on a period of its own, which is what moves the
-        // tick while nothing else does: without it, the screen would keep the tip
-        // it opened with for as long as the session lasted.
-        let state = State::default();
-        let started = state.started;
-        assert_eq!(state.tick(started), 0);
-        assert_eq!(state.tick(started + TIP_PERIOD), 1);
-        assert_eq!(
-            state.tick(started + TIP_PERIOD - Duration::from_millis(1)),
-            0
-        );
-    }
-
-    #[test]
-    fn the_tip_comes_round_on_its_own_clock() {
-        let state = State::default();
-        let started = state.started;
-        assert_eq!(state.tip(started), TIPS[0]);
-        assert_eq!(state.tip(started + TIP_PERIOD), TIPS[1]);
-        // Round the whole list, and back to the first: a session that runs long
-        // enough does not run out of tips.
-        assert_eq!(state.tip(started + TIP_PERIOD * TIPS.len() as u32), TIPS[0]);
-        assert_eq!(
-            state.tip(started + TIP_PERIOD * 3 + Duration::from_secs(5)),
-            TIPS[3]
-        );
-    }
-
-    #[test]
-    fn a_turn_that_ends_forgets_the_tool_it_was_running() {
-        // A tool whose turn was interrupted never reports a result, so the name
-        // has to be dropped by the turn ending rather than by the result.
-        let mut state = State::default();
-        let now = Instant::now();
-        state.begin_turn(now);
-        state.apply(Notice::ToolStart {
-            name: "run_command".into(),
-            args: "{}".into(),
-        });
-        assert!(working_line(&state, now).contains("running run_command"));
-        state.end_turn();
-        assert!(state.working(80, now).is_none(), "nothing is running");
-    }
-
-    #[test]
     fn everything_that_changes_the_screen_moves_the_revision() {
         let mut state = State::default();
         let mut moved = Vec::new();
@@ -3423,8 +3193,9 @@ mod tests {
             .key(Event::Key(KeyEvent::from(KeyCode::Char('h'))));
         screen.draw_if_changed().unwrap();
         assert_eq!(frames.get(), 2);
-        // So does a running turn: the spinner has to keep moving.
-        screen.state.begin_turn(Instant::now());
+        // So does a turn starting: the box's placeholder says so, which is a
+        // change the revision has to carry.
+        screen.state.begin_turn();
         screen.draw_if_changed().unwrap();
         assert_eq!(frames.get(), 3);
     }
@@ -3601,7 +3372,7 @@ mod tests {
         let mut state = State::default();
         assert_eq!(state.textarea.placeholder_text(), IDLE_PLACEHOLDER);
 
-        state.begin_turn(Instant::now());
+        state.begin_turn();
         assert_eq!(state.textarea.placeholder_text(), QUEUE_PLACEHOLDER);
 
         let (reply, _answer) = oneshot::channel();
@@ -3625,7 +3396,7 @@ mod tests {
         // box is not one. The gate takes the box for its answer and gives it back.
         let mut state = State::default();
         let (cancel, _cancelled) = watch::channel(false);
-        state.begin_turn(Instant::now());
+        state.begin_turn();
         type_while_working(&mut state, "and then refactor", &cancel);
         let (reply, answer) = oneshot::channel();
         state.open_question(reply);
@@ -3656,6 +3427,174 @@ mod tests {
         assert_eq!(answer.blocking_recv(), Ok(true));
         assert!(screen.question.is_none());
         assert!(screen.textarea.is_empty());
+    }
+
+    #[test]
+    fn a_secret_is_typed_into_the_box_and_answered_with_what_was_typed() {
+        // `/login`'s question. What goes back is the text, not the dots: the
+        // masking is how it is drawn, and a box that answered with its own
+        // drawing would send bullets to the provider.
+        let mut state = State::default();
+        let (cancel, _cancelled) = watch::channel(false);
+        let (reply, answer) = oneshot::channel();
+        state.apply(Notice::Secret {
+            prompt: "glm API key".into(),
+            reply,
+        });
+        assert_eq!(
+            state.textarea.mask_char(),
+            Some(SECRET_MASK),
+            "the text is not on the screen while it is typed"
+        );
+        type_while_working(&mut state, "sk-test", &cancel);
+        assert_eq!(state.textarea.lines(), ["sk-test"], "the box holds it");
+        state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Enter)), &cancel);
+        assert_eq!(answer.blocking_recv(), Ok(Some("sk-test".to_owned())));
+        assert!(
+            state.queued.is_empty(),
+            "an answer is not a line to run next"
+        );
+        assert!(state.reply.is_none(), "the question is closed");
+        assert_eq!(state.textarea.mask_char(), None, "the box is a box again");
+    }
+
+    #[test]
+    fn an_empty_answer_cancels_a_secret() {
+        let mut state = State::default();
+        let (cancel, _cancelled) = watch::channel(false);
+        let (reply, answer) = oneshot::channel();
+        state.apply(Notice::Secret {
+            prompt: "glm API key".into(),
+            reply,
+        });
+        state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Enter)), &cancel);
+        assert_eq!(answer.blocking_recv(), Ok(None));
+    }
+
+    #[test]
+    fn the_answer_to_a_secret_never_reaches_the_transcript_or_the_queue() {
+        // The whole reason it is a question rather than a line: a key typed at
+        // the prompt would be in the session the moment it was submitted.
+        let mut screen = screen_for_test(60, 20);
+        let (cancel, _cancelled) = watch::channel(false);
+        let (reply, answer) = oneshot::channel();
+        screen.state.begin_turn();
+        screen.state.apply(Notice::Secret {
+            prompt: "glm API key".into(),
+            reply,
+        });
+        type_while_working(&mut screen.state, "sk-do-not-keep-me", &cancel);
+        screen.draw().unwrap();
+        let drawn = all_rows(&screen).join("\n");
+        assert!(
+            drawn.contains("glm API key"),
+            "the question is on the screen"
+        );
+        assert!(drawn.contains(SECRET_MASK), "masked, not in the clear");
+        assert!(!drawn.contains("sk-do-not-keep-me"), "{drawn}");
+        screen
+            .state
+            .key_while_working(Event::Key(KeyEvent::from(KeyCode::Enter)), &cancel);
+        assert_eq!(
+            answer.blocking_recv(),
+            Ok(Some("sk-do-not-keep-me".to_owned()))
+        );
+        assert!(
+            screen.state.transcript.is_empty(),
+            "nothing was written down"
+        );
+        assert!(screen.state.queued.is_empty());
+    }
+
+    #[test]
+    fn what_is_drawn_while_a_secret_is_asked_for_says_what_the_box_wants() {
+        let mut screen = screen_for_test(60, 20);
+        let (reply, _answer) = oneshot::channel();
+        screen.state.apply(Notice::Secret {
+            prompt: "glm API key".into(),
+            reply,
+        });
+        screen.draw().unwrap();
+        let last = screen.terminal.backend().buffer().area.height - 1;
+        assert!(
+            row(&screen, last - 2).contains(SECRET_PLACEHOLDER),
+            "the box says what Enter does with it: {:?}",
+            row(&screen, last - 2)
+        );
+    }
+
+    #[test]
+    fn a_line_being_typed_is_held_aside_while_a_secret_is_open() {
+        let mut state = State::default();
+        let (cancel, _cancelled) = watch::channel(false);
+        state.begin_turn();
+        type_while_working(&mut state, "and then refactor", &cancel);
+        let (reply, _answer) = oneshot::channel();
+        state.apply(Notice::Secret {
+            prompt: "deepseek API key".into(),
+            reply,
+        });
+        assert!(
+            state.textarea.is_empty(),
+            "the key starts from an empty box"
+        );
+        state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Enter)), &cancel);
+        assert_eq!(
+            state.textarea.lines(),
+            ["and then refactor"],
+            "the draft came back"
+        );
+        assert!(state.queued.is_empty());
+    }
+
+    #[test]
+    fn a_provider_or_model_row_is_submitted_as_the_line_it_stands_for() {
+        // The pickers `/login` and `/model` open: the row is the argument, and
+        // the command that takes it is the one the plain prompt would be given,
+        // so choosing is implemented once for both front ends.
+        let mut state = State::default();
+        assert!(state.open_choices(
+            Choosing::Provider,
+            vec![
+                Choice {
+                    label: "DeepSeek".into(),
+                    argument: "deepseek".into(),
+                    detail: "key stored".into(),
+                },
+                Choice {
+                    label: "Z.AI Coding CN".into(),
+                    argument: "zai-coding-cn".into(),
+                    detail: "no key".into(),
+                },
+            ]
+        ));
+        state.down();
+        assert!(state.choose());
+        assert_eq!(
+            state.textarea.lines(),
+            ["/login zai-coding-cn"],
+            "the row is read by name and submitted by id"
+        );
+
+        assert!(state.open_choices(
+            Choosing::Model,
+            named_rows(vec![("zai-coding-cn/glm-5.3".into(), "current".into())])
+        ));
+        assert!(state.choose());
+        assert_eq!(state.textarea.lines(), ["/model zai-coding-cn/glm-5.3"]);
+    }
+
+    #[test]
+    fn an_offered_list_of_providers_survives_typing_like_a_session_list_does() {
+        // It was asked for in full; recomputing completions over it would take
+        // the list away the moment a letter was typed.
+        let mut state = State::default();
+        state.open_choices(
+            Choosing::Provider,
+            named_rows(vec![("Z.AI Coding CN".into(), "no key".into())]),
+        );
+        state.refresh_picker();
+        assert_eq!(state.picker.as_ref().unwrap().kind, Choosing::Provider);
     }
 
     #[test]

@@ -4,8 +4,8 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A minimal terminal coding agent in Rust, backed by an OpenAI-compatible
-`/chat/completions` API: DeepSeek by default, Zhipu BigModel (GLM) via
-`--provider glm`. It streams the model's thinking (`reasoning_content`) in
+`/chat/completions` API: DeepSeek by default, Z.AI's GLM coding endpoint via
+`--provider zai-coding-cn`. It streams the model's thinking (`reasoning_content`) in
 dim gray, then runs a tool loop over four tools: `Bash`, `Read`, `Edit`,
 and `Write`. Sessions are append-only JSONL logs under `~/.caocli/sessions/`,
 resumable across runs and replayed byte-for-byte so the backend's prefix
@@ -14,21 +14,22 @@ cache keeps hitting.
 ## Requirements
 
 - Rust 1.85+ (edition 2024)
-- An API key for the selected provider: `DEEPSEEK_API_KEY` (default) or
-  `ZAI_API_KEY` / `GLM_API_KEY` for `--provider glm` (or `CAOCLI_API_KEY`
-  to override either)
+- An API key, which is stored by `/login` (see below)
 
 ## Quick start
 
 ```bash
-export DEEPSEEK_API_KEY=sk-...          # or: export ZAI_API_KEY=...
-
-cargo run --                            # interactive REPL (/help for commands)
+cargo run --                            # interactive REPL: /login, then chat
 cargo run -- -c -p "check disk usage"   # one-shot, continuing the latest session
-cargo run -- --effort max --model deepseek-v4-pro -p "..."
-cargo run -- --provider glm -p "1+1"    # Zhipu GLM-5.3-Flash
+cargo run -- --effort max --model deepseek/deepseek-v4-pro -p "..."
+cargo run -- --provider zai-coding-cn -p "1+1"   # Z.AI Coding CN, glm-5.3-flash
 cargo run -- --list                     # list sessions and exit
 ```
+
+The first run has no key yet: `/login` lists the providers by name, takes the
+key without echoing it, and writes it to `~/.caocli/settings.json`. That file is
+where a key lives — there is no environment variable to set up, and so no second
+place for a key to hide in.
 
 ## Usage
 
@@ -40,7 +41,27 @@ cargo run -- --list                     # list sessions and exit
 | `/new` | Start a new session, inheriting the current model settings |
 | `/sessions` | List sessions (id, message count, last user message preview) |
 | `/resume <id>` | Switch to an existing session, replaying its history to the screen |
+| `/login` | Choose a provider and store its API key. The list shows each provider by *name* (`DeepSeek`, `Z.AI Coding CN`); the plain prompt prints the id beside it, since that is what `/login <id>` takes |
+| `/model` | Choose a model, named `<provider id>/<modelid>` (`deepseek/deepseek-v4-pro`, `zai-coding-cn/glm-5.3`); it switches the model and, when the name carries another provider, the backend with it |
 | `/exit`, `/quit`, `/q` | Quit |
+
+`/login` asks for the key as a question rather than as a line: the prompt is
+drawn, the answer is typed with the text masked in the full-screen front end and
+with the terminal's echo off in the plain one, and it is never written to the
+transcript, the session log, or the input history. A login for the provider the
+session is already talking to takes effect on the next turn.
+
+A model is named by the provider that serves it — `deepseek/deepseek-v4-pro`,
+`zai-coding-cn/glm-5.3` — both on the status line and in `/model`. A bare id
+(`/model deepseek-v4-pro`, `--model deepseek-v4-pro`) belongs to the provider
+the session is running on. Switching to a model whose provider has no key yet is
+refused, with `/login <provider id>` as the reason.
+
+A provider has an id and a name, and they are used for different things: the id
+(`deepseek`, `zai-coding-cn`) is what addresses it — `--provider`, `/login <id>`,
+`<id>/<modelid>`, the session meta, `settings.json` — and the name is what a
+person reads in `/login` and in an error (`no API key for Z.AI Coding CN: run
+/login zai-coding-cn`).
 
 ### Multi-line input
 
@@ -56,8 +77,8 @@ newlines also works (bracketed paste).
 | Flag | Description |
 |---|---|
 | `-p <PROMPT>` | Run one prompt (including the tool loop), then exit |
-| `--provider <NAME>` | Backend provider: `deepseek` (default) or `glm` |
-| `--model <MODEL>` | Model id; defaults to the provider's default model |
+| `--provider <NAME>` | Backend provider: `deepseek` (default) or `zai-coding-cn`. Settles the endpoint of a new session; a resumed session keeps the one its meta names |
+| `--model <MODEL>` | Model id as `<provider>/<modelid>`, or bare for `--provider`; defaults to the provider's default model |
 | `--effort <EFFORT>` | Reasoning effort: `low`, `high`, or `max` (default `max`); other values are rejected locally. On GLM, `low` answers without emitting `reasoning_content`. |
 | `-c, --cont` | Continue the most recent session |
 | `--resume <ID>` | Resume a specific session by id |
@@ -76,9 +97,11 @@ result summaries as they were rendered live (full tool output is not replayed).
 ### The screen front end
 
 By default caocli takes the whole screen. The transcript fills it, and the last
-rows are the pinned region: what the current turn is doing, a tip, and the
-input box. The box is as tall as what is in it — `Ctrl-J` adds a line and room
-for it — and the transcript takes those rows back when the line is submitted.
+rows are the pinned region: the input box, and under it the status line.
+The box is as tall as what is in it — `Ctrl-J` adds a line and room for it — and
+the transcript takes those rows back when the line is submitted. It is ruled off
+above and below rather than boxed in, so a line of the session and a line being
+typed start in the same column.
 
 ```
 ▸ Read Cargo.toml
@@ -86,30 +109,27 @@ ok: package.name = caocli (312 bytes)
 
 › run the tests and fix what fails
 › and bump the version
-✻ Julienning… (1m 5s · ↓ 259 tokens · running Bash)
- ⎿  Tip: PageUp and PageDown read back through the session
-┌──────────────────────────────────────────────────────────────────────────┐
-│ ›  the turn is running · Enter queues this line                          │
-└──────────────────────────────────────────────────────────────────────────┘
+──────────────────────────────────────────────────────────────────────────
+›  the turn is running · Enter queues this line
+──────────────────────────────────────────────────────────────────────────
+zai-coding-cn/glm-5.3 · cache 95.3% · hit 846912 · miss 41538
 ```
 
-- **The working line** appears while a turn runs: a spinner, a word, how long
-  the turn has been going, the output tokens the provider has reported for it
-  (the segment is absent until there is something real to put there), and what
-  the turn is doing — `thinking`, `responding`, or `running <tool>`.
+- **The status line** is the row under the box, always the session summary:
+  the model, the cache hit rate, and the raw hit/miss counts. A new session
+  opens with the defaults (`cache 0.0% · hit 0 · miss 0`) and the counts move
+  as the provider reports usage; what a turn is doing is the transcript's to
+  say, not the status line's.
 - **A line typed while a turn runs is queued, not dropped.** The box takes the
-  next line as usual — Enter puts it after the current turn, drawn dimmed above
-  the status line while it waits, and the box's placeholder says so. When the
-  turn ends the head of the queue runs next, so stopping a turn with `Ctrl-C`
+  next line as usual — Enter puts it after the current turn, drawn dimmed at the
+  foot of the transcript while it waits, and the box's placeholder says so. When
+  the turn ends the head of the queue runs next, so stopping a turn with `Ctrl-C`
   redirects to what was queued rather than throwing it away; a `Ctrl-C` during a
   queued turn stops that one and moves on to the next, which is how a queue is
   abandoned from the front. Commands queue too — a queued `/exit` leaves when it
   reaches the head — and a queued `/resume` with no id opens its picker when it
   runs, with the rest of the queue waiting behind the choice, since the choice is
   what is typed next.
-- **The tip line** comes round on a clock of its own, whether or not a turn is
-  running. When nothing is running the line above it is the session summary
-  (`model · cache …`).
 - **The transcript is the application's**, not the terminal's scrollback: the
   alternate screen is entered on startup, so nothing drawn here reaches the
   terminal's own history. The wheel and `PageUp`/`PageDown` move through the
@@ -132,29 +152,38 @@ In the plain REPL (`--no-tui`), a status bar pinned to the bottom line shows the
 and the session's cumulative cache hit rate, right-aligned:
 
 ```
-deepseek-flash · cache 98.6% · hit 32384 · miss 461
+deepseek/deepseek-flash · cache 98.6% · hit 32384 · miss 461
 ```
 
-The model segment mirrors the active session's meta and is refreshed on
-`/new`, `/resume`, and CLI overrides.
+The model segment names the model by its provider and is refreshed on
+`/new`, `/resume`, `/model` and CLI overrides.
 
 It appears only when stdout is a TTY and the terminal has at least 3 rows;
 `--no-status-bar` turns it off. The bar reserves the last terminal line via
 a scroll region, so output scrolls above it — the trade-off is that lines
 scrolled out of the region do not enter the terminal's scrollback buffer.
-Stats reset when you switch sessions (`/new`, `/resume`), and the bar is
-restored on exit.
+Stats reset when you switch sessions (`/new`, `/resume`) or models
+(`/model`), and the bar is restored on exit.
 
 ### Providers
 
-`--provider` selects a static preset (endpoint, default model, key env).
-It is a per-run choice and is not stored in the session, so resume a GLM
-session with `--provider glm` again (e.g. `caocli -c --provider glm`).
+`--provider` selects a static preset: an endpoint, the models it serves and the
+answer ceiling. It is settled per run, and `--model <provider id>/<modelid>` or `/model`
+names a provider of its own. A session records the provider its model belongs
+to, so continuing one (`caocli -c`) resumes on the same backend — no flag
+needed — and `--provider zai-coding-cn` is how you move it to the other one.
 
-| Provider | Endpoint | Default model | Max answer |
-|---|---|---|---|
-| `deepseek` | `api.deepseek.com` | `deepseek-flash` | 384k tokens |
-| `glm` | `open.bigmodel.cn` (coding) | `GLM-5.3-Flash` | 128k tokens |
+| Provider id | Name | Endpoint | Models | Max answer |
+|---|---|---|---|---|
+| `deepseek` | DeepSeek | `api.deepseek.com` | `deepseek-flash` (default), `deepseek-v4-pro` | 384k tokens |
+| `zai-coding-cn` | Z.AI Coding CN | `open.bigmodel.cn` (coding) | `glm-5.3-flash` (default), `glm-5.3` | 128k tokens |
+
+The id is what the flags, the menus' arguments, the session meta and
+`settings.json` carry; the name is what `/login` lists and what an error message
+calls the provider.
+
+The model list is what `/model` offers; naming one the table does not list is
+allowed, and up to the backend to accept or reject.
 
 Both speak the same `thinking` / `reasoning_content` protocol, so the request
 builder and stream parser are shared. Thinking is always on.
@@ -165,14 +194,36 @@ a *single* completion, not the conversation, and the backends' own default is
 far below what these models emit — a long `Write` would otherwise be cut off
 mid-file, which the model cannot see and the next `Edit` cannot repair.
 
+### Settings
+
+`~/.caocli/settings.json` is written by `/login` and is the only place an API
+key lives. It is keyed by provider **id**:
+
+```json
+{
+  "providers": {
+    "deepseek": { "api_key": "sk-..." },
+    "zai-coding-cn": { "api_key": "..." }
+  }
+}
+```
+
+It is rewritten whole, `0600`, and there is exactly one mechanism: no
+environment variable, no flag, no second location. Anything else the file holds
+is kept as it was found, so it is safe to edit by hand. A key that is missing is
+reported where it matters (the start of an interactive session, `/model`, or the
+first turn of `-p`) with `/login <provider>` as what to do about it.
+
+With no key in it, an interactive session still starts — `/login` is inside it —
+while a `-p` run says what to do instead of failing at the first request.
+
 ### Environment
 
 | Variable | Description |
 |---|---|
-| `DEEPSEEK_API_KEY` | API key for `--provider deepseek` (the default). |
-| `ZAI_API_KEY`, `GLM_API_KEY` | API key for `--provider glm`; either works. |
-| `CAOCLI_API_KEY` | If set, overrides the provider-specific key. |
 | `NO_COLOR` | If set, disable ANSI colors (block separation is preserved). |
+
+There are no API key variables: a key is only ever what `/login` stored.
 
 ## Tools
 
@@ -243,8 +294,8 @@ Limits: 10 KiB of output per tool result, 10 MB per file read/write.
   `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`; GLM/OpenAI report
   nested `prompt_tokens_details.cached_tokens` (miss derived as
   `prompt_tokens - cached_tokens`). Both shapes land in the same hit/miss
-  counters; a provider that reports neither shows `cache —` rather than a
-  fake 0%.
+  counters; a session that has reported nothing keeps the zero defaults rather
+  than a fake-looking rate.
 - **Token usage** is attached to the final content chunk of the stream, not
   to a separate SSE event.
 - **Two levels of cache visibility.** Every sub-request prints a `tokens:`
@@ -257,10 +308,14 @@ Sessions live in `~/.caocli/sessions/<YYYYMMDD-HHMMSS>.jsonl`. Each line is
 one JSON object tagged by `t`; `meta` lines override earlier ones on load.
 
 ```jsonl
-{"t":"header","id":"20250101-120000","created_at":1735704000,"model":"deepseek-flash","reasoning_effort":"high"}
+{"t":"header","id":"20250101-120000","created_at":1735704000,"provider":"deepseek","model":"deepseek-flash","reasoning_effort":"high"}
 {"t":"msg","message":{"role":"user","content":"check disk usage"}}
-{"t":"meta","model":"deepseek-v4-pro","reasoning_effort":"max"}
+{"t":"meta","provider":"zai-coding-cn","model":"glm-5.3","reasoning_effort":"max"}
 ```
+
+`provider` names the backend the model belongs to. It is optional: a session
+written before it existed has none, and such a session runs on whichever
+provider the run selected — which is what every session did then.
 
 ## Development
 
@@ -275,7 +330,9 @@ cargo audit                                # CI runs rustsec/audit-check
 End-to-end smoke test (the primary self-check channel after a change):
 
 ```bash
-DEEPSEEK_API_KEY=... cargo run -- -p "what is 1+1"
+cargo run -- -p "what is 1+1"              # needs a key: /login stores one
+python3 scripts/tui_smoke.py               # the full-screen front end, under a pty
+python3 scripts/pty_smoke.py               # the plain prompt, under a pty
 ```
 
 CI runs on every push to `master` and every pull request: fmt + clippy +

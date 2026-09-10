@@ -12,6 +12,17 @@ pub fn width(s: &str) -> usize {
     s.width()
 }
 
+/// `value` followed by spaces until it takes `columns` columns, for lining text
+/// up in a column of its own.
+///
+/// Not `format!("{:<columns$}")`: that fills up to a count of *characters*, and
+/// what is being lined up is measured in the columns the terminal gives it.
+pub fn padded(value: &str, columns: usize) -> String {
+    let mut out = String::from(value);
+    out.push_str(&" ".repeat(columns.saturating_sub(width(value))));
+    out
+}
+
 /// Clip `s` to at most `max` columns, ending on a char boundary.
 ///
 /// A character that would straddle the limit is dropped whole rather than
@@ -56,6 +67,17 @@ mod tests {
         assert_eq!(width("abc"), 3);
         assert_eq!(width("glm-4.6"), 7);
         assert_eq!(width("deepseek-chat"), 13);
+    }
+
+    #[test]
+    fn padded_fills_to_a_column_count() {
+        assert_eq!(padded("abc", 5), "abc  ");
+        assert_eq!(padded("abcde", 3), "abcde", "never cuts what is there");
+        assert_eq!(padded("", 2), "  ");
+        // A wide glyph is two columns, so one character is already one column
+        // past what a two-column field would take.
+        assert_eq!(padded("\u{6df1}", 2), "\u{6df1}");
+        assert_eq!(padded("\u{6df1}", 3), "\u{6df1} ");
     }
 
     #[test]

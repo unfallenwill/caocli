@@ -27,6 +27,13 @@ use std::os::fd::AsRawFd;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
+    /// Provider the model belongs to: the id from the preset table, which says
+    /// the endpoint and the key to send it to. `None` in a session written
+    /// before this was recorded — such a session runs on whichever provider the
+    /// run selected, which is what every session did then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Model id, sent to the backend as it stands.
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
@@ -353,6 +360,7 @@ mod tests {
 
     fn test_meta() -> SessionMeta {
         SessionMeta {
+            provider: Some("deepseek".into()),
             model: "deepseek-v4-flash".into(),
             reasoning_effort: Some("high".into()),
         }
@@ -392,6 +400,39 @@ mod tests {
             Some("reasoning trace")
         );
         assert_eq!(loaded.messages[2].tool_call_id.as_deref(), Some("call_1"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_header_names_the_provider_the_model_belongs_to() {
+        let dir = tmpdir();
+        let s = Session::create(&dir, test_meta()).unwrap();
+        let line = std::fs::read_to_string(&s.path).unwrap();
+        assert!(
+            line.contains(r#""provider":"deepseek""#),
+            "the header should carry it: {line}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_session_written_before_providers_were_recorded_still_loads() {
+        // The field is optional because every session written before it existed
+        // has no provider in it, and refusing to load one would strand the
+        // sessions of whoever upgraded.
+        let dir = tmpdir();
+        let path = dir.join("20250101-120000.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"t":"header","id":"20250101-120000","created_at":1,"model":"deepseek-v4-pro","reasoning_effort":"high"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let loaded = Session::load(&path).unwrap();
+        assert_eq!(loaded.meta.provider, None);
+        assert_eq!(loaded.meta.model, "deepseek-v4-pro");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -506,6 +547,7 @@ mod tests {
         let dir = tmpdir();
         let mut s = Session::create(&dir, test_meta()).unwrap();
         s.set_meta(SessionMeta {
+            provider: Some("zai-coding-cn".into()),
             model: "deepseek-v4-pro".into(),
             reasoning_effort: Some("max".into()),
         })
@@ -514,6 +556,7 @@ mod tests {
         drop(s);
         let loaded = load_when_released(&path);
         assert_eq!(loaded.meta.model, "deepseek-v4-pro");
+        assert_eq!(loaded.meta.provider.as_deref(), Some("zai-coding-cn"));
         assert_eq!(loaded.meta.reasoning_effort.as_deref(), Some("max"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -576,6 +619,7 @@ mod tests {
         let mut s = Session::create(&dir, test_meta()).unwrap();
         s.append_message(&Message::user("x".repeat(60))).unwrap();
         s.set_meta(SessionMeta {
+            provider: Some("deepseek".into()),
             model: "deepseek-v4-pro".into(),
             reasoning_effort: None,
         })

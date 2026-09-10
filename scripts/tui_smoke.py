@@ -57,12 +57,15 @@ VIEWPORT = "type a message"
 BANNER = "caocli · session"
 STATUS = "cache"
 PICKER = "show this"  # the /help row of the command picker
-HELP = "Commands:"  # the first line of what /help commits
+# One line of what /help commits. Not the first one: the pinned region takes rows
+# from the bottom, so a long answer has its head off the top of the screen before
+# the last row of it is even drawn -- what is looked for here has to be a line the
+# window can still hold.
+HELP = "Startup flags:"
 
-# Live marks: the state word the working line carries, the frames it moves through
-# on its own, and the gate that stands between a tool call and its execution.
-SPINNER = "thinking"
-SPINNER_FRAMES = "·✢✳✶✽✻"
+# Live marks: what the box says while a turn runs, and the gate that stands
+# between a tool call and its execution.
+RUNNING = "the turn is running"
 GATE = "run it? [y/N]"
 
 # The word the queued line asks for and expects back: nonsense, so that what is
@@ -74,6 +77,38 @@ QUEUED_TOKEN = "zqx7"
 # replay half of the same cell a live turn produces; the id and the lines are what
 # the assertions below look for.
 SEED = "20260910-120000"
+
+# What `/login` is given below. Nonsense on purpose: it is never sent anywhere,
+# and looking for exactly it is how the checks below know that what they found
+# is what was typed and never anything the model wrote.
+FAKE_KEY = "sk-tui-smoke-not-a-real-key"
+
+
+def api_key() -> str:
+    """A key for the run: keys are configured in `settings.json` and nowhere else
+    now, so the smoke has to put one there.
+
+    The environment first (a one-off `DEEPSEEK_API_KEY=... SMOKE_LIVE=1`), then the
+    one `/login` stored. A placeholder when there is neither: it is enough for
+    everything here that does not call the backend.
+    """
+    key = os.environ.get("DEEPSEEK_API_KEY")
+    if key:
+        return key
+    try:
+        with open(os.path.expanduser("~/.caocli/settings.json")) as f:
+            return json.load(f)["providers"]["deepseek"]["api_key"]
+    except (OSError, KeyError, ValueError):
+        return "smoke-test-placeholder"
+
+
+def seed_settings(home: str, key: str) -> None:
+    """Write the file `/login` writes, so the run has a key to find. Without it
+    `/model` could not switch anything: a model with no key behind it is refused."""
+    directory = os.path.join(home, ".caocli")
+    os.makedirs(directory, exist_ok=True)
+    with open(os.path.join(directory, "settings.json"), "w") as f:
+        json.dump({"providers": {"deepseek": {"api_key": key}}}, f)
 
 
 def seed_session(home: str) -> str:
@@ -159,7 +194,6 @@ def spawn(home: str, extra: list[str]):
         env = dict(os.environ)
         # A temporary HOME keeps the run out of the user's sessions and history.
         env["HOME"] = home
-        env.setdefault("DEEPSEEK_API_KEY", "smoke-test-placeholder")
         env.pop("NO_COLOR", None)
         os.execve(BIN, ["caocli", *extra], env)
     os.close(slave)
@@ -329,14 +363,10 @@ class Terminal:
                 next_note = time.time() + 15
             self.pump(0.5)
 
-    def working_row(self) -> str:
-        """The working line: the row above the tip line, which is the row above the
-        input box."""
+    def status_row(self) -> str:
+        """The status line: the last row of the screen, under the input box."""
         rows = self.screen.lines()
-        for y in range(len(rows) - 1, 1, -1):
-            if rows[y].startswith("┌"):
-                return rows[y - 2]
-        return ""
+        return rows[-1] if rows else ""
 
     def transcript_top(self) -> str:
         """The first row of the transcript: what the window over it is scrolled to.
@@ -360,43 +390,28 @@ class Terminal:
             self.pump(0.3)
 
     def box_rows(self) -> list[str]:
-        """The input box as drawn: its border rows and what is between them, which
-        is what says how tall it is."""
+        """The input box as drawn: the two rules that close it in and what lies
+        between them, which is what says how tall it is. The box has no vertical
+        edges, so its rules are rows of nothing but rule -- there are no corners
+        to look for -- and the status line is the row under the bottom one."""
         rows = self.screen.lines()
-        top = next(
-            (y for y in range(len(rows) - 1, 1, -1) if rows[y].startswith("┌")), None
-        )
-        if top is None:
+        rules = [y for y in range(len(rows) - 2, 0, -1) if set(rows[y]) == {"─"}]
+        if len(rules) < 2:
             return []
-        bottom = next(
-            (y for y in range(top, len(rows)) if rows[y].startswith("└")), top
-        )
+        bottom, top = rules[0], rules[1]
         return rows[top : bottom + 1]
 
-    def spinner_moved(self, timeout: float) -> bool:
-        """Watch the working line's first column: a spinner that only ever shows
-        one frame is not a spinner, and this is the only path that runs one."""
-        seen = set()
-        end = time.time() + timeout
-        while time.time() < end and len(seen) < 3:
-            head = self.working_row()[:1]
-            if head in SPINNER_FRAMES:
-                seen.add(head)
-            self.pump(0.2)
-        if len(seen) < 3:
-            print(f"  ✗ the spinner never advanced: {sorted(seen)}")
-            return False
-        return True
+    def idle(self, settle: float, timeout: float) -> bool:
+        """Wait until the box is idle: its placeholder says so, and the
+        terminal has been silent for `settle` seconds after it.
 
-    def quiet(self, silence: float, timeout: float) -> bool:
-        """Wait until the terminal has been silent for `silence` seconds.
-
-        A running turn repaints the status line on every tick, so a still
-        terminal is an idle one -- and this is the signal that says a key can be
-        sent: a key pressed during a turn is taken as the next line, so a line
-        sent without waiting arrives half-composed at the prompt and the fragment
-        left in the box is what gets submitted. (It would now be *queued* rather
-        than dropped, which is a different way to be wrong: the assertions below
+        Nothing on the screen moves on its own, so silence alone is not
+        evidence that a turn has ended -- a running turn is a still terminal
+        too. The placeholder is what says a key can be sent: a key pressed
+        during a turn is taken as the next line, so a line sent without
+        waiting arrives half-composed at the prompt and the fragment left in
+        the box is what gets submitted. (It would be *queued* rather than
+        dropped, which is a different way to be wrong: the assertions below
         about the prompt would be about a line waiting behind a turn.)
         """
         end = time.time() + timeout
@@ -404,9 +419,9 @@ class Terminal:
         while time.time() < end:
             if self.pump(0.2):
                 last = time.time()
-            elif time.time() - last >= silence:
+            elif self.screen.find(VIEWPORT) and time.time() - last >= settle:
                 return True
-        print("  ✗ the terminal never went quiet")
+        print("  ✗ the front end never went idle")
         return False
 
     def wait_for_file(self, path: str, timeout: float) -> bool:
@@ -436,8 +451,8 @@ def live(term: "Terminal", home: str) -> bool:
     command line by the caller, which is what puts the gate in the way.
     """
     ok = True
-    # The status line reports the turn while it runs, on a clock of its own: it
-    # moves without anything else about the screen changing.
+    # The box is what says a turn is running now: its placeholder changes the
+    # moment the turn begins, before any model output has arrived.
     # Note: what the user said is in here, but it is not asserted on screen. A
     # turn that fails or answers quickly writes more than the window shows before
     # the first frame is painted -- and the screen is written incrementally, so a
@@ -445,8 +460,7 @@ def live(term: "Terminal", home: str) -> bool:
     # cell a submitted line produces is covered by unit tests and by the resumed
     # turn above, which draws one out of the log.
     term.send(f"use the Read tool to read {ROOT}/Cargo.toml\r")
-    ok &= term.expect(SPINNER, 15)
-    ok &= term.spinner_moved(5)
+    ok &= term.expect(RUNNING, 15)
 
     # A line typed while the turn runs is queued rather than dropped: Enter takes
     # it out of the box, it is drawn above the status line while it waits, and the
@@ -492,7 +506,7 @@ def live(term: "Terminal", home: str) -> bool:
             gated = term.wait_for_file(marker, 90)
             break
         print(f"  · no Bash call on attempt {attempt}")
-        if not term.quiet(2.0, 60):
+        if not term.idle(2.0, 60):
             return False
     if not gated:
         print("  ✗ no tool call ever needed approval")
@@ -509,9 +523,9 @@ def live(term: "Terminal", home: str) -> bool:
     # the transcript: QUEUED_TOKEN is matched twice -- once as the line itself,
     # once in what the model answers with. A single match would only mean the row
     # is still waiting in the queue, which is where it was already.
-    term.quiet(2.0, 120)
+    term.idle(2.0, 120)
     term.send("count from one to a hundred, one number per line\r")
-    ok &= term.expect(SPINNER, 30)
+    ok &= term.expect(RUNNING, 30)
     term.send(f"say {QUEUED_TOKEN} and nothing else\r")
     term.send("\x03")
 
@@ -539,6 +553,8 @@ def main() -> int:
         # `-c` resumes the session seeded above, so the first thing drawn is a
         # turn that happened in an earlier process.
         seed_session(home)
+        seeded = api_key()
+        seed_settings(home, seeded)
         pid, master = spawn(home, ["-c", *(["--ask"] if is_live else [])])
         term = Terminal(master)
         try:
@@ -548,7 +564,6 @@ def main() -> int:
             # own scrollback.
             ok &= term.expect(VIEWPORT, 30)
             ok &= term.expect(STATUS, 15)
-            ok &= term.expect("⎿  Tip:", 15)
             if b"\x1b[?1049h" not in term.raw:
                 print("  ✗ the alternate screen was never entered")
                 ok = False
@@ -578,7 +593,7 @@ def main() -> int:
             # it adds on screen, and give the rows back when the draft goes. The
             # screen is read back rather than the byte stream: a drawn cell that
             # did not change is never written again.
-            term.quiet(2.0, 30)
+            term.idle(2.0, 30)
             empty = term.box_rows()
             term.send("alpha\nbeta")  # Ctrl-J between the two lines
             ok &= term.expect("beta", 15)
@@ -608,7 +623,7 @@ def main() -> int:
             # Typing a command prefix opens the picker, which draws over the live
             # area: it is the one widget that is not part of either the
             # transcript or the box.
-            term.quiet(2.0, 30)
+            term.idle(2.0, 30)
             term.send("/he")
             ok &= term.expect(PICKER, 15)
 
@@ -625,10 +640,10 @@ def main() -> int:
             # A second session is needed to switch to: the open one is the single
             # writer of its own file and cannot be resumed, which is a constraint
             # the front end has nothing to do with.
-            ok &= term.quiet(2.0, 30)
+            ok &= term.idle(2.0, 30)
             term.send("/new\r")
             ok &= term.expect("new session", 30)
-            ok &= term.quiet(2.0, 30)
+            ok &= term.idle(2.0, 30)
             term.send("/resume\r")
             ok &= term.expect("messages ·", 15)  # a picker row, not `/sessions`
             term.send("\x1b[B")  # Down: the first row is the session just opened
@@ -640,15 +655,23 @@ def main() -> int:
             # lines than the screen has rows, so the first line of the session has
             # been pushed off the top of it -- and paging back is the only way to
             # see it again, since nothing writes that banner twice.
-            ok &= term.quiet(2.0, 30)
+            ok &= term.idle(2.0, 30)
             if not term.screen.find("Startup flags"):
                 print("  ✗ /help did not reach the screen")
                 ok = False
             if term.screen.find(BANNER):
                 print("  ✗ the transcript did not scroll: the banner is still up")
                 ok = False
-            term.send("\x1b[5~")  # PageUp
-            ok &= term.expect(BANNER, 15)
+            # A page at a time until the banner comes back: how far up it is
+            # depends on everything drawn since, which is what this file keeps
+            # adding to.
+            for _ in range(10):
+                term.send("\x1b[5~")  # PageUp
+                if term.until(lambda: term.screen.find(BANNER), 3):
+                    break
+            else:
+                print("  \u2717 paging back never reached the banner")
+                ok = False
 
             # The wheel, which is the other way back through the transcript and
             # the one that has a terminal to argue with: while it was left to the
@@ -661,7 +684,7 @@ def main() -> int:
             notches = {"up": "\x1b[<64;10;10M", "down": "\x1b[<65;10;10M"}
             for _ in range(50):
                 term.send(notches["down"])
-            ok &= term.quiet(1.0, 30)
+            ok &= term.idle(1.0, 30)
             top = term.transcript_top()
             term.send(notches["up"])
             if not term.until(lambda: term.transcript_top() != top, 15):
@@ -675,6 +698,60 @@ def main() -> int:
                 print("  ✗ a notch down did not return the window")
                 ok = False
 
+            # `/model` offers the models the preset table knows, each named
+            # `<provider>/<modelid>`. Choosing a row submits it as the line the
+            # plain prompt would have been given, and the status line takes the
+            # new name -- the whole point of naming a model by its provider.
+            ok &= term.idle(2.0, 30)
+            term.send("/model\r")
+            ok &= term.expect("deepseek/deepseek-v4-pro", 15)
+            term.send("\x1b[B")  # Down: the first row is the model in use
+            time.sleep(0.3)
+            term.send("\r")
+            if not term.until(
+                lambda: "deepseek/deepseek-v4-pro" in term.status_row(), 15
+            ):
+                print("  \u2717 the status line did not take the chosen model")
+                print("    " + term.shown())
+                ok = False
+
+            # `/login` offers the providers, then asks for the key in a box that
+            # hides it. Nothing else in this file can check the hiding: the key
+            # must not be on the screen, in the byte stream, or in the session --
+            # and it must be in settings.json, which is what it is for.
+            ok &= term.idle(2.0, 30)
+            term.send("/login\r")
+            # The rows are the providers' *names*: what the file and the session
+            # carry is an id, and that is not what a person is asked to read.
+            ok &= term.expect("Z.AI Coding CN", 15)
+            ok &= term.expect("no key", 15)  # its detail, not `/help`
+            term.send("\x1b[B")  # Down: DeepSeek is first, Z.AI is what is wanted
+            time.sleep(0.3)
+            term.send("\r")
+            ok &= term.expect("Z.AI Coding CN API key", 15)  # the question
+            term.send(FAKE_KEY + "\r")
+            ok &= term.expect("stored the Z.AI Coding CN API key", 15)
+            if FAKE_KEY.encode() in term.raw:
+                print("  \u2717 the key was written to the terminal")
+                ok = False
+            if FAKE_KEY in term.text():
+                print("  \u2717 the key was shown in the clear")
+                ok = False
+            settings = json.load(
+                open(os.path.join(home, ".caocli", "settings.json"))
+            )
+            if settings["providers"]["zai-coding-cn"]["api_key"] != FAKE_KEY:
+                print("  \u2717 the key did not reach settings.json")
+                ok = False
+            if settings["providers"]["deepseek"]["api_key"] != seeded:
+                print("  \u2717 logging in dropped another provider's key")
+                ok = False
+            for path in (SEED + ".jsonl",):
+                log = open(os.path.join(home, ".caocli", "sessions", path)).read()
+                if FAKE_KEY in log:
+                    print("  \u2717 the key reached the session log")
+                    ok = False
+
             if is_live:
                 ok &= live(term, home)
 
@@ -682,7 +759,7 @@ def main() -> int:
             # off and the alternate screen gone -- rather than left in the state the
             # front end put it in. Sent again while it is not taken, because a key
             # that arrives during a turn would be queued behind it instead.
-            term.quiet(2.0, 120)
+            term.idle(2.0, 120)
             status = None
             deadline = time.time() + 90
             while time.time() < deadline and status is None:

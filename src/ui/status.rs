@@ -1,4 +1,4 @@
-//! The status line: what the session is doing, in one row.
+//! The status line: the session summary, in one row.
 //!
 //! Shared by both front ends so the line reads the same either way, and so the
 //! progressive-disclosure rule lives in one place.
@@ -16,31 +16,33 @@ pub struct CacheStats {
 impl CacheStats {
     fn record(&mut self, u: &Usage) {
         // Normalization: DeepSeek's flat fields and GLM's nested details both
-        // converge in Usage::cache(). When a provider does not report caching,
-        // nothing is recorded, so "unknown" is never displayed as 0% hit.
+        // converge in Usage::cache(). A provider that does not report caching
+        // records nothing, so the line keeps the defaults it opened with.
         if let Some(c) = u.cache() {
             self.hit += c.hit;
             self.miss += c.miss;
         }
     }
 
-    /// Hit rate as a percentage; None while there is no data yet.
-    pub fn hit_rate(&self) -> Option<f64> {
+    /// Hit rate as a percentage; zero until any request has reported caching,
+    /// which is the default a new session opens with.
+    pub fn hit_rate(&self) -> f64 {
         let total = self.hit + self.miss;
-        (total > 0).then(|| self.hit as f64 * 100.0 / total as f64)
+        if total == 0 {
+            0.0
+        } else {
+            self.hit as f64 * 100.0 / total as f64
+        }
     }
 
     /// Status segments, most significant first: the hit rate, then the raw
-    /// counts. A provider that reports no cache usage yields a single
-    /// "unknown" segment, so it is never displayed as 0% hit.
+    /// counts. A session that has reported nothing shows the same segments with
+    /// zero in them, so the line is the same line from the first row onwards.
     fn segments(&self) -> Vec<String> {
-        match self.hit_rate() {
-            Some(rate) => vec![
-                format!("cache {rate:.1}%"),
-                format!("hit {} · miss {}", self.hit, self.miss),
-            ],
-            None => vec!["cache —".to_string()],
-        }
+        vec![
+            format!("cache {:.1}%", self.hit_rate()),
+            format!("hit {} · miss {}", self.hit, self.miss),
+        ]
     }
 }
 
@@ -129,10 +131,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_status_reports_an_unknown_rate() {
+    fn an_empty_status_shows_the_zero_defaults() {
         let s = Status::default();
-        assert_eq!(s.full_line(), "cache —");
-        assert_eq!(s.stats().hit_rate(), None);
+        assert_eq!(s.full_line(), "cache 0.0% · hit 0 · miss 0");
+        assert_eq!(s.stats().hit_rate(), 0.0);
     }
 
     #[test]
@@ -145,14 +147,17 @@ mod tests {
             "deepseek-v4-flash · cache 60.0% · hit 6 · miss 4"
         );
         s.reset_stats();
-        assert_eq!(s.full_line(), "deepseek-v4-flash · cache —");
+        assert_eq!(
+            s.full_line(),
+            "deepseek-v4-flash · cache 0.0% · hit 0 · miss 0"
+        );
     }
 
     #[test]
     fn an_empty_model_is_not_a_segment() {
         let mut s = Status::default();
         s.set_model("");
-        assert_eq!(s.full_line(), "cache —");
+        assert_eq!(s.full_line(), "cache 0.0% · hit 0 · miss 0");
     }
 
     #[test]
@@ -178,9 +183,14 @@ mod tests {
         let mut s = Status::default();
         // four ideographs: 8 columns, 4 chars
         s.set_model("\u{6df1}\u{5ea6}\u{6c42}\u{7d22}");
-        // the model plus " · cache —" is 18 columns, so 20 fits and 17 does not
-        assert_eq!(s.line(20), "\u{6df1}\u{5ea6}\u{6c42}\u{7d22} · cache —");
-        assert_eq!(s.line(17), "\u{6df1}\u{5ea6}\u{6c42}\u{7d22}");
+        // the model plus " · cache 0.0%" is 21 columns, and the counts are 14
+        // more: 21 fits, 20 does not, and the whole line is 38.
+        assert_eq!(
+            s.line(38),
+            "\u{6df1}\u{5ea6}\u{6c42}\u{7d22} · cache 0.0% · hit 0 · miss 0"
+        );
+        assert_eq!(s.line(21), "\u{6df1}\u{5ea6}\u{6c42}\u{7d22} · cache 0.0%");
+        assert_eq!(s.line(20), "\u{6df1}\u{5ea6}\u{6c42}\u{7d22}");
     }
 
     #[test]
@@ -190,11 +200,11 @@ mod tests {
         s.record(&usage(0, 10));
         assert_eq!(s.stats().hit, 6);
         assert_eq!(s.stats().miss, 14);
-        assert_eq!(s.stats().hit_rate(), Some(30.0));
+        assert_eq!(s.stats().hit_rate(), 30.0);
     }
 
     #[test]
-    fn a_provider_without_cache_reporting_stays_unknown() {
+    fn a_provider_without_cache_reporting_keeps_the_defaults() {
         let mut s = Status::default();
         s.record(&Usage {
             prompt_tokens: 20,
@@ -202,7 +212,7 @@ mod tests {
             completion_tokens: 8,
             ..Usage::default()
         });
-        assert_eq!(s.full_line(), "cache —");
+        assert_eq!(s.full_line(), "cache 0.0% · hit 0 · miss 0");
     }
 
     #[test]

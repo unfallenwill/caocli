@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::api::Client;
-use crate::config::DEFAULT_EFFORT;
+use crate::config::{self, DEFAULT_EFFORT};
 use crate::machine::{self, Action};
 use crate::session::Session;
 use crate::tools;
@@ -19,6 +19,10 @@ pub const SYSTEM_PROMPT: &str = "You are caocli, a terminal coding agent. Prefer
 pub struct Agent {
     api: Client,
     pub session: Session,
+    /// The provider the client is bound to. The endpoint, the key and the
+    /// answer ceiling all come from it, and the model is named by it: the
+    /// status line reads `<provider>/<modelid>` from here.
+    provider: config::Provider,
     /// Ceiling on one answer, in tokens: the provider preset's value, sent as
     /// `max_tokens` on every request.
     max_tokens: u32,
@@ -107,15 +111,36 @@ impl Approve for StdinApproval {
 }
 
 impl Agent {
-    pub fn new(api: Client, session: Session, max_tokens: u32) -> Self {
+    pub fn new(api: Client, session: Session, provider: config::Provider) -> Self {
         Self {
             api,
             session,
-            max_tokens,
+            provider,
+            max_tokens: provider.max_tokens,
             confirm_tools: false,
             max_tool_steps: machine::MAX_TOOL_STEPS,
             tool_steps: 0,
         }
+    }
+
+    /// The provider the machine is talking to.
+    pub fn provider(&self) -> config::Provider {
+        self.provider
+    }
+
+    /// The model as the front ends name it: `<provider>/<modelid>`, which is the
+    /// form `/model` takes back and the only form that says where it is served.
+    pub fn model_label(&self) -> String {
+        format!("{}/{}", self.provider.id, self.session.meta.model)
+    }
+
+    /// Point the machine at a provider: a client for its endpoint and key, and
+    /// the ceiling its preset declares. The session's meta is the caller's to
+    /// write -- it is a change to the log, and the interpreter writes the log.
+    pub fn bind(&mut self, provider: config::Provider, api: Client) {
+        self.provider = provider;
+        self.max_tokens = provider.max_tokens;
+        self.api = api;
     }
 
     /// The only control-plane entrance: shell commands such as `/new` and
@@ -397,6 +422,7 @@ mod tests {
 
     fn test_meta() -> SessionMeta {
         SessionMeta {
+            provider: Some("deepseek".into()),
             model: "deepseek-v4-flash".into(),
             reasoning_effort: Some("high".into()),
         }
@@ -437,7 +463,7 @@ mod tests {
         )
         .unwrap();
         let session = Session::create(dir, test_meta()).unwrap();
-        Agent::new(api, session, crate::config::DEEPSEEK.max_tokens)
+        Agent::new(api, session, config::DEEPSEEK)
     }
 
     #[test]
@@ -454,9 +480,9 @@ mod tests {
         let mut s = Session::create(&dir, test_meta()).unwrap();
         s.append_message(&Message::user("q1")).unwrap();
         let agent = Agent::new(
-            Client::new("k".into(), crate::config::DEEPSEEK.url.into()).unwrap(),
+            Client::new("k".into(), config::DEEPSEEK.url.into()).unwrap(),
             s,
-            crate::config::DEEPSEEK.max_tokens,
+            config::DEEPSEEK,
         );
         let req = agent.build_request();
         assert_eq!(req.messages.len(), 2);
@@ -477,9 +503,9 @@ mod tests {
         s.meta.reasoning_effort = None;
         s.append_message(&Message::user("q1")).unwrap();
         let agent = Agent::new(
-            Client::new("k".into(), crate::config::DEEPSEEK.url.into()).unwrap(),
+            Client::new("k".into(), config::DEEPSEEK.url.into()).unwrap(),
             s,
-            crate::config::DEEPSEEK.max_tokens,
+            config::DEEPSEEK,
         );
         let req = agent.build_request();
         assert_eq!(req.reasoning_effort.as_deref(), Some("max"));

@@ -120,6 +120,17 @@ that talks to a network API and drives an interactive terminal.
   synthesized text must be a constant, otherwise the prefix cache becomes unstable).
 - **Exactly one renderer per process**: streaming output and usage accounting must go
   through the same instance, otherwise counts are lost.
+- **A provider has an id and a name, and they do not stand in for each other**: the
+  id addresses it (flags, `/login <id>`, `<id>/<modelid>`, the session meta,
+  `settings.json`); the name is what a person reads (the `/login` menu, an error
+  message). Anything typed or stored takes the id, and the menus are the only place
+  the two meet.
+- **A secret the user types is answered, not stored**: an API key reaches
+  `settings.json` (written by `/login`) and exists nowhere else — not in the
+  transcript, the session log, the input history, or an environment variable. It is
+  asked for as a question, so the front end hides it while it is typed and nothing
+  that is submitted can carry it onwards; a configuration a second mechanism could
+  also satisfy is one whose state nobody can see.
 - **A front end that cannot take the terminal declines; it does not fail.** Raw mode
   and the alternate screen are process-wide, and a terminal that refuses either leaves
   nothing to draw on. Starting the session must survive that by falling back to the
