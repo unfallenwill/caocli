@@ -993,6 +993,86 @@ mod tests {
         assert_eq!(buf_of(&replay_buf), format!("{}\n", buf_of(&live_buf)));
     }
 
+    /// The plain front end's whole vocabulary in one scripted session, frozen
+    /// byte for byte.
+    ///
+    /// Every later change to this module has to keep this green: moving the parts
+    /// into their own files is a move, not a rewrite, and the existing assertions
+    /// are about pieces rather than about the stream they add up to. Driven in the
+    /// order `main.rs` and the agent drive it -- the bar before the banner, a
+    /// resumed history, a turn with thinking and an answer, a call and its result,
+    /// the usage line, a notice, the approval question, a cancellation, then the
+    /// bar coming down as the terminal goes back.
+    #[test]
+    fn the_plain_front_ends_stream_is_frozen() {
+        let (mut r, buf) = Renderer::with_buffer(true);
+        r.set_model("deepseek-v4-pro");
+        r.set_effort("max");
+        r.apply_status_bar(Some(StatusBar { rows: 24, cols: 80 }));
+        r.info("caocli · session 20260910-213122 (2 messages) · deepseek-v4-pro");
+        r.replay(&[
+            Message::user("take a look"),
+            Message {
+                role: Role::Assistant,
+                content: Some("running it".into()),
+                reasoning_content: Some("let me think".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ]);
+        r.reasoning_delta("weigh");
+        r.reasoning_delta(" it");
+        r.content_delta("here");
+        r.content_delta(" goes");
+        r.finish_turn();
+        r.tool_start("Bash", r#"{"command":"ls -la"}"#);
+        r.tool_result("exit_code: 0\n--- stdout ---\nBODY");
+        r.usage(&usage_fixture(6, 4), Duration::from_millis(1500));
+        r.approval_requested("Write", r#"{"file_path":"/tmp/x"}"#);
+        r.interrupted();
+        r.teardown();
+
+        // Frozen against the bytes this front end writes today: a move that
+        // changes any of them is a rewrite, not a move.
+        let expected = concat!(
+            // the bar comes up on a 24x80 terminal: scroll region 1..23, cursor on 23,
+            "\x1b[24;1H\x1b[2K\x1b[1;23r\x1b[23;1H",
+            "\x1b7\x1b[24;1H\x1b[2K                     ",
+            "\x1b[2mdeepseek-v4-pro · effort max · cache 0.0% · hit 0 · miss 0\x1b[0m\x1b8",
+            // the banner is an info cell
+            "\x1b[2m  caocli · session 20260910-213122 (2 messages) · deepseek-v4-pro\x1b[0m\n",
+            "\n",
+            "\x1b[2m› \x1b[0mtake a look\x1b[0m\n",
+            "\x1b[2m┆ let me think\x1b[0m\n",
+            "\n",
+            "running it\x1b[0m\n",
+            "\n",
+            "\n",
+            // a resumed history, then a live turn: thinking, then the answer
+            "\x1b[2m┆ weigh it\x1b[0m\n",
+            "\n",
+            "here goes\x1b[0m\n",
+            "\n",
+            // a call, its result, and the usage line
+            "\x1b[1;33m▸ Bash ls -la\x1b[0m\n",
+            "\x1b[2m· exit_code: 0 · 32 bytes\x1b[0m\n",
+            "\x1b[2m  tokens: in 10/10 (hit 6/miss 4) · out 0\x1b[0m\n",
+            // the bar picks up the usage the line just recorded, then the gate asks
+            "\x1b7\x1b[24;1H\x1b[2K                    ",
+            "\x1b[2mdeepseek-v4-pro · effort max · cache 60.0% · hit 6 · miss 4\x1b[0m\x1b8",
+            "\x1b[1;33m▸ Write /tmp/x — run it? [y/N] \x1b[0m",
+            "\x1b[1;33m  ⏹ interrupted (Ctrl-C)\x1b[0m\n",
+            // and the bar goes down as the terminal is handed back
+            "\x1b[r\x1b[24;1H\x1b[2K\r\n",
+        );
+
+        assert_eq!(
+            buf_of(&buf),
+            expected,
+            "the plain front end's byte stream changed"
+        );
+    }
+
     #[test]
     fn interrupted_closes_block_and_prints_notice() {
         let (mut r, buf) = Renderer::with_buffer(true);
