@@ -8,10 +8,10 @@ marker -> back to the prompt), and `/login` -- which is the one place the plain
 front end asks a question of its own, with the terminal's echo off. The front end
 that owns the screen is `tui_smoke.py`'s subject, so `--no-tui` picks this one
 out.
-Exit code 0 = pass. The live half needs a real API key, which now lives in
-`settings.json` and nowhere else: it is taken from `DEEPSEEK_API_KEY` if that is
-exported, otherwise from the one `/login` stored, and written into the run's own
-HOME. With neither, the live half is skipped.
+Exit code 0 = pass. The live half needs a real API key, which lives in
+`settings.json` and nowhere else: it is taken from the one `/login` stored on
+this machine and written into the run's own HOME. With none, the live half is
+skipped.
 """
 
 import fcntl
@@ -39,11 +39,7 @@ FAKE_KEY = "sk-pty-smoke-not-a-real-key"
 
 
 def api_key() -> str | None:
-    """A key to run a real turn with: the environment first (a one-off export),
-    then the one `/login` stored."""
-    key = os.environ.get("DEEPSEEK_API_KEY")
-    if key:
-        return key
+    """A key to run a real turn with: the one `/login` stored on this machine."""
     try:
         with open(os.path.expanduser("~/.caocli/settings.json")) as f:
             return json.load(f)["providers"]["deepseek"]["api_key"]
@@ -222,7 +218,7 @@ def main() -> int:
     key = api_key()
     if key is None:
         print(
-            "  · no API key (neither $DEEPSEEK_API_KEY nor one stored by /login):"
+            "  · no API key stored by /login:"
             " the live half is skipped"
         )
         print("pty smoke:", "✅ pass" if ok else "❌ fail")

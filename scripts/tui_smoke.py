@@ -88,13 +88,9 @@ def api_key() -> str:
     """A key for the run: keys are configured in `settings.json` and nowhere else
     now, so the smoke has to put one there.
 
-    The environment first (a one-off `DEEPSEEK_API_KEY=... SMOKE_LIVE=1`), then the
-    one `/login` stored. A placeholder when there is neither: it is enough for
-    everything here that does not call the backend.
+    The one `/login` stored on this machine. A placeholder when there is none:
+    it is enough for everything here that does not call the backend.
     """
-    key = os.environ.get("DEEPSEEK_API_KEY")
-    if key:
-        return key
     try:
         with open(os.path.expanduser("~/.caocli/settings.json")) as f:
             return json.load(f)["providers"]["deepseek"]["api_key"]
