@@ -16,6 +16,7 @@ turn does, and the approval gate that asks before a tool runs.
 """
 
 import fcntl
+import json
 import os
 import pty
 import re
@@ -48,6 +49,61 @@ HELP = "Commands:"  # the first line of what /help commits
 SPINNER = "thinking"
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 GATE = "run it? [y/N]"
+
+# A session with an edit already in it. Resuming it draws the change, which is the
+# replay half of the same cell a live turn produces; the id and the lines are what
+# the assertions below look for.
+SEED = "20260910-120000"
+
+
+def seed_session(home: str) -> str:
+    """Write a session that has already made an edit, and return its id.
+
+    The log format is the one the front end writes: a header, then the messages.
+    The edit is what a live turn would have produced, so what is drawn from it on
+    resume is what would have been drawn when it happened.
+    """
+    directory = os.path.join(home, ".caocli", "sessions")
+    os.makedirs(directory, exist_ok=True)
+    arguments = json.dumps(
+        {"file_path": "a.txt", "old_string": "one", "new_string": "two"}
+    )
+    lines = [
+        json.dumps(
+            {
+                "t": "header",
+                "id": SEED,
+                "created_at": 1_789_000_000,
+                "model": "deepseek-v4.1-flash-expires-on-0910",
+                "reasoning_effort": "max",
+            }
+        ),
+        json.dumps({"t": "msg", "message": {"role": "user", "content": "change a.txt"}}),
+        json.dumps(
+            {
+                "t": "msg",
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "Edit", "arguments": arguments},
+                        }
+                    ],
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "t": "msg",
+                "message": {"role": "tool", "content": "ok: a.txt", "tool_call_id": "call_1"},
+            }
+        ),
+    ]
+    with open(os.path.join(directory, f"{SEED}.jsonl"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return SEED
 
 
 def spawn(home: str, extra: list[str]):
@@ -233,13 +289,20 @@ def main() -> int:
     is_live = os.environ.get("SMOKE_LIVE") == "1"
     ok = True
     with tempfile.TemporaryDirectory(prefix="caocli-tui-smoke-") as home:
-        pid, master = spawn(home, ["--ask"] if is_live else [])
+        # `-c` resumes the session seeded above, so the first thing drawn is a
+        # turn that happened in an earlier process.
+        seed_session(home)
+        pid, master = spawn(home, ["-c", *(["--ask"] if is_live else [])])
         term = Terminal(master)
         try:
             # Startup: the box, the pinned line. Both are drawn before the first
             # key, so seeing them is seeing that the viewport was entered.
             ok &= term.expect(VIEWPORT, 30)
             ok &= term.expect(STATUS, 15)
+            # The resumed turn's edit, line by line, from the log rather than from
+            # anything that is running now.
+            ok &= term.expect("  - one", 15)
+            ok &= term.expect("  + two", 15)
             if term.queries == 0:
                 print("  ✗ the viewport never asked where the cursor was")
                 ok = False

@@ -360,7 +360,10 @@ impl State {
     fn lines(&self, width: usize) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         for cell in &self.pending {
-            lines.push(one_line(&cell.spans()));
+            // Every cell is wrapped, not just the text blocks: a tool call that
+            // shows a change is several lines, and a long one clips silently if
+            // the terminal is left to deal with it.
+            lines.extend(wrapped_lines(&cell.spans(), width));
         }
         if let Some((style, text)) = &self.live {
             lines.extend(wrapped_lines(&[Span::new(*style, text.clone())], width));
@@ -1222,6 +1225,7 @@ fn style_of(style: Style) -> RStyle {
         Style::Plain => RStyle::new(),
         Style::Dim => RStyle::new().add_modifier(Modifier::DIM),
         Style::Yellow => RStyle::new().fg(Color::Yellow),
+        Style::Green => RStyle::new().fg(Color::Green),
         Style::Red => RStyle::new().fg(Color::Red),
     }
 }
@@ -1659,6 +1663,37 @@ mod tests {
             row(&screen, top + LIVE_ROWS),
             "m · cache — · ⠋ read_file · 0.0s"
         );
+    }
+
+    #[test]
+    fn a_tool_call_that_changes_a_file_is_drawn_across_its_lines() {
+        let mut screen = screen_for_test(40, 20);
+        screen.state.pending.push(Cell::tool_call(
+            "Edit",
+            r#"{"file_path":"a.rs","old_string":"one\ntwo","new_string":"three"}"#,
+        ));
+        screen.draw().unwrap();
+        let top = origin(&mut screen).y;
+        assert_eq!(row(&screen, top), "▸ Edit a.rs");
+        assert_eq!(row(&screen, top + 1), "  - one");
+        assert_eq!(row(&screen, top + 2), "  - two");
+        assert_eq!(row(&screen, top + 3), "  + three");
+    }
+
+    #[test]
+    fn a_long_line_of_a_change_is_wrapped_like_any_other() {
+        // It is drawn into a fixed-width region: the terminal cannot be left to
+        // wrap it, or the tail of the line is lost.
+        let mut screen = screen_for_test(20, 20);
+        let long = "x".repeat(30);
+        screen.state.pending.push(Cell::tool_call(
+            "Write",
+            &format!(r#"{{"file_path":"a.txt","content":"{long}"}}"#),
+        ));
+        screen.draw().unwrap();
+        let top = origin(&mut screen).y;
+        assert_eq!(row(&screen, top + 1), format!("  + {}", "x".repeat(16)));
+        assert_eq!(row(&screen, top + 2), "x".repeat(14));
     }
 
     #[test]

@@ -19,6 +19,8 @@ pub enum Style {
     Dim,
     /// Attention text: tool calls, interruptions.
     Yellow,
+    /// Text a change adds.
+    Green,
     /// Failures, written to stderr.
     Red,
 }
@@ -30,6 +32,7 @@ impl Style {
             Style::Plain => "",
             Style::Dim => "\x1b[2m",
             Style::Yellow => "\x1b[33m",
+            Style::Green => "\x1b[32m",
             Style::Red => "\x1b[31m",
         }
     }
@@ -51,6 +54,24 @@ impl Span {
     }
 }
 
+/// One line of a change, as a tool call shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffLine {
+    pub kind: DiffKind,
+    pub text: String,
+}
+
+/// What a line of a change is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffKind {
+    /// A line the call takes out.
+    Removed,
+    /// A line the call puts in.
+    Added,
+    /// Lines the cell does not show, and how many there are.
+    Omitted(usize),
+}
+
 /// One unit of transcript output.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cell {
@@ -61,8 +82,12 @@ pub enum Cell {
     Reasoning(String),
     /// A body-text block.
     Content(String),
-    /// A tool call about to run.
-    ToolCall { name: String, hint: String },
+    /// A tool call about to run, with the change it makes if it makes one.
+    ToolCall {
+        name: String,
+        hint: String,
+        diff: Vec<DiffLine>,
+    },
     /// A tool result. Only a summary is ever rendered, never the full text.
     ToolResult(String),
     /// A dim informational line.
@@ -85,6 +110,7 @@ impl Cell {
         Cell::ToolCall {
             name: name.to_owned(),
             hint: hint(args),
+            diff: diff_lines(name, args),
         }
     }
 
@@ -106,8 +132,18 @@ impl Cell {
             ],
             Cell::Reasoning(text) => vec![Span::new(Style::Dim, text.as_str())],
             Cell::Content(text) => vec![Span::new(Style::Plain, text.as_str())],
-            Cell::ToolCall { name, hint } => {
-                vec![Span::new(Style::Yellow, format!("▸ {name} {hint}"))]
+            Cell::ToolCall { name, hint, diff } => {
+                let mut spans = vec![Span::new(Style::Yellow, format!("▸ {name} {hint}"))];
+                for line in diff {
+                    spans.push(match line.kind {
+                        DiffKind::Removed => Span::new(Style::Red, format!("\n  - {}", line.text)),
+                        DiffKind::Added => Span::new(Style::Green, format!("\n  + {}", line.text)),
+                        DiffKind::Omitted(n) => {
+                            Span::new(Style::Dim, format!("\n  … {n} more line(s)"))
+                        }
+                    });
+                }
+                spans
             }
             Cell::ToolResult(result) => vec![Span::new(Style::Dim, summary(result))],
             Cell::Notice(text) => vec![Span::new(Style::Dim, text.as_str())],
@@ -212,6 +248,56 @@ fn hint(args: &str) -> String {
 
 /// Columns of raw arguments kept when they cannot be summarized by name.
 const HINT_COLUMNS: usize = 80;
+
+/// How many lines of a change a tool call shows before it says how many are left.
+///
+/// A call is announced before it runs, and an edit can be hundreds of lines: what
+/// the announcement is for is seeing what is about to happen, not reading the
+/// whole file. The rest is one line, so a long change costs a screenful at most.
+const DIFF_LINES: usize = 12;
+
+/// The change a call makes, for the calls that make one.
+///
+/// The arguments are the wire format of a tool call, which is also what replay
+/// reads out of the session log, so live and replayed turns show the same lines
+/// without a second source for either one.
+fn diff_lines(name: &str, args: &str) -> Vec<DiffLine> {
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(args) else {
+        return Vec::new();
+    };
+    let side = |key: &str, kind: DiffKind| -> Vec<DiffLine> {
+        args.get(key)
+            .and_then(|s| s.as_str())
+            .map(|text| {
+                text.lines()
+                    .map(|line| DiffLine {
+                        kind,
+                        text: line.to_owned(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut lines = match name {
+        // The order a diff is read in: what goes, then what arrives.
+        "Edit" => {
+            let mut lines = side("old_string", DiffKind::Removed);
+            lines.extend(side("new_string", DiffKind::Added));
+            lines
+        }
+        "Write" => side("content", DiffKind::Added),
+        _ => return Vec::new(),
+    };
+    if lines.len() > DIFF_LINES {
+        let omitted = lines.len() - DIFF_LINES;
+        lines.truncate(DIFF_LINES);
+        lines.push(DiffLine {
+            kind: DiffKind::Omitted(omitted),
+            text: String::new(),
+        });
+    }
+    lines
+}
 
 /// One-line summary of a tool result: its first line and how much text came
 /// back.
@@ -328,12 +414,101 @@ mod tests {
         assert_eq!(got.chars().count(), HINT_COLUMNS / 2);
     }
 
+    /// The arguments an edit arrives with, as the wire format spells them.
+    fn edit(old: &str, new: &str) -> String {
+        serde_json::json!({
+            "file_path": "src/main.rs",
+            "old_string": old,
+            "new_string": new,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn an_edit_shows_what_leaves_and_what_arrives() {
+        let lines = diff_lines("Edit", &edit("let a = 1;\nlet b = 2;", "let a = 3;"));
+        assert_eq!(
+            lines,
+            vec![
+                DiffLine {
+                    kind: DiffKind::Removed,
+                    text: "let a = 1;".into(),
+                },
+                DiffLine {
+                    kind: DiffKind::Removed,
+                    text: "let b = 2;".into(),
+                },
+                DiffLine {
+                    kind: DiffKind::Added,
+                    text: "let a = 3;".into(),
+                },
+            ],
+            "what goes is shown before what arrives"
+        );
+    }
+
+    #[test]
+    fn a_deletion_shows_only_what_goes() {
+        let lines = diff_lines("Edit", &edit("gone", ""));
+        assert_eq!(
+            lines,
+            vec![DiffLine {
+                kind: DiffKind::Removed,
+                text: "gone".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_write_shows_what_it_puts_there() {
+        let args = serde_json::json!({ "file_path": "a.txt", "content": "one\ntwo\n" }).to_string();
+        let lines = diff_lines("Write", &args);
+        assert_eq!(lines.len(), 2, "a trailing newline does not start a line");
+        assert!(lines.iter().all(|l| l.kind == DiffKind::Added));
+    }
+
+    #[test]
+    fn a_long_change_ends_in_a_count_of_the_rest() {
+        let many = (0..DIFF_LINES + 5)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = diff_lines("Write", &serde_json::json!({ "content": many }).to_string());
+        assert_eq!(lines.len(), DIFF_LINES + 1, "the lines and the count");
+        assert_eq!(lines.last().unwrap().kind, DiffKind::Omitted(5));
+    }
+
+    #[test]
+    fn only_a_change_has_lines_to_show() {
+        assert!(diff_lines("Bash", r#"{"command":"ls"}"#).is_empty());
+        assert!(diff_lines("Read", r#"{"file_path":"x"}"#).is_empty());
+        assert!(diff_lines("Edit", "not json at all").is_empty());
+        assert!(
+            diff_lines("Edit", r#"{"file_path":"x"}"#).is_empty(),
+            "the strings are what makes it a change"
+        );
+    }
+
+    #[test]
+    fn the_rendered_call_is_its_header_then_its_lines() {
+        let spans = Cell::tool_call("Edit", &edit("old", "new")).spans();
+        assert_eq!(
+            spans,
+            vec![
+                Span::new(Style::Yellow, "▸ Edit src/main.rs"),
+                Span::new(Style::Red, "\n  - old"),
+                Span::new(Style::Green, "\n  + new"),
+            ]
+        );
+    }
+
     #[test]
     fn tool_cells_carry_the_extracted_hint() {
         match Cell::tool_call("Bash", r#"{"command":"ls"}"#) {
-            Cell::ToolCall { name, hint } => {
+            Cell::ToolCall { name, hint, diff } => {
                 assert_eq!(name, "Bash");
                 assert_eq!(hint, "ls");
+                assert!(diff.is_empty(), "a command has no lines to show");
             }
             other => panic!("expected a tool call, got {other:?}"),
         }
