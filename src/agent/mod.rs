@@ -226,14 +226,20 @@ impl Agent {
                         }
                     }
                     if !denied {
-                        let out = tokio::select! {
+                        // The arm that wins decides the outcome. A tool result
+                        // that happens to read like the cancellation marker is
+                        // still a result: only the cancel arm can end the call as
+                        // cancelled.
+                        let (tool_output, cancelled_call) = tokio::select! {
                             biased;
-                            out = tools::execute(&call.function.name, &call.function.arguments) => out,
-                            _ = cancel.wait() => machine::Marker::Cancelled.text().to_owned(),
+                            output = tools::execute(&call.function.name, &call.function.arguments) => (output, false),
+                            _ = cancel.wait() => {
+                                (machine::Marker::Cancelled.text().to_owned(), true)
+                            }
                         };
-                        let cancelled_call = out == machine::Marker::Cancelled.text();
-                        ui.tool_result(&out);
-                        self.session.append_message(&Message::tool(&call.id, out))?;
+                        ui.tool_result(&tool_output);
+                        self.session
+                            .append_message(&Message::tool(&call.id, tool_output))?;
                         if cancelled_call {
                             cancelled = true;
                         }
@@ -760,6 +766,73 @@ mod tests {
                 .is_ok(),
             "the signal must not be lost"
         );
+    }
+
+    /// A result that reads like the cancellation marker is still a result: a file
+    /// whose text is that marker must not end the turn. Cancellation is decided by
+    /// which arm of the race won, not by comparing what a tool returned.
+    #[tokio::test]
+    async fn a_tool_result_is_not_mistaken_for_a_cancellation() {
+        let dir = tmpdir();
+        let marker_file = dir.join("marker.txt");
+        // Exactly the marker text, with nothing added around it.
+        std::fs::write(&marker_file, machine::Marker::Cancelled.text()).unwrap();
+
+        let server = MockServer::start().await;
+        let read_args = json!({"file_path": marker_file}).to_string();
+        let turn1 = [
+            sse(
+                json!({"tool_calls": [{"index": 0, "id": "call_read", "type": "function",
+                       "function": {"name": "Read", "arguments": read_args}}]}),
+                None,
+                None,
+            ),
+            sse(json!({"content": ""}), Some("tool_calls"), None),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let turn2 = [
+            sse(
+                json!({"content": "the file holds the marker text"}),
+                None,
+                None,
+            ),
+            sse(json!({"content": ""}), Some("stop"), None),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        mount_chat(&server, turn1, Some(1)).await;
+        mount_chat(&server, turn2, None).await;
+
+        let mut agent = test_agent(&server, &dir);
+        let mut ui = Renderer::new();
+        agent
+            .turn(
+                "read that file",
+                &mut ui,
+                &mut Silent,
+                &mut Answer(Verdict::Allowed),
+            )
+            .await
+            .unwrap();
+
+        let msgs = &agent.session.messages;
+        assert_eq!(
+            msgs[2].content.as_deref(),
+            Some(machine::Marker::Cancelled.text()),
+            "the tool really returned the marker text"
+        );
+        assert_eq!(
+            msgs.len(),
+            4,
+            "the turn went back to the model instead of ending as cancelled: {msgs:?}"
+        );
+        assert_eq!(
+            msgs[3].content.as_deref(),
+            Some("the file holds the marker text")
+        );
+        assert!(machine::is_request_valid(msgs));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The step budget is the turn's, not the process's: a session that has spent
