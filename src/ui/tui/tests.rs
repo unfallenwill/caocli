@@ -93,6 +93,7 @@ fn a_fragment_in_the_other_style_opens_a_new_block() {
 fn status_notices_reach_the_status_line() {
     let mut screen = State::default();
     screen.apply(Notice::SetModel("m-1".into()));
+    screen.apply(Notice::SetEffort("high".into()));
     screen.apply(Notice::Usage(
         Usage {
             prompt_tokens: 6,
@@ -106,12 +107,12 @@ fn status_notices_reach_the_status_line() {
     ));
     assert_eq!(
         screen.status.full_line(),
-        "m-1 · cache 60.0% · hit 6 · miss 4"
+        "m-1 · effort high · cache 60.0% · hit 6 · miss 4"
     );
     screen.apply(Notice::ResetStats);
     assert_eq!(
         screen.status.full_line(),
-        "m-1 · cache 0.0% · hit 0 · miss 0"
+        "m-1 · effort high · cache 0.0% · hit 0 · miss 0"
     );
 }
 

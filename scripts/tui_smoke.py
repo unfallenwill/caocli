@@ -758,6 +758,21 @@ def main() -> int:
                 print("    " + term.shown())
                 ok = False
 
+            # `/effort` offers the tiers the provider in use accepts, with the
+            # one in effect marked. Choosing a row submits it as the line the
+            # plain prompt would have been given, and the status line takes the
+            # tier beside the model.
+            ok &= term.idle(2.0, 30)
+            term.send("/effort\r")
+            ok &= term.expect("current", 15)  # the tier in effect, marked
+            term.send("\x1b[B")  # Down: from the first tier to the next one
+            time.sleep(0.3)
+            term.send("\r")
+            if not term.until(lambda: "effort high" in term.status_row(), 15):
+                print("  \u2717 the status line did not take the chosen tier")
+                print("    " + term.shown())
+                ok = False
+
             # `/login` offers the providers, then asks for the key in a box that
             # hides it. Nothing else in this file can check the hiding: the key
             # must not be on the screen, in the byte stream, or in the session --

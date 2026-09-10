@@ -519,6 +519,7 @@ impl State {
                 self.transcript.push(Cell::Failure(text));
             }
             Notice::SetModel(model) => self.status.set_model(&model),
+            Notice::SetEffort(effort) => self.status.set_effort(&effort),
             Notice::ResetStats => self.status.reset_stats(),
         }
     }

@@ -192,20 +192,15 @@ async fn run(cli: Cli) -> Result<()> {
     let mut agent = Agent::new(api, session, provider);
     agent.confirm_tools = cli.ask;
     ui.set_model(&agent.model_label());
+    ui.set_effort(agent.effort_label());
 
     // One-shot mode (the agent's primary self-test channel)
     if let Some(prompt) = &cli.prompt {
         ui.info(&format!(
-            "session {} · {}{}",
+            "session {} · {} · effort {}",
             agent.session.id,
             agent.model_label(),
-            agent
-                .session
-                .meta
-                .reasoning_effort
-                .as_deref()
-                .map(|e| format!(" · effort {e}"))
-                .unwrap_or_default()
+            agent.effort_label()
         ));
         // One interrupt listener per turn, subscribed before the turn's first
         // await point (see Agent::turn).

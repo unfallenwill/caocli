@@ -50,6 +50,7 @@ pub(super) enum Notice {
     Info(String),
     Error(String),
     SetModel(String),
+    SetEffort(String),
     ResetStats,
 }
 
@@ -114,6 +115,9 @@ impl Front for Notifier {
     fn set_model(&mut self, model: &str) {
         self.send(Notice::SetModel(model.to_owned()));
     }
+    fn set_effort(&mut self, effort: &str) {
+        self.send(Notice::SetEffort(effort.to_owned()));
+    }
     fn reset_stats(&mut self) {
         self.send(Notice::ResetStats);
     }
@@ -162,6 +166,7 @@ mod tests {
         notifier.info("note");
         notifier.error("bad");
         notifier.set_model("glm-4.6");
+        notifier.set_effort("high");
         notifier.reset_stats();
         let expected = [
             Notice::Reasoning("think".into()),
@@ -177,6 +182,7 @@ mod tests {
             Notice::Info("note".into()),
             Notice::Error("bad".into()),
             Notice::SetModel("glm-4.6".into()),
+            Notice::SetEffort("high".into()),
             Notice::ResetStats,
         ];
         for notice in expected {

@@ -146,6 +146,7 @@ pub async fn run(
     let history_path = crate::config::history_file()?;
     screen.state.history = history::load(&history_path);
     screen.state.status.set_model(&agent.model_label());
+    screen.state.status.set_effort(agent.effort_label());
     screen.state.show(Cell::Notice(banner.to_owned()));
     screen.state.transcript.extend(cell::from_messages(history));
 

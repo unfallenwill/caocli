@@ -46,11 +46,15 @@ impl CacheStats {
     }
 }
 
-/// The status line's content: the model id and the session's cache statistics.
+/// The status line's content: the model id, the reasoning effort tier, and the
+/// session's cache statistics.
 #[derive(Debug, Default)]
 pub struct Status {
     /// Model id (updated when a session is created or switched).
     model: Option<String>,
+    /// Reasoning effort tier in effect (updated when a session is created or
+    /// switched, and when `/effort` changes it).
+    effort: Option<String>,
     stats: CacheStats,
 }
 
@@ -58,6 +62,11 @@ impl Status {
     /// Set the model id shown in the first segment.
     pub fn set_model(&mut self, model: &str) {
         self.model = Some(model.to_owned());
+    }
+
+    /// Set the reasoning effort tier shown right after the model.
+    pub fn set_effort(&mut self, effort: &str) {
+        self.effort = Some(effort.to_owned());
     }
 
     /// Fold one sub-request's usage into the cache statistics.
@@ -77,14 +86,19 @@ impl Status {
         self.stats
     }
 
-    /// Status segments, most significant first: the model, then the cache
-    /// statistics. This is the order a narrow line drops them in.
+    /// Status segments, most significant first: the model, the effort tier,
+    /// then the cache statistics. This is the order a narrow line drops them in.
     pub fn parts(&self) -> Vec<String> {
         let mut parts = Vec::new();
         if let Some(m) = &self.model
             && !m.is_empty()
         {
             parts.push(m.clone());
+        }
+        if let Some(e) = &self.effort
+            && !e.is_empty()
+        {
+            parts.push(format!("effort {e}"));
         }
         parts.extend(self.stats.segments());
         parts
@@ -158,6 +172,46 @@ mod tests {
         let mut s = Status::default();
         s.set_model("");
         assert_eq!(s.full_line(), "cache 0.0% · hit 0 · miss 0");
+    }
+
+    #[test]
+    fn effort_sits_between_the_model_and_the_cache() {
+        let mut s = Status::default();
+        s.set_model("deepseek/deepseek-flash");
+        s.set_effort("high");
+        s.record(&usage(6, 4));
+        assert_eq!(
+            s.full_line(),
+            "deepseek/deepseek-flash · effort high · cache 60.0% · hit 6 · miss 4"
+        );
+        // It follows the session, not the statistics.
+        s.reset_stats();
+        assert_eq!(
+            s.full_line(),
+            "deepseek/deepseek-flash · effort high · cache 0.0% · hit 0 · miss 0"
+        );
+    }
+
+    #[test]
+    fn an_empty_effort_is_not_a_segment() {
+        let mut s = Status::default();
+        s.set_model("m-1");
+        s.set_effort("");
+        assert_eq!(s.full_line(), "m-1 · cache 0.0% · hit 0 · miss 0");
+    }
+
+    #[test]
+    fn line_drops_the_effort_before_the_model() {
+        let mut s = Status::default();
+        s.set_model("m-1");
+        s.set_effort("max");
+        assert_eq!(
+            s.line(29),
+            "m-1 · effort max · cache 0.0%",
+            "the counts go first"
+        );
+        assert_eq!(s.line(16), "m-1 · effort max");
+        assert_eq!(s.line(15), "m-1", "the model is the last thing dropped");
     }
 
     #[test]

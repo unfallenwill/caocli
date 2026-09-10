@@ -2,12 +2,13 @@
 """pty interactive smoke test: run the plain front end inside a pseudo-terminal to
 exercise the branches that only execute on a TTY.
 
-Covers: the status bar (scroll region + cache label), the prompt round trip,
-graceful Ctrl-C cancellation during a turn (cooked-mode SIGINT -> cancellation
-marker -> back to the prompt), and `/login` -- which is the one place the plain
-front end asks a question of its own, with the terminal's echo off. The front end
-that owns the screen is `tui_smoke.py`'s subject, so `--no-tui` picks this one
-out.
+Covers: the status bar (scroll region + model, effort and cache labels), the
+prompt round trip, graceful Ctrl-C cancellation during a turn (cooked-mode
+SIGINT -> cancellation marker -> back to the prompt), `/effort` (both the plain
+menu and the status line taking the tier), and `/login` -- which is the one place
+the plain front end asks a question of its own, with the terminal's echo off.
+The front end that owns the screen is `tui_smoke.py`'s subject, so `--no-tui`
+picks this one out.
 Exit code 0 = pass. The live half needs a real API key, which lives in
 `settings.json` and nowhere else: it is taken from the one `/login` stored on
 this machine and written into the run's own HOME. With none, the live half is
@@ -184,7 +185,15 @@ def login_case() -> bool:
             # without ever having run anything.
             ok &= scr.ready()
             scr.send("/model zai-coding-cn/glm-5.3\r".encode())
-            ok &= scr.expect("zai-coding-cn/glm-5.3 · cache", 15)
+            ok &= scr.expect("zai-coding-cn/glm-5.3 · effort max · cache", 15)
+            ok &= scr.ready()
+            # `/effort` names a tier the provider offers; the status line takes
+            # it beside the model, and with no argument it answers with the menu.
+            scr.send("/effort low\r".encode())
+            ok &= scr.expect("zai-coding-cn/glm-5.3 · effort low · cache", 15)
+            ok &= scr.ready()
+            scr.send("/effort\r".encode())
+            ok &= scr.expect("choose a reasoning effort tier", 15)
             ok &= scr.ready()
             scr.send("/model\r".encode())
             ok &= scr.expect("choose a model", 15)   # the menu, for the plain front end

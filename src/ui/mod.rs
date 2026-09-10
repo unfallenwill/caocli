@@ -247,6 +247,8 @@ pub trait Front: Ui {
     fn error(&mut self, s: &str);
     /// Adopt the model id the status line reports.
     fn set_model(&mut self, model: &str);
+    /// Adopt the reasoning effort tier the status line reports.
+    fn set_effort(&mut self, effort: &str);
     /// Clear the session's cache statistics.
     fn reset_stats(&mut self);
     /// Ask for a secret: `prompt` says what it is for, and the answer is the
@@ -352,7 +354,8 @@ pub struct Renderer {
     /// previous cell is kept: it is all the spacing rule needs, and the
     /// transcript itself lives in the session log.
     prev_was_block: bool,
-    /// What the status bar reports: the model and the session's cache statistics.
+    /// What the status bar reports: the model, the effort tier and the session's
+    /// cache statistics.
     status: Status,
     bar: Option<StatusBar>,
 }
@@ -598,6 +601,11 @@ impl Front for Renderer {
 
     fn set_model(&mut self, model: &str) {
         self.status.set_model(model);
+        self.redraw_status_bar();
+    }
+
+    fn set_effort(&mut self, effort: &str) {
+        self.status.set_effort(effort);
         self.redraw_status_bar();
     }
 

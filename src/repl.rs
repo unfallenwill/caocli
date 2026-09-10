@@ -93,6 +93,7 @@ pub async fn handle(
                     }
                     ui.reset_stats();
                     ui.set_model(&agent.model_label());
+                    ui.set_effort(agent.effort_label());
                 }
                 Err(e) => ui.error(&format!("{e:#}")),
             }
@@ -200,6 +201,9 @@ fn choose_model(agent: &mut Agent, ui: &mut dyn Front, spec: &str) {
     }
     agent.bind(provider, api);
     ui.set_model(&agent.model_label());
+    // A model can move the session to another provider, whose default tier is
+    // sent when the session stored none; the status line says which that is.
+    ui.set_effort(agent.effort_label());
     // The cache figures belong to the model that answered, not to the session.
     ui.reset_stats();
     ui.info(&format!("model {}", agent.model_label()));
@@ -222,6 +226,7 @@ fn choose_effort(agent: &mut Agent, ui: &mut dyn Front, tier: &str) {
             return ui.error(&format!("{e:#}"));
         }
     }
+    ui.set_effort(agent.effort_label());
     ui.info(&format!("effort {tier}"));
 }
 
@@ -382,6 +387,7 @@ mod tests {
         errors: Vec<String>,
         replayed: usize,
         model: Option<String>,
+        effort: Option<String>,
         resets: usize,
         /// What `ask_secret` answers with; `None` is a cancellation, which is
         /// also what a front end that never answers gives.
@@ -414,6 +420,9 @@ mod tests {
         }
         fn set_model(&mut self, model: &str) {
             self.model = Some(model.to_owned());
+        }
+        fn set_effort(&mut self, effort: &str) {
+            self.effort = Some(effort.to_owned());
         }
         fn reset_stats(&mut self) {
             self.resets += 1;
@@ -626,7 +635,7 @@ mod tests {
             SessionMeta {
                 provider: Some("zai-coding-cn".to_owned()),
                 model: "glm-5.3".to_owned(),
-                reasoning_effort: None,
+                reasoning_effort: Some("low".into()),
             },
         )
         .unwrap();
@@ -643,6 +652,11 @@ mod tests {
             "the session's own endpoint"
         );
         assert_eq!(ui.model.as_deref(), Some("zai-coding-cn/glm-5.3"));
+        assert_eq!(
+            ui.effort.as_deref(),
+            Some("low"),
+            "the status line takes the resumed session's tier"
+        );
         drop(guard);
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&home).unwrap();
@@ -911,6 +925,11 @@ mod tests {
         );
         assert_eq!(agent.session.meta.model, "glm-5.3");
         assert_eq!(ui.model.as_deref(), Some("zai-coding-cn/glm-5.3"));
+        assert_eq!(
+            ui.effort.as_deref(),
+            Some("max"),
+            "the status line follows the tier in effect"
+        );
         drop(guard);
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&home).unwrap();
@@ -959,6 +978,11 @@ mod tests {
             ui.info,
             vec![effort_menu(&agent.provider(), agent.effort_label())]
         );
+        assert_eq!(
+            ui.effort.as_deref(),
+            None,
+            "the menu is a question, not a switch"
+        );
         // Every tier the provider offers, and the one in effect marked.
         for tier in agent.provider().efforts {
             assert!(ui.info[0].contains(tier), "{:?}", ui.info);
@@ -976,6 +1000,7 @@ mod tests {
         assert!(ui.errors.is_empty(), "{:?}", ui.errors);
         assert_eq!(agent.session.meta.reasoning_effort.as_deref(), Some("low"));
         assert_eq!(ui.info, vec!["effort low"]);
+        assert_eq!(ui.effort.as_deref(), Some("low"), "the status line took it");
         // The log is the state: a resume has to find the tier there.
         let log = std::fs::read_to_string(&agent.session.path).unwrap();
         assert!(log.contains("\"reasoning_effort\":\"low\""), "{log}");
@@ -989,6 +1014,7 @@ mod tests {
         let mut ui = Recording::default();
         submit(&mut agent, &mut ui, &dir, "/effort bogus").await;
         assert!(ui.info.is_empty(), "{:?}", ui.info);
+        assert_eq!(ui.effort, None, "the status line was left alone");
         assert!(
             ui.errors[0].contains("low | high | max"),
             "it says what is available: {:?}",
