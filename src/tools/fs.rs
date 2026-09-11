@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{MAX_FILE_BYTES, MAX_OUTPUT, MAX_READ_BYTES, parse_args, str_arg};
+use super::{MAX_FILE_BYTES, MAX_OUTPUT, MAX_READ_BYTES, parse_args, str_arg, truncate};
 use crate::types::{FunctionDef, ToolDef};
 
 pub const READ_NAME: &str = "Read";
@@ -470,6 +470,11 @@ fn int_arg(v: &serde_json::Value, key: &str) -> Result<Option<usize>, String> {
 /// The text a call inserts lands in the target's own line endings, so that a
 /// replacement typed with plain newlines is not a block of lines that differ
 /// from the ones around them in their endings alone.
+///
+/// A call that matched nothing, or matched more than once, is answered with
+/// where the trouble is: the nearest text and what is between the two, or the
+/// lines that would tell the occurrences apart. A model cannot see a file it has
+/// not read, so a bare "not found" leaves it nothing to act on but another Read.
 pub fn edit(args_json: &str) -> String {
     let v = match parse_args(args_json) {
         Ok(v) => v,
@@ -496,9 +501,7 @@ pub fn edit(args_json: &str) -> String {
     };
     match content.matches(&old).count() {
         0 => {
-            return format!(
-                "error: old_string not found in {path}. Use Read to check the original text first"
-            );
+            return not_found(&path, &content, &old);
         }
         n if n > 1 => {
             return format!(
@@ -535,6 +538,449 @@ pub fn edit(args_json: &str) -> String {
         ),
         Err(e) => format!("error: failed to write {path}: {e}"),
     }
+}
+
+/// How many bytes of a line a hint quotes before cutting it: a hint is a tool
+/// result, and the model pays for every byte of it.
+const HINT_LINE_BYTES: usize = 160;
+
+/// How many lines of the nearest text a hint shows when the text that was not
+/// found is longer than that, and how many of them stand around the first line
+/// that differs.
+const HINT_LINES: usize = 12;
+const HINT_AROUND: usize = 3;
+
+/// How much of a line has to read like the call's, out of 1000, before a window
+/// is offered as the place that was meant: half alike is near enough to name,
+/// and below that a hint is a guess that costs more than saying nothing.
+const NEAR_ENOUGH: u32 = 500;
+
+/// What an Edit that matched nothing is answered with: the endings the file's
+/// lines have, when they are the one thing between the call and a match, and
+/// otherwise the text that comes nearest to the call's, with the line that
+/// differs and the difference named.
+///
+/// A call that was one character off is corrected from this in the same turn,
+/// where a bare "not found" costs it a round trip through Read.
+fn not_found(path: &str, content: &str, old: &str) -> String {
+    let mut out = format!("error: old_string not found in {path}.");
+    if let Some(hint) = endings_hint(content, old) {
+        out.push_str(&hint);
+        return out;
+    }
+    match nearest_hint(content, old) {
+        Some(hint) => {
+            out.push_str(&hint);
+            out
+        }
+        None => format!(
+            "{out} Nothing in the file is close to it; use Read to check the original text \
+             first (the file has {} lines{})",
+            line_count(content),
+            shape(content)
+        ),
+    }
+}
+
+/// The difference an Edit is most often one character away from: the endings of
+/// the file's lines. What a call writes is brought into them, but an old_string
+/// is the file's own text and has to be sent as it stands -- so when the
+/// endings alone stand between the call and a match, saying which ones the
+/// file's lines have is the whole of the correction.
+fn endings_hint(content: &str, old: &str) -> Option<String> {
+    let endings = one_style(content)?;
+    // `None` here is the call's text already being in the file's endings, which
+    // is not what a not-found report is about.
+    let (wanted, _) = in_endings(old, Some(endings))?;
+    let n = content.matches(&wanted).count();
+    if n == 0 {
+        return None;
+    }
+    let count = match n {
+        1 => "once".to_string(),
+        n => format!("{n} times"),
+    };
+    let (fix, carries, unique) = match endings {
+        Endings::Crlf => (
+            "with a carriage return in front of every newline",
+            "old_string's newlines do not carry a carriage return",
+            if n > 1 {
+                " and enough context to make it unique"
+            } else {
+                ""
+            },
+        ),
+        Endings::Lf => (
+            "without the carriage returns in front of its newlines",
+            "old_string's newlines carry a carriage return",
+            if n > 1 {
+                " and enough context to make it unique"
+            } else {
+                ""
+            },
+        ),
+    };
+    Some(format!(
+        " The file's lines end with {}; with them the same text occurs {count} in it. Resend \
+         old_string {fix}{unique} ({carries}).",
+        endings.name()
+    ))
+}
+
+/// The other difference an Edit is one step away from: a text that is in the
+/// file, but not as the call sent it. What is offered is the window of the
+/// file's lines that comes nearest -- numbered as Read numbers them -- with the
+/// first line that differs and what is between the two named.
+///
+/// `None` when nothing in the file reads like the call's text, since a hint
+/// that points at a line the call did not mean costs more than no hint at all.
+fn nearest_hint(content: &str, old: &str) -> Option<String> {
+    let file = lines_of(content);
+    let mut want = lines_of(old);
+    // The empty line a text that ends with a newline splits into is not a line
+    // of the file: what is left of it is the newline the call's text ends with,
+    // and whether the file has a line to end.
+    while want.last() == Some(&"") {
+        want.pop();
+    }
+    let near = nearest(&file, &want)?;
+    let last = near.first + near.lines.len() - 1;
+    let mut out = format!(" The nearest text is at {}:", lines_name(near.first, last));
+    // A window longer than a hint may spend on one is shown around the line
+    // that differs, which is the line the call is read for.
+    let differs = near.fits.iter().position(|fit| *fit != Fit::Same);
+    let (from, to) = match differs {
+        Some(i) if near.lines.len() > HINT_LINES => (
+            i.saturating_sub(HINT_AROUND),
+            (i + HINT_AROUND + 1).min(near.lines.len()),
+        ),
+        _ => (0, near.lines.len()),
+    };
+    if from > 0 {
+        out.push_str(&format!("\n  [... {from} lines before ...]"));
+    }
+    for i in from..to {
+        out.push_str(&format!("\n{}|{}", near.first + i, quoted(near.lines[i])));
+    }
+    if to < near.lines.len() {
+        out.push_str(&format!(
+            "\n  [... {} lines after ...]",
+            near.lines.len() - to
+        ));
+    }
+    out.push('\n');
+    out.push_str(&reason(&near, &want, differs));
+    if differs.is_some() {
+        // The line at fault is named first, but it is rarely the only one: a
+        // text that missed is usually a text that changed in more than one
+        // place, and a call that fixes one line at a time pays for it.
+        let others = near.fits.iter().filter(|fit| **fit != Fit::Same).count() - 1;
+        if others > 0 {
+            let (line, differs) = if others == 1 {
+                ("line", "differs")
+            } else {
+                ("lines", "differ")
+            };
+            out.push_str(&format!(" {others} more {line} {differs} as well."));
+        }
+    }
+    out.push_str(endings_note(content, old));
+    Some(out)
+}
+
+/// Why the nearest text is not the call's: the line that is at fault, and every
+/// difference between it and the line of the call's text it stands for.
+fn reason(near: &Nearest, want: &[&str], differs: Option<usize>) -> String {
+    let Some(i) = differs else {
+        // Every line reads the same, so what is left is the end of the call's
+        // text: a newline, or a line, that the file has nothing to end.
+        return "every line of it reads the same as old_string's, and the difference is at the \
+                end of old_string: the file has no line there for the newline it ends with."
+            .to_string();
+    };
+    format!(
+        "line {} differs from old_string's line {} in {}.",
+        near.first + i,
+        i + 1,
+        differences(near.lines[i], want[i])
+    )
+}
+
+/// What is between two lines, named in the order it sits in the line: the text,
+/// the whitespace the line starts with, the whitespace it ends with, and -- for
+/// two lines whose words are the same -- the whitespace between them. A reader
+/// cannot see a tab or count the spaces at the end of a line, so each of them is
+/// spelled out rather than left to be read off a line that does not show it.
+fn differences(file: &str, want: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if squeeze(file) != squeeze(want) {
+        parts.push("its text".to_string());
+    }
+    let (file_leads, want_leads) = (leading(file), leading(want));
+    if file_leads != want_leads {
+        parts.push(format!(
+            "the whitespace it starts with (the file's line starts with {}, old_string's line \
+             starts with {})",
+            ws_name(file_leads),
+            ws_name(want_leads)
+        ));
+    }
+    let (file_ends, want_ends) = (trailing(file), trailing(want));
+    if file_ends != want_ends {
+        parts.push(format!(
+            "the whitespace at its end (the file's line ends with {}, old_string's line ends \
+             with {})",
+            ws_name(file_ends),
+            ws_name(want_ends)
+        ));
+    }
+    // Nothing at the ends and nothing in the words: the difference there is left
+    // is the whitespace between the words.
+    if parts.is_empty() {
+        parts.push("the whitespace inside it".to_string());
+    }
+    joined(&parts)
+}
+
+/// A list of things as a sentence lists them: "a", "a and b", "a, b and c".
+fn joined(parts: &[String]) -> String {
+    match parts {
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        [] => String::new(),
+    }
+}
+
+/// A line with every run of whitespace squeezed into one space and its ends
+/// trimmed: what two lines are compared as when the question is whether they
+/// carry the same text, whatever the whitespace between the words does.
+fn squeeze(line: &str) -> String {
+    let mut out = String::new();
+    let mut space = false;
+    for c in line.trim().chars() {
+        if c.is_whitespace() {
+            space = true;
+            continue;
+        }
+        if space && !out.is_empty() {
+            out.push(' ');
+        }
+        space = false;
+        out.push(c);
+    }
+    out
+}
+
+/// What a hint says about a file whose lines carry a carriage return the
+/// excerpt does not show: a call of one line has no line ending to send, and a
+/// call of several that does not carry them would miss the file again.
+fn endings_note(content: &str, old: &str) -> &'static str {
+    if old.contains('\n') && one_style(content) == Some(Endings::Crlf) && !old.contains("\r\n") {
+        "\n[note: the file's lines end with CRLF; a multi-line old_string carries a carriage \
+         return in front of every newline]"
+    } else {
+        ""
+    }
+}
+
+/// How one line of the file reads against the line of the call's text it stands
+/// for: the same, the same but for whitespace, or only alike. The rank is what
+/// the window the call meant is found by; what is between the two lines is said
+/// by `differences`, which tells apart the several ways a line can differ.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fit {
+    Same,
+    Trailing,
+    Leading,
+    Whitespace,
+    Text,
+}
+
+/// The window of the file's lines that comes nearest to the text that was not
+/// found: as many lines as the call sent, starting where the two read most
+/// alike, and only when that is near enough to be worth naming.
+fn nearest<'a>(file: &[&'a str], want: &[&str]) -> Option<Nearest<'a>> {
+    if want.is_empty() || want.len() > file.len() {
+        return None;
+    }
+    let mut best: Option<(u32, usize, Vec<Fit>)> = None;
+    for at in 0..=file.len() - want.len() {
+        let mut score = 0;
+        let mut fits = Vec::with_capacity(want.len());
+        for (line, wanted) in file[at..].iter().zip(want) {
+            let (fit, what) = fit_line(line, wanted);
+            score += fit;
+            fits.push(what);
+        }
+        if best.as_ref().is_none_or(|(before, _, _)| score > *before) {
+            best = Some((score, at, fits));
+        }
+    }
+    let (score, at, fits) = best?;
+    (score >= want.len() as u32 * NEAR_ENOUGH).then(|| Nearest {
+        first: at + 1,
+        lines: file[at..at + want.len()].to_vec(),
+        fits,
+    })
+}
+
+/// The place in the file the text that was not found comes nearest to: the
+/// file's own lines, and how each of them reads against the call's.
+struct Nearest<'a> {
+    /// The 1-based number of the first line, as Read numbers it.
+    first: usize,
+    /// The file's lines, as the file has them.
+    lines: Vec<&'a str>,
+    /// How each line reads against the line of the call's text it stands for.
+    fits: Vec<Fit>,
+}
+
+/// How much one line reads like another, out of 1000, and what is between them.
+/// The three whitespace differences are ranked above everything else, so that a
+/// line which is the same but for a trailing space is never offered as a near
+/// miss of the text the call sent.
+fn fit_line(file: &str, want: &str) -> (u32, Fit) {
+    if file == want {
+        (1000, Fit::Same)
+    } else if file.trim_end() == want.trim_end() {
+        (990, Fit::Trailing)
+    } else if file.trim_start() == want.trim_start() {
+        (980, Fit::Leading)
+    } else if file.trim() == want.trim() {
+        (970, Fit::Whitespace)
+    } else {
+        // The indentation is not part of what the two lines say: a line that
+        // was sent with the wrong indent is still the line the call meant.
+        (alike(file.trim_start(), want.trim_start()) * 9, Fit::Text)
+    }
+}
+
+/// How much of two lines reads the same, out of 100: what they share at the
+/// start and at the end, measured against the longer of them. The letters are
+/// read without regard to case, since a line that was sent in the wrong case is
+/// a near miss rather than a line that is not there. Cheap on purpose -- a hint
+/// is worked out while the call that asked for it waits.
+fn alike(a: &str, b: &str) -> u32 {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let longest = a.len().max(b.len());
+    let mut head = 0;
+    while head < a.len() && head < b.len() && a[head].eq_ignore_ascii_case(&b[head]) {
+        head += 1;
+    }
+    let mut tail = 0;
+    while head + tail < a.len()
+        && head + tail < b.len()
+        && a[a.len() - 1 - tail].eq_ignore_ascii_case(&b[b.len() - 1 - tail])
+    {
+        tail += 1;
+    }
+    ((head + tail) * 100 / longest) as u32
+}
+
+/// The lines of a text, as a reader of it sees them: the carriage return of a
+/// CRLF line is the file's shape rather than its text, so it is not part of the
+/// line a hint quotes.
+fn lines_of(text: &str) -> Vec<&str> {
+    text.split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect()
+}
+
+/// How many lines a text has, the way Read numbers them: every newline ends a
+/// line, and a last line with no newline after it is one too.
+fn line_count(text: &str) -> usize {
+    let newlines = text.matches('\n').count();
+    newlines + usize::from(!text.is_empty() && !text.ends_with('\n'))
+}
+
+/// One line, or a run of them, said the way Read numbers them.
+fn lines_name(first: usize, last: usize) -> String {
+    if first == last {
+        format!("line {first}")
+    } else {
+        format!("lines {first}-{last}")
+    }
+}
+
+/// One line of a file, as a hint shows it: cut to the width a hint may spend on
+/// a line, on a character boundary, and marked when there was more of it.
+fn quoted(line: &str) -> String {
+    let (mut text, cut) = truncate(line, HINT_LINE_BYTES);
+    if cut {
+        text.push('…');
+    }
+    text
+}
+
+/// The whitespace a line ends with.
+fn trailing(line: &str) -> &str {
+    let rest = line.trim_end();
+    &line[rest.len()..]
+}
+
+/// The whitespace a line starts with.
+fn leading(line: &str) -> &str {
+    let rest = line.trim_start();
+    &line[..line.len() - rest.len()]
+}
+
+/// What a run of whitespace is, said in words: a reader cannot see a trailing
+/// space or tell a tab from one, so a hint that turns on one has to name it.
+fn ws_name(ws: &str) -> String {
+    let (mut tabs, mut spaces, mut other) = (0, 0, 0);
+    for c in ws.chars() {
+        match c {
+            '\t' => tabs += 1,
+            ' ' => spaces += 1,
+            _ => other += 1,
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if tabs > 0 {
+        parts.push(format!("{tabs} tab{}", plural(tabs)));
+    }
+    if spaces > 0 {
+        parts.push(format!("{spaces} space{}", plural(spaces)));
+    }
+    if other > 0 {
+        parts.push(format!(
+            "{other} other whitespace character{}",
+            plural(other)
+        ));
+    }
+    if parts.is_empty() {
+        "no whitespace".to_string()
+    } else {
+        parts.join(" and ")
+    }
+}
+
+/// The `s` of a plural count.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// What the file's lines end with, for a message that has to say what a call is
+/// read against; empty when the lines have no one style to name.
+fn shape(content: &str) -> &'static str {
+    match one_style(content) {
+        Some(Endings::Crlf) => ", and its lines end with CRLF",
+        Some(Endings::Lf) => ", and its lines end with LF",
+        None => "",
+    }
+}
+
+/// The one style a text's lines end in: `None` when they have none to name,
+/// which is a text with no line ending to go by and one that carries both kinds
+/// at once. A message that names the endings of a file may not say "LF" about a
+/// file that is half CRLF, so this is what such a message is read from.
+fn one_style(text: &str) -> Option<Endings> {
+    let mut count = EndingCount::default();
+    count.feed(text.as_bytes());
+    if count.mixed() {
+        return None;
+    }
+    count.style()
 }
 
 /// Write: creates or overwrites a whole file; parent directories are created.
@@ -1219,6 +1665,362 @@ mod tests {
         let out = edit(&args(&p, r#","old_string":"aa","new_string":"cc""#));
         assert!(out.contains("occurs 2 times"), "{out}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "aa bb aa");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A call that matched nothing is answered with the nearest text and what
+    /// is between the two, so that a call which was one character off is
+    /// corrected without spending a Read to find out what the file says.
+    #[test]
+    fn edit_names_the_nearest_text_and_the_whitespace_that_differs() {
+        let dir = tmpdir();
+
+        // Indentation: the file indents with a tab where the call sent four
+        // spaces. Neither is visible to a reader of the line, so the hint has
+        // to name which is which.
+        let tabs = dir.join("tabs.rs");
+        std::fs::write(&tabs, "fn f() {\n\tlet a = 1;\n}\n").unwrap();
+        let out = edit(&args(
+            &tabs,
+            r#","old_string":"    let a = 1;","new_string":"    let a = 2;""#,
+        ));
+        assert!(out.starts_with("error: old_string not found"), "{out}");
+        assert!(out.contains("The nearest text is at line 2:"), "{out}");
+        assert!(out.contains("2|\tlet a = 1;"), "{out}");
+        assert!(out.contains("the whitespace it starts with"), "{out}");
+        assert!(out.contains("the file's line starts with 1 tab"), "{out}");
+        assert!(
+            out.contains("old_string's line starts with 4 spaces"),
+            "{out}"
+        );
+
+        // Trailing whitespace: the file's line ends with two spaces the call
+        // did not carry, so the text in the call crosses the line end and
+        // matches nowhere.
+        let spaces = dir.join("spaces.txt");
+        std::fs::write(&spaces, "let a = 1;  \nlet b = 2;\n").unwrap();
+        let out = edit(&args(
+            &spaces,
+            r#","old_string":"let a = 1;\nlet b = 2;","new_string":"let a = 9;""#,
+        ));
+        assert!(out.contains("The nearest text is at lines 1-2:"), "{out}");
+        assert!(
+            out.contains("line 1 differs from old_string's line 1 in the whitespace at its end"),
+            "{out}"
+        );
+        assert!(out.contains("the file's line ends with 2 spaces"), "{out}");
+        assert!(
+            out.contains("old_string's line ends with no whitespace"),
+            "{out}"
+        );
+
+        // A word that reads almost the same: the difference is in the text, and
+        // the excerpt carries the file's own line for the call to copy.
+        let typo = dir.join("typo.rs");
+        std::fs::write(&typo, "let total = count + 1;\n").unwrap();
+        let out = edit(&args(
+            &typo,
+            r#","old_string":"let total = count + 2;","new_string":"let total = count + 3;""#,
+        ));
+        assert!(out.contains("1|let total = count + 1;"), "{out}");
+        assert!(
+            out.contains("line 1 differs from old_string's line 1 in its text"),
+            "{out}"
+        );
+        assert!(out.contains("in its text"), "{out}");
+
+        // None of it is a lie about the file: nothing was written.
+        assert_eq!(
+            std::fs::read_to_string(&typo).unwrap(),
+            "let total = count + 1;\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The endings of a file's lines are the difference an Edit is most often
+    /// one character away from: a call that sent plain newlines for a CRLF file
+    /// -- or the other way round -- is told which endings the file's lines have
+    /// and what to send instead.
+    #[test]
+    fn edit_names_the_endings_a_match_needs() {
+        let dir = tmpdir();
+        let crlf = dir.join("crlf.txt");
+        std::fs::write(&crlf, "one\r\ntwo\r\n").unwrap();
+        let out = edit(&args(
+            &crlf,
+            r#","old_string":"one\ntwo\n","new_string":"three\n""#,
+        ));
+        assert!(out.contains("The file's lines end with CRLF"), "{out}");
+        assert!(out.contains("occurs once in it"), "{out}");
+        assert!(
+            out.contains("with a carriage return in front of every newline"),
+            "{out}"
+        );
+        assert_eq!(std::fs::read(&crlf).unwrap(), b"one\r\ntwo\r\n");
+
+        // And the way round: an LF file, an old_string sent with CRLF.
+        let lf = dir.join("lf.txt");
+        std::fs::write(&lf, "one\ntwo\n").unwrap();
+        let out = edit(&args(
+            &lf,
+            r#","old_string":"one\r\ntwo","new_string":"three""#,
+        ));
+        assert!(out.contains("The file's lines end with LF"), "{out}");
+        assert!(
+            out.contains("without the carriage returns in front of its newlines"),
+            "{out}"
+        );
+        assert_eq!(std::fs::read(&lf).unwrap(), b"one\ntwo\n");
+
+        // The endings are named only when they are what stands between the call
+        // and a match: a text that is in the file as it stands is an ordinary
+        // near miss, and is answered as one.
+        let near = dir.join("near.txt");
+        std::fs::write(&near, "one\r\ntwo\r\n").unwrap();
+        let out = edit(&args(&near, r#","old_string":"ONE\ntwo","new_string":"x""#));
+        assert!(!out.contains("The file's lines end with"), "{out}");
+        assert!(out.contains("The nearest text is at lines 1-2:"), "{out}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A text that is in the file but not as the call sent it, in more lines
+    /// than a hint shows: what is shown is the lines around the one that
+    /// differs, and what was left out is counted.
+    #[test]
+    fn edit_shows_a_long_nearest_text_around_the_line_that_differs() {
+        let dir = tmpdir();
+        let p = dir.join("long.txt");
+        let file: Vec<String> = (1..=30).map(|n| format!("line {n} of the file")).collect();
+        std::fs::write(&p, file.join("\n") + "\n").unwrap();
+        let mut want = file.clone();
+        want[19] = "line 20 of the call".to_string();
+        let out = edit(&format!(
+            r#"{{"file_path":{:?},"old_string":{:?},"new_string":"x"}}"#,
+            p.to_string_lossy(),
+            want.join("\n")
+        ));
+        assert!(out.contains("The nearest text is at lines 1-30:"), "{out}");
+        assert!(out.contains("[... 16 lines before ...]"), "{out}");
+        assert!(out.contains("[... 7 lines after ...]"), "{out}");
+        assert!(out.contains("17|line 17 of the file"), "{out}");
+        assert!(out.contains("20|line 20 of the file"), "{out}");
+        assert!(out.contains("23|line 23 of the file"), "{out}");
+        assert!(!out.contains("16|line 16 of the file"), "{out}");
+        assert!(
+            out.contains("line 20 differs from old_string's line 20 in its text"),
+            "{out}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The last line of a file with no newline after it: the call's text is in
+    /// the file but for the newline it ends with, and the hint says that rather
+    /// than pointing at a line that does not differ.
+    #[test]
+    fn edit_names_the_newline_a_file_does_not_end_with() {
+        let dir = tmpdir();
+        let p = dir.join("f.txt");
+        std::fs::write(&p, "one\ntwo").unwrap();
+        let out = edit(&args(&p, r#","old_string":"two\n","new_string":"three\n""#));
+        assert!(out.contains("The nearest text is at line 2:"), "{out}");
+        assert!(out.contains("2|two"), "{out}");
+        assert!(
+            out.contains("the file has no line there for the newline it ends with"),
+            "{out}"
+        );
+        assert_eq!(std::fs::read(&p).unwrap(), b"one\ntwo");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Nothing in the file reads like the call's text: the report says so, and
+    /// how much there is to read, rather than pointing at a line the call never
+    /// meant.
+    #[test]
+    fn edit_says_when_nothing_is_close() {
+        let dir = tmpdir();
+        let p = dir.join("f.txt");
+        std::fs::write(&p, "alpha\r\nbeta\r\n").unwrap();
+        let out = edit(&args(&p, r#","old_string":"zzzz qqqq","new_string":"x""#));
+        assert!(
+            out.contains("Nothing in the file is close to it; use Read to check the original"),
+            "{out}"
+        );
+        assert!(
+            out.contains("the file has 2 lines, and its lines end with CRLF"),
+            "{out}"
+        );
+
+        // A file that is half LF and half CRLF has no one style to name, so the
+        // report names none rather than calling it one of them.
+        let mixed = dir.join("mixed.txt");
+        std::fs::write(&mixed, "alpha\nbeta\r\n").unwrap();
+        let out = edit(&args(
+            &mixed,
+            r#","old_string":"zzzz qqqq","new_string":"x""#,
+        ));
+        assert!(out.contains("the file has 2 lines)"), "{out}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Whatever a hint shows, it is a tool result like any other: a line is cut
+    /// to a readable width on a character boundary, and the whole report stays
+    /// inside the output cap however large the text that missed was.
+    #[test]
+    fn the_hint_a_failed_edit_gives_stays_bounded() {
+        let dir = tmpdir();
+        let p = dir.join("wide.txt");
+        let file: Vec<String> = (1..=12)
+            .map(|n| format!("{} line {n}", "€".repeat(400)))
+            .collect();
+        std::fs::write(&p, file.join("\n") + "\n").unwrap();
+        let mut want = file.clone();
+        want[5] = format!("{} line 6 changed", "€".repeat(400));
+        let out = edit(&format!(
+            r#"{{"file_path":{:?},"old_string":{:?},"new_string":"x"}}"#,
+            p.to_string_lossy(),
+            want.join("\n")
+        ));
+        assert!(out.len() < MAX_OUTPUT, "{} bytes", out.len());
+        assert!(out.contains("6|"), "{out}");
+        assert!(out.contains('…'), "{out}");
+        for line in out.lines().filter(|line| line.contains('|')) {
+            assert!(
+                line.len() < HINT_LINE_BYTES + 32,
+                "{} bytes: {line}",
+                line.len()
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A text that differs in more than one line: the hint names the first line
+    /// at fault and counts the rest, so that a call is not corrected one line at
+    /// a time.
+    #[test]
+    fn edit_counts_the_other_lines_that_differ() {
+        let dir = tmpdir();
+        let p = dir.join("f.txt");
+        std::fs::write(&p, "alpha\nbeta\ngamma\ndelta\n").unwrap();
+        let out = edit(&args(
+            &p,
+            r#","old_string":"alpha\nBETA\nGAMMA\nDELTA","new_string":"x""#,
+        ));
+        assert!(
+            out.contains("line 2 differs from old_string's line 2 in its text"),
+            "{out}"
+        );
+        assert!(out.contains("2 more lines differ as well"), "{out}");
+
+        let one = dir.join("one.txt");
+        std::fs::write(&one, "head\nONE\ntail\n").unwrap();
+        let out = edit(&args(
+            &one,
+            r#","old_string":"head\none\nTAIL","new_string":"x""#,
+        ));
+        assert!(out.contains("1 more line differs as well"), "{out}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The endings hint counts what it turns up: a text that is in the file
+    /// more than once with the file's endings is not made unique by them, and
+    /// the call is told to add context as well.
+    #[test]
+    fn edit_counts_what_the_endings_turn_up() {
+        let dir = tmpdir();
+        let p = dir.join("twice.txt");
+        std::fs::write(&p, "one\r\ntwo\r\none\r\ntwo\r\n").unwrap();
+        let out = edit(&args(&p, r#","old_string":"one\ntwo","new_string":"x""#));
+        assert!(out.contains("The file's lines end with CRLF"), "{out}");
+        assert!(out.contains("occurs 2 times in it"), "{out}");
+        assert!(
+            out.contains("and enough context to make it unique"),
+            "{out}"
+        );
+        assert_eq!(std::fs::read(&p).unwrap(), b"one\r\ntwo\r\none\r\ntwo\r\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The excerpt a hint shows is the file's lines without their carriage
+    /// returns, so a CRLF file whose text also missed in its words is told what
+    /// to send: the endings are not the fix, but they are what a multi-line
+    /// old_string has to carry all the same.
+    #[test]
+    fn edit_says_the_endings_the_excerpt_does_not_show() {
+        let dir = tmpdir();
+        let p = dir.join("f.txt");
+        std::fs::write(&p, "one\r\ntwo\r\nthree\r\n").unwrap();
+        let out = edit(&args(&p, r#","old_string":"one\nTWO","new_string":"x""#));
+        assert!(!out.contains("with them the same text"), "{out}");
+        assert!(out.contains("The nearest text is at lines 1-2:"), "{out}");
+        assert!(
+            out.contains("[note: the file's lines end with CRLF; a multi-line old_string carries"),
+            "{out}"
+        );
+
+        // A text of one line has no line ending to send, so there is nothing to
+        // say about the file's.
+        let out = edit(&args(&p, r#","old_string":"TWO","new_string":"x""#));
+        assert!(out.contains("The nearest text is at line 2:"), "{out}");
+        assert!(!out.contains("[note:"), "{out}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A text of nothing but newlines: there is no line of it to look for, and
+    /// the report says the file has nothing like it rather than offering a
+    /// window that would be a guess.
+    #[test]
+    fn edit_says_nothing_for_a_text_of_newlines() {
+        let dir = tmpdir();
+        let p = dir.join("f.txt");
+        std::fs::write(&p, "alpha\n").unwrap();
+        let out = edit(&args(&p, r#","old_string":"\n\n\n","new_string":"x""#));
+        assert!(out.contains("Nothing in the file is close to it"), "{out}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Whitespace is named as what it is: a reader cannot see a trailing space
+    /// or tell a tab from four of them, and a hint that turns on one has to say
+    /// which it was.
+    #[test]
+    fn whitespace_is_named_as_what_it_is() {
+        assert_eq!(ws_name(""), "no whitespace");
+        assert_eq!(ws_name("\t"), "1 tab");
+        assert_eq!(ws_name("\t\t"), "2 tabs");
+        assert_eq!(ws_name(" \t "), "1 tab and 2 spaces");
+        assert_eq!(ws_name("\u{b}\u{c}"), "2 other whitespace characters");
+    }
+
+    /// A line that differs in more than one way at once: every difference is
+    /// named, since a call that fixes the words and not the indent misses the
+    /// file again.
+    #[test]
+    fn edit_names_every_difference_a_line_has() {
+        let dir = tmpdir();
+        let p = dir.join("f.rs");
+        std::fs::write(&p, "fn f() {\n\tlet a = 1;\n}\n").unwrap();
+        let out = edit(&args(
+            &p,
+            r#","old_string":"    let a = 2;","new_string":"    let a = 3;""#,
+        ));
+        assert!(
+            out.contains("in its text and the whitespace it starts with"),
+            "{out}"
+        );
+        assert!(out.contains("the file's line starts with 1 tab"), "{out}");
+        assert!(
+            out.contains("old_string's line starts with 4 spaces"),
+            "{out}"
+        );
+
+        // The words are the same and the ends are the same: what is left is the
+        // whitespace between them.
+        let inner = dir.join("inner.txt");
+        std::fs::write(&inner, "let a = f(x,  y);\n").unwrap();
+        let out = edit(&args(
+            &inner,
+            r#","old_string":"let a = f(x, y);","new_string":"x""#,
+        ));
+        assert!(out.contains("in the whitespace inside it"), "{out}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
