@@ -359,8 +359,10 @@ async fn cancel_during_tool_marks_remaining_calls_cancelled() {
 async fn a_tool_result_is_not_mistaken_for_a_cancellation() {
     let dir = tmpdir();
     let marker_file = dir.join("marker.txt");
-    // Exactly the marker text, with nothing added around it.
-    std::fs::write(&marker_file, machine::Marker::Cancelled.text()).unwrap();
+    let marker = machine::Marker::Cancelled.text();
+    // The marker text as the file's one line: Read's row numbering is the only
+    // thing in front of it, and the result still reads like the marker.
+    std::fs::write(&marker_file, marker).unwrap();
 
     let server = MockServer::start().await;
     let read_args = json!({"file_path": marker_file}).to_string();
@@ -404,7 +406,7 @@ async fn a_tool_result_is_not_mistaken_for_a_cancellation() {
     let msgs = &agent.session.messages;
     assert_eq!(
         msgs[2].text().as_deref(),
-        Some(machine::Marker::Cancelled.text()),
+        Some(format!("1\t{marker}").as_str()),
         "the tool really returned the marker text"
     );
     assert_eq!(

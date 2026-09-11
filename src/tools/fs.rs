@@ -14,19 +14,23 @@ pub fn read_definition() -> ToolDef {
         function: FunctionDef {
             name: READ_NAME.into(),
             description: Some(
-                "Read the full contents of a text file. Confirm the original text with this tool \
-                 before modifying a file. \
-                 UTF-8 text only: a directory raises an error, while a binary file is decoded \
-                 into garbage without raising one. \
-                 Output over 10240 bytes is truncated on a byte boundary and reported, and a \
-                 file over 10MB raises an error; in either case read it in pieces with Bash \
-                 instead, e.g. sed -n '100,200p'."
+                "Read a UTF-8 text file, one numbered row per line: the line number, a tab, \
+                 then the line. The number and the tab are not part of the file content. \
+                 Confirm the original text with this tool before modifying a file. \
+                 Use offset (the 1-based line number to start at; default 1) and limit (how \
+                 many lines to read; default to the end of the file) to page through a long \
+                 file. A directory, a non-UTF-8 file, and a file over 10MB are reported as \
+                 errors. Output is capped at 10240 bytes: it is cut on a line boundary, and \
+                 the marker after the last row says which lines were shown and the offset to \
+                 read on from."
                     .into(),
             ),
             parameters: Some(json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "path of the file to read" }
+                    "file_path": { "type": "string", "description": "path of the file to read" },
+                    "offset": { "type": "integer", "description": "the 1-based line number to start reading at; default 1, the first line" },
+                    "limit": { "type": "integer", "description": "how many lines to read; default all the way to the end" }
                 },
                 "required": ["file_path"]
             })),
@@ -92,7 +96,11 @@ pub fn write_definition() -> ToolDef {
     }
 }
 
-/// Read: returns the whole file; truncated with a notice beyond MAX_OUTPUT.
+/// Bytes held back from the output cap so the continuation marker always fits
+/// inside it.
+const MARKER_BYTES: usize = 128;
+
+/// Read: pages through a text file, one numbered line per row.
 pub fn read(args_json: &str) -> String {
     let v = match parse_args(args_json) {
         Ok(v) => v,
@@ -102,18 +110,93 @@ pub fn read(args_json: &str) -> String {
         Ok(p) => p,
         Err(e) => return e,
     };
+    let offset = match int_arg(&v, "offset") {
+        Ok(n) => n.unwrap_or(1),
+        Err(e) => return e,
+    };
+    let limit = match int_arg(&v, "limit") {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if offset == 0 {
+        return "error: offset is the 1-based line number to start at, so the first line is \
+                offset=1"
+            .into();
+    }
+    if limit == Some(0) {
+        return "error: limit must be at least 1 line".into();
+    }
     match read_text(&path) {
         Err(e) => e,
-        Ok(text) => {
-            let (out, cut) = truncate(&text, MAX_OUTPUT);
-            if cut {
-                format!(
-                    "{out}\n[truncated to {MAX_OUTPUT} bytes; read the rest in pieces with Bash]"
-                )
-            } else {
-                out
+        Ok(text) => render_lines(&path, &text, offset, limit),
+    }
+}
+
+/// Number the requested lines and cut them to the output cap, on a line
+/// boundary: a row is kept whole or the result says where to go on from.
+fn render_lines(path: &str, text: &str, offset: usize, limit: Option<usize>) -> String {
+    let total = text.lines().count();
+    if total == 0 {
+        return "[empty file]".into();
+    }
+    if offset > total {
+        return format!("error: offset {offset} is past the end of {path} ({total} lines)");
+    }
+    let wanted = limit.unwrap_or(usize::MAX).min(total - (offset - 1));
+    let width = total.to_string().len();
+    let budget = MAX_OUTPUT.saturating_sub(MARKER_BYTES);
+    let mut out = String::new();
+    let mut shown = 0usize;
+    let mut cut_mid_line = false;
+    for (i, line) in text.lines().skip(offset - 1).take(wanted).enumerate() {
+        let prefix = format!("{:>width$}\t", offset + i);
+        let separator = usize::from(shown > 0);
+        if out.len() + separator + prefix.len() + line.len() <= budget {
+            if shown > 0 {
+                out.push('\n');
             }
+            out.push_str(&prefix);
+            out.push_str(line);
+            shown += 1;
+            continue;
         }
+        if shown == 0 {
+            // A single line longer than the whole budget: show what fits and
+            // say so, rather than a page that never advances.
+            let (head, _) = truncate(line, budget.saturating_sub(prefix.len()));
+            out.push_str(&prefix);
+            out.push_str(&head);
+            shown = 1;
+            cut_mid_line = true;
+        }
+        break;
+    }
+    let last = offset + shown - 1;
+    if cut_mid_line {
+        out.push_str(&format!(
+            "\n[line {last} is longer than the {MAX_OUTPUT}-byte output limit; read the rest \
+             of it with Bash]"
+        ));
+    } else if last < total {
+        out.push_str(&format!(
+            "\n[showing lines {offset}-{last} of {total}; read on with offset={}]",
+            last + 1
+        ));
+    }
+    out
+}
+
+/// Fetch an optional non-negative integer argument. A negative, fractional or
+/// non-numeric value is a bad field rather than a number of lines, and saying
+/// so is what lets the model correct the call.
+fn int_arg(v: &serde_json::Value, key: &str) -> Result<Option<usize>, String> {
+    match v.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(x) => x
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .map(Some)
+            .ok_or_else(|| format!("error: {key} must be a non-negative whole number")),
     }
 }
 
@@ -269,19 +352,119 @@ mod tests {
         let dir = tmpdir();
         let p = dir.join("f.txt");
         std::fs::write(&p, "content").unwrap();
-        assert_eq!(read(&args(&p, "")), "content");
+        assert_eq!(read(&args(&p, "")), "1\tcontent");
         let missing = read(&args(&dir.join("nope.txt"), ""));
         assert!(missing.contains("cannot access"), "{missing}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn read_truncates_large_file() {
+    fn read_numbers_lines_and_pages_with_offset_and_limit() {
+        let dir = tmpdir();
+        let p = dir.join("f.txt");
+        std::fs::write(&p, "a\nb\nc\nd\ne").unwrap();
+        // The whole file: one numbered row per line, in order.
+        assert_eq!(read(&args(&p, "")), "1\ta\n2\tb\n3\tc\n4\td\n5\te");
+        // A null offset is the default, not a bad field.
+        assert_eq!(
+            read(&args(&p, r#","offset":null"#)),
+            "1\ta\n2\tb\n3\tc\n4\td\n5\te"
+        );
+        // A page that stops short says where to read on from.
+        assert_eq!(
+            read(&args(&p, r#","offset":3,"limit":2"#)),
+            "3\tc\n4\td\n[showing lines 3-4 of 5; read on with offset=5]"
+        );
+        // Starting at the last line ends the file, so there is nothing to add.
+        assert_eq!(read(&args(&p, r#","offset":5"#)), "5\te");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_marks_a_truncated_page_and_reads_on() {
         let dir = tmpdir();
         let p = dir.join("big.txt");
+        let lines: Vec<String> = (1..=2000).map(|i| format!("line number {i}")).collect();
+        std::fs::write(&p, lines.join("\n")).unwrap();
+        // Page through to the end: every line is seen once, in order, and no
+        // page goes over the cap.
+        let mut offset = 1usize;
+        let mut seen: Vec<String> = Vec::new();
+        let mut pages = 0;
+        loop {
+            let out = read(&args(&p, &format!(r#","offset":{offset}"#)));
+            assert!(out.len() <= MAX_OUTPUT, "page is {} bytes", out.len());
+            let mut next = None;
+            for row in out.lines() {
+                if let Some(rest) = row.strip_prefix("[showing lines ") {
+                    next = Some(
+                        rest.rsplit_once("offset=")
+                            .expect("the marker says how to read on")
+                            .1
+                            .trim_end_matches(']')
+                            .parse::<usize>()
+                            .unwrap(),
+                    );
+                    continue;
+                }
+                let (number, text) = row.split_once('\t').expect("every row is numbered");
+                let number = number
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap_or_else(|e| panic!("row {row:?}: {e}"));
+                assert_eq!(number, seen.len() + 1);
+                seen.push(text.to_owned());
+            }
+            match next {
+                Some(n) => offset = n,
+                None => break,
+            }
+            pages += 1;
+            assert!(pages < 100, "paging is not advancing");
+        }
+        assert_eq!(seen, lines);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_marks_a_line_longer_than_the_output_limit() {
+        let dir = tmpdir();
+        let p = dir.join("one-line.txt");
         std::fs::write(&p, "x".repeat(MAX_OUTPUT + 100)).unwrap();
         let out = read(&args(&p, ""));
-        assert!(out.contains("[truncated to"), "should report truncation");
+        assert!(out.len() <= MAX_OUTPUT, "{} bytes", out.len());
+        assert!(out.contains("line 1 is longer than the"), "{out}");
+        assert!(out.contains("with Bash"), "{out}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_reports_an_empty_file() {
+        let dir = tmpdir();
+        let p = dir.join("empty.txt");
+        std::fs::write(&p, "").unwrap();
+        assert_eq!(read(&args(&p, "")), "[empty file]");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_rejects_bad_paging_arguments() {
+        let dir = tmpdir();
+        let p = dir.join("f.txt");
+        std::fs::write(&p, "a\nb").unwrap();
+        for extra in [
+            r#","offset":0"#,
+            r#","limit":0"#,
+            r#","offset":-1"#,
+            r#","offset":1.5"#,
+            r#","offset":"2""#,
+            r#","limit":"all""#,
+        ] {
+            let out = read(&args(&p, extra));
+            assert!(out.starts_with("error:"), "{extra} got {out}");
+        }
+        let past = read(&args(&p, r#","offset":9"#));
+        assert!(past.contains("past the end"), "{past}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

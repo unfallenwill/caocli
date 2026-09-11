@@ -295,7 +295,7 @@ are returned to the model as text so it can recover, never as a hard error.
 | Tool | Behavior |
 |---|---|
 | `Bash` | Run one `bash -c` command. 120s timeout; stdout and stderr are each truncated to 10 KiB. |
-| `Read` | Read a UTF-8 text file. Output truncated to 10 KiB. |
+| `Read` | Read a UTF-8 text file, one numbered row per line. `offset`/`limit` page through a long file; output is capped at 10 KiB and cut on a line boundary, with a marker saying which lines were shown and where to read on. |
 | `Edit` | Replace `old_string` with `new_string`; `old_string` must match exactly once. Written atomically via tmp + rename. |
 | `Write` | Create or fully overwrite a file; parent directories are created automatically. |
 | `AskUserQuestion` | Ask you to choose: up to four questions, each with up to four options. The answer comes back as the call's result (`<id>: <chosen label>`), so the model continues with what you picked. |
