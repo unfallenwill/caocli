@@ -31,6 +31,8 @@ pub(super) enum Notice {
         args: String,
     },
     ToolResult(String),
+    /// A chunk of a running command's own output, as it arrived.
+    ToolOutput(String),
     Usage(Usage, Duration),
     Interrupted,
     Approval {
@@ -84,6 +86,9 @@ impl Ui for Notifier {
             name: name.to_owned(),
             args: args.to_owned(),
         });
+    }
+    fn tool_output(&mut self, chunk: &str) {
+        self.send(Notice::ToolOutput(chunk.to_owned()));
     }
     fn tool_result(&mut self, result: &str) {
         self.send(Notice::ToolResult(result.to_owned()));
@@ -160,6 +165,7 @@ mod tests {
         notifier.content_delta("say");
         notifier.finish_turn();
         notifier.tool_start("Bash", "{}");
+        notifier.tool_output("out");
         notifier.tool_result("done");
         notifier.usage(&Usage::default(), Duration::from_secs(1));
         notifier.interrupted();
@@ -176,6 +182,7 @@ mod tests {
                 name: "Bash".into(),
                 args: "{}".into(),
             },
+            Notice::ToolOutput("out".into()),
             Notice::ToolResult("done".into()),
             Notice::Usage(Usage::default(), Duration::from_secs(1)),
             Notice::Interrupted,

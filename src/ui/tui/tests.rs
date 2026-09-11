@@ -56,6 +56,7 @@ fn every_notice_becomes_a_cell_or_a_status_change() {
         name: "Bash".into(),
         args: r#"{"command":"ls"}"#.into(),
     });
+    screen.apply(Notice::ToolOutput("out\n".into()));
     screen.apply(Notice::ToolResult("exit_code: 0\nbody".into()));
     screen.apply(Notice::Info("note".into()));
     screen.apply(Notice::Error("boom".into()));
@@ -66,6 +67,7 @@ fn every_notice_becomes_a_cell_or_a_status_change() {
             Cell::Reasoning("think".into()),
             Cell::Content("answer".into()),
             Cell::tool_call("Bash", r#"{"command":"ls"}"#),
+            Cell::ToolOutput("out\n".into()),
             Cell::ToolResult("exit_code: 0\nbody".into()),
             Cell::Notice("note".into()),
             Cell::Failure("boom".into()),
@@ -984,6 +986,42 @@ fn only_a_think_folds() {
     let drawn = all_rows(&screen).join("\n");
     assert!(drawn.contains("line 29"), "kept whole: {drawn}");
     assert!(!drawn.contains("more line(s)"), "{drawn}");
+}
+
+/// What a command prints while it runs is watched as it arrives, and the block it
+/// arrives in is filed away as a cell of its own when the result lands: the frame
+/// that files it away is not allowed to change anything either.
+#[test]
+fn a_running_commands_output_is_watched_and_then_kept() {
+    let mut screen = screen_for_test(40, 30);
+    screen.state.apply(Notice::ToolStart {
+        name: "Bash".into(),
+        args: r#"{"command":"echo one; echo two"}"#.into(),
+    });
+    screen.state.apply(Notice::ToolOutput("one\n".into()));
+    screen.state.apply(Notice::ToolOutput("two\n".into()));
+    screen.draw().unwrap();
+    let live = rendered(&screen.state.lines(40));
+    assert!(
+        live.iter().any(|(text, _)| text.contains("one")),
+        "on screen while the command runs: {live:?}"
+    );
+    screen
+        .state
+        .apply(Notice::ToolResult("exit_code: 0".into()));
+    screen.draw().unwrap();
+    assert_eq!(
+        screen.state.transcript.last(),
+        Some(&Cell::ToolResult("exit_code: 0".into()))
+    );
+    assert_eq!(
+        screen.state.transcript[screen.state.transcript.len() - 2],
+        Cell::ToolOutput("one\ntwo\n".into()),
+        "the run of output is one cell, whole"
+    );
+    let drawn = rendered(&screen.state.lines(40));
+    let drawn: String = drawn.into_iter().map(|(text, _)| text).collect();
+    assert!(drawn.contains("one") && drawn.contains("two"), "{drawn}");
 }
 
 #[test]

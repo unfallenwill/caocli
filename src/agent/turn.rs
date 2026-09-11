@@ -30,6 +30,20 @@ enum Step {
     Stop,
 }
 
+/// The front end as the tool layer sees it: where a running command's own output
+/// goes, as a notification and never as a value.
+///
+/// The machine notifies and never executes, and a tool has no way to reach a screen:
+/// this is the one line between them, so that what a call prints while it runs
+/// reaches the person watching without the tool ever seeing a front end.
+struct Watching<'a>(&'a mut dyn Ui);
+
+impl tools::Live for Watching<'_> {
+    fn chunk(&mut self, text: &str) {
+        self.0.tool_output(text);
+    }
+}
+
 /// The outcome of racing one effect against the user's cancel.
 enum Ran<T> {
     /// The effect finished. `biased` polls it first, so a cancel arriving at the
@@ -288,8 +302,15 @@ impl Turn<'_> {
     /// Run one tool call, raced against the cancel. The dispatch is one string in
     /// and one string out; a tool that fails says so in its own result text, which
     /// the model reads like any other result.
+    ///
+    /// The one thing that arrives while the call is still running is a command's own
+    /// output, and it goes where the result of that call will go a moment later: to
+    /// the front end, as a notification and never as data. What the model reads is
+    /// the result, and this changes nothing about it.
     async fn run(&mut self, call: &ToolCall) -> Result<Step> {
-        let invoked = tools::execute(&call.function.name, &call.function.arguments);
+        let mut watching = Watching(&mut *self.ui);
+        let invoked =
+            tools::execute_live(&call.function.name, &call.function.arguments, &mut watching);
         match race(self.cancel, invoked).await {
             Ran::Finished(tool_output) => {
                 self.settle(call, &tool_output)?;

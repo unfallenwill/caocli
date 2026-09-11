@@ -692,6 +692,83 @@ async fn mock_write_tool_creates_file() {
     std::fs::remove_dir_all(&file_dir).unwrap();
 }
 
+/// A front end that keeps what it was told, in the order it was told it.
+///
+/// A running command's output is the one notification with no other way to see it:
+/// it is not a value the machine gets back, and it is deliberately not part of the
+/// log -- the log keeps the result -- so what proves it arrived is the front end it
+/// arrived at. `Watching` implements the notification channel alone: the turn asks
+/// for nothing back.
+#[derive(Default)]
+struct Hearing(Vec<String>);
+
+impl crate::ui::Ui for Hearing {
+    fn reasoning_delta(&mut self, _s: &str) {}
+    fn content_delta(&mut self, _s: &str) {}
+    fn finish_turn(&mut self) {}
+    fn tool_start(&mut self, name: &str, _args: &str) {
+        self.0.push(format!("call:{name}"));
+    }
+    fn tool_output(&mut self, chunk: &str) {
+        self.0.push(format!("out:{}", chunk.trim_end()));
+    }
+    fn tool_result(&mut self, result: &str) {
+        self.0
+            .push(format!("result:{}", result.lines().next().unwrap_or("")));
+    }
+    fn usage(&mut self, _usage: &crate::types::Usage, _stream: std::time::Duration) {}
+    fn interrupted(&mut self) {}
+    fn approval_requested(&mut self, _name: &str, _args: &str) {}
+}
+
+/// End to end: what a command prints while it runs reaches the front end before the
+/// result does, and the log keeps the result rather than the stream.
+#[tokio::test]
+async fn mock_a_running_commands_output_reaches_the_front_end() {
+    let server = MockServer::start().await;
+    let turn1 = [
+        sse(json!({"tool_calls":[{"index":0,"id":"call_live_1","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"echo caocli-live-marker\"}"}}]}), None, None),
+        sse(json!({"content":""}), Some("tool_calls"), None),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    let turn2 = [
+        sse(json!({"content":"Saw it."}), None, None),
+        sse(json!({"content":""}), Some("stop"), None),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    mount_chat(&server, turn1, Some(1)).await;
+    mount_chat(&server, turn2, None).await;
+
+    let dir = tmpdir();
+    let mut agent = test_agent(&server, &dir);
+    let mut ui = Hearing::default();
+    agent
+        .turn(
+            "run it",
+            &mut ui,
+            &mut NoCancel,
+            &mut Answer::denies(),
+            &mut NoQuestions,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ui.0,
+        vec!["call:Bash", "out:caocli-live-marker", "result:exit_code: 0"],
+        "the stream arrives while the call is still running"
+    );
+    // What the log holds is the result, which carries the same marker: the stream is
+    // a view of the call and never a second record of it.
+    let tool_msg = &agent.session.messages[2];
+    let text = tool_msg.text().unwrap();
+    assert!(text.starts_with("exit_code: 0"), "{text}");
+    assert!(text.contains("caocli-live-marker"), "{text}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// An HTTP error must carry the status code and the response body, and must
 /// not damage the already-persisted session.
 #[tokio::test]

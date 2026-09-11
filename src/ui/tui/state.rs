@@ -543,6 +543,7 @@ impl State {
                 self.end_block();
                 self.transcript.push(Cell::tool_call(&name, &args));
             }
+            Notice::ToolOutput(chunk) => self.stream_output(&chunk),
             Notice::ToolResult(result) => {
                 self.end_block();
                 self.transcript.push(Cell::ToolResult(result));
@@ -599,13 +600,27 @@ impl State {
         let chars = text.chars().count();
         self.streamed_chars += chars;
         self.chars_since_usage += chars;
-        match &mut self.live {
-            Some((open, buffer)) if *open == style => buffer.push_str(text),
-            _ => {
-                self.end_block();
-                self.live = Some((style, text.to_owned()));
-            }
+        self.block(style).push_str(text);
+    }
+
+    /// Append a running command's own output.
+    ///
+    /// Deliberately not [`State::stream`]: the counters behind the speed estimate
+    /// measure the model's output against the tokens it was billed for, and a
+    /// compiler's chatter is neither.
+    pub(super) fn stream_output(&mut self, text: &str) {
+        self.block(Style::Dim).push_str(text);
+    }
+
+    /// The block a fragment in `style` belongs to, opening one if the block being
+    /// streamed is another style's: the style is the block's identity, which is what
+    /// an arriving fragment in a different one means.
+    fn block(&mut self, style: Style) -> &mut String {
+        if self.live.as_ref().is_none_or(|(open, _)| *open != style) {
+            self.end_block();
+            self.live = Some((style, String::new()));
         }
+        &mut self.live.as_mut().expect("the block was just opened").1
     }
 
     /// Close the block being streamed, if any, so it becomes a finished cell.

@@ -124,6 +124,9 @@ pub(super) fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
 pub(super) fn live_cell(style: Style, text: &str) -> Cell {
     match style {
         Style::Reasoning => Cell::Reasoning(text.to_owned()),
+        // Dim is the one other style a block is streamed in, and the one thing it
+        // streams: a command's output, while the command runs.
+        Style::Dim => Cell::ToolOutput(text.to_owned()),
         _ => Cell::Content(text.to_owned()),
     }
 }

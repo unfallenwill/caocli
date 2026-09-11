@@ -11,7 +11,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use super::MAX_OUTPUT;
+use super::{Live, MAX_OUTPUT};
 use crate::types::{FunctionDef, ToolDef};
 
 pub const NAME: &str = "Bash";
@@ -114,7 +114,8 @@ pub fn definition() -> ToolDef {
                  creating or fully rewriting a file (use Write); do not substitute cat/sed -i/tee \
                  for them. \
                  Each stream is kept to 10240 bytes: a longer one is shown from both of its ends, \
-                 with what fell between them counted in its place. \
+                 with what fell between them counted in its place. What the command prints is \
+                 streamed to the user while they wait; what you read is the result. \
                  A command that runs past its timeout is killed, with everything it started: 120s \
                  unless timeout says otherwise (at most 1800). A job that should outlive the call \
                  -- a build, a server, a long test run -- is started with background:true instead: \
@@ -140,7 +141,7 @@ pub fn definition() -> ToolDef {
 
 /// Run a shell command. Never returns Err: bad arguments, command failure and
 /// timeouts all come back as tool result text.
-pub async fn execute(args_json: &str) -> String {
+pub async fn execute(args_json: &str, live: &mut dyn Live) -> String {
     let args = match super::parse_args(args_json) {
         Ok(v) => v,
         Err(e) => return e,
@@ -174,7 +175,7 @@ pub async fn execute(args_json: &str) -> String {
     if background {
         return start_in_background(command);
     }
-    run(command, budget).await
+    run(command, budget, live).await
 }
 
 /// How many jobs this process has started in the background, which is what numbers
@@ -360,7 +361,7 @@ fn timeout(args: &serde_json::Value) -> Result<Duration, String> {
 /// output is given after it, and the time a killed child is given to be reaped.
 /// Nothing can wait forever, and what the command printed is never thrown away --
 /// a timeout used to answer with a note where the output should have been.
-async fn run(command: &str, budget: Duration) -> String {
+async fn run(command: &str, budget: Duration, live: &mut dyn Live) -> String {
     let mut group = match Group::spawn(command) {
         Ok(group) => group,
         Err(e) => return format!("exit_code: 127\n--- stderr ---\nfailed to start bash: {e}"),
@@ -377,15 +378,24 @@ async fn run(command: &str, budget: Duration) -> String {
     let out_read = tokio::spawn(read(stdout, tx.clone(), Arc::clone(&out_kept)));
     let err_read = tokio::spawn(read(stderr, tx, Arc::clone(&err_kept)));
 
+    let mut watching = Watching {
+        live,
+        shown: 0,
+        cut: false,
+    };
     let mut deadline = Box::pin(tokio::time::sleep(budget));
     let mut timed_out = false;
     let mut ended = false;
     let code = loop {
         tokio::select! {
             biased;
-            // A chunk that has already been read: the readers keep the bytes, so
-            // nothing is lost by not looking at it here.
-            chunk = rx.recv(), if !ended => ended = chunk.is_none(),
+            // A chunk that has already been read, on its way to whoever is watching:
+            // the readers keep the bytes for the result, so nothing here is the
+            // record of it.
+            chunk = rx.recv(), if !ended => match chunk {
+                Some(text) => watching.show(&text),
+                None => ended = true,
+            },
             status = group.wait() => break status.ok().and_then(|s| s.code()),
             _ = &mut deadline => {
                 if timed_out {
@@ -404,7 +414,7 @@ async fn run(command: &str, budget: Duration) -> String {
     // arrive: the channel closing is both pipes reaching their end.
     let held_open = loop {
         match tokio::time::timeout(Duration::from_secs(DRAIN_SECS), rx.recv()).await {
-            Ok(Some(_)) => {}
+            Ok(Some(text)) => watching.show(&text),
             Ok(None) => break false,
             Err(_) => break true,
         }
@@ -440,6 +450,41 @@ async fn run(command: &str, budget: Duration) -> String {
         );
     }
     result
+}
+
+/// Bytes of a running command's output streamed to the front end while it runs.
+///
+/// The result is the record and this is a view of it being made, so the two are
+/// budgeted apart: a command that prints a megabyte of build log must not put a
+/// megabyte of rows in front of somebody who is watching, and what it does put
+/// there has to end. Where it ends, the front end is told so -- and the result
+/// still carries both ends of what was printed.
+const LIVE_BYTES: usize = MAX_OUTPUT;
+
+/// What the live view says where it stops, on a line of its own.
+const LIVE_CUT: &str = "\n… live output cut off here; the result carries the rest";
+
+/// A running command's output on its way to whoever is watching, counted as it goes.
+struct Watching<'a> {
+    live: &'a mut dyn Live,
+    /// How much has been shown.
+    shown: usize,
+    /// Whether the front end has already been told that the rest is not coming, so
+    /// that it is told once rather than at every chunk after the budget.
+    cut: bool,
+}
+
+impl Watching<'_> {
+    /// Show `text`, while there is a live view's worth of room for it.
+    fn show(&mut self, text: &str) {
+        if self.shown < LIVE_BYTES {
+            self.live.chunk(text);
+            self.shown += text.len();
+        } else if !self.cut {
+            self.cut = true;
+            self.live.chunk(LIVE_CUT);
+        }
+    }
 }
 
 /// Read one of a command's pipes to its end: every byte is kept for the result.
@@ -713,6 +758,105 @@ fn omitted(bytes: u64, lines: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::Silent;
+    /// The tool called with nobody watching, which is what every test that is not
+    /// about the live view is about.
+    async fn execute(args_json: &str) -> String {
+        super::execute(args_json, &mut Silent).await
+    }
+
+    /// The same for the runner the arguments are read into.
+    async fn run_q(command: &str, budget: Duration) -> String {
+        super::run(command, budget, &mut Silent).await
+    }
+
+    /// A sink that keeps what a running command streamed to it.
+    #[derive(Default)]
+    struct Watched(Arc<Mutex<String>>);
+
+    impl Live for Watched {
+        fn chunk(&mut self, text: &str) {
+            self.0.lock().unwrap().push_str(text);
+        }
+    }
+
+    /// What a command prints reaches the front end while the command is still
+    /// running: the point of it is a build that is watched rather than waited for,
+    /// so the assertion is made with the call still in flight.
+    #[tokio::test]
+    async fn a_running_commands_output_is_streamed_while_it_runs() {
+        let seen = Arc::new(Mutex::new(String::new()));
+        let mut sink = Watched(Arc::clone(&seen));
+        let mut call = Box::pin(run(
+            "echo first; sleep 30",
+            Duration::from_secs(60),
+            &mut sink,
+        ));
+        let mut got = String::new();
+        for _ in 0..100 {
+            tokio::select! {
+                _ = &mut call => panic!("the call finished before its output was seen"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            got = seen.lock().unwrap().clone();
+            if got.contains("first") {
+                break;
+            }
+        }
+        assert!(got.contains("first"), "{got:?}");
+    }
+
+    /// Both streams reach the front end: a command that logs to the error stream is
+    /// watched the same way, and the order they arrived in is the only order there
+    /// is.
+    #[tokio::test]
+    async fn the_live_view_carries_both_streams() {
+        let seen = Arc::new(Mutex::new(String::new()));
+        let mut sink = Watched(Arc::clone(&seen));
+        let out = run("echo out; echo err >&2", Duration::from_secs(30), &mut sink).await;
+        let live = seen.lock().unwrap().clone();
+        assert!(live.contains("out"), "{live:?}");
+        assert!(live.contains("err"), "{live:?}");
+        // The result is unchanged by any of it: the streams are still kept apart in
+        // what the model reads.
+        assert!(out.contains("--- stdout ---\nout"), "{out}");
+        assert!(out.contains("--- stderr ---\nerr"), "{out}");
+    }
+
+    /// A command that prints more than a view of it is worth stops being streamed,
+    /// once, where it stops -- and the result still carries both ends of it.
+    #[tokio::test]
+    async fn a_live_view_is_cut_off_where_it_gets_too_long_to_watch() {
+        let seen = Arc::new(Mutex::new(String::new()));
+        let mut sink = Watched(Arc::clone(&seen));
+        let out = run(
+            "awk 'BEGIN{for(i=1;i<=4000;i++) print \"line\", i}'",
+            Duration::from_secs(30),
+            &mut sink,
+        )
+        .await;
+        let live = seen.lock().unwrap().clone();
+        assert_eq!(live.matches("cut off").count(), 1, "cut once");
+        assert!(
+            live.len() < LIVE_BYTES + CHUNK + LIVE_CUT.len(),
+            "{} bytes streamed",
+            live.len()
+        );
+        assert!(out.contains("line 1\n"), "the head is in the result");
+        assert!(out.contains("line 4000"), "the tail is in the result");
+    }
+
+    /// A command that prints nothing streams nothing: an empty chunk is not an
+    /// event, and a front end told about one would open a block on no text.
+    #[tokio::test]
+    async fn a_quiet_command_streams_nothing() {
+        let seen = Arc::new(Mutex::new(String::new()));
+        let mut sink = Watched(Arc::clone(&seen));
+        let out = run("true", Duration::from_secs(30), &mut sink).await;
+        assert_eq!(seen.lock().unwrap().as_str(), "");
+        assert!(out.contains("exit_code: 0"), "{out}");
+    }
+
     use std::time::Instant;
 
     #[tokio::test]
@@ -1004,7 +1148,7 @@ mod tests {
     /// that is the result rather than a note saying it was lost.
     #[tokio::test]
     async fn a_timeout_keeps_what_the_command_printed() {
-        let out = run("echo before; sleep 30", Duration::from_secs(1)).await;
+        let out = run_q("echo before; sleep 30", Duration::from_secs(1)).await;
         assert!(out.contains("exit_code: 124"), "{out}");
         assert!(
             out.contains("timeout: the command ran longer than 1s"),
@@ -1018,7 +1162,7 @@ mod tests {
     #[tokio::test]
     async fn a_timeout_does_not_wait_for_the_command() {
         let started = Instant::now();
-        let out = run("sleep 30", Duration::from_millis(200)).await;
+        let out = run_q("sleep 30", Duration::from_millis(200)).await;
         assert!(out.contains("exit_code: 124"), "{out}");
         assert!(
             started.elapsed() < Duration::from_secs(10),
@@ -1034,7 +1178,7 @@ mod tests {
     async fn a_timeout_kills_what_the_command_started() {
         let pidfile = std::env::temp_dir().join(format!("caocli-kill-{}", std::process::id()));
         let command = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
-        let out = run(&command, Duration::from_secs(1)).await;
+        let out = run_q(&command, Duration::from_secs(1)).await;
         assert!(out.contains("exit_code: 124"), "{out}");
         let pid = read_pid(&pidfile);
         assert!(!still_running(pid).await, "{pid} outlived the timeout");
@@ -1049,7 +1193,7 @@ mod tests {
         let command = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
         let dropped = tokio::time::timeout(
             Duration::from_millis(300),
-            run(&command, Duration::from_secs(30)),
+            run_q(&command, Duration::from_secs(30)),
         )
         .await;
         assert!(dropped.is_err(), "the call was dropped, not finished");
@@ -1063,7 +1207,7 @@ mod tests {
     #[tokio::test]
     async fn a_process_left_behind_does_not_hold_the_result() {
         let started = Instant::now();
-        let out = run("sleep 5 & echo done", Duration::from_secs(30)).await;
+        let out = run_q("sleep 5 & echo done", Duration::from_secs(30)).await;
         assert!(out.contains("exit_code: 0"), "{out}");
         assert!(out.contains("done"), "{out}");
         assert!(out.contains("still running"), "{out}");

@@ -27,6 +27,15 @@ pub trait Ui {
     fn finish_turn(&mut self);
     /// A tool is starting: echo the tool name and an argument summary.
     fn tool_start(&mut self, name: &str, args: &str);
+    /// A chunk of a running command's own output, as it arrives.
+    ///
+    /// Not the result: the result is what the model reads and what the log keeps,
+    /// and this is the same bytes as the person watching reads them before the
+    /// call is over. A command can print a great deal of it, so a front end is free
+    /// to show less than it is given -- the tool cuts a live view at a budget of its
+    /// own before it reaches here -- and nothing that arrives has to be kept: what
+    /// came of the call is the result, which follows.
+    fn tool_output(&mut self, chunk: &str);
     /// A tool result summary.
     fn tool_result(&mut self, result: &str);
     /// Token usage for a sub-request, with the wall time the stream took (also

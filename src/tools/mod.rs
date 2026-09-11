@@ -27,6 +27,32 @@ pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 /// line of the file it is asked for, which is a scan the answer has to wait for.
 pub const MAX_READ_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Where a running command's own output goes while the command is still running.
+///
+/// The result of a call is what the model reads and what the log keeps; this is the
+/// same bytes as the person watching reads them, as they arrive. A tool has no way
+/// to reach a screen of its own, so the interpreter is what pairs a tool with the
+/// front end that is watching it, and the tool is what decides how much of it is
+/// worth streaming: a build can print megabytes, and a view of it is not a record
+/// of it.
+pub trait Live {
+    fn chunk(&mut self, text: &str);
+}
+
+/// Nobody watching: a sink that drops what it is given, for the tests whose
+/// subject is not what a running command prints.
+///
+/// A call with no front end behind it is a call only a test makes -- the
+/// interpreter always has one, and what a tool is handed is the front end that was
+/// watching -- so this is a fixture rather than a front end.
+#[cfg(test)]
+pub struct Silent;
+
+#[cfg(test)]
+impl Live for Silent {
+    fn chunk(&mut self, _text: &str) {}
+}
+
 /// All tool definitions. The order is fixed: changing it changes the request
 /// prefix and causes a full KVCache miss.
 pub fn definitions() -> Vec<ToolDef> {
@@ -62,9 +88,17 @@ pub fn changes_files(name: &str) -> bool {
 /// anything reaches this function; the arm below is the answer a call that
 /// somehow arrives here anyway gets -- text the model can correct itself from,
 /// never a panic and never a question nobody can answer.
+#[cfg(test)]
 pub async fn execute(name: &str, args_json: &str) -> String {
+    execute_live(name, args_json, &mut Silent).await
+}
+
+/// The same, with the output of a command that is still running streamed to `live`
+/// as it arrives: what the person watching reads while the model waits for the
+/// result. Only the one tool runs anything, so the sink reaches it and no other.
+pub async fn execute_live(name: &str, args_json: &str, live: &mut dyn Live) -> String {
     match name {
-        shell::NAME => shell::execute(args_json).await,
+        shell::NAME => shell::execute(args_json, live).await,
         fs::READ_NAME => fs::read(args_json),
         fs::EDIT_NAME => fs::edit(args_json),
         fs::WRITE_NAME => fs::write(args_json),

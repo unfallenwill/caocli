@@ -469,6 +469,7 @@ mod tests {
         fn content_delta(&mut self, _s: &str) {}
         fn finish_turn(&mut self) {}
         fn tool_start(&mut self, _name: &str, _args: &str) {}
+        fn tool_output(&mut self, _chunk: &str) {}
         fn tool_result(&mut self, _result: &str) {}
         fn usage(&mut self, _u: &Usage, _stream: std::time::Duration) {}
         fn interrupted(&mut self) {}

@@ -32,6 +32,9 @@ const RESET: &str = "\x1b[0m";
 enum Block {
     Reasoning,
     Content,
+    /// A running command's output: the one block whose text is not the model's, and
+    /// the only one that is not a part of the answer's own two.
+    Output,
 }
 
 impl Block {
@@ -43,6 +46,7 @@ impl Block {
         match self {
             Block::Reasoning => Style::Reasoning,
             Block::Content => Style::Plain,
+            Block::Output => Style::Dim,
         }
     }
 
@@ -52,6 +56,7 @@ impl Block {
         match self {
             Block::Reasoning => Cell::Reasoning(String::new()),
             Block::Content => Cell::Content(String::new()),
+            Block::Output => Cell::ToolOutput(String::new()),
         }
     }
 }
@@ -235,6 +240,10 @@ impl Renderer {
     /// Write a cell: the blank line separating it from the previous one, its marker
     /// in its gutter, its spans, then its line ending.
     fn paint_cell(&mut self, cell: &Cell) {
+        // A cell is a line of its own: a block still streaming when one arrives --
+        // which is what a running command's output leaves open -- ends here rather
+        // than running on into it.
+        self.close_block();
         if cell.gap_after(self.prev_was_block) {
             self.emit("\n");
         }
@@ -371,6 +380,31 @@ impl Ui for Renderer {
 
     fn tool_start(&mut self, name: &str, args: &str) {
         self.paint_cell(&Cell::tool_call(name, args));
+    }
+
+    fn tool_output(&mut self, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.open_block(Block::Output);
+        // The command's own lines are set in like every other line of a cell, and
+        // this is the only layer that sees where they break: what arrives is a run
+        // of bytes, so a `\n` in it is a line of the cell that has to carry the
+        // continuation columns itself. A line the terminal wraps is still the
+        // terminal's, since only it knows where the screen ends.
+        let rest = Block::Output
+            .spacing_cell()
+            .gutter()
+            .map_or("", |gutter| gutter.rest);
+        let mut lines = chunk.split('\n');
+        if let Some(first) = lines.next() {
+            self.emit(first);
+        }
+        for line in lines {
+            self.emit("\n");
+            self.emit(rest);
+            self.emit(line);
+        }
     }
 
     fn tool_result(&mut self, result: &str) {

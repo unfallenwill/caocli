@@ -326,6 +326,33 @@ fn tool_start_extracts_command_hint() {
     assert!(s.contains("▸ Write not json at all"), "{s}"); // bad JSON falls back to raw text
 }
 
+/// A running command's output is written as it arrives, in its own block: the
+/// marker opens it once and every line after a break inside a chunk is set in to the
+/// same column, since this front end is the one that sees those breaks.
+#[test]
+fn a_running_commands_output_is_written_as_it_arrives() {
+    let (mut r, buf) = with_buffer(true);
+    r.tool_start("Bash", r#"{"command":"echo one; echo two"}"#);
+    r.tool_output("one\n");
+    r.tool_output("two");
+    r.tool_result("exit_code: 0\n--- stdout ---\none\ntwo");
+    let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(s.contains("▸ Bash echo one; echo two"), "{s:?}");
+    assert!(s.contains("\x1b[2m· one\n  two\x1b[0m\n"), "{s:?}");
+    assert!(s.contains("· exit_code: 0"), "{s:?}");
+}
+
+/// Nothing is written for a command that printed nothing: an empty chunk is not a
+/// line, and a block opened on one would leave the marker behind on its own.
+#[test]
+fn an_empty_chunk_opens_no_block() {
+    let (mut r, buf) = with_buffer(true);
+    r.tool_output("");
+    r.tool_result("exit_code: 0");
+    let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert_eq!(s, "\x1b[2m· exit_code: 0 · 12 bytes\x1b[0m\n");
+}
+
 #[test]
 fn replay_renders_history_compactly_with_colors() {
     use crate::types::{ToolCall, ToolCallFunction};

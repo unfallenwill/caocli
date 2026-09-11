@@ -145,6 +145,15 @@ pub enum Cell {
     Todo(Vec<Todo>),
     /// A tool result. Only a summary is ever rendered, never the full text.
     ToolResult(String),
+    /// A running command's own output, as it arrived.
+    ///
+    /// The one cell no session log can rebuild: those bytes are the terminal's, the
+    /// log keeps a result and not a view of one, and a resumed session therefore
+    /// shows the result where a watched one showed this and then the result. It is
+    /// marked as a result because that is what it is -- the result, arriving before
+    /// the call is over -- and a reader tells the two apart by what they say: a
+    /// stream of the command's lines, then the line the call answered with.
+    ToolOutput(String),
     /// A dim informational line.
     Notice(String),
     /// A failure. The plain front end writes these to the error stream; a front
@@ -281,7 +290,9 @@ impl Cell {
             Cell::ToolCall { .. } | Cell::Approval { .. } | Cell::Question(_) | Cell::Todo(_) => {
                 Some(Gutter::new("▸ ", "  ", Style::Yellow))
             }
-            Cell::ToolResult(_) => Some(Gutter::new("· ", "  ", Style::Dim)),
+            // The result and the output of the command it is the result of: one
+            // marker, because one is the other arriving early.
+            Cell::ToolResult(_) | Cell::ToolOutput(_) => Some(Gutter::new("· ", "  ", Style::Dim)),
             Cell::Notice(_) => Some(Gutter::new("  ", "  ", Style::Dim)),
             Cell::Failure(_) => Some(Gutter::new("  ", "  ", Style::Red)),
             Cell::Interrupted => Some(Gutter::new("  ", "  ", Style::Yellow)),
@@ -329,6 +340,7 @@ impl Cell {
                 spans
             }
             Cell::ToolResult(result) => vec![Span::new(Style::Dim, summary(result))],
+            Cell::ToolOutput(text) => vec![Span::new(Style::Dim, text.as_str())],
             Cell::Notice(text) => vec![Span::new(Style::Dim, text.as_str())],
             Cell::Failure(text) => vec![Span::new(Style::Red, format!("error: {text}"))],
             Cell::Interrupted => vec![Span::new(Style::Yellow, "⏹ interrupted (Ctrl-C)")],
@@ -938,6 +950,22 @@ mod tests {
             "▸ ",
             "the gate is a call, and is marked as one"
         );
+    }
+
+    /// A command's own output is kept whole, unlike the result of the call: it is
+    /// what the command printed, and a reader watching a build is reading it.
+    #[test]
+    fn tool_output_renders_the_lines_it_was_given() {
+        let cell = Cell::ToolOutput("Compiling foo\nwarning: unused\n".into());
+        assert_eq!(
+            cell.spans(),
+            vec![Span::new(Style::Dim, "Compiling foo\nwarning: unused\n")]
+        );
+        // Marked as a result, since it is one arriving early, and set in like one.
+        assert_eq!(cell.gutter(), Cell::ToolResult(String::new()).gutter());
+        assert!(cell.ends_line());
+        assert!(!cell.is_text_block());
+        assert!(!cell.gap_after(true));
     }
 
     #[test]
