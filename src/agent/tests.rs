@@ -360,9 +360,10 @@ async fn a_tool_result_is_not_mistaken_for_a_cancellation() {
     let dir = tmpdir();
     let marker_file = dir.join("marker.txt");
     let marker = machine::Marker::Cancelled.text();
-    // The marker text as the file's one line: Read's row numbering is the only
-    // thing in front of it, and the result still reads like the marker.
-    std::fs::write(&marker_file, marker).unwrap();
+    // The marker text as the file's one line, newline-terminated so that Read's
+    // row numbering is the only thing in front of it: the result reads like the
+    // marker and is still a result.
+    std::fs::write(&marker_file, format!("{marker}\n")).unwrap();
 
     let server = MockServer::start().await;
     let read_args = json!({"file_path": marker_file}).to_string();

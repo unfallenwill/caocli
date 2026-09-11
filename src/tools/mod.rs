@@ -22,6 +22,10 @@ pub const MAX_OUTPUT: usize = 10 * 1024;
 /// Per-file read/write cap (bytes), so a huge file cannot be pulled into memory
 /// or into the context window.
 pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+/// Cap on the file a paged read will stream (bytes). A read holds one page and
+/// not the file, so this is not about memory: it is about a read numbering every
+/// line of the file it is asked for, which is a scan the answer has to wait for.
+pub const MAX_READ_BYTES: u64 = 256 * 1024 * 1024;
 
 /// All tool definitions. The order is fixed: changing it changes the request
 /// prefix and causes a full KVCache miss.

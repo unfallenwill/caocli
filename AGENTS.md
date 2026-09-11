@@ -138,6 +138,15 @@ that talks to a network API and drives an interactive terminal.
   termination guarantee.
 - **Tool results are always text and are never raised as hard errors**: failures are
   also passed back to the model so it can correct itself.
+- **Read is a page, not a copy of the file**: one streaming pass per call — skip to the
+  line the call asked for, keep the rows the page has room for, count the lines that
+  follow — so a page of a huge file costs a page of memory, and the cap on a file's
+  size is about how long the scan behind a page may take rather than about memory. The
+  facts about a file's shape that decide whether an Edit will match (CRLF line endings,
+  a last line with no newline) are read off the bytes of that same pass and said where
+  they are known, rather than left for the model to guess. What cannot be paged at all
+  — a directory, a fifo, a device — is refused before a byte is read: a fifo has no end
+  to reach and no size to check, and a device can be endless.
 - **Approval gate**: execution is trusted by default; with `--ask`, Bash/Edit/Write
   require a user y/N before running (a call that changes nothing on disk is always
   allowed: reading, and writing the todo list). Denial, cancellation,

@@ -1,7 +1,8 @@
 use serde_json::json;
+use std::io::Read;
 use std::path::Path;
 
-use super::{MAX_FILE_BYTES, MAX_OUTPUT, parse_args, str_arg, truncate};
+use super::{MAX_FILE_BYTES, MAX_OUTPUT, MAX_READ_BYTES, parse_args, str_arg};
 use crate::types::{FunctionDef, ToolDef};
 
 pub const READ_NAME: &str = "Read";
@@ -19,10 +20,15 @@ pub fn read_definition() -> ToolDef {
                  Confirm the original text with this tool before modifying a file. \
                  Use offset (the 1-based line number to start at; default 1) and limit (how \
                  many lines to read; default to the end of the file) to page through a long \
-                 file. A directory, a non-UTF-8 file, and a file over 10MB are reported as \
-                 errors. Output is capped at 10240 bytes: it is cut on a line boundary, and \
-                 the marker after the last row says which lines were shown and the offset to \
-                 read on from."
+                 file: it is read a page at a time, so a page of a huge file costs no more \
+                 than a page of a small one. \
+                 Output is capped at 10240 bytes, cut on a line boundary. The marker after the \
+                 last row says which lines were shown, how many lines the file has, and the \
+                 offset to read on from. A note says so when the page's lines end with CRLF \
+                 or the file has no newline after its last line; a single line longer than the \
+                 whole cap is shown cut and named, and the rest of it is read with Bash. \
+                 A directory, a file that is not regular, a page that is not valid UTF-8, and \
+                 a file over 256MB are reported as errors."
                     .into(),
             ),
             parameters: Some(json!({
@@ -96,9 +102,14 @@ pub fn write_definition() -> ToolDef {
     }
 }
 
-/// Bytes held back from the output cap so the continuation marker always fits
-/// inside it.
-const MARKER_BYTES: usize = 128;
+/// The chunk a paged read streams a file in: what bounds a read is the page it
+/// keeps, not this buffer.
+const CHUNK: usize = 64 * 1024;
+
+/// Bytes held back from the output cap so the markers and the notes that follow
+/// the last row always fit inside it: the longest of them is the cut-line
+/// marker with the CRLF note under it.
+const MARKER_BYTES: usize = 256;
 
 /// Read: pages through a text file, one numbered line per row.
 pub fn read(args_json: &str) -> String {
@@ -126,64 +137,309 @@ pub fn read(args_json: &str) -> String {
     if limit == Some(0) {
         return "error: limit must be at least 1 line".into();
     }
-    match read_text(&path) {
+    match page_file(&path, offset, limit) {
         Err(e) => e,
-        Ok(text) => render_lines(&path, &text, offset, limit),
+        // A file with no lines at all is answered before the offset is checked:
+        // there is nowhere in it to start from.
+        Ok(page) if page.total == 0 => "[empty file]".into(),
+        Ok(page) if offset > page.total => {
+            format!(
+                "error: offset {offset} is past the end of {path} ({} lines)",
+                page.total
+            )
+        }
+        Ok(page) => render_page(&page),
     }
 }
 
-/// Number the requested lines and cut them to the output cap, on a line
-/// boundary: a row is kept whole or the result says where to go on from.
-fn render_lines(path: &str, text: &str, offset: usize, limit: Option<usize>) -> String {
-    let total = text.lines().count();
-    if total == 0 {
-        return "[empty file]".into();
-    }
-    if offset > total {
-        return format!("error: offset {offset} is past the end of {path} ({total} lines)");
-    }
-    let wanted = limit.unwrap_or(usize::MAX).min(total - (offset - 1));
-    let width = total.to_string().len();
-    let budget = MAX_OUTPUT.saturating_sub(MARKER_BYTES);
-    let mut out = String::new();
-    let mut shown = 0usize;
-    let mut cut_mid_line = false;
-    for (i, line) in text.lines().skip(offset - 1).take(wanted).enumerate() {
-        let prefix = format!("{:>width$}\t", offset + i);
-        let separator = usize::from(shown > 0);
-        if out.len() + separator + prefix.len() + line.len() <= budget {
-            if shown > 0 {
-                out.push('\n');
-            }
-            out.push_str(&prefix);
-            out.push_str(line);
-            shown += 1;
-            continue;
-        }
-        if shown == 0 {
-            // A single line longer than the whole budget: show what fits and
-            // say so, rather than a page that never advances.
-            let (head, _) = truncate(line, budget.saturating_sub(prefix.len()));
-            out.push_str(&prefix);
-            out.push_str(&head);
-            shown = 1;
-            cut_mid_line = true;
-        }
-        break;
-    }
-    let last = offset + shown - 1;
-    if cut_mid_line {
-        out.push_str(&format!(
-            "\n[line {last} is longer than the {MAX_OUTPUT}-byte output limit; read the rest \
-             of it with Bash]"
+/// One page out of a file: the rows, and what the rows cannot say about the part
+/// of the file the page is.
+struct Page {
+    /// The rows in order, as the file reads once it is split into lines, and
+    /// without their numbers. A page of a file that has a line at all keeps at
+    /// least one row: a page that kept none could not say where to read on.
+    rows: Vec<String>,
+    /// The 1-based number of the first row.
+    first: usize,
+    /// The number of lines in the whole file.
+    total: usize,
+    /// The last row is the head of a line longer than the whole page.
+    cut: bool,
+    /// A line the page shows ends with CRLF.
+    crlf: bool,
+    /// The last byte of the file is not a newline.
+    no_final_newline: bool,
+}
+
+/// Read one page out of a file, in a single streaming pass: skip to the line the
+/// call asked for, keep the rows the page has room for, and count every line of
+/// the file on the way -- the count is what the marker after the last row is
+/// read from.
+///
+/// What is held is the page, never the file, so a file far larger than the
+/// output cap can be paged. The cap on a file's size is therefore about how long
+/// a read may take, and not about how much memory it takes.
+fn page_file(path: &str, offset: usize, limit: Option<usize>) -> Result<Page, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("error: cannot access {path}: {e}"))?;
+    check_readable(path, &meta)?;
+    if meta.len() > MAX_READ_BYTES {
+        return Err(format!(
+            "error: file {path} is {} bytes, over the {MAX_READ_BYTES}-byte limit; read a range \
+             of it with Bash (e.g. sed -n '1,200p')",
+            meta.len()
         ));
-    } else if last < total {
+    }
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("error: failed to read {path}: {e}"))?;
+    let mut pager = Pager::new(
+        path,
+        offset,
+        limit.unwrap_or(usize::MAX),
+        MAX_OUTPUT - MARKER_BYTES,
+    );
+    let mut chunk = vec![0u8; CHUNK];
+    let mut last = None;
+    loop {
+        let n = file
+            .read(&mut chunk)
+            .map_err(|e| format!("error: failed to read {path}: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        last = Some(chunk[n - 1]);
+        pager.feed(&chunk[..n])?;
+    }
+    // A file whose last byte is not a newline ends in a line of its own, and
+    // that line is finished here rather than by a newline that never came.
+    if last.is_some_and(|b| b != b'\n') {
+        pager.page.total += 1;
+        pager.page.no_final_newline = true;
+        pager.finish()?;
+    }
+    Ok(pager.page)
+}
+
+/// Refuse what cannot be read as a file, with the reason it cannot: a directory,
+/// or anything that is not a regular file. A fifo has no end and reports no
+/// size, so a read of one blocks forever, and a device can be endless in a way
+/// that has nothing to do with how much memory a reader has.
+fn check_readable(path: &str, meta: &std::fs::Metadata) -> Result<(), String> {
+    if meta.is_dir() {
+        return Err(format!("error: {path} is a directory, not a file"));
+    }
+    if !meta.is_file() {
+        return Err(format!(
+            "error: {path} is not a regular file, so it cannot be read as text"
+        ));
+    }
+    Ok(())
+}
+
+/// The state of one streaming pass: what the page has kept, and where in the
+/// file the pass has got to.
+struct Pager {
+    /// The path, for the one failure that names a line rather than the file.
+    path: String,
+    page: Page,
+    /// Lines the call asked for (`usize::MAX` when it did not say).
+    wanted: usize,
+    /// What a page may take, and what it has taken: a row costs its number, the
+    /// tab, the newline that separates it from the row before, and its text.
+    budget: usize,
+    kept: usize,
+    /// The line being read, while the page still has room for it.
+    cur: Option<Vec<u8>>,
+    /// The last byte of that line, which is what tells a CRLF line from an LF
+    /// one however much of the line was kept.
+    tail: Option<u8>,
+    /// That line is longer than the room left for it.
+    over: bool,
+    /// The page is full: from here on the pass only counts lines.
+    closed: bool,
+    /// The 1-based number of the line being read.
+    line: usize,
+}
+
+impl Pager {
+    fn new(path: &str, first: usize, wanted: usize, budget: usize) -> Self {
+        Pager {
+            path: path.to_owned(),
+            page: Page {
+                rows: Vec::new(),
+                first,
+                total: 0,
+                cut: false,
+                crlf: false,
+                no_final_newline: false,
+            },
+            wanted,
+            budget,
+            kept: 0,
+            cur: None,
+            tail: None,
+            over: false,
+            closed: false,
+            line: 1,
+        }
+    }
+
+    /// Take one chunk of the file: count the lines it holds, and collect the
+    /// ones the page has room for.
+    fn feed(&mut self, chunk: &[u8]) -> Result<(), String> {
+        for (run, terminated) in runs(chunk) {
+            if terminated {
+                self.page.total += 1;
+            }
+            if self.cur.is_none() && !self.closed && self.line >= self.page.first {
+                self.cur = Some(Vec::new());
+                self.tail = None;
+                self.over = false;
+            }
+            if let Some(bytes) = self.cur.as_mut() {
+                if !self.over {
+                    let cost = overhead(self.line, self.page.rows.is_empty());
+                    let room = self.budget.saturating_sub(self.kept + cost);
+                    let take = run.len().min(room.saturating_sub(bytes.len()));
+                    bytes.extend_from_slice(&run[..take]);
+                    self.over = take < run.len();
+                }
+                if let Some(&b) = run.last() {
+                    self.tail = Some(b);
+                }
+            }
+            if terminated && let Some(bytes) = self.cur.take() {
+                self.keep(bytes)?;
+            }
+            if terminated {
+                self.line += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// The end of the file: the last line, if no newline ended it.
+    fn finish(&mut self) -> Result<(), String> {
+        if let Some(bytes) = self.cur.take() {
+            self.keep(bytes)?;
+        }
+        Ok(())
+    }
+
+    /// What the page does with the line it has just read: keep it, keep its head
+    /// and say the line is longer than a page, or end the page before it -- and
+    /// then go on counting lines, since the marker names the file's size as well
+    /// as where to read on from.
+    fn keep(&mut self, mut bytes: Vec<u8>) -> Result<(), String> {
+        // A line that ends in a carriage return is a CRLF line: the row is shown
+        // without it -- a reader cannot see it -- and the note says what a
+        // multi-line old_string has to carry.
+        if self.tail == Some(b'\r') {
+            self.page.crlf = true;
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+        }
+        let cost = overhead(self.line, self.page.rows.is_empty());
+        if !self.over && self.kept + cost + bytes.len() <= self.budget {
+            let len = bytes.len();
+            self.push(bytes, false)?;
+            self.kept += cost + len;
+            if self.page.rows.len() >= self.wanted {
+                self.closed = true;
+            }
+        } else if self.page.rows.is_empty() {
+            // The page's first line does not fit in a whole page: show the head
+            // of it and say so, rather than a page that never advances.
+            self.push(bytes, true)?;
+            self.page.cut = true;
+            self.closed = true;
+        } else {
+            self.closed = true;
+        }
+        Ok(())
+    }
+
+    /// Add one row to the page. What cannot be read as text is refused with its
+    /// line number; a row cut out of a longer line backs off to a character
+    /// boundary instead, since half a character there is the cut and not the
+    /// file.
+    fn push(&mut self, bytes: Vec<u8>, cut: bool) -> Result<(), String> {
+        match String::from_utf8(bytes) {
+            Ok(row) => self.page.rows.push(row),
+            Err(e) if cut && e.utf8_error().error_len().is_none() => {
+                let end = e.utf8_error().valid_up_to();
+                let row = String::from_utf8(e.into_bytes()[..end].to_vec())
+                    .expect("a prefix of valid UTF-8 is valid UTF-8");
+                self.page.rows.push(row);
+            }
+            Err(_) => {
+                return Err(format!(
+                    "error: {} is not valid UTF-8 text at line {}",
+                    self.path, self.line
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Number the rows, and say what a reader of the page cannot see: that the last
+/// row is the head of a longer line, which lines were shown and where to read on
+/// from, and the two facts about a file's shape that decide whether an Edit will
+/// match -- CRLF line endings, and a last line with no newline.
+fn render_page(page: &Page) -> String {
+    let mut out = String::new();
+    for (i, row) in page.rows.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&(page.first + i).to_string());
+        out.push('\t');
+        out.push_str(row);
+    }
+    let last = page.first + page.rows.len() - 1;
+    if page.cut {
         out.push_str(&format!(
-            "\n[showing lines {offset}-{last} of {total}; read on with offset={}]",
+            "\n[line {last} is longer than the {MAX_OUTPUT}-byte output limit; read the rest of \
+             it with Bash]"
+        ));
+    } else if last < page.total {
+        out.push_str(&format!(
+            "\n[showing lines {}-{last} of {}; read on with offset={}]",
+            page.first,
+            page.total,
             last + 1
         ));
+    } else if page.no_final_newline {
+        out.push_str("\n[note: the file does not end with a newline]");
+    }
+    if page.crlf {
+        out.push_str("\n[note: CRLF line endings; keep \\r\\n in a multi-line old_string]");
     }
     out
+}
+
+/// Split a chunk into the runs of one line's text and the newline that ends it.
+/// A run with no newline after it is either the start of a line that continues
+/// in the next chunk or the middle of one.
+fn runs(chunk: &[u8]) -> impl Iterator<Item = (&[u8], bool)> {
+    chunk
+        .split_inclusive(|&b| b == b'\n')
+        .map(|piece| match piece.split_last() {
+            Some((&b'\n', head)) => (head, true),
+            _ => (piece, false),
+        })
+}
+
+/// What a row costs besides its text: its number, the tab, and the newline that
+/// separates it from the row before.
+fn overhead(line: usize, first: bool) -> usize {
+    digits(line) + 1 + usize::from(!first)
+}
+
+/// The digits a line number takes up.
+fn digits(n: usize) -> usize {
+    n.checked_ilog10().unwrap_or(0) as usize + 1
 }
 
 /// Fetch an optional non-negative integer argument. A negative, fractional or
@@ -285,17 +541,17 @@ pub fn write(args_json: &str) -> String {
     }
 }
 
-/// Read a UTF-8 text file. Every failure becomes error text for the model.
+/// Read a whole file as text: Edit's reader, which has to hold all of a file to
+/// change part of it, and so is capped where a paged read is not. Every failure
+/// becomes error text for the model.
 fn read_text(path: &str) -> Result<String, String> {
     let p = Path::new(path);
     let meta = std::fs::metadata(p).map_err(|e| format!("error: cannot access {path}: {e}"))?;
-    if meta.is_dir() {
-        return Err(format!("error: {path} is a directory, not a file"));
-    }
+    check_readable(path, &meta)?;
     if meta.len() > MAX_FILE_BYTES {
         return Err(format!(
-            "error: file {path} is {} bytes, over the {MAX_FILE_BYTES} byte limit; read it in \
-             pieces with Bash (e.g. sed -n '1,200p')",
+            "error: file {path} is {} bytes, over the {MAX_FILE_BYTES}-byte limit, too large to \
+             edit in one piece",
             meta.len()
         ));
     }
@@ -334,6 +590,20 @@ mod tests {
         format!(r#"{{"file_path":{:?}{extra}}}"#, path.to_string_lossy())
     }
 
+    /// The offset the continuation marker names, or `None` when the page ended
+    /// the file.
+    fn read_on(out: &str) -> Option<usize> {
+        let row = out.lines().find(|row| row.starts_with("[showing lines "))?;
+        Some(
+            row.rsplit_once("offset=")
+                .expect("the marker says how to read on")
+                .1
+                .trim_end_matches(']')
+                .parse()
+                .expect("the marker's offset is a line number"),
+        )
+    }
+
     #[test]
     fn write_creates_file_and_parents() {
         let dir = tmpdir();
@@ -351,7 +621,7 @@ mod tests {
     fn read_returns_content_and_errors_on_missing() {
         let dir = tmpdir();
         let p = dir.join("f.txt");
-        std::fs::write(&p, "content").unwrap();
+        std::fs::write(&p, "content\n").unwrap();
         assert_eq!(read(&args(&p, "")), "1\tcontent");
         let missing = read(&args(&dir.join("nope.txt"), ""));
         assert!(missing.contains("cannot access"), "{missing}");
@@ -362,7 +632,7 @@ mod tests {
     fn read_numbers_lines_and_pages_with_offset_and_limit() {
         let dir = tmpdir();
         let p = dir.join("f.txt");
-        std::fs::write(&p, "a\nb\nc\nd\ne").unwrap();
+        std::fs::write(&p, "a\nb\nc\nd\ne\n").unwrap();
         // The whole file: one numbered row per line, in order.
         assert_eq!(read(&args(&p, "")), "1\ta\n2\tb\n3\tc\n4\td\n5\te");
         // A null offset is the default, not a bad field.
@@ -385,7 +655,7 @@ mod tests {
         let dir = tmpdir();
         let p = dir.join("big.txt");
         let lines: Vec<String> = (1..=2000).map(|i| format!("line number {i}")).collect();
-        std::fs::write(&p, lines.join("\n")).unwrap();
+        std::fs::write(&p, lines.join("\n") + "\n").unwrap();
         // Page through to the end: every line is seen once, in order, and no
         // page goes over the cap.
         let mut offset = 1usize;
@@ -394,18 +664,9 @@ mod tests {
         loop {
             let out = read(&args(&p, &format!(r#","offset":{offset}"#)));
             assert!(out.len() <= MAX_OUTPUT, "page is {} bytes", out.len());
-            let mut next = None;
             for row in out.lines() {
-                if let Some(rest) = row.strip_prefix("[showing lines ") {
-                    next = Some(
-                        rest.rsplit_once("offset=")
-                            .expect("the marker says how to read on")
-                            .1
-                            .trim_end_matches(']')
-                            .parse::<usize>()
-                            .unwrap(),
-                    );
-                    continue;
+                if row.starts_with('[') {
+                    continue; // a marker or a note, not a row
                 }
                 let (number, text) = row.split_once('\t').expect("every row is numbered");
                 let number = number
@@ -415,7 +676,7 @@ mod tests {
                 assert_eq!(number, seen.len() + 1);
                 seen.push(text.to_owned());
             }
-            match next {
+            match read_on(&out) {
                 Some(n) => offset = n,
                 None => break,
             }
@@ -426,15 +687,170 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A file far larger than the output cap is read a page at a time: the range
+    /// a call asks for is found by streaming the file, and the page is the whole
+    /// of what is held.
+    #[test]
+    fn read_pages_a_file_far_larger_than_the_output_cap() {
+        let dir = tmpdir();
+        let p = dir.join("big.txt");
+        let mut text = String::new();
+        let mut lines = 0usize;
+        while text.len() <= MAX_FILE_BYTES as usize {
+            lines += 1;
+            text.push_str(&format!("line number {lines}\n"));
+        }
+        std::fs::write(&p, &text).unwrap();
+        // The size Read used to refuse outright, answered with a page the cap
+        // bounds -- and the page names the size of the file behind it.
+        let out = read(&args(&p, ""));
+        assert!(out.len() <= MAX_OUTPUT, "page is {} bytes", out.len());
+        assert!(out.starts_with("1\tline number 1\n"), "{out}");
+        assert!(
+            out.contains(&format!("of {lines};")),
+            "the page names the file's size"
+        );
+        // The page after it starts where the marker said, at that line.
+        let next = read_on(&out).expect("a file this size takes more than one page");
+        let page = read(&args(&p, &format!(r#","offset":{next}"#)));
+        assert!(
+            page.starts_with(&format!("{next}\tline number {next}")),
+            "{page}"
+        );
+        // And a line near the end is reached in one call, wherever it is.
+        let last = read(&args(&p, &format!(r#","offset":{lines}"#)));
+        assert_eq!(last, format!("{lines}\tline number {lines}"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The cap on a read is about how long the scan behind a page may take, not
+    /// about memory: a file over it is refused before a byte of it is read.
+    #[test]
+    fn read_refuses_a_file_over_the_read_limit() {
+        let dir = tmpdir();
+        let p = dir.join("sparse.txt");
+        std::fs::File::create(&p)
+            .unwrap()
+            .set_len(MAX_READ_BYTES + 1)
+            .unwrap();
+        let out = read(&args(&p, ""));
+        assert!(
+            out.contains(&format!("over the {MAX_READ_BYTES}-byte limit")),
+            "{out}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A fifo has no end and reports no size, and a device can be endless in a
+    /// way that has nothing to do with how much memory a reader has: neither is
+    /// opened, and a read of either is text the model can correct itself from.
+    /// (The fifo is the case that hangs the test if the check goes.)
+    #[test]
+    fn read_refuses_a_file_that_is_not_regular() {
+        let dir = tmpdir();
+        let fifo = dir.join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo is how the test makes a fifo");
+        for p in [fifo.as_path(), Path::new("/dev/zero")] {
+            let out = read(&args(p, ""));
+            assert!(out.starts_with("error:"), "{out}");
+            assert!(out.contains("not a regular file"), "{out}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The two facts about a file's shape that decide whether an Edit will match
+    /// are said where they are known, and only while they hold.
+    #[test]
+    fn read_names_crlf_and_a_missing_final_newline() {
+        let dir = tmpdir();
+        let crlf = dir.join("crlf.txt");
+        std::fs::write(&crlf, "a\r\nb\r\n").unwrap();
+        assert_eq!(
+            read(&args(&crlf, "")),
+            "1\ta\n2\tb\n[note: CRLF line endings; keep \\r\\n in a multi-line old_string]"
+        );
+        let no_eol = dir.join("no-eol.txt");
+        std::fs::write(&no_eol, "a\nb").unwrap();
+        assert_eq!(
+            read(&args(&no_eol, "")),
+            "1\ta\n2\tb\n[note: the file does not end with a newline]"
+        );
+        // A page that stops before the end of the file has neither to say.
+        assert_eq!(
+            read(&args(&no_eol, r#","limit":1"#)),
+            "1\ta\n[showing lines 1-1 of 2; read on with offset=2]"
+        );
+        // And a file that ends with a newline gets no note at all.
+        let lf = dir.join("lf.txt");
+        std::fs::write(&lf, "a\n").unwrap();
+        assert_eq!(read(&args(&lf, "")), "1\ta");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The notes ride inside the cap as well: the longest pair of them -- a cut
+    /// line in a CRLF file -- still leaves a page no larger than the cap.
+    #[test]
+    fn read_keeps_its_notes_inside_the_output_cap() {
+        let dir = tmpdir();
+        let p = dir.join("cut-crlf.txt");
+        std::fs::write(&p, format!("{}\r\n", "x".repeat(MAX_OUTPUT + 100))).unwrap();
+        let out = read(&args(&p, ""));
+        assert!(out.len() <= MAX_OUTPUT, "{} bytes", out.len());
+        assert!(out.contains("is longer than the"), "{out}");
+        assert!(out.contains("CRLF"), "{out}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn read_marks_a_line_longer_than_the_output_limit() {
         let dir = tmpdir();
         let p = dir.join("one-line.txt");
-        std::fs::write(&p, "x".repeat(MAX_OUTPUT + 100)).unwrap();
+        std::fs::write(&p, "x".repeat(CHUNK + MAX_OUTPUT)).unwrap();
         let out = read(&args(&p, ""));
         assert!(out.len() <= MAX_OUTPUT, "{} bytes", out.len());
         assert!(out.contains("line 1 is longer than the"), "{out}");
         assert!(out.contains("with Bash"), "{out}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A row cut out of a long line ends on a character boundary: half a
+    /// character there is the cut and not a defect in the file.
+    #[test]
+    fn read_cuts_a_long_line_on_a_character_boundary() {
+        let dir = tmpdir();
+        let p = dir.join("wide.txt");
+        std::fs::write(&p, "€".repeat(CHUNK)).unwrap();
+        let out = read(&args(&p, ""));
+        assert!(out.len() <= MAX_OUTPUT, "{} bytes", out.len());
+        let row = out
+            .lines()
+            .next()
+            .expect("the head of the line")
+            .strip_prefix("1\t")
+            .expect("the row is numbered");
+        assert_eq!(row.len() % "€".len(), 0, "a whole number of characters");
+        assert!(row.chars().all(|c| c == '€'), "{row:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Bytes the page does not show are not the page's business: a file with a
+    /// binary line is read up to that line, and refused at it.
+    #[test]
+    fn read_reports_a_page_that_is_not_utf8_with_its_line() {
+        let dir = tmpdir();
+        let p = dir.join("binary.bin");
+        std::fs::write(&p, [b"first\n".as_slice(), &[0xff, 0xfe], b"\n"].concat()).unwrap();
+        let out = read(&args(&p, ""));
+        assert!(out.starts_with("error:"), "{out}");
+        assert!(out.contains("at line 2"), "{out}");
+        assert_eq!(
+            read(&args(&p, r#","limit":1"#)),
+            "1\tfirst\n[showing lines 1-1 of 2; read on with offset=2]"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -554,16 +970,10 @@ mod tests {
     }
 
     #[test]
-    fn read_rejects_directory_and_oversized_file() {
+    fn read_rejects_a_directory() {
         let dir = tmpdir();
-        // a directory reports "is a directory"
         let out = read(&args(&dir, ""));
         assert!(out.contains("is a directory"), "{out}");
-        // over the per-file limit
-        let big = dir.join("huge.bin");
-        std::fs::write(&big, vec![b'x'; MAX_FILE_BYTES as usize + 1]).unwrap();
-        let out = read(&args(&big, ""));
-        assert!(out.contains("over the"), "{out}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
