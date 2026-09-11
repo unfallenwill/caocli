@@ -982,14 +982,23 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn login_with_no_provider_prints_the_menu_instead_of_a_question() {
+        // What the menu says about a provider is whether a key is stored for it, and
+        // a key is read from HOME: a home of its own, under the lock that serializes
+        // the tests that read or write one. Without it the menu is a function of
+        // whatever home the test process happens to have, and of whichever test last
+        // moved it.
+        let (guard, home) = own_home();
         let dir = tmpdir("login-menu");
         let mut agent = agent_in(&dir, "m");
         let mut ui = Recording::default();
         submit(&mut agent, &mut ui, &dir, "/login").await;
         assert_eq!(ui.info, vec![login_menu()]);
         assert!(ui.prompts.is_empty(), "nothing was asked for yet");
+        drop(guard);
         std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[tokio::test]
@@ -1067,7 +1076,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn model_with_no_argument_prints_the_menu_instead_of_switching() {
+        // The menu marks the default model of every provider that has a key, so it is
+        // a function of HOME -- see the login menu above.
+        let (guard, home) = own_home();
         let dir = tmpdir("model-menu");
         let mut agent = agent_in(&dir, "deepseek-v4-flash");
         let mut ui = Recording::default();
@@ -1078,7 +1091,9 @@ mod tests {
             "{:?}",
             ui.info
         );
+        drop(guard);
         std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[tokio::test]
@@ -1237,7 +1252,10 @@ mod tests {
     #[test]
     fn the_menus_are_built_from_the_same_tables_the_pickers_read() {
         // Structure, not text: a provider that cannot be logged into, or a model
-        // that cannot be chosen, is the drift this catches.
+        // that cannot be chosen, is the drift this catches. A home of its own under
+        // the lock, since the details beside a name are read from HOME and a menu
+        // built beside a key search is a menu built from two homes.
+        let _guard = crate::config::env_lock();
         let menu = login_menu();
         for row in crate::config::provider_choices() {
             assert!(menu.contains(&row.label), "{row:?} has no name on the menu");
