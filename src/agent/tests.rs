@@ -1453,3 +1453,59 @@ async fn the_gate_never_stands_in_front_of_a_question() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The stream clock opens at the first delta, not at the response headers: a
+/// stream that carries usage alone never opens it, so its tokens-per-second
+/// figure is not a division by zero and one that carries deltas is the speed
+/// of the deltas rather than of the prefill that preceded them.
+#[tokio::test]
+async fn stream_time_opens_at_the_first_delta() {
+    let server = MockServer::start().await;
+    // Usage alone: no delta ever lands, so the window never opens.
+    let usage_only = [
+        r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+        "\n\n",
+        "data: [DONE]\n\n",
+    ]
+    .concat();
+    mount_chat(&server, usage_only, None).await;
+    let dir = tmpdir();
+    let agent = test_agent(&server, &dir);
+    let request = agent.build_request();
+    let mut ui = Renderer::new();
+    let reply = agent.stream_reply(&request, &mut ui).await.unwrap();
+    assert_eq!(
+        reply.stream_time,
+        std::time::Duration::ZERO,
+        "no delta, no window"
+    );
+    drop(agent);
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    // With deltas the window is real: it opened somewhere between the first
+    // chunk arriving and the last, so it is nonzero — and, the point of the
+    // change, it cannot have opened before the first delta did.
+    let server = MockServer::start().await;
+    let with_delta = [
+        sse(json!({"content":"hi"}), None, None),
+        sse(
+            json!({"content":""}),
+            Some("stop"),
+            Some(json!({"prompt_tokens":10,"completion_tokens":1,"total_tokens":11})),
+        ),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    mount_chat(&server, with_delta, None).await;
+    let dir = tmpdir();
+    let agent = test_agent(&server, &dir);
+    let request = agent.build_request();
+    let mut ui = Renderer::new();
+    let reply = agent.stream_reply(&request, &mut ui).await.unwrap();
+    assert!(
+        reply.stream_time > std::time::Duration::ZERO,
+        "a delta opened the window"
+    );
+    drop(agent);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

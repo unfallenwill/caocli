@@ -1412,6 +1412,34 @@ fn calibration_learns_from_a_usage_notice() {
 }
 
 #[test]
+fn a_tool_calls_arguments_join_the_calibration_window() {
+    // The arguments are output the backend billed for, so their characters
+    // count towards both the live estimate's numerator and the window the
+    // next usage notice calibrates on — otherwise a call-heavy turn runs the
+    // ratio towards zero tokens per character.
+    let mut s = State {
+        turn_running: true,
+        turn_started: Some(Instant::now()),
+        ..State::default()
+    };
+    s.apply(Notice::ToolStart {
+        name: "Bash".into(),
+        args: r#"{"command":"echo hi"}"#.into(),
+    });
+    let args_chars = r#"{"command":"echo hi"}"#.chars().count();
+    assert_eq!(s.streamed_chars, args_chars);
+    assert_eq!(s.chars_since_usage, args_chars);
+    s.apply(Notice::Usage(
+        Usage {
+            completion_tokens: 10,
+            ..Usage::default()
+        },
+        Duration::ZERO,
+    ));
+    assert_eq!(s.chars_per_token, args_chars as f64 / 10.0);
+}
+
+#[test]
 fn a_question_takes_the_border_title_back() {
     let mut s = working(Duration::from_secs(12), 4000, 4.0);
     let (tx, _rx) = oneshot::channel();
