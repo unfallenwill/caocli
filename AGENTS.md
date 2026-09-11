@@ -164,6 +164,21 @@ that talks to a network API and drives an interactive terminal.
   line ending to go by, or one too large to read the endings off — what the call sent is
   what lands. The endings are read off the file itself and never guessed from the
   extension, and the result says when the text was brought into them.
+- **A failed Edit says where the trouble is**, since the model cannot see a file it has
+  not read and a bare "not found" costs it a round trip through `Read`. A call that
+  matched nothing is answered with the text in the file that comes nearest — the window
+  of lines it best reads against, numbered as `Read` numbers them — and with every
+  difference between the line at fault and the line of the call's that it stands for:
+  the endings of the file's lines when they are the whole of it, and otherwise the text,
+  the whitespace a line starts or ends with, or the whitespace inside it, each one
+  **named** rather than left to be read off a line that cannot show a tab or a trailing
+  space. A call that matched more than once is answered with where each occurrence is
+  and what stands on either side of it, which is what one of them has to be quoted with
+  to be singled out. The report is bounded on purpose — a quoted line to a readable
+  width, occurrences up to a count, a long text shown around the line that differs —
+  because it is a tool result and the model pays for every byte of it. It is a
+  **report and never a match**: a tolerant fallback would edit text the call did not
+  send, and an `old_string` is the file's own text or it is a miss.
 - **Approval gate**: execution is trusted by default; with `--ask`, Bash/Edit/Write
   require a user y/N before running (a call that changes nothing on disk is always
   allowed: reading, and writing the todo list). Denial, cancellation,
