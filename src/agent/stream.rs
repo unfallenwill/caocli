@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::types::{ChatRequest, Message, TurnAccumulator, Usage};
+use crate::types::{Message, TurnAccumulator, Usage, WireRequest};
 use crate::ui::Ui;
 
 use super::Agent;
@@ -22,10 +22,11 @@ pub(super) struct Reply {
     pub(super) message: Message,
     /// Token usage as the backend reported it, if it reported any.
     pub(super) usage: Option<Usage>,
-    /// The wall time the stream took, first chunk to last: what a
+    /// The wall time from the first delta to the end of the stream: what a
     /// tokens-per-second figure divides the reported completion tokens by.
-    /// Connection setup is not counted — the speed of a stream is the speed of
-    /// the tokens, not of the handshake.
+    /// Everything before the first delta — the handshake and, on a long
+    /// prompt, the backend's whole prefill — is the wait for tokens, not the
+    /// speed of them, and is left out.
     pub(super) stream_time: Duration,
 }
 
@@ -36,16 +37,21 @@ impl Agent {
     /// persisted, so the session stays at a valid prefix.
     pub(super) async fn stream_reply(
         &self,
-        request: &ChatRequest,
+        request: &WireRequest,
         ui: &mut dyn Ui,
     ) -> Result<Reply> {
         let mut stream = self.api.stream_chat(request).await?;
-        let started = Instant::now();
+        let mut started: Option<Instant> = None;
         let mut accumulator = TurnAccumulator::default();
         let mut usage: Option<Usage> = None;
         while let Some(chunk) = stream.next_chunk().await? {
             for choice in chunk.choices {
                 let Some(delta) = choice.delta else { continue };
+                // Generation is what is being timed, and it starts when the
+                // first delta of any kind lands — text, thinking, or the first
+                // shard of a tool call. Usage-only chunks carry no delta and
+                // so never open the window.
+                started.get_or_insert_with(Instant::now);
                 if let Some(fragment) = &delta.reasoning_content {
                     ui.reasoning_delta(fragment);
                 }
@@ -63,7 +69,7 @@ impl Agent {
         Ok(Reply {
             message: accumulator.finish(),
             usage,
-            stream_time: started.elapsed(),
+            stream_time: started.map(|s| s.elapsed()).unwrap_or_default(),
         })
     }
 }

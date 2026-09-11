@@ -6,11 +6,17 @@
 //! That is the cache contract made visible — the same three inputs must produce
 //! the same bytes, because the backend's prefix cache matches on them.
 
+use serde_json::json;
+
 use crate::machine;
-use crate::provider;
+use crate::provider::{self, Wire};
 use crate::session::SessionMeta;
 use crate::tools;
-use crate::types::{ChatRequest, Message, Thinking};
+use crate::types::{
+    AnthropicBlock, AnthropicContent, AnthropicImageSource, AnthropicMessage, AnthropicRequest,
+    AnthropicRole, AnthropicTool, AnthropicToolChoice, ChatRequest, Message, Thinking, ToolDef,
+    WireRequest,
+};
 
 /// Participates in the request prefix (KVCache). Injecting time, cwd, a random
 /// id or any other dynamic content is forbidden, or every request would have a
@@ -29,6 +35,18 @@ pub fn build_request(
     provider: &provider::Provider,
     meta: &SessionMeta,
     history: &[Message],
+) -> WireRequest {
+    match provider.wire {
+        Wire::OpenAi => WireRequest::OpenAi(openai_request(provider, meta, history)),
+        Wire::Anthropic => WireRequest::Anthropic(anthropic_request(provider, meta, history)),
+    }
+}
+
+/// The OpenAI chat-completions shape, as it has always been sent.
+fn openai_request(
+    provider: &provider::Provider,
+    meta: &SessionMeta,
+    history: &[Message],
 ) -> ChatRequest {
     let mut messages = Vec::with_capacity(history.len() + 2);
     messages.push(Message::system(SYSTEM_PROMPT));
@@ -42,7 +60,15 @@ pub fn build_request(
     if let Some(text) = meta.instructions.as_deref().filter(|t| !t.is_empty()) {
         messages.push(Message::user(text));
     }
-    messages.extend(history.iter().cloned());
+    // A message that arrived on the Anthropic wire carries its thinking
+    // blocks with it; those are that wire's business and are stripped here,
+    // so a session that switched providers never sends them to a backend
+    // that rejects fields it does not know.
+    messages.extend(history.iter().map(|m| {
+        let mut m = m.clone();
+        m.thinking = None;
+        m
+    }));
     // Specification tripwire (debug builds only): the history being sent must
     // satisfy the executable specification. A violation is a shape the
     // backend answers with a 400 — catch it during development rather than in
@@ -67,6 +93,178 @@ pub fn build_request(
                 .clone()
                 .unwrap_or_else(|| provider.default_effort.to_string()),
         ),
+    }
+}
+
+/// The Anthropic messages shape: the system prompt is a top-level field, the
+/// history is content blocks, a tool call is a `tool_use` block and its
+/// result a `tool_result` block in the user turn that follows.
+fn anthropic_request(
+    provider: &provider::Provider,
+    meta: &SessionMeta,
+    history: &[Message],
+) -> AnthropicRequest {
+    // Specification tripwire, same as the OpenAI shape: the window
+    // specification is wire-agnostic, so it is checked before the mapping.
+    debug_assert!(
+        machine::is_request_valid(history),
+        "request history violates the tool_calls window specification: {history:?}"
+    );
+    let mut messages: Vec<AnthropicMessage> = Vec::with_capacity(history.len());
+    // A system message never occurs in the history (the system prompt rides
+    // on the request, not in the log); should one ever get there, it folds
+    // into the system field rather than being dropped.
+    let mut system = vec![SYSTEM_PROMPT.to_string()];
+    for msg in history {
+        match msg.role {
+            crate::types::Role::System => {
+                if let Some(text) = msg.text() {
+                    system.push(text);
+                }
+            }
+            crate::types::Role::User => messages.push(AnthropicMessage {
+                role: AnthropicRole::User,
+                content: user_content(msg),
+            }),
+            crate::types::Role::Assistant => messages.push(assistant_message(msg)),
+            crate::types::Role::Tool => {
+                // Results ride in the user turn that follows the calls, so
+                // consecutive results fold into one user message of
+                // tool_result blocks — the shape the wire expects, and one
+                // the window specification above guarantees is well placed.
+                let block = tool_result_block(msg);
+                match messages.last_mut() {
+                    Some(AnthropicMessage {
+                        role: AnthropicRole::User,
+                        content: AnthropicContent::Blocks(blocks),
+                    }) if blocks
+                        .iter()
+                        .all(|b| matches!(b, AnthropicBlock::ToolResult { .. })) =>
+                    {
+                        blocks.push(block);
+                    }
+                    _ => messages.push(AnthropicMessage {
+                        role: AnthropicRole::User,
+                        content: AnthropicContent::Blocks(vec![block]),
+                    }),
+                }
+            }
+        }
+    }
+    AnthropicRequest {
+        model: meta.model.clone(),
+        max_tokens: provider.max_tokens,
+        system: Some(system.join("\n\n")),
+        messages,
+        tools: Some(
+            tools::definitions()
+                .into_iter()
+                .map(anthropic_tool)
+                .collect(),
+        ),
+        tool_choice: Some(AnthropicToolChoice::Auto),
+        stream: true,
+        // The effort slot is the thinking switch on this wire: MiniMax M3 has
+        // no effort tiers, only thinking on (`adaptive`) and off.
+        thinking: Some(match effort_in_force(provider, meta).as_str() {
+            "off" => Thinking::disabled(),
+            _ => Thinking::adaptive(),
+        }),
+    }
+}
+
+/// The tier in force: the one the session stored, or the provider's default —
+/// the same fallback the status line reports.
+fn effort_in_force(provider: &provider::Provider, meta: &SessionMeta) -> String {
+    meta.reasoning_effort
+        .clone()
+        .unwrap_or_else(|| provider.default_effort.to_string())
+}
+
+/// A user message's content: the string it is, or the parts it carries, each
+/// part becoming the block the wire serves it in.
+fn user_content(msg: &Message) -> AnthropicContent {
+    match &msg.content {
+        Some(crate::types::Content::Text(text)) => AnthropicContent::Text(text.clone()),
+        Some(crate::types::Content::Parts(parts)) => AnthropicContent::Blocks(
+            parts
+                .iter()
+                .map(|p| match (&p.text, &p.image_url) {
+                    (Some(text), _) => AnthropicBlock::Text { text: text.clone() },
+                    (None, Some(image)) => image_block(&image.url),
+                    (None, None) => AnthropicBlock::Text {
+                        text: String::new(),
+                    },
+                })
+                .collect(),
+        ),
+        None => AnthropicContent::Text(String::new()),
+    }
+}
+
+/// An image as the wire reads it: a `data:` URL carries the bytes themselves
+/// and is split into the base64 source (media type from the URL); anything
+/// else is somewhere to be fetched from, and is passed as a URL source.
+fn image_block(url: &str) -> AnthropicBlock {
+    let base64 = url
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(";base64,"))
+        .map(|(media_type, data)| AnthropicImageSource::Base64 {
+            media_type: media_type.to_string(),
+            data: data.to_string(),
+        });
+    AnthropicBlock::Image {
+        source: base64.unwrap_or_else(|| AnthropicImageSource::Url {
+            url: url.to_string(),
+        }),
+    }
+}
+
+/// An assistant message as blocks, in the order the model wrote them:
+/// thinking (replayed verbatim, signature included), then text, then the
+/// calls it declared. `reasoning_content` — the OpenAI-wire spelling of the
+/// same reasoning — is deliberately not replayed: without the signature that
+/// came with it on this wire it would not be the content the model returned,
+/// and a made-up signature would be worse than none.
+fn assistant_message(msg: &Message) -> AnthropicMessage {
+    let mut blocks: Vec<AnthropicBlock> = Vec::new();
+    for block in msg.thinking.iter().flatten() {
+        blocks.push(AnthropicBlock::Thinking {
+            thinking: block.thinking.clone(),
+            signature: block.signature.clone(),
+        });
+    }
+    if let Some(text) = msg.text().filter(|text| !text.is_empty()) {
+        blocks.push(AnthropicBlock::Text { text });
+    }
+    for call in msg.tool_calls.iter().flatten() {
+        blocks.push(AnthropicBlock::ToolUse {
+            id: call.id.clone(),
+            name: call.function.name.clone(),
+            input: serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| json!({})),
+        });
+    }
+    AnthropicMessage {
+        role: AnthropicRole::Assistant,
+        content: AnthropicContent::Blocks(blocks),
+    }
+}
+
+fn tool_result_block(msg: &Message) -> AnthropicBlock {
+    AnthropicBlock::ToolResult {
+        tool_use_id: msg.tool_call_id.clone().unwrap_or_default(),
+        content: msg.text().unwrap_or_default(),
+    }
+}
+
+fn anthropic_tool(def: ToolDef) -> AnthropicTool {
+    AnthropicTool {
+        name: def.function.name,
+        description: def.function.description,
+        input_schema: def
+            .function
+            .parameters
+            .unwrap_or_else(|| json!({"type": "object"})),
     }
 }
 

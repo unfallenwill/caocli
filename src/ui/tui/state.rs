@@ -130,13 +130,16 @@ pub(super) struct State {
     /// When the running turn began. None between turns; what the border's
     /// working indicator counts up from.
     pub(super) turn_started: Option<Instant>,
-    /// Characters streamed this turn, reasoning and content both: the numerator
-    /// of the live tokens-per-second estimate.
+    /// Characters the model produced this turn — streamed reasoning and
+    /// content, plus the arguments of every tool call it declared: the
+    /// numerator of the live tokens-per-second estimate, and the same set of
+    /// text the backend's completion tokens bill for.
     pub(super) streamed_chars: usize,
-    /// Characters streamed since the last usage notice. With that notice's
-    /// completion tokens it measures the characters-per-token ratio this
-    /// provider and model actually produce, which is what keeps the estimate
-    /// honest after the first sub-request.
+    /// Characters produced since the last usage notice, counted the same way
+    /// [`State::streamed_chars`] is. With that notice's completion tokens it
+    /// measures the characters-per-token ratio this provider and model
+    /// actually produce, which is what keeps the estimate honest after the
+    /// first sub-request.
     pub(super) chars_since_usage: usize,
     /// Characters per token, as last measured, or [`BLIND_CHARS_PER_TOKEN`]
     /// before the first measurement. Session-level: it survives the turn that
@@ -540,6 +543,16 @@ impl State {
             Notice::Content(text) => self.stream(Style::Plain, &text),
             Notice::FinishTurn => self.end_block(),
             Notice::ToolStart { name, args } => {
+                // The call's arguments are output the backend billed for: the
+                // characters join both counters so the usage notice that ends
+                // the next sub-request calibrates against the same text the
+                // completion tokens covered. The notice lands after the
+                // sub-request that declared the call, so its tokens ride one
+                // window late — an offset a turn with several calls averages
+                // out.
+                let chars = args.chars().count();
+                self.streamed_chars += chars;
+                self.chars_since_usage += chars;
                 self.end_block();
                 self.transcript.push(Cell::tool_call(&name, &args));
             }

@@ -9,6 +9,16 @@
 
 use anyhow::{Context, Result, bail};
 
+/// The wire protocol a provider speaks. Two shapes are served today: the
+/// OpenAI chat-completions body and SSE chunk stream, and the Anthropic
+/// messages body and event stream. The internal history is provider-agnostic;
+/// the request builder and the stream parser each branch on this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wire {
+    OpenAi,
+    Anthropic,
+}
+
 /// Backend provider presets. Deliberately a static table instead of a trait or
 /// dynamic registration: adding a provider = adding one const line, which keeps
 /// the "one backend, one loop" minimalism.
@@ -23,6 +33,8 @@ pub struct Provider {
     pub name: &'static str,
     /// Full chat/completions endpoint.
     pub url: &'static str,
+    /// The wire protocol the endpoint speaks (see [`Wire`]).
+    pub wire: Wire,
     /// Model ids this provider is known to serve, the first being the default
     /// when no model is given. This is the menu `/model` offers, not a
     /// whitelist: any id may be named explicitly, and an id the backend does not
@@ -34,21 +46,26 @@ pub struct Provider {
     /// next `Edit` would then fail to match. The cap is a ceiling, not a
     /// reservation: a short answer costs nothing extra.
     ///
-    /// This bounds a single completion, not the conversation: both backends take
+    /// This bounds a single completion, not the conversation: the backends take
     /// 1M tokens of context and history is replayed whole (never trimmed), so
     /// there is nothing else here for a context window to do.
     pub max_tokens: u32,
-    /// Whether the request carries the DeepSeek-style `thinking` switch. Both
-    /// backends today take `{"type":"enabled"}`; a backend that rejects fields
-    /// it does not know sets this to false, and nothing else changes.
+    /// Whether the request carries the DeepSeek-style `thinking` switch (an
+    /// OpenAi-wire field; an Anthropic-wire preset drives thinking through its
+    /// effort tiers instead, see `default_effort`). Both OpenAi-wire backends
+    /// take `{"type":"enabled"}`; a backend that rejects fields it does not
+    /// know sets this to false, and nothing else changes.
     pub send_thinking: bool,
     /// Valid `reasoning_effort` tiers this backend accepts. The tiers are the
     /// backend's answer, not the program's, so they live in the preset: a
     /// provider with other tiers declares them here and nothing else changes.
     pub efforts: &'static [&'static str],
     /// Tier sent when no effort is stored. The backends' own defaults differ
-    /// (DeepSeek high, GLM max), so the preset pins one explicitly — the only
-    /// way to make them behave the same.
+    /// (DeepSeek high, GLM max, MiniMax thinking on), so the preset pins one
+    /// explicitly — the only way to make them behave the same. On the
+    /// Anthropic wire the tier is not sent as an effort: the request builder
+    /// reads it as the thinking switch (`off` disables thinking, anything
+    /// else keeps it adaptive).
     pub default_effort: &'static str,
 }
 
@@ -80,6 +97,7 @@ pub const DEEPSEEK: Provider = Provider {
     id: "deepseek",
     name: "DeepSeek",
     url: "https://api.deepseek.com/chat/completions",
+    wire: Wire::OpenAi,
     // What GET /models returns for this endpoint.
     models: &["deepseek-flash", "deepseek-v4-pro"],
     max_tokens: 384_000,
@@ -96,6 +114,7 @@ pub const ZAI_CODING_CN: Provider = Provider {
     id: "zai-coding-cn",
     name: "Z.AI Coding CN",
     url: "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
+    wire: Wire::OpenAi,
     // The two models the coding plan serves on this endpoint, as the service
     // spells them.
     models: &["glm-5.3-flash", "glm-5.3"],
@@ -106,7 +125,27 @@ pub const ZAI_CODING_CN: Provider = Provider {
     default_effort: "max",
 };
 
-pub const PROVIDERS: &[Provider] = &[DEEPSEEK, ZAI_CODING_CN];
+/// MiniMax's Anthropic-compatible Messages endpoint (mainland-China host, the
+/// platform at platform.minimaxi.com). `MiniMax-M3` is an agentic coding
+/// model with a 1M-token context; it has no effort tiers, only a thinking
+/// switch (`adaptive` / `disabled`), so the effort slots carry `on` / `off`
+/// and the Anthropic request builder maps them onto that switch.
+pub const MINIMAX: Provider = Provider {
+    id: "minimax",
+    name: "MiniMax",
+    url: "https://api.minimax.cn/anthropic/v1/messages",
+    wire: Wire::Anthropic,
+    models: &["MiniMax-M3"],
+    // The recommended value for M3 (the ceiling the endpoint allows is
+    // 512 Ki tokens); a ceiling, not a reservation.
+    max_tokens: 131_072,
+    // The thinking switch on this wire is the effort tier's job.
+    send_thinking: false,
+    efforts: &["on", "off"],
+    default_effort: "on",
+};
+
+pub const PROVIDERS: &[Provider] = &[DEEPSEEK, ZAI_CODING_CN, MINIMAX];
 /// Provider used when `--provider` is not given.
 pub const DEFAULT_PROVIDER: &str = "deepseek";
 
@@ -157,23 +196,41 @@ mod tests {
     fn provider_lookup_and_presets() {
         assert_eq!(provider("deepseek").unwrap(), DEEPSEEK);
         assert_eq!(provider("zai-coding-cn").unwrap(), ZAI_CODING_CN);
+        assert_eq!(provider("minimax").unwrap(), MINIMAX);
         assert_eq!(DEEPSEEK.name, "DeepSeek");
         assert_eq!(ZAI_CODING_CN.name, "Z.AI Coding CN");
+        assert_eq!(MINIMAX.name, "MiniMax");
         assert!(provider("nope").unwrap_err().to_string().contains("zai"));
         assert_eq!(DEFAULT_PROVIDER, "deepseek");
         assert_eq!(DEEPSEEK.default_model(), "deepseek-flash");
         assert_eq!(ZAI_CODING_CN.default_model(), "glm-5.3-flash");
+        assert_eq!(MINIMAX.default_model(), "MiniMax-M3");
         // Every preset offers something to pick, and the first of them is what
         // `default_model` reads: an empty list would panic there.
         for p in PROVIDERS {
             assert!(!p.models.is_empty(), "{} offers no model", p.id);
             assert!(!p.id.contains('/'), "a provider id may not carry a slash");
         }
-        // The two backends cap a single answer differently; both are ceilings
+        // The three backends cap a single answer differently; all are ceilings
         // well above the defaults they replace.
         assert_eq!(DEEPSEEK.max_tokens, 384_000);
         assert_eq!(ZAI_CODING_CN.max_tokens, 128_000);
+        assert_eq!(MINIMAX.max_tokens, 131_072);
         assert!(ZAI_CODING_CN.url.contains("open.bigmodel.cn"));
+        // The wire split: the first two speak the OpenAI shape, MiniMax the
+        // Anthropic one, on its own messages endpoint.
+        assert_eq!(DEEPSEEK.wire, Wire::OpenAi);
+        assert_eq!(ZAI_CODING_CN.wire, Wire::OpenAi);
+        assert_eq!(MINIMAX.wire, Wire::Anthropic);
+        assert!(MINIMAX.url.contains("/anthropic/v1/messages"));
+        // The Anthropic wire carries no reasoning_effort: its effort slots are
+        // the thinking switch, and `send_thinking` (an OpenAi-wire field) is
+        // out of service.
+        assert_eq!(MINIMAX.efforts, &["on", "off"]);
+        assert_eq!(MINIMAX.default_effort, "on");
+        // Through the lookup, so the assertion reads a runtime value rather
+        // than folding a const away.
+        assert!(!provider("minimax").unwrap().send_thinking);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use clap::Parser;
 #[command(
     name = "caocli",
     version,
-    about = "Terminal coding agent · DeepSeek / Z.AI backends · thinking + Bash"
+    about = "Terminal coding agent · DeepSeek / Z.AI / MiniMax backends · thinking + Bash"
 )]
 pub struct Cli {
     /// One-shot mode: run this prompt (including the tool loop), then exit
@@ -16,7 +16,7 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub image: Vec<std::path::PathBuf>,
 
-    /// Provider: deepseek (default) | zai-coding-cn
+    /// Provider: deepseek (default) | zai-coding-cn | minimax
     #[arg(long)]
     pub provider: Option<String>,
 
@@ -25,7 +25,8 @@ pub struct Cli {
     #[arg(long)]
     pub model: Option<String>,
 
-    /// Thinking effort: low|high|max (default max)
+    /// Thinking effort tier: low|high|max (or on|off on the Anthropic wire;
+    /// provider defaults otherwise)
     #[arg(long)]
     pub effort: Option<String>,
 

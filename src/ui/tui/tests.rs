@@ -132,6 +132,7 @@ fn replay_and_the_live_stream_produce_the_same_cells() {
             reasoning_content: Some("let me think".into()),
             tool_calls: None,
             tool_call_id: None,
+            thinking: None,
         },
         Message::tool("call_1", "exit_code: 0\n--- stdout ---\nbody"),
     ]));
@@ -1408,6 +1409,34 @@ fn calibration_learns_from_a_usage_notice() {
     assert_eq!(s.chars_per_token, 4.0);
     // the counter is spent on the measurement: the next ratio starts clean
     assert_eq!(s.chars_since_usage, 0);
+}
+
+#[test]
+fn a_tool_calls_arguments_join_the_calibration_window() {
+    // The arguments are output the backend billed for, so their characters
+    // count towards both the live estimate's numerator and the window the
+    // next usage notice calibrates on — otherwise a call-heavy turn runs the
+    // ratio towards zero tokens per character.
+    let mut s = State {
+        turn_running: true,
+        turn_started: Some(Instant::now()),
+        ..State::default()
+    };
+    s.apply(Notice::ToolStart {
+        name: "Bash".into(),
+        args: r#"{"command":"echo hi"}"#.into(),
+    });
+    let args_chars = r#"{"command":"echo hi"}"#.chars().count();
+    assert_eq!(s.streamed_chars, args_chars);
+    assert_eq!(s.chars_since_usage, args_chars);
+    s.apply(Notice::Usage(
+        Usage {
+            completion_tokens: 10,
+            ..Usage::default()
+        },
+        Duration::ZERO,
+    ));
+    assert_eq!(s.chars_per_token, args_chars as f64 / 10.0);
 }
 
 #[test]
