@@ -1,6 +1,8 @@
 use serde_json::json;
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -114,8 +116,10 @@ pub fn definition() -> ToolDef {
                  Each stream is kept to 10240 bytes: a longer one is shown from both of its ends, \
                  with what fell between them counted in its place. \
                  A command that runs past its timeout is killed, with everything it started: 120s \
-                 unless timeout says otherwise (at most 1800), and a job that wants longer belongs \
-                 in the background, where its output can be polled from a file. \
+                 unless timeout says otherwise (at most 1800). A job that should outlive the call \
+                 -- a build, a server, a long test run -- is started with background:true instead: \
+                 the call returns at once and the result names the pid and the file the output \
+                 goes to. \
                  A screen editor (vim, nano, ...) is refused: nothing a call runs has a terminal, \
                  so one would only draw its interface into the result. Edit a file with Edit/Write, \
                  or with sed -i, python3 -c, or the editor's own script mode (vim -es)."
@@ -125,7 +129,8 @@ pub fn definition() -> ToolDef {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "the bash command to run" },
-                    "timeout": { "type": "integer", "description": "seconds to let the command run before it is killed (default 120, at most 1800)" }
+                    "timeout": { "type": "integer", "description": "seconds to let the command run before it is killed (default 120, at most 1800); a background run returns at once and takes none" },
+                    "background": { "type": "boolean", "description": "start the command and return at once, its output going to the file the result names (default false)" }
                 },
                 "required": ["command"]
             })),
@@ -147,6 +152,13 @@ pub async fn execute(args_json: &str) -> String {
         Ok(budget) => budget,
         Err(e) => return e,
     };
+    let background = match args.get("background") {
+        None => false,
+        Some(given) => match given.as_bool() {
+            Some(background) => background,
+            None => return "error: background must be true or false".into(),
+        },
+    };
     // Refused before the command is run, the way a write refuses a path that is a
     // directory: what cannot work is answered with what to do instead rather than
     // with whatever it does to a screen it cannot have.
@@ -159,7 +171,65 @@ pub async fn execute(args_json: &str) -> String {
         );
     }
 
+    if background {
+        return start_in_background(command);
+    }
     run(command, budget).await
+}
+
+/// How many jobs this process has started in the background, which is what numbers
+/// the files their output goes to: two jobs writing one file would answer with each
+/// other's output, and the calls that started them cannot see each other.
+static BACKGROUND_JOBS: AtomicU64 = AtomicU64::new(0);
+
+/// Start the command and return, leaving it running.
+///
+/// A call that waits is a call the turn waits for, and a build that takes ten
+/// minutes is ten minutes of a conversation that cannot be answered. What comes
+/// back instead is what a call needs to follow it: the pid to kill, and the file
+/// its output goes to. Neither stream is a pipe, so nothing this process does can
+/// block the job, and the job itself is in a session of its own -- it outlives the
+/// turn, and the session, until somebody or something ends it.
+fn start_in_background(command: &str) -> String {
+    let number = BACKGROUND_JOBS.fetch_add(1, Ordering::Relaxed) + 1;
+    let path = background_log(number);
+    let dir = path.parent().expect("a log has a directory");
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        return format!("error: cannot make {}: {e}", dir.display());
+    }
+    let file = match std::fs::File::create(&path) {
+        Ok(file) => file,
+        Err(e) => return format!("error: cannot write {}: {e}", path.display()),
+    };
+    let errors = match file.try_clone() {
+        Ok(errors) => errors,
+        Err(e) => return format!("error: cannot write {}: {e}", path.display()),
+    };
+
+    // No `kill_on_drop` here: the handle is dropped as soon as the job is named, and
+    // the job is not this call's to end -- the runtime reaps it when it finishes.
+    match bash(command).stdout(file).stderr(errors).spawn() {
+        Err(e) => format!("exit_code: 127\n--- stderr ---\nfailed to start bash: {e}"),
+        Ok(child) => {
+            let pid = child.id().unwrap_or_default();
+            drop(child);
+            format!(
+                "exit_code: 0\nbackground: started as pid {pid}, its output going to {}; the call \
+                 returned as soon as it was started. Read that file to follow it. Nothing else \
+                 ends it -- not this session, and not a timeout -- so `kill -9 -{pid}` kills the \
+                 whole job when it is no longer wanted.",
+                path.display()
+            )
+        }
+    }
+}
+
+/// Where a background job's output goes: one file per call, in a directory of this
+/// process's own under the temporary directory.
+fn background_log(number: u64) -> PathBuf {
+    Path::new(&std::env::temp_dir())
+        .join(format!("caocli-{}", std::process::id()))
+        .join(format!("bash-{number}.log"))
 }
 
 /// The program this call runs that cannot run here, if there is one.
@@ -443,6 +513,46 @@ fn kill_group(pgroup: Option<u32>) {
     let _ = pgroup;
 }
 
+/// `bash -c command`, with nothing of ours on its standard input, in a session of
+/// its own, and with the editor variables pointed somewhere harmless.
+///
+/// The session is what keeps the command away from the user's terminal. A program
+/// that wants to ask a person something opens `/dev/tty` rather than reading its
+/// standard input, and it would find the very terminal the front end is reading:
+/// the front end owns the screen and the keys, so a question typed into it by a
+/// command is a question the front end answers, or a keystroke that never reaches
+/// the line being typed. Measured: with the terminal reachable, `sudo true` waits
+/// minutes for a password; without one it fails in a tenth of a second, which is a
+/// result the model can act on. The session is also what makes the pid a process
+/// group's id, which is what a timeout, a cancel and a background job are killed
+/// by.
+///
+/// The editor variables are the one thing that cannot be refused by name: an editor
+/// opened by a program of its own (`git commit` with no message) is named by a
+/// variable rather than by the command. Both therefore point at `true`, which
+/// changes nothing and says so -- measured: without them that call draws a screen
+/// into the result before giving its own error, and with them it gives only the
+/// error. A call that sets either one itself still overrides this.
+fn bash(command: &str) -> Command {
+    let mut spawn = Command::new("bash");
+    spawn
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .env("GIT_EDITOR", "true")
+        .env("EDITOR", "true");
+    #[cfg(unix)]
+    // SAFETY: `setsid` takes no arguments and touches nothing but the child's own
+    // process attributes; it is called after the fork, before the exec.
+    unsafe {
+        spawn.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    spawn
+}
+
 /// A command and the process group it leads.
 ///
 /// The group is killed when this is dropped without the child having been reaped,
@@ -460,46 +570,14 @@ struct Group {
 }
 
 impl Group {
-    /// Spawn `bash -c command` in a session of its own, with its output piped and
-    /// its input at an end of file.
-    ///
-    /// The session is what keeps the command away from the user's terminal.
-    /// A program that wants to ask the user something opens `/dev/tty` rather than
-    /// reading its standard input, and it would find the terminal the front end is
-    /// reading: the front end owns the screen and the keys, so a question typed into
-    /// it by a command is a question the front end answers, or a keystroke that
-    /// never reaches the line being typed. Measured: with the terminal reachable,
-    /// `sudo true` waits minutes for a password; without one it fails in a tenth of
-    /// a second, which is a result the model can act on.
+    /// Spawn the command with its output piped, so that this call can read it as it
+    /// arrives.
     fn spawn(command: &str) -> std::io::Result<Self> {
-        let mut spawn = Command::new("bash");
-        spawn
-            .arg("-c")
-            .arg(command)
-            .stdin(Stdio::null())
+        let child = bash(command)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // An editor is the one thing a program here may still try to open: it is
-            // named by a variable rather than by the program's own name, so nothing
-            // about the command says so and nothing can refuse it ahead of time.
-            // Both variables therefore point at `true`, which changes nothing and
-            // says so -- measured: `git commit` with no message draws a screen into
-            // the result before it gives its own error, and with these it gives only
-            // the error. A call that sets either one itself overrides this, which is
-            // the last word on the subject.
-            .env("GIT_EDITOR", "true")
-            .env("EDITOR", "true")
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        // SAFETY: `setsid` takes no arguments and touches nothing but the child's
-        // own process attributes; it is called after the fork, before the exec.
-        unsafe {
-            spawn.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-        let child = spawn.spawn()?;
+            .kill_on_drop(true)
+            .spawn()?;
         Ok(Self {
             pgroup: child.id(),
             child,
@@ -812,6 +890,70 @@ mod tests {
     /// Whether a result is the refusal rather than whatever the command did.
     fn refused(out: &str) -> bool {
         out.starts_with("error: ") && out.contains("a call has no screen")
+    }
+
+    /// A background call returns as soon as the job is started, and what it returns
+    /// is what a call needs to follow and to end it: the pid and the file.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_background_call_returns_at_once_with_where_its_output_went() {
+        let started = Instant::now();
+        let out = execute(r#"{"command":"echo started; sleep 30","background":true}"#).await;
+        assert!(out.contains("exit_code: 0"), "{out}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        let pid: i32 = field(&out, "pid ").parse().expect("a pid");
+        let path = field(&out, "going to ");
+        // The job writes its output where the result says it does, and it is still
+        // running when the call has long since returned.
+        let mut log = String::new();
+        for _ in 0..40 {
+            log = std::fs::read_to_string(path).unwrap_or_default();
+            if log.contains("started") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(log.contains("started"), "{log:?}");
+        let alive = still_running(pid).await;
+        kill_group(Some(pid as u32));
+        assert!(alive, "the job outlived the call");
+        assert!(!still_running(pid).await, "the job did not die");
+    }
+
+    /// Each job gets a file of its own: two calls writing one file would each answer
+    /// with the other's output.
+    #[tokio::test]
+    async fn every_background_job_gets_a_file_of_its_own() {
+        let first = execute(r#"{"command":"true","background":true}"#).await;
+        let second = execute(r#"{"command":"true","background":true}"#).await;
+        assert_ne!(
+            field(&first, "going to "),
+            field(&second, "going to "),
+            "{first}\n{second}"
+        );
+    }
+
+    /// What cannot be read as a background is said rather than guessed at.
+    #[tokio::test]
+    async fn background_has_to_be_a_boolean() {
+        let out = execute(r#"{"command":"true","background":"yes"}"#).await;
+        assert_eq!(out, "error: background must be true or false");
+    }
+
+    /// The word that follows `label` in a result, without the punctuation that ends
+    /// it.
+    fn field<'a>(out: &'a str, label: &str) -> &'a str {
+        out.split_once(label)
+            .expect("the result names it")
+            .1
+            .split_whitespace()
+            .next()
+            .expect("a value")
+            .trim_end_matches([',', ';'])
     }
 
     #[test]
