@@ -504,10 +504,7 @@ pub fn edit(args_json: &str) -> String {
             return not_found(&path, &content, &old);
         }
         n if n > 1 => {
-            return format!(
-                "error: old_string occurs {n} times in {path}, so it is not unique. Add \
-                 surrounding context to make it unique and retry"
-            );
+            return not_unique(&path, &content, &old, n);
         }
         _ => {}
     }
@@ -539,6 +536,10 @@ pub fn edit(args_json: &str) -> String {
         Err(e) => format!("error: failed to write {path}: {e}"),
     }
 }
+
+/// How many occurrences of a text that matched more than once are shown, before
+/// the rest are only counted.
+const SHOWN_OCCURRENCES: usize = 5;
 
 /// How many bytes of a line a hint quotes before cutting it: a hint is a tool
 /// result, and the model pays for every byte of it.
@@ -783,6 +784,38 @@ fn endings_note(content: &str, old: &str) -> &'static str {
     }
 }
 
+/// What an Edit that matched more than once is answered with: where each
+/// occurrence is, and what stands on either side of it -- which are the lines a
+/// call has to quote to single one of them out.
+fn not_unique(path: &str, content: &str, old: &str, n: usize) -> String {
+    let mut out = format!(
+        "error: old_string occurs {n} times in {path}, so it is not unique. Add the line before \
+         or after one occurrence to make it unique and retry; they are at:"
+    );
+    let mut lines = lines_of(content);
+    // The empty line a text ending with a newline splits into is not a line of
+    // the file, and an occurrence cannot start past the file's last line.
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    for (at, _) in content.match_indices(old).take(SHOWN_OCCURRENCES) {
+        let first = line_at(content, at);
+        // What the occurrence covers, newlines and all: a call may send several
+        // lines, and the hint says which of the file's lines they are.
+        let last = first + old.strip_suffix('\n').unwrap_or(old).matches('\n').count();
+        out.push_str(&format!(
+            "\n  {}: {}; {}",
+            lines_name(first, last),
+            beside(&lines, first.checked_sub(2), "before"),
+            beside(&lines, (last < lines.len()).then_some(last), "after"),
+        ));
+    }
+    if n > SHOWN_OCCURRENCES {
+        out.push_str(&format!("\n  [and {} more]", n - SHOWN_OCCURRENCES));
+    }
+    out
+}
+
 /// How one line of the file reads against the line of the call's text it stands
 /// for: the same, the same but for whitespace, or only alike. The rank is what
 /// the window the call meant is found by; what is between the two lines is said
@@ -893,6 +926,15 @@ fn line_count(text: &str) -> usize {
     newlines + usize::from(!text.is_empty() && !text.ends_with('\n'))
 }
 
+/// The 1-based number of the line a byte offset sits in.
+fn line_at(text: &str, offset: usize) -> usize {
+    text.as_bytes()[..offset]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+        + 1
+}
+
 /// One line, or a run of them, said the way Read numbers them.
 fn lines_name(first: usize, last: usize) -> String {
     if first == last {
@@ -910,6 +952,16 @@ fn quoted(line: &str) -> String {
         text.push('…');
     }
     text
+}
+
+/// What stands beside one occurrence, quoted, or the fact that the file has no
+/// line there: the lines around an occurrence are what a call sends to single
+/// it out, so a side with nothing on it has to say so.
+fn beside(lines: &[&str], index: Option<usize>, side: &str) -> String {
+    match index.and_then(|i| lines.get(i)) {
+        Some(line) => format!("the line {side} is \"{}\"", quoted(line)),
+        None => format!("nothing stands {side} it"),
+    }
 }
 
 /// The whitespace a line ends with.
@@ -1990,6 +2042,32 @@ mod tests {
         assert_eq!(ws_name("\u{b}\u{c}"), "2 other whitespace characters");
     }
 
+    /// A call that matched more than once is told where each occurrence is and
+    /// what stands on either side of it, which is what the next call has to
+    /// quote to single one of them out.
+    #[test]
+    fn edit_names_where_each_match_is_when_not_unique() {
+        let dir = tmpdir();
+        let p = dir.join("f.rs");
+        let file = "fn a() {\n    let x = 1;\n}\nfn b() {\n    let x = 1;\n}\n";
+        std::fs::write(&p, file).unwrap();
+        let out = edit(&args(
+            &p,
+            r#","old_string":"    let x = 1;","new_string":"    let x = 2;""#,
+        ));
+        assert!(out.contains("old_string occurs 2 times"), "{out}");
+        assert!(
+            out.contains("line 2: the line before is \"fn a() {\"; the line after is \"}\""),
+            "{out}"
+        );
+        assert!(
+            out.contains("line 5: the line before is \"fn b() {\"; the line after is \"}\""),
+            "{out}"
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), file);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A line that differs in more than one way at once: every difference is
     /// named, since a call that fixes the words and not the indent misses the
     /// file again.
@@ -2021,6 +2099,100 @@ mod tests {
             r#","old_string":"let a = f(x, y);","new_string":"x""#,
         ));
         assert!(out.contains("in the whitespace inside it"), "{out}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A text of several lines: an occurrence names the run of lines it covers,
+    /// and the lines on either side of the run -- which is what a multi-line
+    /// old_string has to quote to be unique.
+    #[test]
+    fn edit_names_a_multi_line_occurrence() {
+        let dir = tmpdir();
+        let p = dir.join("f.txt");
+        std::fs::write(
+            &p,
+            "head\nlet a = 1;\nlet b = 2;\ntail\nlet a = 1;\nlet b = 2;\n",
+        )
+        .unwrap();
+        let out = edit(&args(
+            &p,
+            r#","old_string":"let a = 1;\nlet b = 2;","new_string":"x""#,
+        ));
+        assert!(
+            out.contains("lines 2-3: the line before is \"head\"; the line after is \"tail\""),
+            "{out}"
+        );
+        assert!(
+            out.contains("lines 5-6: the line before is \"tail\"; nothing stands after it"),
+            "{out}"
+        );
+
+        // An occurrence that ends with a newline covers the line that newline
+        // ends and not the one after it.
+        let out = edit(&args(
+            &p,
+            r#","old_string":"let b = 2;\n","new_string":"x""#,
+        ));
+        assert!(
+            out.contains("line 3: the line before is \"let a = 1;\"; the line after is \"tail\""),
+            "{out}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// More occurrences than a hint shows: the ones past the cap are counted
+    /// rather than dropped without a word.
+    #[test]
+    fn edit_counts_the_matches_past_the_ones_it_shows() {
+        let dir = tmpdir();
+        let p = dir.join("f.txt");
+        let body: Vec<String> = (1..=7).map(|n| format!("line {n}\nlet x = 1;")).collect();
+        std::fs::write(&p, body.join("\n") + "\n").unwrap();
+        let out = edit(&args(
+            &p,
+            r#","old_string":"let x = 1;","new_string":"let y = 2;""#,
+        ));
+        assert!(out.contains("old_string occurs 7 times"), "{out}");
+        assert!(out.contains("[and 2 more]"), "{out}");
+        assert_eq!(
+            out.matches("the line before is").count(),
+            SHOWN_OCCURRENCES,
+            "{out}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An occurrence with nothing beside it: the file is one line with the text
+    /// twice in it, so both sides have to say that there is nothing there.
+    #[test]
+    fn edit_says_when_an_occurrence_has_nothing_beside_it() {
+        let dir = tmpdir();
+        let p = dir.join("f.txt");
+        std::fs::write(&p, "aaaa").unwrap();
+        let out = edit(&args(&p, r#","old_string":"aa","new_string":"b""#));
+        assert!(
+            out.contains("line 1: nothing stands before it; nothing stands after it"),
+            "{out}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What a report of repeated text shows is a tool result like any other: a
+    /// line is cut to a readable width, and the whole report stays inside the
+    /// output cap however long the lines it names are.
+    #[test]
+    fn the_report_of_a_repeated_text_stays_bounded() {
+        let dir = tmpdir();
+        let p = dir.join("wide.txt");
+        let line = format!("{} let x = 1;", "€".repeat(400));
+        std::fs::write(&p, format!("{line}\n").repeat(6)).unwrap();
+        let out = edit(&args(
+            &p,
+            r#","old_string":"let x = 1;","new_string":"let y = 2;""#,
+        ));
+        assert!(out.contains("old_string occurs 6 times"), "{out}");
+        assert!(out.len() < MAX_OUTPUT, "{} bytes", out.len());
+        assert!(out.contains('…'), "{out}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
