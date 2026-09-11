@@ -607,6 +607,44 @@ def live(term: "Terminal", home: str) -> bool:
         term.send("\x1b")  # leave nothing waiting for an answer
         ok = False
 
+    # A command's own output is on the screen while the command is still running.
+    # The two tokens are printed apart -- one now, one after a wait -- and the
+    # command is written so that neither is in its own text: the call is what puts
+    # its command on the screen twice over (the echo and the gate's question), and a
+    # token that were part of it would be on screen before the command ran at all.
+    # So what is asserted is that the first token is on screen while the second
+    # cannot be: the one proves the stream arrived, the other that the call was not
+    # over when it did. The frame is read back off the grid, not looked for in the
+    # byte stream, which only carries what changed since the frame before it.
+    term.idle(2.0, 120)
+    term.send(
+        "use the Bash tool to run exactly: printf 'LIVE-%s\\n' FIRST; sleep 12; "
+        "printf 'LIVE-%s\\n' LAST\r"
+    )
+    # The box's own row is what says the gate is open: the question itself is the
+    # command echoed under it, and a long command wraps, so the two halves of
+    # "run it? [y/N]" need not be on one row.
+    if term.expect("y to allow", 120):
+        term.send("y\r")  # the answer comes out of the box, like any line
+        if term.expect("LIVE-FIRST", 120):
+            # Read the frame at that moment: the second token is twelve seconds
+            # behind the first, so a frame holding both is a frame drawn after the
+            # command had already finished.
+            if any("LIVE-LAST" in line for line in term.screen.lines()):
+                print(
+                    "  \u2717 the second token was on screen with the first:"
+                    " the call was over by then"
+                )
+                ok = False
+            else:
+                print("  \u2713 a running command's output is on the screen it runs under")
+        else:
+            print("  \u2717 a running command's output never reached the screen")
+            ok = False
+    else:
+        print("  \u2717 the command was never put to the gate")
+        ok = False
+
     # Ctrl-C with a line queued behind the turn: the turn stops and the head of
     # the queue runs. The turn asked for is one that would take a while, and the
     # cancel key is sent right behind the line -- the model call is in flight, so
