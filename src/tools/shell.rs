@@ -13,7 +13,17 @@ use super::MAX_OUTPUT;
 use crate::types::{FunctionDef, ToolDef};
 
 pub const NAME: &str = "Bash";
+
+/// How long a call is given when it does not ask for a length of its own.
 pub const TIMEOUT_SECS: u64 = 120;
+
+/// The longest a call may ask to be given (seconds).
+///
+/// A cap rather than a longer default because a turn is a conversation: a call
+/// that runs for an hour is an hour in which the user cannot be answered, and the
+/// background is the right shape for a job that long -- it costs the turn nothing
+/// and its output can be read whenever it is wanted.
+pub const MAX_TIMEOUT_SECS: u64 = 1800;
 
 /// Bytes of a command's output kept for the result, per stream and per end.
 ///
@@ -67,15 +77,17 @@ pub fn definition() -> ToolDef {
                  for them. \
                  Each stream is kept to 10240 bytes: a longer one is shown from both of its ends, \
                  with what fell between them counted in its place. \
-                 Do not run something that waits for a terminal (an editor, a pager, top) or a \
-                 long-lived command (a server, watch, tail -f): neither can work here, and a \
-                 command that runs past the 120s timeout is killed with everything it started."
+                 A command that runs past its timeout is killed, with everything it started: 120s \
+                 unless timeout says otherwise (at most 1800), and a job that wants longer belongs \
+                 in the background, where its output can be polled from a file. \
+                 Do not run something that waits for a terminal (an editor, a pager, top)."
                     .into(),
             ),
             parameters: Some(json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "the bash command to run" }
+                    "command": { "type": "string", "description": "the bash command to run" },
+                    "timeout": { "type": "integer", "description": "seconds to let the command run before it is killed (default 120, at most 1800)" }
                 },
                 "required": ["command"]
             })),
@@ -86,15 +98,43 @@ pub fn definition() -> ToolDef {
 /// Run a shell command. Never returns Err: bad arguments, command failure and
 /// timeouts all come back as tool result text.
 pub async fn execute(args_json: &str) -> String {
-    let command = match super::parse_args(args_json) {
-        Ok(v) => v.get("command").and_then(|c| c.as_str()).map(str::to_owned),
+    let args = match super::parse_args(args_json) {
+        Ok(v) => v,
         Err(e) => return e,
     };
-    let Some(command) = command else {
+    let Some(command) = args.get("command").and_then(|c| c.as_str()) else {
         return "error: missing required argument command (string)".into();
     };
+    let budget = match timeout(&args) {
+        Ok(budget) => budget,
+        Err(e) => return e,
+    };
 
-    run(&command, Duration::from_secs(TIMEOUT_SECS)).await
+    run(command, budget).await
+}
+
+/// How long the call asked to be given, and [`TIMEOUT_SECS`] when it said nothing.
+///
+/// A length of its own is what a call needs for a build or a test suite that is
+/// slow rather than stuck, and the cap is what keeps one call from being a turn
+/// nobody can answer: a job longer than that is a job for the background.
+fn timeout(args: &serde_json::Value) -> Result<Duration, String> {
+    let Some(given) = args.get("timeout") else {
+        return Ok(Duration::from_secs(TIMEOUT_SECS));
+    };
+    let Some(seconds) = given.as_u64() else {
+        return Err("error: timeout must be a whole number of seconds".into());
+    };
+    if seconds == 0 {
+        return Err("error: timeout must be at least 1 second".into());
+    }
+    if seconds > MAX_TIMEOUT_SECS {
+        return Err(format!(
+            "error: timeout is at most {MAX_TIMEOUT_SECS} seconds; a job longer than that belongs \
+             in the background, where its output can be polled from a file"
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 /// One command, from `bash -c` to the text the model reads.
@@ -166,8 +206,9 @@ async fn run(command: &str, budget: Duration) -> String {
     if timed_out {
         result.push_str(&format!(
             "timeout: the command ran longer than {}s and was killed, along with everything it \
-             had started; what it printed up to then is below. Use a faster command, or run a \
-             long task in the background and poll an output file.\n",
+             had started; what it printed up to then is below. A call may ask for up to \
+             {MAX_TIMEOUT_SECS}s with the timeout argument, and a job that wants longer belongs in \
+             the background, where its output can be polled from a file.\n",
             budget.as_secs()
         ));
     }
@@ -457,6 +498,55 @@ mod tests {
         assert!(out.contains("exit_code: 3"));
         assert!(out.contains("hello"));
         assert!(out.contains("err"));
+    }
+
+    /// A call that asks for a length of its own is given it, and one that asks for
+    /// nothing is given the default.
+    #[test]
+    fn a_call_may_ask_for_its_own_timeout() {
+        assert_eq!(
+            timeout(&json!({})).unwrap(),
+            Duration::from_secs(TIMEOUT_SECS)
+        );
+        assert_eq!(
+            timeout(&json!({"timeout": 900})).unwrap(),
+            Duration::from_secs(900)
+        );
+        assert_eq!(
+            timeout(&json!({"timeout": MAX_TIMEOUT_SECS})).unwrap(),
+            Duration::from_secs(MAX_TIMEOUT_SECS)
+        );
+    }
+
+    /// What a call cannot have is said rather than rounded to something it did not
+    /// ask for: a timeout of zero would kill the command before it started, and one
+    /// past the cap would be a turn nobody can answer.
+    #[test]
+    fn an_impossible_timeout_is_answered_with_what_is_possible() {
+        for (given, expected) in [
+            (json!({"timeout": 0}), "at least 1 second"),
+            (
+                json!({"timeout": MAX_TIMEOUT_SECS + 1}),
+                "at most 1800 seconds",
+            ),
+            (json!({"timeout": "900"}), "a whole number of seconds"),
+            (json!({"timeout": 1.5}), "a whole number of seconds"),
+            (json!({"timeout": -1}), "a whole number of seconds"),
+        ] {
+            let e = timeout(&given).expect_err("refused");
+            assert!(e.starts_with("error: "), "{e}");
+            assert!(e.contains(expected), "{e}");
+        }
+    }
+
+    /// The length a call asked for is the one it is told about: the note names the
+    /// budget rather than the default.
+    #[tokio::test]
+    async fn a_timeout_note_names_the_budget_that_ran_out() {
+        let out = execute(r#"{"command":"sleep 30","timeout":1}"#).await;
+        assert!(out.contains("exit_code: 124"), "{out}");
+        assert!(out.contains("longer than 1s"), "{out}");
+        assert!(out.contains("with the timeout argument"), "{out}");
     }
 
     /// A short output is the whole output: the head and the tail put back together
