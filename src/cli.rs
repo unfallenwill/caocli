@@ -53,7 +53,7 @@ pub struct Cli {
     pub no_tui: bool,
 
     /// Approval gate: ask y/N before Bash/Edit/Write executes (a call that changes
-    /// nothing on disk -- Read, TodoWrite -- is always allowed)
+    /// nothing on disk -- Read, Glob, TodoWrite -- is always allowed)
     #[arg(long)]
     pub ask: bool,
 }
