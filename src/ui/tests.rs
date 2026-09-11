@@ -340,6 +340,23 @@ fn a_running_commands_output_is_written_as_it_arrives() {
     assert!(s.contains("▸ Bash echo one; echo two"), "{s:?}");
     assert!(s.contains("\x1b[2m· one\n  two\x1b[0m\n"), "{s:?}");
     assert!(s.contains("· exit_code: 0"), "{s:?}");
+    // Nothing is left on the line the last chunk ended: a chunk that ends with a
+    // break ends the block, and the cell after it follows on the next line.
+    assert!(!s.contains("  \n"), "no line of nothing but columns: {s:?}");
+}
+
+/// A chunk that ends with a line break leaves the block standing at the start of a
+/// line, and the chunk after it is set in like the line it continues -- which is the
+/// one thing this front end has to remember between chunks.
+#[test]
+fn a_chunk_after_a_break_continues_the_line_it_started() {
+    let (mut r, buf) = with_buffer(true);
+    r.tool_output("one\n");
+    r.tool_output("two\n");
+    r.tool_output("three");
+    r.tool_result("exit_code: 0");
+    let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(s.contains("\x1b[2m· one\n  two\n  three\x1b[0m\n"), "{s:?}");
 }
 
 /// Nothing is written for a command that printed nothing: an empty chunk is not a

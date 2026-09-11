@@ -82,6 +82,11 @@ pub struct Renderer {
     color: bool,
     /// The text block currently being streamed, if any.
     live: Option<Block>,
+    /// Whether the cursor is at the start of a line of the block being streamed,
+    /// which is a fact only a command's output has a use for: a chunk can end in the
+    /// middle of a line, and the line it continues is set in like the rest of the
+    /// block. A block of the model's own has no lines this front end breaks.
+    at_line_start: bool,
     /// Whether the cell written last was a text block. Only this much of the
     /// previous cell is kept: it is all the spacing rule needs, and the
     /// transcript itself lives in the session log.
@@ -108,6 +113,7 @@ impl Renderer {
             term,
             color,
             live: None,
+            at_line_start: false,
             prev_was_block: false,
             status: Status::default(),
             bar: None,
@@ -296,7 +302,13 @@ impl Renderer {
             return;
         }
         self.emit(self.close_style());
-        self.emit("\n");
+        // A block whose last chunk ended with a line break has nothing left on the
+        // line it is standing on, and an empty line before the next cell is not a
+        // line of anything.
+        if !self.at_line_start {
+            self.emit("\n");
+        }
+        self.at_line_start = false;
         self.prev_was_block = true;
     }
 
@@ -396,14 +408,22 @@ impl Ui for Renderer {
             .spacing_cell()
             .gutter()
             .map_or("", |gutter| gutter.rest);
-        let mut lines = chunk.split('\n');
-        if let Some(first) = lines.next() {
-            self.emit(first);
-        }
-        for line in lines {
-            self.emit("\n");
-            self.emit(rest);
-            self.emit(line);
+        let mut lines = chunk.split('\n').peekable();
+        while let Some(line) = lines.next() {
+            // A line with nothing on it is a line the block leaves empty: it takes no
+            // columns, and the line the cursor is standing at the start of is still
+            // the one the next chunk continues.
+            if !line.is_empty() {
+                if self.at_line_start {
+                    self.emit(rest);
+                }
+                self.at_line_start = false;
+                self.emit(line);
+            }
+            if lines.peek().is_some() {
+                self.emit("\n");
+                self.at_line_start = true;
+            }
         }
     }
 
