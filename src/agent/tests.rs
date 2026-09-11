@@ -532,6 +532,7 @@ async fn mock_anthropic_loop_replays_thinking_blocks_verbatim() {
             provider: Some("minimax".into()),
             model: "MiniMax-M3".into(),
             reasoning_effort: Some("on".into()),
+            instructions: None,
         },
     )
     .unwrap();

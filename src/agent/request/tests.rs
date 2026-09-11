@@ -180,7 +180,7 @@ fn the_instructions_sit_between_the_system_prompt_and_the_history() {
         ..test_meta()
     };
     let history = vec![Message::user("q1")];
-    let request = build_request(&provider::DEEPSEEK, &meta, &history);
+    let request = openai_of(&build_request(&provider::DEEPSEEK, &meta, &history));
     assert_eq!(request.messages.len(), 3);
     assert_eq!(request.messages[0].role, Role::System);
     assert_eq!(request.messages[0].text().as_deref(), Some(SYSTEM_PROMPT));
@@ -197,7 +197,7 @@ fn the_instructions_sit_between_the_system_prompt_and_the_history() {
 #[test]
 fn a_session_without_instructions_sends_nothing_for_them() {
     let history = vec![Message::user("q1")];
-    let request = build_request(&provider::DEEPSEEK, &test_meta(), &history);
+    let request = openai_of(&build_request(&provider::DEEPSEEK, &test_meta(), &history));
     assert_eq!(request.messages.len(), 2);
     assert_eq!(request.messages[1], Message::user("q1"));
 }
@@ -209,7 +209,7 @@ fn empty_instructions_are_not_sent() {
         instructions: Some(String::new()),
         ..test_meta()
     };
-    let request = build_request(&provider::DEEPSEEK, &meta, &[]);
+    let request = openai_of(&build_request(&provider::DEEPSEEK, &meta, &[]));
     assert_eq!(request.messages.len(), 1);
 }
 
@@ -222,6 +222,7 @@ fn minimax_meta(effort: Option<&str>) -> SessionMeta {
         provider: Some("minimax".into()),
         model: "MiniMax-M3".into(),
         reasoning_effort: effort.map(str::to_owned),
+        instructions: None,
     }
 }
 

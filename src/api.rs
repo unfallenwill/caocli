@@ -682,6 +682,7 @@ mod tests {
                 provider: Some("minimax".into()),
                 model: "MiniMax-M3".into(),
                 reasoning_effort: None,
+                instructions: None,
             },
             &[],
         );
