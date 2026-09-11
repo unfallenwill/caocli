@@ -443,7 +443,7 @@ python3 scripts/tui_smoke.py               # the full-screen front end, under a 
 python3 scripts/pty_smoke.py               # the plain prompt, under a pty
 ```
 
-CI runs on every push to `master` and every pull request: fmt + clippy +
+CI runs on every push to `main` and every pull request: fmt + clippy +
 tests + line coverage ≥ 90% + dependency audit. Any red gate blocks merging.
 
 [`AGENTS.md`](AGENTS.md) is the behavior guide for AI agents working in this
