@@ -58,6 +58,9 @@ pub fn edit_definition() -> ToolDef {
                  indentation, tab-versus-space differences and line endings — one character off \
                  is reported as not found, so use Read to check the original when the \
                  indentation is uncertain. \
+                 new_string does not have to carry them: the text inserted is written in the \
+                 line endings of the file it goes into, so a replacement typed with plain \
+                 newlines lands as the file's own. \
                  old_string must occur exactly once in the file (zero or multiple occurrences is \
                  an error); one call replaces one occurrence, so make several calls for several \
                  edits. old_string must not be empty; an empty new_string deletes the matched text."
@@ -463,6 +466,10 @@ fn int_arg(v: &serde_json::Value, key: &str) -> Result<Option<usize>, String> {
 }
 
 /// Edit: replaces only on a unique match; writes back via an atomic tmp+rename.
+///
+/// The text a call inserts lands in the target's own line endings, so that a
+/// replacement typed with plain newlines is not a block of lines that differ
+/// from the ones around them in their endings alone.
 pub fn edit(args_json: &str) -> String {
     let v = match parse_args(args_json) {
         Ok(v) => v,
@@ -505,10 +512,25 @@ pub fn edit(args_json: &str) -> String {
         Ok(t) => t,
         Err(e) => return e,
     };
-    let updated = content.replacen(&old, &new, 1);
+    // The text the call inserts is written in the endings of the file it goes
+    // into: a block typed with plain newlines would otherwise land among lines
+    // that differ from it in their endings alone. The old_string around it is
+    // the file's own text and has to match it as it stands.
+    let inserted = in_endings(&new, text_endings(&content));
+    let (text, ending) = match &inserted {
+        Some((text, endings)) => (
+            text.as_str(),
+            format!(
+                "; the new text was written in the file's own {}",
+                endings.name()
+            ),
+        ),
+        None => (new.as_str(), String::new()),
+    };
+    let updated = content.replacen(&old, text, 1);
     match atomic_write(&target, &updated) {
         Ok(()) => format!(
-            "ok: replaced 1 occurrence; {path} is now {} bytes",
+            "ok: replaced 1 occurrence; {path} is now {} bytes{ending}",
             updated.len()
         ),
         Err(e) => format!("error: failed to write {path}: {e}"),
@@ -622,39 +644,76 @@ fn endings(path: &Path) -> Option<Endings> {
     }
     let mut file = std::fs::File::open(path).ok()?;
     let mut chunk = vec![0u8; CHUNK];
-    let (mut crlf, mut lf) = (0usize, 0usize);
-    // The byte before the one in hand, chunk boundaries included: whether a
-    // newline ends a CRLF line is decided by what stands in front of it.
-    let mut before = None;
+    let mut count = EndingCount::default();
     loop {
         let n = file.read(&mut chunk).ok()?;
         if n == 0 {
             break;
         }
-        for &b in &chunk[..n] {
-            if b == b'\n' {
-                if before == Some(b'\r') {
-                    crlf += 1;
-                } else {
-                    lf += 1;
-                }
-            }
-            before = Some(b);
-        }
+        count.feed(&chunk[..n]);
         // With both kinds in hand the file has no one style to follow, and what
         // is left of it cannot give it one.
-        if crlf > 0 && lf > 0 {
+        if count.mixed() {
             return None;
         }
     }
-    match (crlf, lf) {
-        (0, 0) => None,
-        (_, 0) => Some(Endings::Crlf),
-        _ => Some(Endings::Lf),
+    count.style()
+}
+
+/// The line endings of a text already in hand, which is the whole of a file an
+/// edit has just read to replace part of it.
+fn text_endings(text: &str) -> Option<Endings> {
+    let mut count = EndingCount::default();
+    count.feed(text.as_bytes());
+    count.style()
+}
+
+/// Lines counted as they are read, before it is known whether they are one
+/// style.
+#[derive(Default)]
+struct EndingCount {
+    /// Lines that end with a carriage return and then a newline.
+    crlf: usize,
+    /// Lines that end with a newline alone.
+    lf: usize,
+    /// The last byte counted: whether the next one ends a CRLF line is decided
+    /// by what stands in front of it, a chunk boundary included.
+    before: Option<u8>,
+}
+
+impl EndingCount {
+    /// Count one run of bytes.
+    fn feed(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if b == b'\n' {
+                if self.before == Some(b'\r') {
+                    self.crlf += 1;
+                } else {
+                    self.lf += 1;
+                }
+            }
+            self.before = Some(b);
+        }
+    }
+
+    /// Both kinds have been seen: the text has no one style to follow, and what
+    /// is left of it cannot give it one.
+    fn mixed(&self) -> bool {
+        self.crlf > 0 && self.lf > 0
+    }
+
+    /// The one style these lines end in, if they end in one: `None` for a text
+    /// with no line ending to go by, and for one that mixes the two.
+    fn style(&self) -> Option<Endings> {
+        match (self.crlf, self.lf) {
+            (0, 0) => None,
+            (_, 0) => Some(Endings::Crlf),
+            _ => Some(Endings::Lf),
+        }
     }
 }
 
-/// The text this write puts on disk, in the endings of the file it replaces --
+/// The text a call puts into a file, in the endings of the file it goes into --
 /// `Some` when the call's own text had to be brought into them, with the endings
 /// it was brought into. `None` when there is nothing to bring it into: the file
 /// has no one style to follow, or the text is already in its style, and either
@@ -1529,6 +1588,64 @@ mod tests {
         assert!(out.contains("already has exactly this content"), "{out}");
         assert_eq!(std::fs::metadata(&p).unwrap().ino(), inode);
         assert_eq!(std::fs::read(&p).unwrap(), b"a\r\nb\r\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The text an Edit inserts lands in the line endings of the file it goes
+    /// into, where the old_string around it had to be the file's own text as it
+    /// stands: a replacement typed with plain newlines is not a block of lines
+    /// that differ from their neighbours in their endings alone.
+    #[test]
+    fn edit_writes_the_new_text_in_the_endings_of_the_file() {
+        let dir = tmpdir();
+        let crlf = dir.join("crlf.txt");
+        std::fs::write(&crlf, "keep\r\n").unwrap();
+        let out = edit(&args(
+            &crlf,
+            r#","old_string":"keep","new_string":"one\ntwo""#,
+        ));
+        assert!(
+            out.contains("the new text was written in the file's own CRLF"),
+            "{out}"
+        );
+        assert_eq!(std::fs::read(&crlf).unwrap(), b"one\r\ntwo\r\n");
+
+        // And the other way round: an LF file is not given CRLF lines.
+        let lf = dir.join("lf.txt");
+        std::fs::write(&lf, "keep\n").unwrap();
+        let out = edit(&args(
+            &lf,
+            r#","old_string":"keep","new_string":"one\r\ntwo""#,
+        ));
+        assert!(
+            out.contains("the new text was written in the file's own LF"),
+            "{out}"
+        );
+        assert_eq!(std::fs::read(&lf).unwrap(), b"one\ntwo\n");
+
+        // Text already in the file's own endings is written byte for byte, with
+        // nothing to say about it.
+        let out = edit(&args(
+            &lf,
+            r#","old_string":"one\n","new_string":"three\n""#,
+        ));
+        assert!(out.starts_with("ok: replaced 1 occurrence"), "{out}");
+        assert!(!out.contains("the new text"), "{out}");
+        assert_eq!(std::fs::read(&lf).unwrap(), b"three\ntwo\n");
+
+        // A file with no one style to follow takes the text as it was typed,
+        // and a deletion carries no ending to bring over in any case.
+        let mixed = dir.join("mixed.txt");
+        std::fs::write(&mixed, "keep\r\nx\n").unwrap();
+        let out = edit(&args(
+            &mixed,
+            r#","old_string":"keep","new_string":"one\ntwo""#,
+        ));
+        assert!(out.starts_with("ok: replaced 1 occurrence"), "{out}");
+        assert_eq!(std::fs::read(&mixed).unwrap(), b"one\ntwo\r\nx\n");
+        let out = edit(&args(&mixed, r#","old_string":"x","new_string":"""#));
+        assert!(out.starts_with("ok: replaced 1 occurrence"), "{out}");
+        assert_eq!(std::fs::read(&mixed).unwrap(), b"one\ntwo\r\n\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
