@@ -84,6 +84,11 @@ pub fn write_definition() -> ToolDef {
             description: Some(
                 "Create a file, or overwrite a whole file; missing parent directories are \
                  created automatically. \
+                 Content is written in the line endings the file already uses -- a CRLF file \
+                 stays CRLF and an LF one stays LF, and the call's own newlines are brought \
+                 into them -- so a whole-file rewrite does not turn every line of a long file \
+                 into a change. A file that does not exist yet, one whose endings are mixed, \
+                 and one over 10MB are written exactly as they were sent. \
                  An existing file is overwritten completely and unrecoverably, so use Read to \
                  check it first; \
                  use this only to create a file or rewrite one wholesale, and use Edit for \
@@ -515,8 +520,10 @@ pub fn edit(args_json: &str) -> String {
 /// The write lands on the file the path finally names: a symlink is followed to
 /// its target rather than replaced by a regular file, an overwrite keeps the
 /// target's own permissions, and content that is already there is left alone.
-/// Everything that can be refused is refused before a byte is written, and a
-/// write that fails takes its temporary file with it.
+/// The text lands in the target's own line endings, so that a whole-file rewrite
+/// does not turn every line of a file into a change. Everything that can be
+/// refused is refused before a byte is written, and a write that fails takes its
+/// temporary file with it.
 pub fn write(args_json: &str) -> String {
     let v = match parse_args(args_json) {
         Ok(v) => v,
@@ -549,16 +556,150 @@ pub fn write(args_json: &str) -> String {
             parent.display()
         );
     }
-    if already_holds(&target, &content) {
+    // The text that lands is the call's own, in the line endings of the file it
+    // replaces: a whole-file rewrite sent in the other endings would otherwise
+    // read, to whoever watches the file, as a change to every line of it.
+    let kept = in_endings(&content, endings(&target));
+    let data = match &kept {
+        Some((text, _)) => text.as_str(),
+        None => &content,
+    };
+    if already_holds(&target, data) {
         return format!(
             "ok: {path} already has exactly this content ({} bytes); left unchanged",
-            content.len()
+            data.len()
         );
     }
-    match atomic_write(&target, &content) {
-        Ok(()) => format!("ok: wrote {path} ({} bytes)", content.len()),
+    match atomic_write(&target, data) {
+        Ok(()) => {
+            let ending = match kept {
+                Some((_, endings)) => {
+                    format!(
+                        "; line endings converted to the file's own {}",
+                        endings.name()
+                    )
+                }
+                None => String::new(),
+            };
+            format!("ok: wrote {path} ({} bytes){ending}", data.len())
+        }
         Err(e) => format!("error: failed to write {path}: {e}"),
     }
+}
+
+/// How the lines of a file end: the one thing a whole-file write carries over
+/// from the file it replaces, since it replaces everything else.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Endings {
+    /// Every line ends with a newline, and no carriage return in front of it.
+    Lf,
+    /// Every line ends with a carriage return and then a newline.
+    Crlf,
+}
+
+impl Endings {
+    /// What these endings are called, for the one line that says what a write
+    /// did to the text the call sent.
+    fn name(self) -> &'static str {
+        match self {
+            Endings::Lf => "LF",
+            Endings::Crlf => "CRLF",
+        }
+    }
+}
+
+/// The line endings of the file a write is about to replace, as far as reading
+/// it can say: `Crlf` when every line in it ends with a carriage return and a
+/// newline, `Lf` when no line does, and `None` -- no one style for a write to
+/// follow, so the call's own text is what lands -- for a file with no line
+/// ending to go by, one that mixes the two, one larger than a write may replace,
+/// and one that cannot be read at all; the last of those is every write that
+/// creates a file.
+fn endings(path: &Path) -> Option<Endings> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > MAX_FILE_BYTES {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut chunk = vec![0u8; CHUNK];
+    let (mut crlf, mut lf) = (0usize, 0usize);
+    // The byte before the one in hand, chunk boundaries included: whether a
+    // newline ends a CRLF line is decided by what stands in front of it.
+    let mut before = None;
+    loop {
+        let n = file.read(&mut chunk).ok()?;
+        if n == 0 {
+            break;
+        }
+        for &b in &chunk[..n] {
+            if b == b'\n' {
+                if before == Some(b'\r') {
+                    crlf += 1;
+                } else {
+                    lf += 1;
+                }
+            }
+            before = Some(b);
+        }
+        // With both kinds in hand the file has no one style to follow, and what
+        // is left of it cannot give it one.
+        if crlf > 0 && lf > 0 {
+            return None;
+        }
+    }
+    match (crlf, lf) {
+        (0, 0) => None,
+        (_, 0) => Some(Endings::Crlf),
+        _ => Some(Endings::Lf),
+    }
+}
+
+/// The text this write puts on disk, in the endings of the file it replaces --
+/// `Some` when the call's own text had to be brought into them, with the endings
+/// it was brought into. `None` when there is nothing to bring it into: the file
+/// has no one style to follow, or the text is already in its style, and either
+/// way the bytes the call sent are the bytes that land.
+fn in_endings(content: &str, endings: Option<Endings>) -> Option<(String, Endings)> {
+    let endings = endings?;
+    match endings {
+        Endings::Crlf => crlf_lines(content).map(|text| (text, Endings::Crlf)),
+        Endings::Lf => lf_lines(content).map(|text| (text, Endings::Lf)),
+    }
+}
+
+/// The text with a carriage return in front of every newline that has none --
+/// what a CRLF file's own text has. `None` when every newline in it has one
+/// already.
+fn crlf_lines(content: &str) -> Option<String> {
+    let bytes = content.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut added = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        // A newline with nothing in front of it, or with something other than a
+        // carriage return, is where a line ends in a file of LF lines.
+        if b == b'\n' && (i == 0 || bytes[i - 1] != b'\r') {
+            out.push(b'\r');
+            added = true;
+        }
+        out.push(b);
+    }
+    added.then(|| String::from_utf8(out).expect("a carriage return added to UTF-8 is UTF-8"))
+}
+
+/// The text without the carriage return in front of a newline -- what an LF
+/// file's own text has. `None` when there is no CRLF line to take one off.
+fn lf_lines(content: &str) -> Option<String> {
+    let bytes = content.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut dropped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+            dropped = true;
+            continue;
+        }
+        out.push(b);
+    }
+    dropped.then(|| String::from_utf8(out).expect("a carriage return dropped from UTF-8 is UTF-8"))
 }
 
 /// The file a write lands on: the path with any symlink at its end followed, so
@@ -1231,6 +1372,163 @@ mod tests {
         );
         assert!(write(&changed).starts_with("ok: wrote"));
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "diff");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The text of a write lands in the line endings the file it replaces uses:
+    /// a whole-file rewrite sent in the other endings would otherwise read, to
+    /// whoever watches the file, as a change to every line of it.
+    #[test]
+    fn write_keeps_the_line_endings_of_the_file_it_replaces() {
+        let dir = tmpdir();
+        let crlf = dir.join("crlf.txt");
+        std::fs::write(&crlf, "a\r\nb\r\n").unwrap();
+        let out = write(&format!(
+            r#"{{"file_path":{:?},"content":"a\nb\nc\n"}}"#,
+            crlf.to_string_lossy()
+        ));
+        assert!(out.contains("converted to the file's own CRLF"), "{out}");
+        assert_eq!(std::fs::read(&crlf).unwrap(), b"a\r\nb\r\nc\r\n");
+
+        // And the other way round: an LF file is not turned into a CRLF one.
+        let lf = dir.join("lf.txt");
+        std::fs::write(&lf, "a\nb\n").unwrap();
+        let out = write(&format!(
+            r#"{{"file_path":{:?},"content":"a\r\nb\r\nc\r\n"}}"#,
+            lf.to_string_lossy()
+        ));
+        assert!(out.contains("converted to the file's own LF"), "{out}");
+        assert_eq!(std::fs::read(&lf).unwrap(), b"a\nb\nc\n");
+
+        // Text already in the file's own endings is written byte for byte, and
+        // there is nothing to say about it.
+        let out = write(&format!(
+            r#"{{"file_path":{:?},"content":"a\nb\n"}}"#,
+            lf.to_string_lossy()
+        ));
+        assert!(out.starts_with("ok: wrote"), "{out}");
+        assert!(!out.contains("line endings"), "{out}");
+        assert_eq!(std::fs::read(&lf).unwrap(), b"a\nb\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A created file has no endings to follow, so what the call sent is what
+    /// lands -- the same for a file with no line ending to go by, one whose
+    /// endings are mixed, and one too large to read the endings off.
+    #[test]
+    fn write_follows_no_endings_it_cannot_read() {
+        let dir = tmpdir();
+        // A file that is not there yet keeps the endings of the call.
+        let fresh = dir.join("fresh.txt");
+        let out = write(&format!(
+            r#"{{"file_path":{:?},"content":"a\r\nb\r\n"}}"#,
+            fresh.to_string_lossy()
+        ));
+        assert!(out.starts_with("ok: wrote"), "{out}");
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"a\r\nb\r\n");
+
+        // One line and no ending at all: there is nothing to say how it ends.
+        let one = dir.join("one-line.txt");
+        std::fs::write(&one, "just one line").unwrap();
+        let out = write(&format!(
+            r#"{{"file_path":{:?},"content":"a\nb\n"}}"#,
+            one.to_string_lossy()
+        ));
+        assert!(out.starts_with("ok: wrote"), "{out}");
+        assert_eq!(std::fs::read(&one).unwrap(), b"a\nb\n");
+
+        // Mixed endings: neither style is the file's, so neither is imposed.
+        let mixed = dir.join("mixed.txt");
+        std::fs::write(&mixed, "a\nb\r\n").unwrap();
+        let out = write(&format!(
+            r#"{{"file_path":{:?},"content":"x\nc\r\n"}}"#,
+            mixed.to_string_lossy()
+        ));
+        assert!(out.starts_with("ok: wrote"), "{out}");
+        assert_eq!(std::fs::read(&mixed).unwrap(), b"x\nc\r\n");
+
+        // A file larger than a write may replace is not read to find its
+        // endings: the call's own text is what lands.
+        let big = dir.join("big.txt");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_FILE_BYTES + 1)
+            .unwrap();
+        let out = write(&format!(
+            r#"{{"file_path":{:?},"content":"x\n"}}"#,
+            big.to_string_lossy()
+        ));
+        assert!(out.starts_with("ok: wrote"), "{out}");
+        assert_eq!(std::fs::read(&big).unwrap(), b"x\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The endings of a file are read off the whole of it, in chunks: a pair
+    /// split across two reads is still one CRLF line, and a file that mixes the
+    /// two kinds is not read as the one it happened to start with.
+    #[test]
+    fn endings_are_read_across_chunk_boundaries() {
+        let dir = tmpdir();
+        let split = dir.join("split.txt");
+        let mut text = vec![b'x'; CHUNK - 1];
+        text.extend_from_slice(b"\r\n");
+        text.extend_from_slice(b"y\r\n");
+        std::fs::write(&split, &text).unwrap();
+        assert_eq!(endings(&split), Some(Endings::Crlf));
+
+        let mixed = dir.join("mixed.txt");
+        std::fs::write(&mixed, b"a\nb\r\nc\r\n").unwrap();
+        assert_eq!(endings(&mixed), None);
+
+        // Nothing to read them off: a file that is not there, a directory, and
+        // a file the write cap does not reach.
+        assert_eq!(endings(&dir.join("nope.txt")), None);
+        assert_eq!(endings(&dir), None);
+        let over = dir.join("over.txt");
+        std::fs::File::create(&over)
+            .unwrap()
+            .set_len(MAX_FILE_BYTES + 1)
+            .unwrap();
+        assert_eq!(endings(&over), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Text is brought into the file's own endings as a whole line does: a
+    /// newline at the very start of the text counts, a carriage return that ends
+    /// no line is left where it is, and multi-byte characters survive the trip.
+    #[test]
+    fn the_text_is_brought_into_the_endings_of_the_file() {
+        assert_eq!(crlf_lines("\na\n"), Some("\r\na\r\n".into()));
+        assert_eq!(crlf_lines("a\rb\n"), Some("a\rb\r\n".into()));
+        assert_eq!(crlf_lines("a\r\n"), None);
+        assert_eq!(crlf_lines("no newline at all"), None);
+        assert_eq!(lf_lines("é\r\n日\r\n"), Some("é\n日\n".into()));
+        assert_eq!(lf_lines("é\n日\n"), None);
+        assert_eq!(
+            lf_lines("a\rb"),
+            None,
+            "a carriage return ends no line here"
+        );
+    }
+
+    /// A text that only reads as what is already on disk once it is in the
+    /// file's endings is still left alone: the comparison is made on the bytes a
+    /// write would land, not on the ones the call sent.
+    #[cfg(unix)]
+    #[test]
+    fn write_answers_unchanged_for_text_it_brought_over() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tmpdir();
+        let p = dir.join("crlf.txt");
+        std::fs::write(&p, "a\r\nb\r\n").unwrap();
+        let inode = std::fs::metadata(&p).unwrap().ino();
+        let out = write(&format!(
+            r#"{{"file_path":{:?},"content":"a\nb\n"}}"#,
+            p.to_string_lossy()
+        ));
+        assert!(out.contains("already has exactly this content"), "{out}");
+        assert_eq!(std::fs::metadata(&p).unwrap().ino(), inode);
+        assert_eq!(std::fs::read(&p).unwrap(), b"a\r\nb\r\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

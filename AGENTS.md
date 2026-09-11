@@ -154,6 +154,14 @@ that talks to a network API and drives an interactive terminal.
   rewritten, a directory or anything else that is not a regular file is refused before
   anything is created, and a write that fails removes its temp file. What is refusable
   is refused before a byte is written.
+- **A whole-file write carries the file's line endings over**, since the endings are
+  the one thing it does not replace deliberately: a rewrite sent in LF keeps a CRLF
+  file CRLF and the other way round, so the diff is the size of what the model meant
+  to change instead of every line of the file. Where there is no one style to follow
+  — a file being created, endings that are mixed, a file with no line ending to go by,
+  or one too large to read the endings off — what the call sent is what lands. The
+  endings are read off the file itself and never guessed from the extension, and the
+  result says when the text was brought into them.
 - **Approval gate**: execution is trusted by default; with `--ask`, Bash/Edit/Write
   require a user y/N before running (a call that changes nothing on disk is always
   allowed: reading, and writing the todo list). Denial, cancellation,
