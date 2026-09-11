@@ -1,5 +1,6 @@
 pub mod ask;
 mod fs;
+mod glob;
 mod shell;
 pub mod todo;
 
@@ -8,6 +9,11 @@ use crate::types::ToolDef;
 /// Name of the read-only tool referenced by the approval gate policy (never
 /// needs to ask the user).
 pub const READ_NAME: &str = fs::READ_NAME;
+
+/// The same for the tool that lists the files a pattern matches: it is the read
+/// side of the workspace without opening anything, so it never needs to ask
+/// either.
+pub const GLOB_NAME: &str = glob::NAME;
 
 /// Name of the one tool whose result is a person's answer rather than the
 /// machine's: the interpreter recognizes it before dispatching anything.
@@ -54,7 +60,9 @@ impl Live for Silent {
 }
 
 /// All tool definitions. The order is fixed: changing it changes the request
-/// prefix and causes a full KVCache miss.
+/// prefix and causes a full KVCache miss -- which is why a tool added later
+/// goes at the end of the list, the one place where everything a session
+/// already sent stays byte-for-byte what it was.
 pub fn definitions() -> Vec<ToolDef> {
     vec![
         shell::definition(),
@@ -63,6 +71,7 @@ pub fn definitions() -> Vec<ToolDef> {
         fs::write_definition(),
         ask::definition(),
         todo::definition(),
+        glob::definition(),
     ]
 }
 
@@ -71,18 +80,22 @@ pub fn definitions() -> Vec<ToolDef> {
 ///
 /// A blacklist and not a list of the calls that write: a tool added later is one
 /// nobody has decided about yet, and the safe reading of "nobody has decided" is
-/// to ask rather than to run. The two that are settled: reading changes nothing,
-/// and a todo list is a note to the user rather than a change to anything, so
-/// putting a y/N in front of it would only teach the reader to answer without
-/// looking.
+/// to ask rather than to run. The three that are settled: reading changes
+/// nothing, looking for a file to read changes nothing either, and a todo list
+/// is a note to the user rather than a change to anything -- so putting a y/N in
+/// front of one of them would only teach the reader to answer without looking.
 pub fn changes_files(name: &str) -> bool {
-    !matches!(name, READ_NAME | TODO_NAME)
+    !matches!(name, READ_NAME | GLOB_NAME | TODO_NAME)
 }
 
 /// Whether a call names a file: the three tools that operate on one. These are
 /// the calls whose target directory's own instructions can be discovered from
 /// the call — a Bash command can `cat` anything, and what it named is not
 /// recoverable from its arguments.
+///
+/// Glob is not one of them: it names a directory to look in, and the
+/// instructions that apply to a file are discovered by the Read that file is
+/// read with, which is the call that names the file itself.
 pub fn carries_file_path(name: &str) -> bool {
     matches!(name, fs::READ_NAME | fs::EDIT_NAME | fs::WRITE_NAME)
 }
@@ -122,16 +135,18 @@ pub async fn execute_live(name: &str, args_json: &str, live: &mut dyn Live) -> S
         fs::EDIT_NAME => fs::edit(args_json),
         fs::WRITE_NAME => fs::write(args_json),
         todo::TODO_NAME => todo::execute(args_json),
+        glob::NAME => glob::glob(args_json),
         ask::ASK_NAME => {
             format!("error: {ASK_NAME} is answered by the front end and cannot be executed here")
         }
         other => format!(
-            "error: unknown tool {other:?}. Available tools: Bash, {}, {}, {}, {}, {}",
+            "error: unknown tool {other:?}. Available tools: Bash, {}, {}, {}, {}, {}, {}",
             fs::READ_NAME,
             fs::EDIT_NAME,
             fs::WRITE_NAME,
             ASK_NAME,
-            TODO_NAME
+            TODO_NAME,
+            glob::NAME
         ),
     }
 }
@@ -209,13 +224,14 @@ mod tests {
                 "Edit",
                 "Write",
                 "AskUserQuestion",
-                "TodoWrite"
+                "TodoWrite",
+                "Glob"
             ]
         );
     }
 
     /// The gate's policy: the calls that change something on disk are asked
-    /// about, and the two that cannot go wrong are not.
+    /// about, and the three that cannot go wrong are not.
     #[test]
     fn the_gate_asks_about_the_calls_that_change_disk() {
         for name in ["Bash", "Edit", "Write"] {
@@ -224,7 +240,7 @@ mod tests {
                 "{name} changes disk and is asked about"
             );
         }
-        for name in [READ_NAME, TODO_NAME] {
+        for name in [READ_NAME, GLOB_NAME, TODO_NAME] {
             assert!(!changes_files(name), "{name} changes nothing to ask about");
         }
         // A tool nobody has decided about yet is asked about rather than run:
@@ -257,6 +273,19 @@ mod tests {
     async fn dispatch_reaches_shell() {
         let out = execute("Bash", r#"{"command":"echo dispatched"}"#).await;
         assert!(out.contains("dispatched"));
+    }
+
+    /// The glob tool is dispatched like the others: its answer is text, and
+    /// which files a pattern matches is the tool's own business.
+    #[tokio::test]
+    async fn dispatch_reaches_the_glob_tool() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let out = execute(
+            GLOB_NAME,
+            &format!(r#"{{"pattern":"Cargo.toml","path":{manifest:?}}}"#),
+        )
+        .await;
+        assert!(out.ends_with("Cargo.toml"), "{out}");
     }
 
     /// The todo tool is dispatched like the tools that touch the world, even

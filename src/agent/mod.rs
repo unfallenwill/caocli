@@ -41,7 +41,7 @@ pub struct Agent {
 pub enum Approval {
     /// Execution is trusted; every call runs.
     Trusted,
-    /// Bash/Edit/Write ask the user first (Read never does).
+    /// Bash/Edit/Write ask the user first (Read and Glob never do).
     Ask,
 }
 

@@ -6,13 +6,15 @@
 A minimal terminal coding agent in Rust, backed by two wire protocols: an
 OpenAI-compatible `/chat/completions` API (DeepSeek by default, Z.AI's GLM
 coding endpoint via `--provider zai-coding-cn`) and an Anthropic-compatible
-`/v1/messages` API (MiniMax's M3 via `--provider minimax`). It streams the model's thinking (`reasoning_content`) in
-dim gray, then runs a tool loop over six tools: `Bash`, `Read`, `Edit`,
+`/v1/messages` API (MiniMax's M3 via `--provider minimax`). It streams the
+model's thinking (`reasoning_content`) in dim gray, then runs a tool loop over
+seven tools: `Bash`, `Read`, `Glob` (which finds files by name), `Edit`,
 `Write`, `AskUserQuestion` (which asks you rather than the filesystem) and
-`TodoWrite` (which writes the plan where you can see it while it works). Both backends see images, which are attached with `/image` or
-`--image` and travel inside the message itself. Project instructions in the
-workspace's `AGENTS.md` files are read when a session starts and sent with
-every request (see [Project instructions](#project-instructions-agentsmd)).
+`TodoWrite` (which writes the plan where you can see it while it works). Both
+backends see images, which are attached with `/image` or `--image` and travel
+inside the message itself. Project instructions in the workspace's `AGENTS.md`
+files are read when a session starts and sent with every request (see
+[Project instructions](#project-instructions-agentsmd)).
 Sessions are append-only JSONL
 logs under `~/.caocli/sessions/`, resumable across runs and replayed
 byte-for-byte so the backend's prefix cache keeps hitting.
@@ -101,7 +103,7 @@ newlines also works (bracketed paste).
 | `-c, --cont` | Continue the most recent session |
 | `--resume <ID>` | Resume a specific session by id |
 | `--list` | List sessions and exit |
-| `--ask` | Approval gate: ask y/N before Bash/Edit/Write (Read always allowed, as is `TodoWrite`, which changes nothing; a question reaches you either way). Denials are recorded as deterministic markers the model can see and adapt to. |
+| `--ask` | Approval gate: ask y/N before Bash/Edit/Write (Read always allowed, and so is `Glob` — looking for a file to read changes nothing on disk — as is `TodoWrite`; a question reaches you either way). Denials are recorded as deterministic markers the model can see and adapt to. |
 | `--no-tui` | Keep the plain prompt instead of the full-screen front end |
 | `--no-status-bar` | Disable the plain prompt's status bar |
 | `-h, --help` / `-V, --version` | Print help / version |
@@ -326,13 +328,14 @@ There are no API key variables: a key is only ever what `/login` stored.
 
 ## Tools
 
-The model can call six tools. Tool results are always plain text: failures
+The model can call seven tools. Tool results are always plain text: failures
 are returned to the model as text so it can recover, never as a hard error.
 
 | Tool | Behavior |
 |---|---|
 | `Bash` | Run one `bash -c` command. What it prints while it runs is streamed to you as it arrives; what the model reads is the result, and each stream is kept to 10 KiB there — shown from both ends, with what fell between them counted in its place. A command that runs past its timeout is killed *with everything it started*: 120s by default, up to 1800 with `timeout`. A job that should outlive the call — a build, a server, a test run — is started with `background: true`, which returns at once with the pid and the file its output goes to. Nothing a call runs can reach the terminal the front end owns, and a screen editor is refused rather than left to hang. |
 | `Read` | Read a UTF-8 text file, one numbered row per line. `offset`/`limit` page through a long file, and the file is streamed: a page costs one page of memory however large the file is, and the marker after the last row says which lines were shown, how many lines the file has, and where to read on. A page whose lines end with CRLF says so, and so does a file whose last line has no newline after it: the two things about a file's shape that decide whether an `Edit` will match. |
+| `Glob` | Find the files whose name matches a pattern, under `path` and below it (the working directory when no `path` is given) — how a file is found to `Read`. `*` and `?` stop at a `/`, `**` as a whole name stands for any number of directories, `[abc]` is a class, and a backslash is literal. A pattern with no `/` in it is asked at any depth, as if it began with `**/`: `*.rs` is where the `.rs` files are. The answer lists absolute paths, most recently modified first, ties by path, files only. A directory whose name starts with a dot, and `node_modules` and `target`, are entered only when the pattern names them exactly (`target/**/*.rs`, or `target` as the `path`) — they are whole cache, build and vendored trees, and a workspace holds more files in them than in its source. Finding nothing is a sentence, not an error. |
 | `Edit` | Replace `old_string` with `new_string`; `old_string` must match exactly once, endings included. A call that matches nothing is answered with the text in the file that comes nearest — numbered as `Read` numbers it — and every difference between the two, with the file's line endings named when they are the whole of it; one that matches more than once is answered with the lines each occurrence is at and what stands beside it. The next call is written from that instead of another `Read`. The text inserted is written in the file's own line endings, so a replacement typed with plain newlines lands as the file's own. Written atomically via tmp + rename. |
 | `Write` | Create or fully overwrite a file; parent directories are created automatically. The write lands on the file the path finally names: a symlink is followed to its target rather than replaced by a regular file, and an overwrite keeps the target's own permissions. The text lands in the target's own line endings, so a whole-file rewrite in the other ones is not a change to every line of the file; a file being created, one whose endings are mixed, and one over 10MB are written exactly as they were sent. Content that is already there is left unchanged, and a write that fails takes its temp file with it. |
 | `AskUserQuestion` | Ask you to choose: up to four questions, each with up to four options. The answer comes back as the call's result (`<id>: <chosen label>`), so the model continues with what you picked. |
@@ -342,7 +345,9 @@ Limits: 10 KiB of output per tool result per stream (a longer one keeps its two
 ends and says how much is missing from between them), 10 MB per file written or
 edited. A read streams and holds only the page it answers with, so what bounds it
 is how long the scan behind a page may take: 256 MB, past which a range of the
-file is a `Bash` call.
+file is a `Bash` call. A glob lists at most 100 paths, and stops after examining
+100000 entries; every cap that cut an answer short is named in its last line, so
+a short list is never read as a small tree.
 
 ### The task list
 
@@ -414,9 +419,10 @@ wherever the answer is typed:
   written: lines typed while a turn runs are queued and the head runs when
   the turn ends, interrupted or not.
 - **Approval gate and step cap.** With `--ask`, Bash/Edit/Write wait for an
-  explicit y/N (Read never blocks, and neither does `TodoWrite`: a question in
-  front of a call that cannot go wrong is a question that teaches you to answer
-  without reading); a denial is committed as a tool result
+  explicit y/N (Read never blocks, and neither does `Glob`, which only looks at
+  names; `TodoWrite` is the third that cannot go wrong, and a question in front
+  of such a call is a question that teaches you to answer without reading); a
+  denial is committed as a tool result
   the model reads and adapts to. Every turn is also capped at
   `machine::MAX_TOOL_STEPS` (500) tool-call steps so a looping model cannot
   burn tokens forever — the cap closes the turn with deterministic markers.

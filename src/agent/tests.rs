@@ -1099,7 +1099,8 @@ async fn mock_write_tool_creates_file() {
             "Edit",
             "Write",
             "AskUserQuestion",
-            "TodoWrite"
+            "TodoWrite",
+            "Glob"
         ]
     );
     std::fs::remove_dir_all(&dir).unwrap();
