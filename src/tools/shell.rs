@@ -59,6 +59,42 @@ const REAP_SECS: u64 = 1;
 /// The code a command that ran out of time is reported with, as `timeout(1)` does.
 const TIMEOUT_CODE: i32 = 124;
 
+/// The programs that draw a screen, and cannot draw one here.
+///
+/// Measured, with the standard input at an end of file and the output a pipe as
+/// every call's is: `vim` starts, warns twice, and then never exits -- the screen
+/// it is drawing is not at its end and there is no keyboard to leave it with, so the
+/// call runs until the timeout kills it and the result is 10 KB of terminal control
+/// codes that changed no file. The same command with its output redirected to a file
+/// exits by itself in two seconds, which is why the pipe is what the measurement is
+/// made with. Nothing else is refused, because everything else either fails at once
+/// on its own (`top: failed tty get`, `sudo: A terminal is required to authenticate`
+/// -- both measured in a tenth of a second) or is a long-lived command whose place
+/// is the background.
+const SCREEN_EDITORS: &[&str] = &[
+    "vi", "vim", "nvim", "nano", "pico", "emacs", "micro", "joe", "mcedit",
+];
+
+/// The programs whose own program is the one that follows them.
+///
+/// A call to `sudo vim f` is a call to an editor, and reading it as a call to sudo
+/// would be reading the command for what it does not say. What is stepped over is a
+/// wrapper and its flags: a wrapper's own argument (`sudo -u root vim f`) is read as
+/// the program and hides what follows it, which costs a refusal rather than making
+/// one that is wrong.
+const WRAPPERS: &[&str] = &[
+    "sudo", "doas", "env", "nice", "ionice", "time", "command", "exec", "nohup", "setsid",
+    "stdbuf", "xargs",
+];
+
+/// The flags that ask one of them for the mode where nothing is drawn.
+///
+/// A screen editor is not refused for existing, but for drawing: `vim -es` reads
+/// its commands from where a screen would have typed them, which is a way to edit
+/// a file from here (measured: it edits one and prints nothing), and `emacs
+/// -batch` is the same idea.
+const SCRIPT_FLAGS: &[&str] = &["-es", "-e", "-E", "--batch", "-batch"];
+
 pub fn definition() -> ToolDef {
     ToolDef {
         r#type: "function".into(),
@@ -80,7 +116,9 @@ pub fn definition() -> ToolDef {
                  A command that runs past its timeout is killed, with everything it started: 120s \
                  unless timeout says otherwise (at most 1800), and a job that wants longer belongs \
                  in the background, where its output can be polled from a file. \
-                 Do not run something that waits for a terminal (an editor, a pager, top)."
+                 A screen editor (vim, nano, ...) is refused: nothing a call runs has a terminal, \
+                 so one would only draw its interface into the result. Edit a file with Edit/Write, \
+                 or with sed -i, python3 -c, or the editor's own script mode (vim -es)."
                     .into(),
             ),
             parameters: Some(json!({
@@ -109,8 +147,117 @@ pub async fn execute(args_json: &str) -> String {
         Ok(budget) => budget,
         Err(e) => return e,
     };
+    // Refused before the command is run, the way a write refuses a path that is a
+    // directory: what cannot work is answered with what to do instead rather than
+    // with whatever it does to a screen it cannot have.
+    if let Some(editor) = screen_editor(command) {
+        return format!(
+            "error: {editor} is a screen editor, and a call has no screen: it would draw its \
+             whole interface into the result as escape codes and edit nothing. Edit a file with \
+             Edit/Write, or with something that needs no screen -- sed -i, python3 -c, or the \
+             editor's own script mode (vim -es)."
+        );
+    }
 
     run(command, budget).await
+}
+
+/// The program this call runs that cannot run here, if there is one.
+///
+/// The command is read the way a shell splits it, quotes and all: a separator
+/// inside quotes is text a command is being given rather than the end of one, so
+/// `echo "a; vim b"` is not a call to an editor. A wrapper is not seen through --
+/// `sudo vim`, or a program that opens an editor of its own (`git commit` with no
+/// message): those are left to fail by themselves, which they now do in a tenth of
+/// a second, and the editor variables the child is given turn the second kind into
+/// an error of its own instead of a screen.
+fn screen_editor(command: &str) -> Option<&'static str> {
+    for simple in simple_commands(command) {
+        let mut words = simple.split_whitespace();
+        // An assignment in front of the program is part of the setting of the
+        // command rather than the command: `FOO=1 vim f` is a call to vim.
+        let mut wrapped = false;
+        let program = loop {
+            let Some(word) = words.next() else { break None };
+            if is_assignment(word) || (wrapped && word.starts_with('-')) {
+                continue;
+            }
+            if WRAPPERS.contains(&word) {
+                wrapped = true;
+                continue;
+            }
+            break Some(word);
+        };
+        let Some(program) = program else { continue };
+        let name = program.rsplit('/').next().unwrap_or(program);
+        let script_mode = words.any(|word| SCRIPT_FLAGS.contains(&word));
+        if script_mode {
+            continue;
+        }
+        if let Some(editor) = SCREEN_EDITORS.iter().find(|e| **e == name) {
+            return Some(editor);
+        }
+    }
+    None
+}
+
+/// The simple commands in `command`, split where a shell would run one instead of
+/// another, and nowhere else: a separator inside quotes is text, and a run of them
+/// (`&&`, `||`, `;;`) is one break rather than several.
+fn simple_commands(command: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    // Whether the character just read was part of a break.
+    let mut broken = false;
+    for (i, c) in command.char_indices() {
+        if escaped {
+            escaped = false;
+        } else {
+            match quote {
+                Some(q) if c == q => quote = None,
+                Some('"') if c == '\\' => escaped = true,
+                Some(_) => {}
+                None if c == '\'' || c == '"' => quote = Some(c),
+                None if c == '\\' => escaped = true,
+                None if is_break(c) => {
+                    if !broken {
+                        out.push(&command[start..i]);
+                    }
+                    start = i + c.len_utf8();
+                    broken = true;
+                    continue;
+                }
+                None => {}
+            }
+        }
+        // Anything that is not a break ends one.
+        broken = false;
+    }
+    out.push(&command[start..]);
+    out
+}
+
+/// Whether a character is a place a shell would end one simple command and begin the
+/// next.
+fn is_break(c: char) -> bool {
+    matches!(c, ';' | '|' | '&' | '\n' | '(' | ')')
+}
+
+/// Whether a word sets a variable for the command that follows it.
+fn is_assignment(word: &str) -> bool {
+    match word.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
 }
 
 /// How long the call asked to be given, and [`TIMEOUT_SECS`] when it said nothing.
@@ -332,6 +479,16 @@ impl Group {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // An editor is the one thing a program here may still try to open: it is
+            // named by a variable rather than by the program's own name, so nothing
+            // about the command says so and nothing can refuse it ahead of time.
+            // Both variables therefore point at `true`, which changes nothing and
+            // says so -- measured: `git commit` with no message draws a screen into
+            // the result before it gives its own error, and with these it gives only
+            // the error. A call that sets either one itself overrides this, which is
+            // the last word on the subject.
+            .env("GIT_EDITOR", "true")
+            .env("EDITOR", "true")
             .kill_on_drop(true);
         #[cfg(unix)]
         // SAFETY: `setsid` takes no arguments and touches nothing but the child's
@@ -547,6 +704,123 @@ mod tests {
         assert!(out.contains("exit_code: 124"), "{out}");
         assert!(out.contains("longer than 1s"), "{out}");
         assert!(out.contains("with the timeout argument"), "{out}");
+    }
+
+    /// A screen editor in the place a shell would run one is found, whatever else
+    /// the command does around it. Read rather than run, on purpose: these commands
+    /// are the ones that hang, so a regression here must fail a test rather than
+    /// hang the suite.
+    #[test]
+    fn a_screen_editor_in_command_position_is_found() {
+        for command in [
+            "vim notes.txt",
+            "cd /tmp && nano notes.txt",
+            "cat notes.txt | vi",
+            "/usr/bin/vim notes.txt",
+            "FOO=1 vim notes.txt",
+            "printf x > f\nemacs -nw f",
+            "grep -n x f; vim f",
+            "vi",
+            "nice vim f",
+            "sudo vim /etc/hostname",
+            "env FOO=1 -i vim f",
+            "xargs -0 vim",
+        ] {
+            assert!(screen_editor(command).is_some(), "{command}");
+        }
+    }
+
+    /// What a refused call is answered with says what to do instead. The editor
+    /// named here is one this machine does not have, so the assertion is about the
+    /// refusal reaching the model and cannot be satisfied by running the editor.
+    #[tokio::test]
+    async fn a_refusal_says_what_to_do_instead() {
+        let out = execute(r#"{"command":"nvim notes.txt"}"#).await;
+        assert!(refused(&out), "{out}");
+        assert!(out.contains("Edit/Write"), "{out}");
+        assert!(out.contains("vim -es"), "{out}");
+    }
+
+    /// The command is a command, not the text it contains: a name is only worth
+    /// refusing where a shell would have run it.
+    #[test]
+    fn naming_an_editor_is_not_running_one() {
+        for command in [
+            "echo vim",
+            "echo 'a; vim b'",
+            "grep -rn vim src | head -3",
+            "git log --oneline --grep=vim",
+            "test -f vim || echo 'no vim here'",
+            r#"echo "an editor: vim""#,
+            "sed -n 1p vim",
+            "cp vim vim.bak",
+            "git commit -m 'a message about vim'",
+        ] {
+            assert_eq!(screen_editor(command), None, "{command}");
+        }
+    }
+
+    /// A wrapper's own argument hides what follows it. That is a refusal missed
+    /// rather than one made wrongly, which is the way round a list of names has to
+    /// err: a missed one costs a call that hangs, a wrong one takes a command away
+    /// from the model.
+    #[test]
+    fn a_wrappers_own_argument_is_not_read_as_the_program() {
+        assert_eq!(screen_editor("sudo -u root cat README.md"), None);
+        assert_eq!(screen_editor("nice -n 5 vim f"), None);
+    }
+
+    /// The editor an editor variable names cannot be refused by name, so the
+    /// variables are pointed at something that changes nothing: a program that opens
+    /// one fails with its own error instead of drawing a screen first.
+    #[tokio::test]
+    async fn a_program_that_opens_an_editor_fails_by_itself() {
+        // `/` is not a repository: what git says here is that there is nothing to
+        // commit from, which is its own error rather than a screen.
+        let out =
+            execute(r#"{"command":"echo \"$GIT_EDITOR $EDITOR\"; cd / && git commit"}"#).await;
+        assert!(out.contains("true true"), "{out}");
+        assert!(!out.contains("\u{1b}["), "{out}");
+    }
+
+    /// The editor's own script mode is the exception the list is written with, and
+    /// it is a real way to edit a file from here.
+    #[tokio::test]
+    async fn an_editors_script_mode_may_edit_a_file() {
+        let path = std::env::temp_dir().join(format!("caocli-vim-{}", std::process::id()));
+        std::fs::write(&path, "before\n").unwrap();
+        let command = format!(
+            "vim -es -c '%s/before/after/' -c wq {}",
+            path.to_string_lossy()
+        );
+        let out = execute(&json!({ "command": command }).to_string()).await;
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(text, "after\n", "{out}");
+    }
+
+    #[test]
+    fn simple_commands_split_where_a_shell_would_run_one() {
+        assert_eq!(simple_commands("a; b && c | d"), ["a", " b ", " c ", " d"]);
+        assert_eq!(simple_commands("echo 'a; b'"), ["echo 'a; b'"]);
+        assert_eq!(simple_commands(r#"echo "a | b""#), [r#"echo "a | b""#]);
+        assert_eq!(simple_commands(r#"echo a\;\ b"#), [r#"echo a\;\ b"#]);
+        assert_eq!(simple_commands("(cd x && ls)"), ["", "cd x ", " ls", ""]);
+        assert_eq!(simple_commands("ls;"), ["ls", ""]);
+    }
+
+    /// Whether a result is the refusal rather than whatever the command did.
+    fn refused(out: &str) -> bool {
+        out.starts_with("error: ") && out.contains("a call has no screen")
+    }
+
+    #[test]
+    fn assignments_are_not_the_program() {
+        assert!(is_assignment("FOO=1"));
+        assert!(is_assignment("_x="));
+        assert!(is_assignment("echo=1=2"));
+        assert!(!is_assignment("1FOO=1"));
+        assert!(!is_assignment("FOO"));
     }
 
     /// A short output is the whole output: the head and the tail put back together
