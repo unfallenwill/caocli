@@ -31,6 +31,9 @@ pub(super) enum Notice {
         args: String,
     },
     ToolResult(String),
+    /// A directory's instructions were picked up mid-session; the string is
+    /// the directory, and the cell it becomes is the same one the replay folds.
+    Instructions(String),
     Usage(Usage, Duration),
     Interrupted,
     Approval {
@@ -87,6 +90,9 @@ impl Ui for Notifier {
     }
     fn tool_result(&mut self, result: &str) {
         self.send(Notice::ToolResult(result.to_owned()));
+    }
+    fn instructions(&mut self, dir: &str) {
+        self.send(Notice::Instructions(dir.to_owned()));
     }
     fn usage(&mut self, usage: &Usage, stream: Duration) {
         self.send(Notice::Usage(usage.clone(), stream));

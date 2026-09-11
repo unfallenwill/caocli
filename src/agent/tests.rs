@@ -8,6 +8,7 @@
 
 use super::*;
 
+use crate::agents_md;
 use crate::session::SessionMeta;
 use crate::types::Role;
 use crate::ui::Renderer;
@@ -42,6 +43,7 @@ fn test_meta() -> SessionMeta {
         provider: Some("deepseek".into()),
         model: "deepseek-v4-flash".into(),
         reasoning_effort: Some("high".into()),
+        instructions: None,
     }
 }
 
@@ -195,6 +197,271 @@ async fn mock_full_tool_loop_replays_reasoning_content() {
     assert_eq!(body["reasoning_effort"], "high");
     assert_eq!(body["tools"][0]["function"]["name"], "Bash");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A workspace with a subdirectory whose AGENTS.md a file-tool call can
+/// discover: the workspace root, the subdirectory, and a file in it to
+/// operate on.
+fn nested_workspace() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let root = tmpdir();
+    let sub = root.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("AGENTS.md"), "the subdirectory's own rules").unwrap();
+    let file = sub.join("notes.txt");
+    std::fs::write(&file, "hello\n").unwrap();
+    (root, sub, file)
+}
+
+/// First touch of a directory with instructions of its own: the instructions
+/// are appended where a user message is legal — after the result window has
+/// closed — and the second sub-request carries them, so the model reads them
+/// in the same turn that touched the directory.
+#[tokio::test]
+async fn mock_first_touch_of_a_directory_appends_its_instructions() {
+    let server = MockServer::start().await;
+    let (root, sub, file) = nested_workspace();
+    let read_args = format!(r#"{{"file_path":"{}"}}"#, file.display());
+    let turn1 = [
+        sse(json!({"tool_calls":[
+            {"index":0,"id":"call_r1","type":"function","function":{"name":"Read","arguments": read_args }}
+        ]}), None, None),
+        sse(json!({"content":""}), Some("tool_calls"), None),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    let turn2 = [
+        sse(json!({"content":"Read it."}), None, None),
+        sse(json!({"content":""}), Some("stop"), None),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    mount_chat(&server, turn1, Some(1)).await;
+    mount_chat(&server, turn2, None).await;
+
+    let dir = tmpdir();
+    let mut agent = test_agent(&server, &dir);
+    let mut ui = Renderer::new();
+    agent
+        .turn(
+            &format!("read {}", file.display()),
+            &mut ui,
+            &mut NoCancel,
+            &mut Answer::denies(),
+            &mut NoQuestions,
+        )
+        .await
+        .unwrap();
+
+    // history: user / assistant(call) / tool(result) / user(inject) / assistant
+    assert_eq!(
+        agent.session.messages.len(),
+        5,
+        "the injection sits between the result and the answer"
+    );
+    let injected = &agent.session.messages[3];
+    assert_eq!(injected.role, Role::User);
+    let text = injected.text().unwrap();
+    assert!(
+        text.starts_with(agents_md::INJECT_LEAD),
+        "the injection is in its own shape: {text}"
+    );
+    assert!(
+        text.contains(&sub.display().to_string()),
+        "it names the directory it came from: {text}"
+    );
+    assert!(
+        text.contains("the subdirectory's own rules"),
+        "it carries the content: {text}"
+    );
+
+    // the second sub-request carried the injection after the tool result
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 2);
+    let body: serde_json::Value = serde_json::from_slice(&reqs[1].body).unwrap();
+    let msgs = body["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 5); // system + user + assistant + tool + inject
+    assert_eq!(msgs[3]["role"], "tool");
+    assert_eq!(msgs[4]["role"], "user");
+    assert!(
+        msgs[4]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(agents_md::INJECT_LEAD),
+        "the request carries what the log carries"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// A directory is injected once per session, not once per call: the second
+/// turn to touch it finds the log already carrying the injection.
+#[tokio::test]
+async fn mock_a_directory_is_injected_once_per_session() {
+    let server = MockServer::start().await;
+    let (root, _sub, file) = nested_workspace();
+    let read_args = format!(r#"{{"file_path":"{}"}}"#, file.display());
+    let read_call = |id: &str| {
+        json!({"tool_calls":[
+            {"index":0,"id":id,"type":"function","function":{"name":"Read","arguments": read_args.as_str() }}
+        ]})
+    };
+    let turn1 = [
+        sse(read_call("call_a1"), None, None),
+        sse(json!({"content":""}), Some("tool_calls"), None),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    let turn2 = [
+        sse(json!({"content":"first answer"}), None, None),
+        sse(json!({"content":""}), Some("stop"), None),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    mount_chat(&server, turn1.clone(), Some(1)).await;
+    mount_chat(&server, turn2.clone(), Some(1)).await;
+    mount_chat(&server, turn1, Some(1)).await;
+    mount_chat(&server, turn2, None).await;
+
+    let dir = tmpdir();
+    let mut agent = test_agent(&server, &dir);
+    let mut ui = Renderer::new();
+    for prompt in ["read it once", "read it again"] {
+        agent
+            .turn(
+                prompt,
+                &mut ui,
+                &mut NoCancel,
+                &mut Answer::denies(),
+                &mut NoQuestions,
+            )
+            .await
+            .unwrap();
+    }
+
+    // 4 messages per plain turn, plus the one injection the first turn made
+    assert_eq!(agent.session.messages.len(), 9);
+    let injections = agent
+        .session
+        .messages
+        .iter()
+        .filter(|m| {
+            m.text()
+                .is_some_and(|t| t.starts_with(agents_md::INJECT_LEAD))
+        })
+        .count();
+    assert_eq!(injections, 1, "the second touch appended nothing");
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// A window of several declared calls keeps its results on uninterrupted: the
+/// injection is appended after the last result, where a user message is
+/// legal, never between the results of one window (a shape the backend
+/// refuses, and the request tripwire panics on).
+#[tokio::test]
+async fn mock_multi_call_window_injects_after_the_last_result() {
+    let server = MockServer::start().await;
+    let (root, sub, file) = nested_workspace();
+    let read_args = format!(r#"{{"file_path":"{}"}}"#, file.display());
+    let turn1 = [
+        sse(json!({"tool_calls":[
+            {"index":0,"id":"call_w1","type":"function","function":{"name":"Read","arguments": read_args }},
+            {"index":1,"id":"call_w2","type":"function","function":{"name":"Read","arguments": read_args }}
+        ]}), None, None),
+        sse(json!({"content":""}), Some("tool_calls"), None),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    let turn2 = [
+        sse(json!({"content":"Both read."}), None, None),
+        sse(json!({"content":""}), Some("stop"), None),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    mount_chat(&server, turn1, Some(1)).await;
+    mount_chat(&server, turn2, None).await;
+
+    let dir = tmpdir();
+    let mut agent = test_agent(&server, &dir);
+    let mut ui = Renderer::new();
+    agent
+        .turn(
+            "read it twice",
+            &mut ui,
+            &mut NoCancel,
+            &mut Answer::denies(),
+            &mut NoQuestions,
+        )
+        .await
+        .unwrap();
+
+    // user / assistant(2 calls) / tool / tool / user(inject) / assistant — and
+    // not user / tool / user(inject) / tool, which would be an invalid history
+    assert_eq!(agent.session.messages.len(), 6);
+    assert_eq!(agent.session.messages[2].role, Role::Tool);
+    assert_eq!(agent.session.messages[3].role, Role::Tool);
+    assert_eq!(agent.session.messages[4].role, Role::User);
+    assert!(
+        agent.session.messages[4]
+            .text()
+            .unwrap()
+            .starts_with(agents_md::INJECT_LEAD)
+    );
+    assert_eq!(
+        agents_md::sent_dirs(&agent.session.messages),
+        [sub].into_iter().collect(),
+        "one directory, sent once"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// A Bash call names no file in any argument the interpreter can read, so it
+/// discovers nothing: instructions are a file-tool discovery here.
+#[tokio::test]
+async fn mock_a_bash_call_discovers_no_instructions() {
+    let server = MockServer::start().await;
+    let (root, _sub, file) = nested_workspace();
+    let cat = format!(r#"{{"command":"cat {}"}}"#, file.display());
+    let turn1 = [
+        sse(json!({"tool_calls":[
+            {"index":0,"id":"call_b1","type":"function","function":{"name":"Bash","arguments": cat }}
+        ]}), None, None),
+        sse(json!({"content":""}), Some("tool_calls"), None),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    let turn2 = [
+        sse(json!({"content":"Cat it."}), None, None),
+        sse(json!({"content":""}), Some("stop"), None),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    mount_chat(&server, turn1, Some(1)).await;
+    mount_chat(&server, turn2, None).await;
+
+    let dir = tmpdir();
+    let mut agent = test_agent(&server, &dir);
+    let mut ui = Renderer::new();
+    agent
+        .turn(
+            "cat the file",
+            &mut ui,
+            &mut NoCancel,
+            &mut Answer::denies(),
+            &mut NoQuestions,
+        )
+        .await
+        .unwrap();
+
+    // user / assistant(call) / tool(result) / assistant — and no injection
+    assert_eq!(agent.session.messages.len(), 4);
+    assert!(!agent.session.messages.iter().any(|m| {
+        m.text()
+            .is_some_and(|t| t.starts_with(agents_md::INJECT_LEAD))
+    }));
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 /// End to end: two tool calls declared at once. The interpreter must finish
