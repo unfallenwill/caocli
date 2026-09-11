@@ -202,9 +202,9 @@ struct Transcoder {
     tool_uses: HashMap<u32, u32>,
     /// The ordinal the next tool_use block gets.
     next_tool: u32,
-    /// What message_start reported about the input; emitted merged with
-    /// message_delta's output count, so usage lands once, complete.
-    input_usage: StreamUsage,
+    /// What the stream has reported about the prompt so far; emitted with the
+    /// output count, so usage lands once, complete.
+    usage: StreamUsage,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -212,6 +212,48 @@ struct StreamUsage {
     input_tokens: u64,
     cache_read: u64,
     cache_creation: u64,
+    output_tokens: u64,
+}
+
+impl StreamUsage {
+    /// Fold one event's usage object: every count the event carries is taken,
+    /// and one it leaves out keeps the value an earlier event reported.
+    ///
+    /// Reading a field off whichever event carries it is the whole point,
+    /// because the two ends of this wire disagree about where the input lives:
+    /// Anthropic's own stream reports it in message_start and only the output
+    /// count in message_delta, while MiniMax reports *zeros* in message_start
+    /// and the prompt — cache reads included — in message_delta. Keying on the
+    /// event rather than on the field loses one of them: a stream whose
+    /// message_delta carries the cache gets reported as no caching at all,
+    /// which is what the status line is built from.
+    fn merge(&mut self, usage: &serde_json::Value) {
+        for (key, slot) in [
+            ("input_tokens", &mut self.input_tokens),
+            ("cache_read_input_tokens", &mut self.cache_read),
+            ("cache_creation_input_tokens", &mut self.cache_creation),
+            ("output_tokens", &mut self.output_tokens),
+        ] {
+            if let Some(v) = usage.get(key).and_then(as_u64) {
+                *slot = v;
+            }
+        }
+    }
+
+    /// The counts in the DeepSeek spelling: hit = tokens served from cache,
+    /// miss = the rest of the prompt (this turn's uncached input and what it
+    /// wrote into the cache), total = the whole request and answer.
+    fn report(&self) -> Usage {
+        let prompt = self.input_tokens + self.cache_read + self.cache_creation;
+        Usage {
+            prompt_tokens: prompt,
+            completion_tokens: self.output_tokens,
+            total_tokens: prompt + self.output_tokens,
+            prompt_cache_hit_tokens: self.cache_read,
+            prompt_cache_miss_tokens: self.input_tokens + self.cache_creation,
+            prompt_tokens_details: None,
+        }
+    }
 }
 
 impl Transcoder {
@@ -222,17 +264,7 @@ impl Transcoder {
         match ev.get("type").and_then(|t| t.as_str()) {
             Some("message_start") => {
                 if let Some(u) = ev.pointer("/message/usage") {
-                    self.input_usage = StreamUsage {
-                        input_tokens: u.get("input_tokens").and_then(as_u64).unwrap_or(0),
-                        cache_read: u
-                            .get("cache_read_input_tokens")
-                            .and_then(as_u64)
-                            .unwrap_or(0),
-                        cache_creation: u
-                            .get("cache_creation_input_tokens")
-                            .and_then(as_u64)
-                            .unwrap_or(0),
-                    };
+                    self.usage.merge(u);
                 }
                 Ok(None)
             }
@@ -305,25 +337,16 @@ impl Transcoder {
                 Ok(Some(chunk_with(d)))
             }
             Some("message_delta") => {
-                // The last event that carries anything: the output count so
-                // far, merged with what message_start said about the input.
-                // Cache mapping, DeepSeek's spelling: hit = tokens served
-                // from cache, miss = the rest of the prompt (this turn's
-                // uncached input and what it wrote into the cache).
-                let output = ev
-                    .pointer("/usage/output_tokens")
-                    .and_then(as_u64)
-                    .unwrap_or(0);
-                let u = self.input_usage;
+                // The last event that carries anything. Its usage object is
+                // folded in whole rather than read for the output count alone:
+                // on this wire it is where the prompt of a stream whose
+                // message_start carried zeros — MiniMax's — actually arrives.
+                if let Some(u) = ev.pointer("/usage") {
+                    self.usage.merge(u);
+                }
                 Ok(Some(ChatChunk {
                     choices: Vec::new(),
-                    usage: Some(Usage {
-                        prompt_tokens: u.input_tokens + u.cache_read + u.cache_creation,
-                        completion_tokens: output,
-                        prompt_cache_hit_tokens: u.cache_read,
-                        prompt_cache_miss_tokens: u.input_tokens + u.cache_creation,
-                        ..Default::default()
-                    }),
+                    usage: Some(self.usage.report()),
                 }))
             }
             // A stream that reports its own failure is a failure: the
@@ -613,6 +636,68 @@ mod tests {
         );
         assert_eq!(u.completion_tokens, 42);
         assert_eq!(u.prompt_tokens, 200);
+        assert_eq!(u.total_tokens, 242, "the whole request and answer");
+    }
+
+    /// The usage shape MiniMax actually streams, read off the live endpoint:
+    /// message_start reports zeros and no cache fields at all, and
+    /// message_delta carries the whole prompt -- cache reads included. Keying
+    /// the cache on message_start reports such a stream as no caching, which
+    /// leaves the status line's hit/miss at zero for every turn.
+    #[tokio::test]
+    async fn anthropic_usage_lands_when_message_delta_carries_it() {
+        let body = [
+            event(
+                "message_start",
+                serde_json::json!({"type":"message_start","message":{"id":"m1","role":"assistant","model":"MiniMax-M3","usage":{"input_tokens":0,"output_tokens":0,"service_tier":"standard"}}}),
+            ),
+            event(
+                "content_block_delta",
+                serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"4"}}),
+            ),
+            event(
+                "message_delta",
+                serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":36,"output_tokens":12,"cache_read_input_tokens":128,"service_tier":"standard"}}),
+            ),
+            event("message_stop", serde_json::json!({"type":"message_stop"})),
+        ]
+        .concat();
+        let mut sse = openai_stream(&body);
+        sse.wire = Wire::Anthropic;
+        let mut usage = None;
+        while let Some(chunk) = sse.next_chunk().await.unwrap() {
+            if chunk.usage.is_some() {
+                usage = chunk.usage;
+            }
+        }
+        let u = usage.unwrap();
+        assert_eq!(
+            u.cache(),
+            Some(crate::types::CacheTokens { hit: 128, miss: 36 }),
+            "the cache read is the hit, the uncached input the miss"
+        );
+        assert_eq!(u.prompt_tokens, 164);
+        assert_eq!(u.completion_tokens, 12);
+        assert_eq!(u.total_tokens, 176);
+    }
+
+    /// A stream that ends without a message_delta reports nothing at all:
+    /// usage is never invented from a stream that did not report it.
+    #[tokio::test]
+    async fn anthropic_stream_without_message_delta_reports_no_usage() {
+        let body = [
+            event(
+                "message_start",
+                serde_json::json!({"type":"message_start","message":{"id":"m1","usage":{"input_tokens":10,"output_tokens":0}}}),
+            ),
+            event("message_stop", serde_json::json!({"type":"message_stop"})),
+        ]
+        .concat();
+        let mut sse = openai_stream(&body);
+        sse.wire = Wire::Anthropic;
+        while let Some(chunk) = sse.next_chunk().await.unwrap() {
+            assert!(chunk.usage.is_none());
+        }
     }
 
     #[tokio::test]

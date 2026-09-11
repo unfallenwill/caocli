@@ -91,6 +91,27 @@ impl Provider {
             self.efforts.join(" | ")
         )
     }
+
+    /// Whether this provider offers `effort`.
+    pub fn offers_effort(&self, effort: &str) -> bool {
+        self.efforts.contains(&effort)
+    }
+
+    /// The tier to carry into this provider: the one the session had when this
+    /// provider offers it, this provider's own default when it does not.
+    ///
+    /// A switch can move a session to another provider, whose tiers are its own
+    /// — MiniMax's thinking switch against DeepSeek's low/high/max, say. Sent,
+    /// the old tier is one backend's 400 and another's silent misreading;
+    /// shown, it names a tier the session is not running on. A session that
+    /// stored no tier keeps storing none, so the provider's default stays the
+    /// fallback it always was.
+    pub fn fit_effort(&self, effort: Option<&str>) -> Option<String> {
+        match effort {
+            Some(tier) if !self.offers_effort(tier) => Some(self.default_effort.to_string()),
+            other => other.map(str::to_owned),
+        }
+    }
 }
 
 pub const DEEPSEEK: Provider = Provider {
@@ -258,6 +279,27 @@ mod tests {
             assert!(err.contains("low | high | max"), "{bad}: {err}");
             assert!(err.contains("DeepSeek"), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn fit_effort_keeps_an_offered_tier_and_falls_back_to_the_default() {
+        // A tier the provider offers is the session's to keep: a switch from
+        // GLM to DeepSeek keeps `max`, which both serve.
+        assert_eq!(DEEPSEEK.fit_effort(Some("max")).as_deref(), Some("max"));
+        assert_eq!(
+            ZAI_CODING_CN.fit_effort(Some("low")).as_deref(),
+            Some("low")
+        );
+        assert_eq!(MINIMAX.fit_effort(Some("off")).as_deref(), Some("off"));
+        // One it does not offer is replaced by its own default: MiniMax has a
+        // thinking switch, not DeepSeek's tiers, and DeepSeek would answer a
+        // request carrying `on` with a 400.
+        assert_eq!(MINIMAX.fit_effort(Some("max")).as_deref(), Some("on"));
+        assert_eq!(DEEPSEEK.fit_effort(Some("on")).as_deref(), Some("max"));
+        // A session that stored no tier keeps storing none: the provider's
+        // default is already what the request falls back to.
+        assert_eq!(DEEPSEEK.fit_effort(None), None);
+        assert_eq!(MINIMAX.fit_effort(None), None);
     }
 
     #[test]
