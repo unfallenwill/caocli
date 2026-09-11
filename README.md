@@ -291,15 +291,24 @@ too; when more than one is found, all are sent, the one nearest to where you
 started last. Each file is capped at 64 KiB, cut on a character boundary, and
 a file that cannot be read is skipped rather than made an error of.
 
-The text is read **once**, when the session is created, and stored in the
-session's meta. From then on the session sends what it stored — never what
-the files say by then. That is what keeps the request prefix byte-for-byte
-stable for the life of the session (the prefix cache depends on it), and what
-makes a resumed session exactly what it was. `/new` starts a session that
-reads the workspace as it stands now; resuming an old session keeps the
-instructions it was started with, whether the files have since changed or
-gone. A workspace with no readable `AGENTS.md` gives a session nothing to
-send, and a session that carries instructions says so in its banner.
+Subdirectories can carry instructions of their own, and those are picked up
+when the model first operates on a file there (`Read`, `Edit`, `Write` — a
+`Bash` command names no file the interpreter can see). The nearest file to the
+one being operated on wins, it is sent once per session, and the transcript
+notes it with a dim line. A call in the middle of touching the directory does
+not interrupt anything: the instructions are appended where a user message is
+legal, after the tool results already owed to the model.
+
+The text is read **once** — at session creation for the workspace, at first
+touch for a subdirectory — and stored in the session. From then on the session
+sends what it stored — never what the files say by then. That is what keeps
+the request prefix byte-for-byte stable for the life of the session (the
+prefix cache depends on it), and what makes a resumed session exactly what it
+was. `/new` starts a session that reads the workspace as it stands now;
+resuming an old session keeps the instructions it was started with, whether
+the files have since changed or gone. A workspace with no readable
+`AGENTS.md` gives a session nothing to send, and a session that carries
+instructions says so in its banner.
 
 ### Environment
 
@@ -422,10 +431,11 @@ wherever the answer is typed:
   reports `hit`/`miss` prompt tokens from `usage`.
 - **Project instructions are frozen into the session.** The `AGENTS.md` files
   of the workspace are read once, at session creation, and stored in the
-  session's meta; requests replay them from there byte-for-byte. Nothing on
-  the request path reads the filesystem, so a request stays pure in
-  `(provider, meta, history)` and the prefix cache keeps matching for the
-  life of the session.
+  session's meta; a subdirectory's own file is picked up on first touch and
+  appended to the log, where a user message is legal. Requests replay both
+  from the log byte-for-byte. Nothing on the request path reads the
+  filesystem, so a request stays pure in `(provider, meta, history)` and the
+  prefix cache keeps matching for the life of the session.
 - **Cache usage is normalized across providers.** DeepSeek reports flat
   `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`; GLM/OpenAI report
   nested `prompt_tokens_details.cached_tokens` (miss derived as

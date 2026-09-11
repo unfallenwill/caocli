@@ -547,6 +547,11 @@ impl State {
                 self.end_block();
                 self.transcript.push(Cell::ToolResult(result));
             }
+            Notice::Instructions(dir) => {
+                self.end_block();
+                self.transcript
+                    .push(Cell::Notice(crate::agents_md::notice_text(&dir)));
+            }
             Notice::Usage(u, _stream) => {
                 self.status.record(&u);
                 // Calibrate the live speed estimate: the characters streamed
