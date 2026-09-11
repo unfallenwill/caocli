@@ -266,6 +266,11 @@ easiest ones to trip over:
 
 - Read the code before changing it; do not rely on implementation descriptions in this
   file (it deliberately omits them).
+- Keep the task list live. It is the only view of a turn's work the user has while it
+  runs, so write it before the first change, mark each task completed as it lands rather
+  than in one batch at the end, and keep at most one task in progress. A step that is
+  worth more than a line still gets its list update first: the reader is watching the
+  list, not the diff.
 - When behavior is uncertain, first confirm it with a `-p` or pty smoke run, then draw
   conclusions.
 - Do not abstract for "we might need it later"; the value of this project is being
