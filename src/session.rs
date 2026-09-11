@@ -37,6 +37,15 @@ pub struct SessionMeta {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// The project instructions the session was started with: the workspace's
+    /// AGENTS.md files, read once at creation and stored framed as the message
+    /// they are sent in. A session sends what it stored — not what the files
+    /// say now — which is what keeps the request prefix byte-for-byte stable
+    /// for the life of the session, and what makes a resumed session exactly
+    /// what it was. `None` in a session written before this was recorded, and
+    /// in a workspace without the files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -376,6 +385,7 @@ mod tests {
             provider: Some("deepseek".into()),
             model: "deepseek-v4-flash".into(),
             reasoning_effort: Some("high".into()),
+            instructions: None,
         }
     }
 
@@ -495,6 +505,82 @@ mod tests {
     }
 
     #[test]
+    fn a_session_written_before_instructions_were_recorded_still_loads() {
+        // Same bargain as the provider field: the absence of the field in an
+        // old session's header is a session without instructions, not a
+        // session that cannot be read.
+        let dir = tmpdir();
+        let path = dir.join("20250101-120000.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"t":"header","id":"20250101-120000","created_at":1,"model":"deepseek-v4-pro"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let loaded = Session::load(&path).unwrap();
+        assert_eq!(loaded.meta.instructions, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_instructions_stored_at_creation_are_what_a_resumed_session_holds() {
+        // The instructions are part of the meta, and the meta is what the
+        // session is: what was frozen in at creation is what every later load
+        // hands back, whether or not the files on disk have moved on since.
+        let dir = tmpdir();
+        let s = Session::create(
+            &dir,
+            SessionMeta {
+                instructions: Some("the instructions as they were".into()),
+                ..test_meta()
+            },
+        )
+        .unwrap();
+        let path = s.path.clone();
+        let line = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            line.contains(r#""instructions":"the instructions as they were""#),
+            "the header carries them: {line}"
+        );
+        drop(s);
+        let loaded = load_when_released(&path);
+        assert_eq!(
+            loaded.meta.instructions.as_deref(),
+            Some("the instructions as they were")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_meta_line_keeps_the_instructions_it_was_written_from() {
+        // A meta line replaces the meta wholesale when the log is read, so a
+        // line written from a meta that carries instructions must carry them
+        // too — or a model switch would silently strip them from the session.
+        // The write below is the one `/model` does: a clone of the session's
+        // meta with one field changed.
+        let dir = tmpdir();
+        let mut s = Session::create(
+            &dir,
+            SessionMeta {
+                instructions: Some("kept".into()),
+                ..test_meta()
+            },
+        )
+        .unwrap();
+        let mut switched = s.meta.clone();
+        switched.reasoning_effort = Some("low".into());
+        s.set_meta(switched).unwrap();
+        let path = s.path.clone();
+        drop(s);
+        let loaded = load_when_released(&path);
+        assert_eq!(loaded.meta.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(loaded.meta.instructions.as_deref(), Some("kept"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn truncated_tail_line_is_skipped() {
         let dir = tmpdir();
         let mut s = Session::create(&dir, test_meta()).unwrap();
@@ -608,6 +694,7 @@ mod tests {
             provider: Some("zai-coding-cn".into()),
             model: "deepseek-v4-pro".into(),
             reasoning_effort: Some("max".into()),
+            instructions: None,
         })
         .unwrap();
         let path = s.path.clone();
@@ -680,6 +767,7 @@ mod tests {
             provider: Some("deepseek".into()),
             model: "deepseek-v4-pro".into(),
             reasoning_effort: None,
+            instructions: None,
         })
         .unwrap();
         // append a corrupt half-written line from a crash

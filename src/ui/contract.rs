@@ -38,6 +38,11 @@ pub trait Ui {
     fn tool_output(&mut self, chunk: &str);
     /// A tool result summary.
     fn tool_result(&mut self, result: &str);
+    /// The session picked up project instructions it had not been sent — a
+    /// directory's AGENTS.md, discovered by a call that touched a file there.
+    /// A dim notice naming the directory; the same line the replay folds out
+    /// of the message it came in.
+    fn instructions(&mut self, dir: &str);
     /// Token usage for a sub-request, with the wall time the stream took (also
     /// accumulates session-level cache stats). The duration is what a
     /// tokens-per-second figure is computed from; a front end that shows none

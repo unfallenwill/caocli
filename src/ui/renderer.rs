@@ -431,6 +431,10 @@ impl Ui for Renderer {
         self.paint_cell(&Cell::ToolResult(result.to_owned()));
     }
 
+    fn instructions(&mut self, dir: &str) {
+        self.paint_cell(&Cell::Notice(crate::agents_md::notice_text(dir)));
+    }
+
     fn interrupted(&mut self) {
         // A block that was still streaming when the turn was cancelled is closed
         // first, so the notice starts on a line of its own.

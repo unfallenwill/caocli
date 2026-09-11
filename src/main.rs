@@ -1,4 +1,5 @@
 mod agent;
+mod agents_md;
 mod api;
 mod cli;
 mod config;
@@ -36,7 +37,10 @@ fn main() -> Result<()> {
 
 /// Meta for a new session: the provider is the one this run selected, and the
 /// model comes from `--model` — which may name a provider of its own as
-/// `<provider>/<modelid>` — otherwise it is that provider's default.
+/// `<provider>/<modelid>` — otherwise it is that provider's default. The
+/// workspace's project instructions (its AGENTS.md files) are read here, once,
+/// and frozen into the session: everything the session later sends is what it
+/// stored, never what the files say by then.
 fn fresh_meta(cli: &Cli, start: provider::Provider) -> Result<SessionMeta> {
     let (provider, model) = match &cli.model {
         Some(spec) => provider::model_spec(spec, start.id)?,
@@ -54,6 +58,7 @@ fn fresh_meta(cli: &Cli, start: provider::Provider) -> Result<SessionMeta> {
             .effort
             .clone()
             .or_else(|| Some(provider.default_effort.to_string())),
+        instructions: agents_md::load(),
     })
 }
 
@@ -208,10 +213,15 @@ async fn run(cli: Cli) -> Result<()> {
     // One-shot mode (the agent's primary self-test channel)
     if let Some(prompt) = &cli.prompt {
         ui.info(&format!(
-            "session {} · {} · effort {}",
+            "session {} · {} · effort {}{}",
             agent.session.id,
             agent.model_label(),
-            agent.effort_label()
+            agent.effort_label(),
+            if agent.session.meta.instructions.is_some() {
+                " · AGENTS.md"
+            } else {
+                ""
+            }
         ));
         let message = match image::user_message(prompt, &cli.image) {
             Ok(message) => message,
@@ -252,6 +262,12 @@ async fn run(cli: Cli) -> Result<()> {
     );
     if let Some(note) = missing_key {
         banner = format!("{note}\n{banner}");
+    }
+    // A session that carries project instructions says so once, where the
+    // session itself is announced: what the model will read is worth the
+    // reader knowing about too.
+    if agent.session.meta.instructions.is_some() {
+        banner = format!("{banner}\nproject instructions: AGENTS.md");
     }
 
     // Interactive front end: it owns the terminal, so nothing may have been
@@ -345,6 +361,7 @@ mod tests {
             provider: Some(provider.into()),
             model: model.into(),
             reasoning_effort: None,
+            instructions: None,
         }
     }
 
@@ -421,6 +438,7 @@ mod tests {
             provider: None,
             model: "deepseek-v4-pro".into(),
             reasoning_effort: None,
+            instructions: None,
         };
         assert!(!apply_overrides(&mut meta, &cli(&[]), provider::ZAI_CODING_CN).unwrap());
         assert_eq!(meta.provider, None, "nothing is invented for it");

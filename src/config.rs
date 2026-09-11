@@ -250,6 +250,24 @@ pub(crate) fn scratch_home() -> PathBuf {
     home
 }
 
+/// Move the process into a working directory of its own, for the tests that
+/// read where the process stands (the workspace a fresh session reads its
+/// instructions from is the cwd). The cwd is one directory for the whole test
+/// binary, like the environment, so the caller holds [`env_lock`] while it
+/// uses it and moves the process back before it returns.
+#[cfg(test)]
+pub(crate) fn scratch_cwd() -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "caocli-test-cwd-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::env::set_current_dir(&dir).unwrap();
+    dir
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

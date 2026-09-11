@@ -79,6 +79,25 @@ pub fn changes_files(name: &str) -> bool {
     !matches!(name, READ_NAME | TODO_NAME)
 }
 
+/// Whether a call names a file: the three tools that operate on one. These are
+/// the calls whose target directory's own instructions can be discovered from
+/// the call — a Bash command can `cat` anything, and what it named is not
+/// recoverable from its arguments.
+pub fn carries_file_path(name: &str) -> bool {
+    matches!(name, fs::READ_NAME | fs::EDIT_NAME | fs::WRITE_NAME)
+}
+
+/// The file a call names, for the calls that name one. `None` when the
+/// arguments carry no readable `file_path` — a fault the tool itself answers
+/// with text, not one to act on here.
+pub fn file_path(args_json: &str) -> Option<std::path::PathBuf> {
+    serde_json::from_str::<serde_json::Value>(args_json)
+        .ok()?
+        .get("file_path")?
+        .as_str()
+        .map(std::path::PathBuf::from)
+}
+
 /// Dispatch by name. Never returns Err: every failure (unknown tool, bad
 /// arguments, IO error) is passed back to the model as tool result text and the
 /// model decides what to do next.

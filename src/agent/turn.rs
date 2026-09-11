@@ -12,6 +12,7 @@ use std::future::Future;
 
 use anyhow::Result;
 
+use crate::agents_md;
 use crate::machine::{self, Action, Marker};
 use crate::session::Session;
 use crate::tools;
@@ -231,7 +232,55 @@ impl Turn<'_> {
             Gate::Denied => return Ok(Step::Again),
             Gate::Cancelled => return Ok(self.stop()),
         }
-        self.run(call).await
+        let step = self.run(call).await?;
+        // A call that ran named a file may have been the session's first touch
+        // of a directory with instructions of its own; what was discovered is
+        // appended before the model is asked again. A cancelled call left no
+        // result to append context after, and the turn is over anyway.
+        if step == Step::Again {
+            self.inject(call)?;
+        }
+        Ok(step)
+    }
+
+    /// First touch of a directory whose instructions the session has not been
+    /// sent: the framed text goes into the log as a user message — the only
+    /// role that can follow a closed tool-result window — and the front end is
+    /// told once, the same cell the replay folds out of the message.
+    ///
+    /// The machine is consulted, not bypassed: the message lands only where
+    /// the next beat is a call to the model anyway. A window of several
+    /// declared calls must run its results on uninterrupted — a user message
+    /// pushed between them is a history the backend refuses — so the earlier
+    /// calls of a window discover nothing here, and the last one's discovery
+    /// stands for the window. Everything that decides whether anything is
+    /// appended at all is a fold of the log: nothing is kept in step, and a
+    /// resumed session neither re-sends nor loses what was sent.
+    fn inject(&mut self, call: &ToolCall) -> Result<()> {
+        if !tools::carries_file_path(&call.function.name) {
+            return Ok(());
+        }
+        if machine::next_action(&self.agent.session.messages) != Some(Action::CallModel) {
+            return Ok(());
+        }
+        let Some(path) = tools::file_path(&call.function.arguments) else {
+            return Ok(());
+        };
+        let Some(dir) = path.parent() else {
+            return Ok(());
+        };
+        // The process stands where the session was started: nothing in it
+        // changes the working directory, so this is the chain the startup
+        // message covered.
+        let workspace = std::env::current_dir().unwrap_or_default();
+        let Some((found, text)) =
+            agents_md::message_for(dir, &workspace, &self.agent.session.messages)
+        else {
+            return Ok(());
+        };
+        self.agent.session.append_message(&Message::user(text))?;
+        self.ui.instructions(&found.to_string_lossy());
+        Ok(())
     }
 
     /// The question tool: the call's arguments are read first, the questions are

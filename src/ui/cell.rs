@@ -396,16 +396,23 @@ pub fn from_messages(messages: &[Message]) -> Vec<Cell> {
         match m.role {
             Role::User => {
                 if let Some(c) = &m.content {
-                    // The images are read back out of the message itself: it is
-                    // all a resumed session has, and all it shows.
-                    cells.push(Cell::User {
-                        text: c.text(),
-                        images: c
-                            .images()
-                            .iter()
-                            .filter_map(|url| image::note(url))
-                            .collect(),
-                    });
+                    let text = c.text();
+                    // An injected instructions message is machinery in the
+                    // shape of a user message — the only shape that can be
+                    // appended after a tool window — and folds into the same
+                    // notice the live turn emitted, never into a line shown
+                    // to the reader as their own.
+                    match crate::agents_md::injected_dir(&text) {
+                        Some(dir) => cells.push(Cell::Notice(crate::agents_md::notice_text(dir))),
+                        None => cells.push(Cell::User {
+                            text,
+                            images: c
+                                .images()
+                                .iter()
+                                .filter_map(|url| image::note(url))
+                                .collect(),
+                        }),
+                    }
                 }
             }
             Role::Assistant => {
@@ -1098,6 +1105,30 @@ mod tests {
         // empty assistant fields contribute nothing
         assert!(from_messages(&[assistant(Some(""), Some(""), None)]).is_empty());
         assert!(from_messages(&[]).is_empty());
+    }
+
+    /// An injected instructions message is machinery in the shape of a user
+    /// message: the replay folds it into the same notice the live turn
+    /// emitted, never into a line shown to the reader as their own.
+    #[test]
+    fn from_messages_folds_an_injected_message_into_a_notice() {
+        let message = Message::user(format!(
+            "{}{}\n\nthe directory's rules",
+            crate::agents_md::INJECT_LEAD,
+            "/workspace/sub"
+        ));
+        assert_eq!(
+            from_messages(&[message]),
+            vec![Cell::Notice(crate::agents_md::notice_text(
+                "/workspace/sub"
+            ))]
+        );
+    }
+
+    #[test]
+    fn a_user_line_is_never_taken_for_an_injected_message() {
+        let cells = from_messages(&[Message::user("Project instructions are a good idea")]);
+        assert!(matches!(cells[0], Cell::User { .. }));
     }
 
     /// The question tool's cell is read back out of the call's own arguments, so

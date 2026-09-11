@@ -9,7 +9,10 @@ A minimal terminal coding agent in Rust, backed by an OpenAI-compatible
 dim gray, then runs a tool loop over six tools: `Bash`, `Read`, `Edit`,
 `Write`, `AskUserQuestion` (which asks you rather than the filesystem) and
 `TodoWrite` (which writes the plan where you can see it while it works). Both backends see images, which are attached with `/image` or
-`--image` and travel inside the message itself. Sessions are append-only JSONL
+`--image` and travel inside the message itself. Project instructions in the
+workspace's `AGENTS.md` files are read when a session starts and sent with
+every request (see [Project instructions](#project-instructions-agentsmd)).
+Sessions are append-only JSONL
 logs under `~/.caocli/sessions/`, resumable across runs and replayed
 byte-for-byte so the backend's prefix cache keeps hitting.
 
@@ -41,7 +44,7 @@ place for a key to hide in.
 | Command | Description |
 |---|---|
 | `/help` | Show available commands |
-| `/new` | Start a new session, inheriting the current model settings |
+| `/new` | Start a new session, inheriting the current model settings; the workspace's `AGENTS.md` instructions are read again for it |
 | `/sessions` | List sessions (id, message count, last user message preview) |
 | `/resume <id>` | Switch to an existing session, replaying its history to the screen |
 | `/login` | Choose a provider and store its API key. The list shows each provider by *name* (`DeepSeek`, `Z.AI Coding CN`); the plain prompt prints the id beside it, since that is what `/login <id>` takes |
@@ -279,6 +282,34 @@ first turn of `-p`) with `/login <provider>` as what to do about it.
 With no key in it, an interactive session still starts — `/login` is inside it —
 while a `-p` run says what to do instead of failing at the first request.
 
+### Project instructions (AGENTS.md)
+
+A new session reads the workspace's `AGENTS.md` files and sends them to the
+model with every request. The lookup walks up from the directory caocli was
+started in, so the file at a repository's root is found from a subdirectory
+too; when more than one is found, all are sent, the one nearest to where you
+started last. Each file is capped at 64 KiB, cut on a character boundary, and
+a file that cannot be read is skipped rather than made an error of.
+
+Subdirectories can carry instructions of their own, and those are picked up
+when the model first operates on a file there (`Read`, `Edit`, `Write` — a
+`Bash` command names no file the interpreter can see). The nearest file to the
+one being operated on wins, it is sent once per session, and the transcript
+notes it with a dim line. A call in the middle of touching the directory does
+not interrupt anything: the instructions are appended where a user message is
+legal, after the tool results already owed to the model.
+
+The text is read **once** — at session creation for the workspace, at first
+touch for a subdirectory — and stored in the session. From then on the session
+sends what it stored — never what the files say by then. That is what keeps
+the request prefix byte-for-byte stable for the life of the session (the
+prefix cache depends on it), and what makes a resumed session exactly what it
+was. `/new` starts a session that reads the workspace as it stands now;
+resuming an old session keeps the instructions it was started with, whether
+the files have since changed or gone. A workspace with no readable
+`AGENTS.md` gives a session nothing to send, and a session that carries
+instructions says so in its banner.
+
 ### Environment
 
 | Variable | Description |
@@ -303,9 +334,9 @@ are returned to the model as text so it can recover, never as a hard error.
 
 Limits: 10 KiB of output per tool result per stream (a longer one keeps its two
 ends and says how much is missing from between them), 10 MB per file written or
-edited. A read
-streams and holds only the page it answers with, so what bounds it is how long the
-scan behind a page may take: 256 MB, past which a range of the file is a `Bash` call.
+edited. A read streams and holds only the page it answers with, so what bounds it
+is how long the scan behind a page may take: 256 MB, past which a range of the
+file is a `Bash` call.
 
 ### The task list
 
@@ -401,6 +432,13 @@ wherever the answer is typed:
   compaction. Injecting volatile data (time, cwd) or changing the tool set
   or its order invalidates the cache. The `tokens:` line after each turn
   reports `hit`/`miss` prompt tokens from `usage`.
+- **Project instructions are frozen into the session.** The `AGENTS.md` files
+  of the workspace are read once, at session creation, and stored in the
+  session's meta; a subdirectory's own file is picked up on first touch and
+  appended to the log, where a user message is legal. Requests replay both
+  from the log byte-for-byte. Nothing on the request path reads the
+  filesystem, so a request stays pure in `(provider, meta, history)` and the
+  prefix cache keeps matching for the life of the session.
 - **Cache usage is normalized across providers.** DeepSeek reports flat
   `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`; GLM/OpenAI report
   nested `prompt_tokens_details.cached_tokens` (miss derived as
@@ -426,7 +464,10 @@ one JSON object tagged by `t`; `meta` lines override earlier ones on load.
 
 `provider` names the backend the model belongs to. It is optional: a session
 written before it existed has none, and such a session runs on whichever
-provider the run selected — which is what every session did then.
+provider the run selected — which is what every session did then. The meta
+also carries the workspace's `instructions` when the session was started in
+one that has `AGENTS.md` files (left out entirely when there are none, as in
+every session written before the field existed).
 
 ## Development
 
