@@ -294,14 +294,16 @@ are returned to the model as text so it can recover, never as a hard error.
 
 | Tool | Behavior |
 |---|---|
-| `Bash` | Run one `bash -c` command. 120s timeout; stdout and stderr are each truncated to 10 KiB. |
+| `Bash` | Run one `bash -c` command. What it prints while it runs is streamed to you as it arrives; what the model reads is the result, and each stream is kept to 10 KiB there — shown from both ends, with what fell between them counted in its place. A command that runs past its timeout is killed *with everything it started*: 120s by default, up to 1800 with `timeout`. A job that should outlive the call — a build, a server, a test run — is started with `background: true`, which returns at once with the pid and the file its output goes to. Nothing a call runs can reach the terminal the front end owns, and a screen editor is refused rather than left to hang. |
 | `Read` | Read a UTF-8 text file, one numbered row per line. `offset`/`limit` page through a long file, and the file is streamed: a page costs one page of memory however large the file is, and the marker after the last row says which lines were shown, how many lines the file has, and where to read on. A page whose lines end with CRLF says so, and so does a file whose last line has no newline after it: the two things about a file's shape that decide whether an `Edit` will match. |
 | `Edit` | Replace `old_string` with `new_string`; `old_string` must match exactly once, endings included. A call that matches nothing is answered with the text in the file that comes nearest — numbered as `Read` numbers it — and every difference between the two, with the file's line endings named when they are the whole of it; one that matches more than once is answered with the lines each occurrence is at and what stands beside it. The next call is written from that instead of another `Read`. The text inserted is written in the file's own line endings, so a replacement typed with plain newlines lands as the file's own. Written atomically via tmp + rename. |
 | `Write` | Create or fully overwrite a file; parent directories are created automatically. The write lands on the file the path finally names: a symlink is followed to its target rather than replaced by a regular file, and an overwrite keeps the target's own permissions. The text lands in the target's own line endings, so a whole-file rewrite in the other ones is not a change to every line of the file; a file being created, one whose endings are mixed, and one over 10MB are written exactly as they were sent. Content that is already there is left unchanged, and a write that fails takes its temp file with it. |
 | `AskUserQuestion` | Ask you to choose: up to four questions, each with up to four options. The answer comes back as the call's result (`<id>: <chosen label>`), so the model continues with what you picked. |
 | `TodoWrite` | Record the plan as a list of tasks, up to 20. The whole list is sent every call and replaces the one before it, so each call is the state of the work rather than a change to it. |
 
-Limits: 10 KiB of output per tool result, 10 MB per file written or edited. A read
+Limits: 10 KiB of output per tool result per stream (a longer one keeps its two
+ends and says how much is missing from between them), 10 MB per file written or
+edited. A read
 streams and holds only the page it answers with, so what bounds it is how long the
 scan behind a page may take: 256 MB, past which a range of the file is a `Bash` call.
 
@@ -366,8 +368,9 @@ wherever the answer is typed:
 - **Append-only session logs.** Files are never rewritten, so a crash costs
   at most a trailing partial line. Corrupt lines are skipped on load.
 - **Ctrl-C mid-turn cancels gracefully.** The turn interpreter races every
-  await against SIGINT. On cancel the running command is killed
-  (`kill_on_drop`), unfinished tool calls get deterministic cancellation
+  await against SIGINT. On cancel the running command's whole process group is
+  killed — the shell leads a session of its own, so what it started dies with it
+  — unfinished tool calls get deterministic cancellation
   markers committed to the log, and history stays request-valid — so the
   next prompt simply continues from a clean, honest state instead of a
   400-ing one. In the screen front end the next prompt may already be

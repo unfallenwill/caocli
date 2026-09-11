@@ -48,11 +48,16 @@ that talks to a network API and drives an interactive terminal.
   boundaries with side effects (network, terminal, files) rely on the smoke run.
 - **Terminal behavior must be verified under a pty**: a unit test's stdout is a pipe,
   so TTY-only branches (status bar, key bindings, escape sequences) never execute.
-  Use `script -qec "..." /dev/null` to get a pseudo-terminal for smoke runs.
+  Use `script -qec "..." /dev/null` to get a pseudo-terminal for smoke runs — and
+  **rebuild before you do**: a smoke run against a binary older than the change is a
+  run of the code before it, and it reads exactly like a bug in the change.
 - **The interactive front end needs a pty**; that is the only place it exists at
   all. `scripts/tui_smoke.py` is that pty, and its live section (`SMOKE_LIVE=1`) is
   the only automated route to a real turn, the running status line, the approval
-  gate and the queue a line typed during a turn goes into. What a tool call did is
+  gate, the queue a line typed during a turn goes into, and a command's own output
+  arriving on the screen while the command is still running -- which is proved by a
+  command that prints one token now and another after a wait, neither of them in the
+  command's own text, since the call puts that text on the screen twice over. What a tool call did is
   asserted on disk rather than on screen: a model's own account of having run
   something reads the same as the thing itself. A *queued* line is asserted on the
   front end's own answer (a command, whose reply only the front end can write),
@@ -179,6 +184,50 @@ that talks to a network API and drives an interactive terminal.
   because it is a tool result and the model pays for every byte of it. It is a
   **report and never a match**: a tolerant fallback would edit text the call did not
   send, and an `old_string` is the file's own text or it is a miss.
+- **A running command's output is a view, and the result is the record.** What a
+  command prints while it is still running is streamed to the front end as it
+  arrives, and that stream is never part of the log: the result is what the model
+  reads and what a resumed session replays, so a watched session shows the output
+  and then the result where a resumed one shows the result alone. It is the one
+  cell a session log cannot rebuild, and it says so. The view is cut at the
+  result's own budget and says where it stopped -- a command that prints a
+  megabyte of build log must not put a megabyte of rows in front of a person --
+  while the result keeps both ends of everything it printed. Nothing awaited while
+  a command runs is allowed to be the record of it either: the bytes are kept by
+  the readers as they arrive, so a chunk nothing is watching for can be dropped
+  without losing it.
+- **A command leads a session of its own, and nothing it starts outlives the call
+  by accident.** That is what keeps a program which wants to ask a person
+  something -- it opens `/dev/tty` rather than reading its standard input -- from
+  finding the terminal the front end is reading: measured, `sudo true` waits
+  minutes for a password where the terminal is reachable and fails in a tenth of a
+  second where it is not, which is a result the model can act on. It is also what
+  makes the child's pid the id of the group that a timeout, a cancel and a
+  background job are killed by, since killing the shell alone leaves a build
+  compiling with nobody reading it and nobody waiting for it. Every wait a call
+  has is on a budget -- the command's own, the grace its output is given after the
+  command is gone, the time a killed child is given to be reaped -- and none of
+  them can be extended by anything the command does.
+- **What cannot work here is answered rather than attempted.** A screen editor is
+  refused by name, because it does not fail on its own: measured, `vim` with its
+  output on a pipe -- which is what every call gives it -- never exits, so the call
+  runs until its timeout kills it and answers with terminal control codes that
+  changed no file. The refusal names what to do instead, its script mode included.
+  Nothing else needs refusing: `top`, `sudo` and a bare `read` are all over in a
+  tenth of a second on their own, and a command that is long rather than stuck
+  belongs in the background, where its output is a file the result names. What a
+  name cannot catch -- a program that opens an editor under a variable, as
+  `git commit` does with no message -- is met by pointing those variables at
+  `true`, so that it gives its own error instead of drawing a screen first.
+- **A call may ask for what it needs, and is told when it cannot have it.** The
+  timeout is the call's to name, within a cap, because a test suite that is slow is
+  not a test suite that is stuck; what it may not have (zero, or longer than the
+  cap) is answered with what is possible rather than rounded to something it did
+  not ask for. A call that returns at once and leaves its job running is the same
+  principle the other way round: what comes back is everything needed to follow the
+  job and to end it -- its pid, the file its output goes to, and how to kill the
+  group -- and the job is in a session of its own, so its own ending is what ends
+  it and not this call's.
 - **Approval gate**: execution is trusted by default; with `--ask`, Bash/Edit/Write
   require a user y/N before running (a call that changes nothing on disk is always
   allowed: reading, and writing the todo list). Denial, cancellation,
