@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::types::{ChatRequest, Message, TurnAccumulator, Usage};
+use crate::types::{Message, TurnAccumulator, Usage, WireRequest};
 use crate::ui::Ui;
 
 use super::Agent;
@@ -36,7 +36,7 @@ impl Agent {
     /// persisted, so the session stays at a valid prefix.
     pub(super) async fn stream_reply(
         &self,
-        request: &ChatRequest,
+        request: &WireRequest,
         ui: &mut dyn Ui,
     ) -> Result<Reply> {
         let mut stream = self.api.stream_chat(request).await?;

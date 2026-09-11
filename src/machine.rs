@@ -281,6 +281,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: (!calls.is_empty()).then_some(calls),
             tool_call_id: None,
+            thinking: None,
         }
     }
 

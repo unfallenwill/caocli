@@ -692,6 +692,7 @@ mod tests {
             reasoning_content: reasoning.map(str::to_owned),
             tool_calls: calls,
             tool_call_id: None,
+            thinking: None,
         }
     }
 

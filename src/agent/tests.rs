@@ -75,6 +75,7 @@ fn test_agent(server: &MockServer, dir: &std::path::Path) -> Agent {
     let api = Client::new(
         "test-key".into(),
         format!("{}/chat/completions", server.uri()),
+        provider::DEEPSEEK.wire,
     )
     .unwrap();
     let session = Session::create(dir, test_meta()).unwrap();
@@ -86,7 +87,12 @@ fn effort_label_reads_the_stored_tier_or_the_providers_default() {
     let dir = tmpdir();
     let s = Session::create(&dir, test_meta()).unwrap();
     let agent = Agent::new(
-        Client::new("k".into(), provider::DEEPSEEK.url.into()).unwrap(),
+        Client::new(
+            "k".into(),
+            provider::DEEPSEEK.url.into(),
+            provider::DEEPSEEK.wire,
+        )
+        .unwrap(),
         s,
         provider::DEEPSEEK,
     );
@@ -97,7 +103,12 @@ fn effort_label_reads_the_stored_tier_or_the_providers_default() {
     let mut s = Session::create(&dir, test_meta()).unwrap();
     s.meta.reasoning_effort = None;
     let agent = Agent::new(
-        Client::new("k".into(), provider::ZAI_CODING_CN.url.into()).unwrap(),
+        Client::new(
+            "k".into(),
+            provider::ZAI_CODING_CN.url.into(),
+            provider::ZAI_CODING_CN.wire,
+        )
+        .unwrap(),
         s,
         provider::ZAI_CODING_CN,
     );
@@ -251,7 +262,6 @@ async fn mock_first_touch_of_a_directory_appends_its_instructions() {
         )
         .await
         .unwrap();
-
     // history: user / assistant(call) / tool(result) / user(inject) / assistant
     assert_eq!(
         agent.session.messages.len(),
@@ -462,6 +472,142 @@ async fn mock_a_bash_call_discovers_no_instructions() {
     }));
     std::fs::remove_dir_all(&dir).unwrap();
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// End to end on the Anthropic wire: a MiniMax-M3 turn with a signed
+/// thinking block and a sharded tool call runs the same loop, and the second
+/// sub-request replays the thinking block verbatim — signature included — as
+/// a tool_use/tool_result block conversation.
+#[tokio::test]
+async fn mock_anthropic_loop_replays_thinking_blocks_verbatim() {
+    let server = MockServer::start().await;
+    let ev = |name: &str, payload: serde_json::Value| format!("event: {name}\ndata: {payload}\n\n");
+    let turn1 = [
+        ev("message_start", json!({"type":"message_start","message":{"id":"m1","model":"MiniMax-M3","usage":{"input_tokens":100,"cache_read_input_tokens":80,"cache_creation_input_tokens":20,"output_tokens":1}}})),
+        ev("content_block_start", json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}})),
+        ev("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"I need to run "}})),
+        ev("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"a command."}})),
+        ev("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-mock-1"}})),
+        ev("content_block_stop", json!({"type":"content_block_stop","index":0})),
+        ev("content_block_start", json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_mock_1","name":"Bash","input":{}}})),
+        ev("content_block_delta", json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}})),
+        ev("content_block_delta", json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"echo caocli-mock-marker\"}"}})),
+        ev("content_block_stop", json!({"type":"content_block_stop","index":1})),
+        ev("message_delta", json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":40}})),
+        ev("message_stop", json!({"type":"message_stop"})),
+    ]
+    .concat();
+    let turn2 = [
+        ev("message_start", json!({"type":"message_start","message":{"id":"m2","model":"MiniMax-M3","usage":{"input_tokens":50,"cache_read_input_tokens":30,"cache_creation_input_tokens":0,"output_tokens":1}}})),
+        ev("content_block_start", json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})),
+        ev("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Done executing."}})),
+        ev("content_block_stop", json!({"type":"content_block_stop","index":0})),
+        ev("message_delta", json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}})),
+        ev("message_stop", json!({"type":"message_stop"})),
+    ]
+    .concat();
+    let server = &server;
+    let mount = |body: String, times: Option<u64>| async move {
+        let mock = Mock::given(method("POST"))
+            .and(path("/anthropic/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body));
+        match times {
+            Some(n) => mock.up_to_n_times(n).mount(server).await,
+            None => mock.mount(server).await,
+        }
+    };
+    mount(turn1, Some(1)).await;
+    mount(turn2, None).await;
+
+    let dir = tmpdir();
+    let api = Client::new(
+        "test-key".into(),
+        format!("{}/anthropic/v1/messages", server.uri()),
+        provider::MINIMAX.wire,
+    )
+    .unwrap();
+    let session = Session::create(
+        &dir,
+        SessionMeta {
+            provider: Some("minimax".into()),
+            model: "MiniMax-M3".into(),
+            reasoning_effort: Some("on".into()),
+        },
+    )
+    .unwrap();
+    let mut agent = Agent::new(api, session, provider::MINIMAX);
+    let mut ui = Renderer::new();
+    agent
+        .turn(
+            "use a tool to leave a marker",
+            &mut ui,
+            &mut NoCancel,
+            &mut Answer::denies(),
+            &mut NoQuestions,
+        )
+        .await
+        .unwrap();
+    // cache stats from both sub-requests accumulate: turn 1 hit 80 / miss
+    // 120, turn 2 hit 30 / miss 50.
+    let cache = ui.stats();
+    assert_eq!((cache.hit, cache.miss), (110, 170));
+
+    // session history: user / assistant(thinking + tool_calls) / tool / assistant
+    assert_eq!(agent.session.messages.len(), 4);
+    let assistant1 = &agent.session.messages[1];
+    assert_eq!(assistant1.text().as_deref(), Some(""));
+    assert_eq!(
+        assistant1.thinking,
+        Some(vec![crate::types::ThinkingBlock {
+            thinking: "I need to run a command.".into(),
+            signature: "sig-mock-1".into(),
+        }])
+    );
+    let calls = assistant1.tool_calls.as_ref().unwrap();
+    assert_eq!(calls.len(), 1, "block indexes 0/1 are not tool ordinals");
+    assert_eq!(calls[0].id, "call_mock_1");
+    assert_eq!(
+        calls[0].function.arguments,
+        r#"{"command":"echo caocli-mock-marker"}"#
+    );
+    // Bash really ran
+    assert!(
+        agent.session.messages[2]
+            .text()
+            .unwrap()
+            .contains("caocli-mock-marker")
+    );
+
+    // second round's request body: the Anthropic shape, thinking replayed
+    // verbatim, the result a tool_result block in the user turn.
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 2);
+    let body: serde_json::Value = serde_json::from_slice(&reqs[1].body).unwrap();
+    assert_eq!(body["model"], "MiniMax-M3");
+    assert_eq!(body["max_tokens"], 131_072);
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+    assert_eq!(body["tool_choice"], json!({"type": "auto"}));
+    assert_eq!(body["tools"][0]["name"], "Bash");
+    assert!(
+        body["system"]
+            .as_str()
+            .unwrap()
+            .starts_with("You are caocli")
+    );
+    let msgs = body["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 3); // user / assistant(blocks) / user(tool_result)
+    let blocks = msgs[1]["content"].as_array().unwrap();
+    assert_eq!(blocks[0]["type"], "thinking");
+    assert_eq!(blocks[0]["signature"], "sig-mock-1");
+    assert_eq!(blocks[0]["thinking"], "I need to run a command.");
+    assert_eq!(blocks[1]["type"], "tool_use");
+    assert_eq!(blocks[1]["id"], "call_mock_1");
+    assert_eq!(blocks[1]["input"]["command"], "echo caocli-mock-marker");
+    assert_eq!(msgs[2]["role"], "user");
+    assert_eq!(msgs[2]["content"][0]["type"], "tool_result");
+    assert_eq!(msgs[2]["content"][0]["tool_use_id"], "call_mock_1");
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// End to end: two tool calls declared at once. The interpreter must finish

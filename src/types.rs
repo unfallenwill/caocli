@@ -150,6 +150,17 @@ impl From<String> for Content {
     }
 }
 
+/// A thinking block as the Anthropic wire returned it, carried on the assistant
+/// message so the next request on that wire replays it verbatim — MiniMax
+/// requires the complete content (the signature included) to come back in
+/// multi-turn tool dialogs, to keep the chain of thought continuous.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThinkingBlock {
+    pub thinking: String,
+    #[serde(default)]
+    pub signature: String,
+}
+
 /// Message. Field names match the API exactly:
 /// - assistant: content / reasoning_content / tool_calls (a request carrying
 ///   tools must send reasoning_content back; missing it means a 400)
@@ -165,6 +176,11 @@ pub struct Message {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Anthropic-wire thinking blocks, set only for an answer that came from
+    /// that wire. Never sent on the OpenAI wire: the request builder strips
+    /// the field before an OpenAi-shaped request is serialized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<Vec<ThinkingBlock>>,
 }
 
 impl Message {
@@ -239,6 +255,137 @@ pub struct ChatRequest {
 }
 
 // ============================================================================
+// Anthropic /v1/messages wire types (MiniMax). Same rule as above: field names
+// are the API's. The internal history is provider-agnostic; the request
+// builder maps it onto one of the two shapes, and the stream parser folds the
+// Anthropic event stream back into the same deltas the accumulator already
+// reads — a second protocol, not a second conversation.
+// ============================================================================
+
+/// The request as the wire that carries it sees it. The client refuses to
+/// serialize one shape onto the other wire, so a preset and a request can
+/// never disagree silently.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WireRequest {
+    OpenAi(ChatRequest),
+    Anthropic(AnthropicRequest),
+}
+
+/// Anthropic-style thinking switch: `adaptive` turns thinking on, `disabled`
+/// keeps it off. (The OpenAI wire's `enabled`/`disabled` values are a
+/// different vocabulary; only the shape is shared.)
+impl Thinking {
+    pub fn adaptive() -> Self {
+        Self {
+            r#type: "adaptive".into(),
+        }
+    }
+    pub fn disabled() -> Self {
+        Self {
+            r#type: "disabled".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnthropicRole {
+    User,
+    Assistant,
+}
+
+/// Message content: a plain string (what a plain text turn maps to) or the
+/// block array the structured turns need. Untagged, string tried first, so a
+/// mapped text turn is written as the string it mapped to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AnthropicContent {
+    Text(String),
+    Blocks(Vec<AnthropicBlock>),
+}
+
+/// One content block. The set the backend serves: text, image (M3),
+/// thinking, tool_use and tool_result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicBlock {
+    Text {
+        text: String,
+    },
+    Image {
+        source: AnthropicImageSource,
+    },
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+    },
+}
+
+/// Where an image block reads its picture. An attached image is a `data:` URL
+/// internally; the request builder splits it into the base64 source the wire
+/// wants. Anything that is not a data URL is passed as a URL source.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicImageSource {
+    Base64 { media_type: String, data: String },
+    Url { url: String },
+}
+
+/// A tool definition, Anthropic shape: the JSON schema rides as
+/// `input_schema` instead of nested under `function`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnthropicTool {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub input_schema: serde_json::Value,
+}
+
+/// Tool choice strategy: the endpoint serves `auto` and `none` only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicToolChoice {
+    Auto,
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnthropicMessage {
+    pub role: AnthropicRole,
+    pub content: AnthropicContent,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnthropicRequest {
+    pub model: String,
+    /// Ceiling on a single answer, from the provider preset. Always sent:
+    /// the endpoint's own default is far below what the model can emit.
+    pub max_tokens: u32,
+    /// The system prompt, a top-level field on this wire (not a message).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+    pub messages: Vec<AnthropicMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<AnthropicTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<AnthropicToolChoice>,
+    pub stream: bool,
+    /// The thinking switch: `adaptive` (on) or `disabled`. Omitting it turns
+    /// thinking off for M3, so the on case is always sent explicitly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<Thinking>,
+}
+
+// ============================================================================
 // Streaming response (SSE chunk)
 // ============================================================================
 
@@ -270,6 +417,11 @@ pub struct Delta {
     pub reasoning_content: Option<String>,
     #[serde(default)]
     pub tool_calls: Option<Vec<DeltaToolCall>>,
+    /// The signature that closes a thinking block on the Anthropic wire. The
+    /// OpenAI wire never sends one; the field is a parse-side detail, never
+    /// serialized back out.
+    #[serde(default)]
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -347,7 +499,9 @@ pub struct ChatChunk {
 // ============================================================================
 // TurnAccumulator: aggregates one request's streaming deltas into a complete
 // assistant Message. tool_calls arrive sharded by index: id/name come in the
-// first shard, arguments are appended shard by shard.
+// first shard, arguments are appended shard by shard. A thinking block on the
+// Anthropic wire ends with a signature delta; the text streamed before it is
+// the block's body, and the pair is kept so the wire can replay it verbatim.
 // ============================================================================
 
 #[derive(Debug, Default)]
@@ -355,6 +509,11 @@ pub struct TurnAccumulator {
     content: String,
     reasoning_content: String,
     tool_calls: Vec<DeltaToolCall>,
+    /// The body of the thinking block being streamed, not yet closed by a
+    /// signature.
+    thinking_buf: String,
+    /// Thinking blocks closed by a signature, in arrival order.
+    thinking: Vec<ThinkingBlock>,
 }
 
 impl TurnAccumulator {
@@ -364,6 +523,18 @@ impl TurnAccumulator {
         }
         if let Some(s) = &delta.reasoning_content {
             self.reasoning_content.push_str(s);
+            self.thinking_buf.push_str(s);
+        }
+        if let Some(sig) = &delta.signature {
+            // Only a real signature closes a block: an empty one over a
+            // streamed body is nothing to replay, and the body stays in the
+            // flat reasoning field.
+            if !sig.is_empty() {
+                self.thinking.push(ThinkingBlock {
+                    thinking: std::mem::take(&mut self.thinking_buf),
+                    signature: sig.clone(),
+                });
+            }
         }
         if let Some(tcs) = &delta.tool_calls {
             for dtc in tcs {
@@ -416,6 +587,15 @@ impl TurnAccumulator {
                     .collect(),
             )
         };
+        // A thinking body no signature ever closed stays out of the blocks:
+        // without its signature it is not the content the model returned,
+        // and replaying a made-up block would be worse than replaying none.
+        // The text itself is kept in `reasoning_content` either way.
+        let thinking = if self.thinking.is_empty() {
+            None
+        } else {
+            Some(self.thinking)
+        };
         Message {
             role: Role::Assistant,
             content: Some(Content::Text(self.content)),
@@ -426,6 +606,7 @@ impl TurnAccumulator {
             },
             tool_calls,
             tool_call_id: None,
+            thinking,
         }
     }
 }
@@ -449,11 +630,36 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
+            thinking: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""reasoning_content":"thinking...""#));
         let back: Message = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn thinking_blocks_round_trip_and_old_logs_read_on() {
+        // A message that carries Anthropic thinking blocks keeps them whole,
+        // signature included: the wire demands them back verbatim.
+        let msg = Message {
+            role: Role::Assistant,
+            content: Some("done".into()),
+            reasoning_content: Some("reasoned".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            thinking: Some(vec![ThinkingBlock {
+                thinking: "reasoned".into(),
+                signature: "cafe".into(),
+            }]),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""thinking":[{"thinking":"reasoned","signature":"cafe"}]"#));
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, back);
+        // A log line written before the field existed reads back as no blocks.
+        let old: Message = serde_json::from_str(r#"{"role":"assistant","content":"hi"}"#).unwrap();
+        assert_eq!(old.thinking, None);
     }
 
     #[test]
@@ -562,6 +768,7 @@ mod tests {
             content: content.map(str::to_owned),
             reasoning_content: reasoning.map(str::to_owned),
             tool_calls: tcs,
+            signature: None,
         };
         let mut acc = TurnAccumulator::default();
         acc.feed(&mk(Some("9.11 "), Some("let me "), None));
@@ -607,6 +814,7 @@ mod tests {
             content: None,
             reasoning_content: None,
             tool_calls: Some(tcs),
+            signature: None,
         };
         let dtc =
             |index: u32, id: Option<&str>, name: Option<&str>, args: Option<&str>| DeltaToolCall {
@@ -644,6 +852,139 @@ mod tests {
         assert_eq!(tcs[2].id, "call_a");
         assert_eq!(tcs[2].function.name, "read");
         assert_eq!(tcs[2].function.arguments, r#"{"file_path":"a.txt"}"#);
+    }
+
+    #[test]
+    fn accumulator_keeps_thinking_blocks_their_signatures_closed() {
+        let delta = |reasoning: Option<&str>, signature: Option<&str>| Delta {
+            role: None,
+            content: None,
+            reasoning_content: reasoning.map(str::to_owned),
+            tool_calls: None,
+            signature: signature.map(str::to_owned),
+        };
+        let mut acc = TurnAccumulator::default();
+        // First thinking block: streamed, then closed by a signature.
+        acc.feed(&delta(Some("step one."), None));
+        acc.feed(&delta(Some(" step two."), Some("sig-1")));
+        // A second block opens: the buffer restarted, and closes signed too.
+        acc.feed(&delta(Some("second block."), Some("sig-2")));
+        let msg = acc.finish();
+        let blocks = msg.thinking.unwrap();
+        assert_eq!(
+            blocks,
+            vec![
+                ThinkingBlock {
+                    thinking: "step one. step two.".into(),
+                    signature: "sig-1".into()
+                },
+                ThinkingBlock {
+                    thinking: "second block.".into(),
+                    signature: "sig-2".into()
+                },
+            ]
+        );
+        // The flat field keeps the whole reasoning for whoever reads text.
+        assert_eq!(
+            msg.reasoning_content.as_deref(),
+            Some("step one. step two.second block.")
+        );
+    }
+
+    #[test]
+    fn accumulator_never_builds_a_block_without_its_signature() {
+        let delta = |reasoning: Option<&str>, signature: Option<&str>| Delta {
+            role: None,
+            content: None,
+            reasoning_content: reasoning.map(str::to_owned),
+            tool_calls: None,
+            signature: signature.map(str::to_owned),
+        };
+        // A body no signature closes (a truncated stream, or the DeepSeek
+        // shape where no signature exists at all) stays out of the blocks;
+        // the flat reasoning field keeps the text either way.
+        let mut acc = TurnAccumulator::default();
+        acc.feed(&delta(Some("unsealed thought"), None));
+        acc.feed(&delta(None, Some("")));
+        let msg = acc.finish();
+        assert_eq!(msg.thinking, None);
+        assert_eq!(msg.reasoning_content.as_deref(), Some("unsealed thought"));
+
+        // The DeepSeek shape: reasoning without any signature at all, so no
+        // block is ever produced and the message is what it always was.
+        let mut acc = TurnAccumulator::default();
+        acc.feed(&delta(Some("plain reasoning"), None));
+        let msg = acc.finish();
+        assert_eq!(msg.thinking, None);
+        assert_eq!(msg.reasoning_content.as_deref(), Some("plain reasoning"));
+    }
+
+    #[test]
+    fn anthropic_request_serializes_in_wire_shape() {
+        let req = AnthropicRequest {
+            model: "MiniMax-M3".into(),
+            max_tokens: 131_072,
+            system: Some("sys".into()),
+            messages: vec![
+                AnthropicMessage {
+                    role: AnthropicRole::User,
+                    content: AnthropicContent::Text("hi".into()),
+                },
+                AnthropicMessage {
+                    role: AnthropicRole::Assistant,
+                    content: AnthropicContent::Blocks(vec![
+                        AnthropicBlock::Thinking {
+                            thinking: "hmm".into(),
+                            signature: "cafe".into(),
+                        },
+                        AnthropicBlock::ToolUse {
+                            id: "call_1".into(),
+                            name: "Bash".into(),
+                            input: serde_json::json!({"command": "ls"}),
+                        },
+                    ]),
+                },
+                AnthropicMessage {
+                    role: AnthropicRole::User,
+                    content: AnthropicContent::Blocks(vec![AnthropicBlock::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: "out".into(),
+                    }]),
+                },
+            ],
+            tools: Some(vec![AnthropicTool {
+                name: "Bash".into(),
+                description: Some("run it".into()),
+                input_schema: serde_json::json!({"type": "object"}),
+            }]),
+            tool_choice: Some(AnthropicToolChoice::Auto),
+            stream: true,
+            thinking: Some(Thinking::adaptive()),
+        };
+        let v: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["model"], "MiniMax-M3");
+        assert_eq!(v["max_tokens"], 131_072);
+        assert_eq!(v["system"], "sys");
+        assert_eq!(v["stream"], true);
+        assert_eq!(v["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(v["tool_choice"], serde_json::json!({"type": "auto"}));
+        assert_eq!(v["messages"][0]["content"], "hi");
+        let blocks = v["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["signature"], "cafe");
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[1]["input"]["command"], "ls");
+        assert_eq!(
+            v["messages"][2]["content"][0],
+            serde_json::json!({"type": "tool_result", "tool_use_id": "call_1", "content": "out"})
+        );
+        assert_eq!(v["tools"][0]["input_schema"]["type"], "object");
+        // The disabled switch is the same shape, other word.
+        let off = Thinking::disabled();
+        assert_eq!(
+            serde_json::to_value(&off).unwrap(),
+            serde_json::json!({"type": "disabled"})
+        );
     }
 
     #[test]

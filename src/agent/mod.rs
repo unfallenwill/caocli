@@ -11,12 +11,13 @@ use crate::api::Client;
 use crate::machine;
 use crate::provider;
 use crate::session::Session;
-use crate::types::ChatRequest;
+use crate::types::WireRequest;
 
-mod request;
+/// `pub(crate)` for the wire-mismatch test in `api`, which builds a request
+/// from a preset to check the client takes it.
+pub(crate) mod request;
 mod stream;
 mod turn;
-
 pub struct Agent {
     api: Client,
     pub session: Session,
@@ -107,7 +108,7 @@ impl Agent {
         self.session = session;
     }
 
-    fn build_request(&self) -> ChatRequest {
+    fn build_request(&self) -> WireRequest {
         request::build_request(&self.provider, &self.session.meta, &self.session.messages)
     }
 }

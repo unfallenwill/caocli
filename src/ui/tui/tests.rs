@@ -132,6 +132,7 @@ fn replay_and_the_live_stream_produce_the_same_cells() {
             reasoning_content: Some("let me think".into()),
             tool_calls: None,
             tool_call_id: None,
+            thinking: None,
         },
         Message::tool("call_1", "exit_code: 0\n--- stdout ---\nbody"),
     ]));

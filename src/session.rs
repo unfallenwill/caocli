@@ -407,6 +407,7 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
+            thinking: None,
         })
         .unwrap();
         s.append_message(&Message::tool("call_1", "file.txt"))
@@ -632,6 +633,7 @@ mod tests {
                 },
             ]),
             tool_call_id: None,
+            thinking: None,
         })
         .unwrap();
         s.append_message(&Message::tool("call_1", "ok")).unwrap();

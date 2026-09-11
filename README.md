@@ -3,9 +3,10 @@
 [![CI](https://github.com/unfallenwill/caocli/actions/workflows/ci.yml/badge.svg)](https://github.com/unfallenwill/caocli/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A minimal terminal coding agent in Rust, backed by an OpenAI-compatible
-`/chat/completions` API: DeepSeek by default, Z.AI's GLM coding endpoint via
-`--provider zai-coding-cn`. It streams the model's thinking (`reasoning_content`) in
+A minimal terminal coding agent in Rust, backed by two wire protocols: an
+OpenAI-compatible `/chat/completions` API (DeepSeek by default, Z.AI's GLM
+coding endpoint via `--provider zai-coding-cn`) and an Anthropic-compatible
+`/v1/messages` API (MiniMax's M3 via `--provider minimax`). It streams the model's thinking (`reasoning_content`) in
 dim gray, then runs a tool loop over six tools: `Bash`, `Read`, `Edit`,
 `Write`, `AskUserQuestion` (which asks you rather than the filesystem) and
 `TodoWrite` (which writes the plan where you can see it while it works). Both backends see images, which are attached with `/image` or
@@ -28,6 +29,7 @@ cargo run --                            # interactive REPL: /login, then chat
 cargo run -- -c -p "check disk usage"   # one-shot, continuing the latest session
 cargo run -- --effort max --model deepseek/deepseek-v4-pro -p "..."
 cargo run -- --provider zai-coding-cn -p "1+1"   # Z.AI Coding CN, glm-5.3-flash
+cargo run -- --provider minimax -p "1+1"         # MiniMax M3 (Anthropic wire)
 cargo run -- -p "what is wrong here?" --image shot.png
 cargo run -- --list                     # list sessions and exit
 ```
@@ -67,7 +69,9 @@ refused, with `/login <provider id>` as the reason.
 
 The reasoning effort is the provider's list too: `/effort` offers the tiers the
 provider in use accepts, and a tier is checked against that list before it is
-stored — the same check `--effort` passes at startup, so neither route can put a
+stored. On the Anthropic wire the tier is the thinking switch instead —
+MiniMax M3 has no effort tiers, only thinking on (`adaptive`) and off — by the
+same check — the same check `--effort` passes at startup, so neither route can put a
 value in the session the backend would reject or quietly ignore.
 
 A provider has an id and a name, and they are used for different things: the id
@@ -91,7 +95,7 @@ newlines also works (bracketed paste).
 |---|---|
 | `-p <PROMPT>` | Run one prompt (including the tool loop), then exit |
 | `--image <PATH>` | Attach an image to `-p`'s prompt; repeat for more than one. In an interactive session, `/image` is how one is attached |
-| `--provider <NAME>` | Backend provider: `deepseek` (default) or `zai-coding-cn`. Settles the endpoint of a new session; a resumed session keeps the one its meta names |
+| `--provider <NAME>` | Backend provider: `deepseek` (default), `zai-coding-cn` or `minimax`. Settles the endpoint of a new session; a resumed session keeps the one its meta names |
 | `--model <MODEL>` | Model id as `<provider>/<modelid>`, or bare for `--provider`; defaults to the provider's default model |
 | `--effort <EFFORT>` | Reasoning effort: `low`, `high`, or `max` (default `max`); other values are rejected locally. `/effort` switches it inside a session. On GLM, `low` answers without emitting `reasoning_content`. |
 | `-c, --cont` | Continue the most recent session |
@@ -203,7 +207,7 @@ Stats reset when you switch sessions (`/new`, `/resume`) or models
 
 ### Images
 
-Both backends take images. `/image <path> [text]` is one turn about a picture:
+All backends take images. `/image <path> [text]` is one turn about a picture:
 the file is read, and the message that goes to the model is the text followed by
 the image. With no text the picture is all there is — the model describes it, and
 the questions that follow are ordinary lines, because the image stays in the
@@ -235,12 +239,13 @@ images).
 answer ceiling. It is settled per run, and `--model <provider id>/<modelid>` or `/model`
 names a provider of its own. A session records the provider its model belongs
 to, so continuing one (`caocli -c`) resumes on the same backend — no flag
-needed — and `--provider zai-coding-cn` is how you move it to the other one.
+needed — and `--provider` is how you move it to another one.
 
-| Provider id | Name | Endpoint | Models | Max answer |
-|---|---|---|---|---|
-| `deepseek` | DeepSeek | `api.deepseek.com` | `deepseek-flash` (default), `deepseek-v4-pro` | 384k tokens |
-| `zai-coding-cn` | Z.AI Coding CN | `open.bigmodel.cn` (coding) | `glm-5.3-flash` (default), `glm-5.3` | 128k tokens |
+| Provider id | Name | Endpoint | Wire | Models | Max answer |
+|---|---|---|---|---|---|
+| `deepseek` | DeepSeek | `api.deepseek.com` | OpenAI | `deepseek-flash` (default), `deepseek-v4-pro` | 384k tokens |
+| `zai-coding-cn` | Z.AI Coding CN | `open.bigmodel.cn` (coding) | OpenAI | `glm-5.3-flash` (default), `glm-5.3` | 128k tokens |
+| `minimax` | MiniMax | `api.minimax.cn` (`/anthropic/v1/messages`) | Anthropic | `MiniMax-M3` (default) | 128k tokens |
 
 The id is what the flags, the menus' arguments, the session meta and
 `settings.json` carry; the name is what `/login` lists and what an error message
@@ -268,7 +273,8 @@ key lives. It is keyed by provider **id**:
 {
   "providers": {
     "deepseek": { "api_key": "sk-..." },
-    "zai-coding-cn": { "api_key": "..." }
+    "zai-coding-cn": { "api_key": "..." },
+    "minimax": { "api_key": "..." }
   }
 }
 ```
@@ -424,7 +430,7 @@ wherever the answer is typed:
   back to a valid one.
 - **One answer is capped, the conversation is not.** `max_tokens` comes from the
   provider preset and is sent on every request; a short answer is unaffected
-  (it is a ceiling, not a reservation). History is never trimmed: both backends
+  (it is a ceiling, not a reservation). History is never trimmed: all backends
   take 1M tokens of context, and the prefix cache depends on replaying it
   byte-for-byte.
 - **Prefix-cache friendly.** `SYSTEM_PROMPT` is a compile-time constant and

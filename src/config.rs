@@ -304,6 +304,7 @@ mod tests {
                 "deepseek/deepseek-v4-pro",
                 "zai-coding-cn/glm-5.3-flash",
                 "zai-coding-cn/glm-5.3",
+                "minimax/MiniMax-M3",
             ]
         );
         // The current one says so, a provider's default says so, and the
@@ -312,6 +313,7 @@ mod tests {
         assert_eq!(rows[0].detail, "default");
         assert_eq!(rows[2].detail, "no key: /login zai-coding-cn");
         assert_eq!(rows[3].detail, "no key: /login zai-coding-cn");
+        assert_eq!(rows[4].detail, "no key: /login minimax");
         // A model is chosen by the name it is shown by.
         assert_eq!(rows[1].argument, rows[1].label);
         std::fs::remove_dir_all(&home).unwrap();
