@@ -1,6 +1,7 @@
 use serde_json::json;
-use std::io::Read;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{MAX_FILE_BYTES, MAX_OUTPUT, MAX_READ_BYTES, parse_args, str_arg};
 use crate::types::{FunctionDef, ToolDef};
@@ -495,8 +496,12 @@ pub fn edit(args_json: &str) -> String {
         }
         _ => {}
     }
+    let target = match write_target(&path) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let updated = content.replacen(&old, &new, 1);
-    match atomic_write(Path::new(&path), &updated) {
+    match atomic_write(&target, &updated) {
         Ok(()) => format!(
             "ok: replaced 1 occurrence; {path} is now {} bytes",
             updated.len()
@@ -506,6 +511,12 @@ pub fn edit(args_json: &str) -> String {
 }
 
 /// Write: creates or overwrites a whole file; parent directories are created.
+///
+/// The write lands on the file the path finally names: a symlink is followed to
+/// its target rather than replaced by a regular file, an overwrite keeps the
+/// target's own permissions, and content that is already there is left alone.
+/// Everything that can be refused is refused before a byte is written, and a
+/// write that fails takes its temporary file with it.
 pub fn write(args_json: &str) -> String {
     let v = match parse_args(args_json) {
         Ok(v) => v,
@@ -525,8 +536,11 @@ pub fn write(args_json: &str) -> String {
             content.len()
         );
     }
-    let p = Path::new(&path);
-    if let Some(parent) = p.parent()
+    let target = match write_target(&path) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if let Some(parent) = target.parent()
         && !parent.as_os_str().is_empty()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
@@ -535,9 +549,66 @@ pub fn write(args_json: &str) -> String {
             parent.display()
         );
     }
-    match atomic_write(p, &content) {
+    if already_holds(&target, &content) {
+        return format!(
+            "ok: {path} already has exactly this content ({} bytes); left unchanged",
+            content.len()
+        );
+    }
+    match atomic_write(&target, &content) {
         Ok(()) => format!("ok: wrote {path} ({} bytes)", content.len()),
         Err(e) => format!("error: failed to write {path}: {e}"),
+    }
+}
+
+/// The file a write lands on: the path with any symlink at its end followed, so
+/// that writing through a link changes what the link points at instead of
+/// replacing the link itself -- which is what a rename lands on.
+///
+/// A directory, and anything else that is not a regular file, is refused here,
+/// before anything is created: a rename onto a path that cannot take a file is
+/// how a temporary file used to be left behind.
+fn write_target(path: &str) -> Result<PathBuf, String> {
+    let mut target = PathBuf::from(path);
+    // A chain longer than this is a loop, which is what the kernel calls it too.
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let link = std::fs::read_link(&target).map_err(|e| {
+                    format!("error: cannot follow the link at {}: {e}", target.display())
+                })?;
+                target = if link.is_absolute() {
+                    link
+                } else {
+                    // A relative link is relative to the directory the link sits
+                    // in, not to the process's own directory.
+                    target.parent().unwrap_or(Path::new(".")).join(link)
+                };
+            }
+            Ok(meta) if meta.is_dir() => {
+                return Err(format!("error: {path} is a directory, not a file"));
+            }
+            Ok(meta) if !meta.is_file() => {
+                return Err(format!(
+                    "error: {path} is not a regular file, so it cannot be written"
+                ));
+            }
+            _ => return Ok(target),
+        }
+    }
+    Err(format!("error: {path} is a loop of symbolic links"))
+}
+
+/// Whether the file already holds exactly this content. The size is read off
+/// the metadata first: a target of another size cannot match, and the read of
+/// one that could is bounded by the content's own size, so a file far larger
+/// than the write cap is never pulled into memory to answer this.
+fn already_holds(path: &Path, content: &str) -> bool {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() == content.len() as u64 => {
+            std::fs::read(path).is_ok_and(|bytes| bytes == content.as_bytes())
+        }
+        _ => false,
     }
 }
 
@@ -560,15 +631,49 @@ fn read_text(path: &str) -> Result<String, String> {
 }
 
 /// tmp file in the same directory + rename, so a crash mid-write cannot corrupt
-/// the original file.
+/// the original file. The temp file is created fresh and exclusively, and the
+/// mode of the file it is about to replace is copied onto it -- a rename hands
+/// the target the temp file's own permissions otherwise -- and a write or a
+/// rename that fails removes the temp file again, so a failed write leaves the
+/// directory as it found it.
 fn atomic_write(path: &Path, data: &str) -> std::io::Result<()> {
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".into());
-    let tmp = path.with_file_name(format!(".{file_name}.caocli-tmp-{}", std::process::id()));
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)
+    let (tmp, mut file) = temp_file(path, &file_name)?;
+    let written = (|| -> std::io::Result<()> {
+        file.write_all(data.as_bytes())?;
+        if let Ok(meta) = std::fs::metadata(path) {
+            file.set_permissions(meta.permissions())?;
+        }
+        Ok(())
+    })();
+    // The handle is closed before the rename: the file is whole on disk by then,
+    // and one that never landed is this call's to remove.
+    drop(file);
+    let result = written.and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// A fresh temp file beside the target, opened exclusively: the name is one
+/// nothing else holds, and a name that is somehow taken -- a leftover from a
+/// crashed run -- is an error rather than a write through whatever holds it.
+fn temp_file(path: &Path, file_name: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_file_name(format!(
+        ".{file_name}.caocli-tmp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    Ok((tmp, file))
 }
 
 #[cfg(test)]
@@ -1008,6 +1113,159 @@ mod tests {
             assert!(out.contains("failed to create directory"), "{out}");
             std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A write through a symlink changes the file the link points at: the link
+    /// is left a link, which is the difference between following it and letting
+    /// a rename land on the link's own path.
+    #[cfg(unix)]
+    #[test]
+    fn write_follows_a_symlink_to_its_target() {
+        let dir = tmpdir();
+        let target = dir.join("real.txt");
+        std::fs::write(&target, "old").unwrap();
+        let link = dir.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let out = write(&format!(
+            r#"{{"file_path":{:?},"content":"new"}}"#,
+            link.to_string_lossy()
+        ));
+        assert!(out.starts_with("ok:"), "{out}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_symlink(), "the link is still a link");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A link that names its target relatively is followed from the directory
+    /// the link sits in, and a link whose target is not there yet is followed
+    /// too: the write creates the target rather than replacing the link.
+    #[cfg(unix)]
+    #[test]
+    fn write_follows_a_relative_link_and_a_dangling_one() {
+        let dir = tmpdir();
+        let link = dir.join("rel.txt");
+        std::os::unix::fs::symlink("real.txt", &link).unwrap();
+        let out = write(&format!(
+            r#"{{"file_path":{:?},"content":"made"}}"#,
+            link.to_string_lossy()
+        ));
+        assert!(out.starts_with("ok:"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("real.txt")).unwrap(),
+            "made"
+        );
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_symlink(), "the link is still a link");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A chain of links that comes back to itself is refused, and refused
+    /// before anything is created: following it would not end.
+    #[cfg(unix)]
+    #[test]
+    fn write_refuses_a_loop_of_symlinks() {
+        let dir = tmpdir();
+        let a = dir.join("a");
+        std::os::unix::fs::symlink("b", &a).unwrap();
+        std::os::unix::fs::symlink("a", dir.join("b")).unwrap();
+        let out = write(&format!(
+            r#"{{"file_path":{:?},"content":"x"}}"#,
+            a.to_string_lossy()
+        ));
+        assert!(out.contains("loop"), "{out}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An overwrite keeps the mode the file had: the temp file a write goes
+    /// through is a new file, and a rename would hand the target the mode of
+    /// whatever replaced it.
+    #[cfg(unix)]
+    #[test]
+    fn write_keeps_the_mode_of_the_file_it_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir();
+        let p = dir.join("run.sh");
+        std::fs::write(&p, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = write(&format!(
+            r##"{{"file_path":{:?},"content":"#!/bin/sh\necho hi\n"}}"##,
+            p.to_string_lossy()
+        ));
+        assert!(out.starts_with("ok:"), "{out}");
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "the executable bit survives the overwrite");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "#!/bin/sh\necho hi\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A write that would put back exactly what is already there is answered
+    /// without a byte going to disk: a rewrite would bump the mtime and summon
+    /// whoever watches the file, for a change that changes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn write_leaves_a_file_that_already_has_the_content_alone() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tmpdir();
+        let p = dir.join("same.txt");
+        let path_arg = format!(
+            r#"{{"file_path":{:?},"content":"same"}}"#,
+            p.to_string_lossy()
+        );
+        assert!(
+            write(&path_arg).starts_with("ok: wrote"),
+            "the first write makes the file"
+        );
+        let inode = std::fs::metadata(&p).unwrap().ino();
+        let again = write(&path_arg);
+        assert!(again.contains("left unchanged"), "{again}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "same");
+        // A rewrite goes through a temp file and a rename, and the inode it
+        // would leave behind is what says one happened.
+        assert_eq!(std::fs::metadata(&p).unwrap().ino(), inode);
+        // A change of the same length is not mistaken for the same content.
+        let changed = format!(
+            r#"{{"file_path":{:?},"content":"diff"}}"#,
+            p.to_string_lossy()
+        );
+        assert!(write(&changed).starts_with("ok: wrote"));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "diff");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A write that cannot land leaves nothing behind: a directory and a fifo
+    /// are refused before a byte is written, and a rename that fails anyway --
+    /// the atomic write called with a path it cannot replace -- removes the temp
+    /// file it made, so no `.caocli-tmp-` file is orphaned in the directory.
+    #[test]
+    fn a_write_that_cannot_land_leaves_nothing_behind() {
+        let dir = tmpdir();
+        let sub = dir.join("a-directory");
+        std::fs::create_dir(&sub).unwrap();
+        let out = write(&format!(
+            r#"{{"file_path":{:?},"content":"x"}}"#,
+            sub.to_string_lossy()
+        ));
+        assert!(out.contains("is a directory"), "{out}");
+        let fifo = dir.join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo is how the test makes a fifo");
+        let out = write(&format!(
+            r#"{{"file_path":{:?},"content":"x"}}"#,
+            fifo.to_string_lossy()
+        ));
+        assert!(out.contains("not a regular file"), "{out}");
+        assert!(atomic_write(&sub, "x").is_err());
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("caocli-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

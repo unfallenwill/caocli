@@ -297,7 +297,7 @@ are returned to the model as text so it can recover, never as a hard error.
 | `Bash` | Run one `bash -c` command. 120s timeout; stdout and stderr are each truncated to 10 KiB. |
 | `Read` | Read a UTF-8 text file, one numbered row per line. `offset`/`limit` page through a long file, and the file is streamed: a page costs one page of memory however large the file is, and the marker after the last row says which lines were shown, how many lines the file has, and where to read on. A page whose lines end with CRLF says so, and so does a file whose last line has no newline after it: the two things about a file's shape that decide whether an `Edit` will match. |
 | `Edit` | Replace `old_string` with `new_string`; `old_string` must match exactly once. Written atomically via tmp + rename. |
-| `Write` | Create or fully overwrite a file; parent directories are created automatically. |
+| `Write` | Create or fully overwrite a file; parent directories are created automatically. The write lands on the file the path finally names: a symlink is followed to its target rather than replaced by a regular file, and an overwrite keeps the target's own permissions. Content that is already there is left unchanged, and a write that fails takes its temp file with it. |
 | `AskUserQuestion` | Ask you to choose: up to four questions, each with up to four options. The answer comes back as the call's result (`<id>: <chosen label>`), so the model continues with what you picked. |
 | `TodoWrite` | Record the plan as a list of tasks, up to 20. The whole list is sent every call and replaces the one before it, so each call is the state of the work rather than a change to it. |
 

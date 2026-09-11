@@ -147,6 +147,13 @@ that talks to a network API and drives an interactive terminal.
   they are known, rather than left for the model to guess. What cannot be paged at all
   — a directory, a fifo, a device — is refused before a byte is read: a fifo has no end
   to reach and no size to check, and a device can be endless.
+- **A write lands on the file the path finally names, and leaves nothing behind**: a
+  symlink at the end of the path is followed to its target rather than replaced by a
+  regular file, an existing target keeps its own permission bits (the tmp file a rename
+  hands over is a new one), content already on disk is answered as unchanged instead of
+  rewritten, a directory or anything else that is not a regular file is refused before
+  anything is created, and a write that fails removes its temp file. What is refusable
+  is refused before a byte is written.
 - **Approval gate**: execution is trusted by default; with `--ask`, Bash/Edit/Write
   require a user y/N before running (a call that changes nothing on disk is always
   allowed: reading, and writing the todo list). Denial, cancellation,
