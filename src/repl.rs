@@ -215,6 +215,11 @@ fn choose_model(agent: &mut Agent, ui: &mut dyn Front, spec: &str) {
     let mut meta = agent.session.meta.clone();
     meta.provider = Some(provider.id.to_string());
     meta.model = model;
+    // The tier is the provider's to offer, and this may be a new provider: one
+    // it does not offer is replaced by its own default rather than carried
+    // over, so what the status line shows is what the request sends. See
+    // `Provider::fit_effort`.
+    meta.reasoning_effort = provider.fit_effort(meta.reasoning_effort.as_deref());
     if meta != agent.session.meta {
         // The log first: it is the state, and a model that is only in memory
         // would be gone at the next resume.
@@ -1206,6 +1211,35 @@ mod tests {
             Some("max"),
             "the status line follows the tier in effect"
         );
+        drop(guard);
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_switch_keeps_an_offered_tier_and_replaces_one_that_is_not() {
+        let (guard, home) = own_home();
+        crate::config::store_key("zai-coding-cn", "zai-test").unwrap();
+        crate::config::store_key("minimax", "mm-test").unwrap();
+        let dir = tmpdir("model-effort");
+        let mut agent = agent_in(&dir, "deepseek-flash");
+        let mut ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/effort max").await;
+        // GLM serves `max` too, so the session keeps it across the switch.
+        submit(&mut agent, &mut ui, &dir, "/model zai-coding-cn/glm-5.3").await;
+        assert!(ui.errors.is_empty(), "{:?}", ui.errors);
+        assert_eq!(agent.session.meta.reasoning_effort.as_deref(), Some("max"));
+        // MiniMax has a thinking switch, not DeepSeek's tiers. Carried over, the
+        // stored `max` would be shown as a tier the session is not running on
+        // (`on` is what the request sends), so the provider's own default
+        // replaces it — and the status line follows the log.
+        submit(&mut agent, &mut ui, &dir, "/model minimax/MiniMax-M3").await;
+        assert!(ui.errors.is_empty(), "{:?}", ui.errors);
+        assert_eq!(agent.session.meta.reasoning_effort.as_deref(), Some("on"));
+        assert_eq!(ui.effort.as_deref(), Some("on"), "the status line took it");
+        let log = std::fs::read_to_string(&agent.session.path).unwrap();
+        assert!(log.contains("\"reasoning_effort\":\"on\""), "{log}");
         drop(guard);
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&home).unwrap();

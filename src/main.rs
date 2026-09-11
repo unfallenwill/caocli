@@ -105,20 +105,28 @@ fn apply_overrides(
         }
         (None, None) => {}
     }
-    // The effort, when given, is checked against the provider the session ends
-    // up on — the one `--model`/`--provider` chose above, or the session's own
-    // when neither was given.
+    // The provider the session ends up on: the one `--model`/`--provider` chose
+    // above, or the session's own when neither was given.
+    let on = match meta.provider.as_deref() {
+        Some(id) => provider::provider(id)?,
+        None => current,
+    };
+    // The effort, when given, is checked against that provider.
     if let Some(e) = &cli.effort {
-        let on = match meta.provider.as_deref() {
-            Some(id) => provider::provider(id)?,
-            None => current,
-        };
         on.validate_effort(e)?;
     }
     if let Some(e) = &cli.effort
         && meta.reasoning_effort.as_deref() != Some(e.as_str())
     {
         meta.reasoning_effort = Some(e.clone());
+        changed = true;
+    }
+    // A tier the provider does not offer is not carried into it: the session
+    // would send a value this backend may reject, and show a tier it is not
+    // running on. See `Provider::fit_effort`.
+    let fitted = on.fit_effort(meta.reasoning_effort.as_deref());
+    if fitted != meta.reasoning_effort {
+        meta.reasoning_effort = fitted;
         changed = true;
     }
     Ok(changed)
@@ -428,6 +436,49 @@ mod tests {
         );
         assert_eq!(meta.provider.as_deref(), Some("zai-coding-cn"));
         assert_eq!(meta.model, "glm-4.6");
+    }
+
+    #[test]
+    fn a_switch_brings_only_a_tier_the_new_provider_serves() {
+        // A resumed session carries its tier into the provider it moves to only
+        // where that provider serves it. MiniMax's only control is a thinking
+        // switch, so DeepSeek's `max` is replaced by MiniMax's own default
+        // rather than sent as a tier this backend answers with a 400.
+        let mut meta = meta_of("deepseek", "deepseek-flash");
+        meta.reasoning_effort = Some("max".into());
+        assert!(
+            apply_overrides(
+                &mut meta,
+                &cli(&["--model", "minimax/MiniMax-M3"]),
+                provider::DEEPSEEK
+            )
+            .unwrap()
+        );
+        assert_eq!(meta.provider.as_deref(), Some("minimax"));
+        assert_eq!(meta.model, "MiniMax-M3");
+        assert_eq!(meta.reasoning_effort.as_deref(), Some("on"));
+        // And back: `off` is not a DeepSeek tier either.
+        assert!(
+            apply_overrides(
+                &mut meta,
+                &cli(&["--model", "deepseek/deepseek-v4-pro"]),
+                provider::DEEPSEEK
+            )
+            .unwrap()
+        );
+        assert_eq!(meta.reasoning_effort.as_deref(), Some("max"));
+        // A tier both providers serve is the session's to keep.
+        let mut meta = meta_of("deepseek", "deepseek-flash");
+        meta.reasoning_effort = Some("low".into());
+        assert!(
+            apply_overrides(
+                &mut meta,
+                &cli(&["--model", "zai-coding-cn/glm-5.3"]),
+                provider::DEEPSEEK
+            )
+            .unwrap()
+        );
+        assert_eq!(meta.reasoning_effort.as_deref(), Some("low"));
     }
 
     #[test]
