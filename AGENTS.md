@@ -163,7 +163,10 @@ that talks to a network API and drives an interactive terminal.
   did. It is executed like any other tool (nothing about its answer needs a person),
   it never passes the gate (asking permission to write down a note is asking about
   nothing), and both surfaces that show it go through the same marks and the same
-  summary line, so they cannot say different things about one list.
+  summary line, so they cannot say different things about one list. The one count that
+  comes back unasked — a call that leaves two tasks in hand — is in the tool's answer
+  and not in that summary line, which is a head line for a person who has the list in
+  front of them.
 - **Session logs are append-only and never rewritten**: a crash loses at most a
   trailing partial line, and corrupt lines are skipped when reading; interrupted tool
   calls are healed **deterministically** at load time (in-memory view only — the
@@ -224,8 +227,8 @@ determines cost and latency:
 - History messages are **replayed byte-for-byte**: no trimming, no reordering, no
   clipping, no compression, no normalization.
 - Changing the tool set, the tool order, or any tool schema text (names,
-  descriptions, parameter descriptions) changes the prefix and causes a full cache
-  miss — only do it deliberately.
+  descriptions, parameter descriptions, parameter keywords) changes the prefix and
+  causes a full cache miss — only do it deliberately.
 - Any change that "optimizes the history" equals a full cache miss.
 - An **attached image is part of the message**: it is stored as the `data:` URL the
   request carried and replayed with it. Reading the file again, or re-encoding the

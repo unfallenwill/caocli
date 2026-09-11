@@ -28,6 +28,11 @@ pub const TODO_NAME: &str = "TodoWrite";
 /// A cap rather than a suggestion: the list is drawn where a person is meant to
 /// read it while the work runs, and a list long enough to be a document is one
 /// nobody reads at all.
+///
+/// Declared to the model as well as enforced here. The schema is what it reads
+/// before it plans a list; this parser is what it meets only after it has
+/// written one too long. One constant feeds both, so a cap moved for one is a
+/// cap moved for the other.
 pub const MAX_ITEMS: usize = 20;
 
 /// Where a task stands.
@@ -91,6 +96,7 @@ pub fn definition() -> ToolDef {
                     "todos": {
                         "type": "array",
                         "description": "The whole list, in the order the work is done. Send an empty array to clear it.",
+                        "maxItems": MAX_ITEMS,
                         "items": {
                             "type": "object",
                             "additionalProperties": true,
@@ -176,14 +182,27 @@ pub fn execute(args_json: &str) -> String {
 ///
 /// The counts and not the list: the model wrote the list and can read it back
 /// from its own call, and what it cannot otherwise know is whether the call
-/// landed at all.
+/// landed at all. With one exception: the asking is done in prose the model may
+/// skim, so a call that leaves two tasks in hand is answered with the count it
+/// has no reason to take of its own marks.
 pub fn result_text(todos: &[Todo]) -> String {
     if todos.is_empty() {
         return "todo list cleared".to_owned();
     }
     // [`summary`] and not a second way of counting the same tasks, so that what
     // the model is told and what the user is shown cannot disagree.
-    format!("todo list updated ({})", summary(todos))
+    let mut state = summary(todos);
+    // Silent while the rule holds, so that it stays a signal rather than a
+    // suffix on every call -- and out of [`summary`], which is a head line for a
+    // person who has the list itself on their screen, a mark per task.
+    let in_hand = todos
+        .iter()
+        .filter(|t| t.status == Status::InProgress)
+        .count();
+    if in_hand > 1 {
+        state.push_str(&format!("; {in_hand} in progress"));
+    }
+    format!("todo list updated ({state})")
 }
 
 /// How far the list has got, in the few columns a head line can spare for it.
@@ -256,10 +275,55 @@ mod tests {
         ];
         // The model wrote the list and can read it back; what it cannot know
         // otherwise is whether the call landed. The same words the user sees,
-        // because it is the same function.
+        // because it is the same function -- and one task in hand is the rule
+        // kept, so there is nothing here to correct.
         assert_eq!(result_text(&todos), "todo list updated (1/3 done)");
         assert_eq!(summary(&todos), "1/3 done");
         assert!(result_text(&todos).contains(&summary(&todos)));
+    }
+
+    #[test]
+    fn only_two_tasks_in_hand_are_counted_back_at_the_model() {
+        fn list(statuses: &[Status]) -> Vec<Todo> {
+            statuses.iter().map(|s| todo("t", *s)).collect()
+        }
+
+        // Nothing in hand, and the one in hand the tool asks for: both are the
+        // plain count, with nothing for the model to correct.
+        let at_most_one: [&[Status]; 4] = [
+            &[Status::Completed, Status::Pending],
+            &[Status::Completed, Status::InProgress],
+            &[Status::InProgress],
+            &[Status::Pending],
+        ];
+        for statuses in at_most_one {
+            let text = result_text(&list(statuses));
+            assert!(!text.contains("in progress"), "{text}");
+        }
+
+        // Two is the rule broken, and the one thing the model has no reason to
+        // read off its own call.
+        let several: [(&[Status], &str); 2] = [
+            (
+                &[Status::InProgress; 2],
+                "todo list updated (0/2 done; 2 in progress)",
+            ),
+            (
+                &[Status::InProgress; 3],
+                "todo list updated (0/3 done; 3 in progress)",
+            ),
+        ];
+        for (statuses, expected) in several {
+            let todos = list(statuses);
+            assert_eq!(result_text(&todos), expected);
+            // And the head line a person reads is untouched by any of it: the
+            // list is on their screen, a mark per task, and how many are in hand
+            // is not something they asked to be told.
+            assert_eq!(summary(&todos), format!("0/{} done", statuses.len()));
+        }
+
+        // A list with nothing left to track is still just cleared.
+        assert_eq!(result_text(&[]), "todo list cleared");
     }
 
     #[test]
@@ -335,6 +399,13 @@ mod tests {
     fn the_schema_the_model_reads_is_frozen() {
         let parameters = definition().function.parameters.unwrap();
         assert_eq!(parameters["required"], json!(["todos"]));
+        // The cap is in the schema and in the parser, both out of [`MAX_ITEMS`]:
+        // what the model is told before it plans a list is the same number that
+        // is enforced once it has written one.
+        assert_eq!(
+            parameters["properties"]["todos"]["maxItems"],
+            json!(MAX_ITEMS)
+        );
         assert_eq!(
             parameters["properties"]["todos"]["items"]["required"],
             json!(["content"])

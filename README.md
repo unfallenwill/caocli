@@ -321,6 +321,11 @@ of those same arguments:
   counts what it left out at each end, so the one row you are waiting on is never
   the one that was cut. Sending an empty list clears it, and the block goes.
 
+One task is meant to be in hand at a time, and the call's result says so when two
+are: `todo list updated (1/3 done; 2 in progress)`. That count is the one thing
+the model is told that it could not read off its own call, and it stays out of the
+two drawings above, which show the list itself.
+
 ### Answering a question
 
 `AskUserQuestion` is the one call whose result is yours, and it is answered
