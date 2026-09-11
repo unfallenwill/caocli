@@ -714,7 +714,8 @@ fn reason(near: &Nearest, want: &[&str], differs: Option<usize>) -> String {
 /// spelled out rather than left to be read off a line that does not show it.
 fn differences(file: &str, want: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if squeeze(file) != squeeze(want) {
+    let same_characters = stripped(file) == stripped(want);
+    if !same_characters {
         parts.push("its text".to_string());
     }
     let (file_leads, want_leads) = (leading(file), leading(want));
@@ -735,9 +736,10 @@ fn differences(file: &str, want: &str) -> String {
             ws_name(want_ends)
         ));
     }
-    // Nothing at the ends and nothing in the words: the difference there is left
-    // is the whitespace between the words.
-    if parts.is_empty() {
+    // The same characters, and the same whitespace at both ends: whatever is
+    // left between them is whitespace too, which is the one difference a reader
+    // cannot count off a line.
+    if same_characters && file.trim() != want.trim() {
         parts.push("the whitespace inside it".to_string());
     }
     joined(&parts)
@@ -752,24 +754,12 @@ fn joined(parts: &[String]) -> String {
     }
 }
 
-/// A line with every run of whitespace squeezed into one space and its ends
-/// trimmed: what two lines are compared as when the question is whether they
-/// carry the same text, whatever the whitespace between the words does.
-fn squeeze(line: &str) -> String {
-    let mut out = String::new();
-    let mut space = false;
-    for c in line.trim().chars() {
-        if c.is_whitespace() {
-            space = true;
-            continue;
-        }
-        if space && !out.is_empty() {
-            out.push(' ');
-        }
-        space = false;
-        out.push(c);
-    }
-    out
+/// A line with every whitespace character taken out of it: what two lines are
+/// compared as when the question is whether they carry the same characters,
+/// whatever the whitespace between them does -- which is what tells a line that
+/// was sent without a space from a line that was sent with the wrong words.
+fn stripped(line: &str) -> String {
+    line.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 /// What a hint says about a file whose lines carry a carriage return the
@@ -2099,6 +2089,17 @@ mod tests {
             r#","old_string":"let a = f(x, y);","new_string":"x""#,
         ));
         assert!(out.contains("in the whitespace inside it"), "{out}");
+
+        // A space the call left out is a difference inside the line, not a
+        // difference in the words: the two carry the same characters.
+        let missing = dir.join("missing.txt");
+        std::fs::write(&missing, "let a = f(x, y);\n").unwrap();
+        let out = edit(&args(
+            &missing,
+            r#","old_string":"let a=f(x, y);","new_string":"x""#,
+        ));
+        assert!(out.contains("in the whitespace inside it"), "{out}");
+        assert!(!out.contains("in its text"), "{out}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
