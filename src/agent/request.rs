@@ -1,5 +1,6 @@
-//! What a sub-request is made of: the system prompt, the history as stored, the
-//! tools, and the provider's wire profile.
+//! What a sub-request is made of: the system prompt, the session's project
+//! instructions (stored in the meta), the history as stored, the tools, and
+//! the provider's wire profile.
 //!
 //! Pure in `(provider, meta, history)`: no client, no session file, no clock.
 //! That is the cache contract made visible — the same three inputs must produce
@@ -29,8 +30,18 @@ pub fn build_request(
     meta: &SessionMeta,
     history: &[Message],
 ) -> ChatRequest {
-    let mut messages = Vec::with_capacity(history.len() + 1);
+    let mut messages = Vec::with_capacity(history.len() + 2);
     messages.push(Message::system(SYSTEM_PROMPT));
+    // The session's project instructions, frozen into the meta at creation and
+    // sent byte-for-byte from there — the prefix they open stays stable for
+    // the life of the session, and nothing here reads the filesystem (the
+    // purity of `(provider, meta, history)` is the cache contract). A user
+    // message rather than a second system one: it is the one shape every
+    // backend in the preset table takes, and the instructions are context the
+    // model reads, not a voice it speaks in.
+    if let Some(text) = meta.instructions.as_deref().filter(|t| !t.is_empty()) {
+        messages.push(Message::user(text));
+    }
     messages.extend(history.iter().cloned());
     // Specification tripwire (debug builds only): the history being sent must
     // satisfy the executable specification. A violation is a shape the

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::agent::Agent;
+use crate::agents_md;
 use crate::api::Client;
 use crate::config;
 use crate::image;
@@ -51,15 +52,31 @@ pub async fn handle(
                 ));
             }
         }
-        "/new" => match Session::create(sdir, agent.session.meta.clone()) {
-            Ok(s) => {
-                ui.info(&format!("new session {}", s.id));
-                agent.adopt(s);
-                ui.reset_stats();
-                ui.set_model(&agent.model_label());
+        "/new" => {
+            // A new session reads the workspace as it stands now: instructions
+            // edited since this one began are picked up here, the same way
+            // they were picked up when it began. What the new session freezes
+            // in is its own, and the old session's log is untouched.
+            let mut meta = agent.session.meta.clone();
+            meta.instructions = agents_md::load();
+            match Session::create(sdir, meta) {
+                Ok(s) => {
+                    ui.info(&format!(
+                        "new session {}{}",
+                        s.id,
+                        if s.meta.instructions.is_some() {
+                            " · AGENTS.md"
+                        } else {
+                            ""
+                        }
+                    ));
+                    agent.adopt(s);
+                    ui.reset_stats();
+                    ui.set_model(&agent.model_label());
+                }
+                Err(e) => ui.error(&format!("{e:#}")),
             }
-            Err(e) => ui.error(&format!("{e:#}")),
-        },
+        }
         // The interactive front end offers the list to choose from instead; this
         // is what both front ends say when there is nothing to offer.
         "/resume" => ui.info("resume needs a session id; /sessions lists them"),
@@ -529,6 +546,7 @@ mod tests {
                 provider: Some(provider.to_owned()),
                 model: model.to_owned(),
                 reasoning_effort: None,
+                instructions: None,
             },
         )
         .unwrap();
@@ -626,6 +644,41 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    async fn new_reads_the_workspace_as_it_stands_now() {
+        // A fresh session reads the workspace's instructions; `/new` is a fresh
+        // session, so it reads them again rather than inheriting what the one
+        // before it read — instructions edited since are what the new session
+        // carries.
+        let _lock = crate::config::env_lock();
+        let back = std::env::current_dir().unwrap();
+        let workspace = crate::config::scratch_cwd();
+        std::fs::write(workspace.join("AGENTS.md"), "be brief").unwrap();
+        let dir = tmpdir("new-instructions");
+        let mut agent = agent_in(&dir, "m");
+        let mut ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/new").await;
+        let text = agent
+            .session
+            .meta
+            .instructions
+            .as_deref()
+            .unwrap_or_default();
+        assert!(
+            text.contains("be brief"),
+            "the new session carries what the workspace says now: {text}"
+        );
+        assert!(
+            ui.info[0].ends_with(" · AGENTS.md"),
+            "the notice says where the session's instructions came from: {:?}",
+            ui.info
+        );
+        std::env::set_current_dir(back).unwrap();
+        std::fs::remove_dir_all(&workspace).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn resume_switches_session_and_replays_its_history() {
         // The key resolution here has to be the test's own: a key for the other
         // provider, left in a HOME of its own by another test, would bind the
@@ -639,6 +692,7 @@ mod tests {
                 provider: Some("zai-coding-cn".to_owned()),
                 model: "second-model".to_owned(),
                 reasoning_effort: None,
+                instructions: None,
             },
         )
         .unwrap();
@@ -692,6 +746,7 @@ mod tests {
                 provider: Some("zai-coding-cn".to_owned()),
                 model: "glm-5.3".to_owned(),
                 reasoning_effort: Some("low".into()),
+                instructions: None,
             },
         )
         .unwrap();

@@ -17,6 +17,7 @@ fn test_meta() -> SessionMeta {
         provider: Some("deepseek".into()),
         model: "deepseek-v4-flash".into(),
         reasoning_effort: Some("high".into()),
+        instructions: None,
     }
 }
 
@@ -87,6 +88,7 @@ fn the_request_prefix_is_frozen() {
         provider: Some("deepseek".into()),
         model: "deepseek-flash".into(),
         reasoning_effort: Some("high".into()),
+        instructions: None,
     };
     assert_eq!(
         serde_json::to_string(&build_request(&provider::DEEPSEEK, &deepseek, &history)).unwrap(),
@@ -98,6 +100,7 @@ fn the_request_prefix_is_frozen() {
         provider: Some("zai-coding-cn".into()),
         model: "glm-5.3".into(),
         reasoning_effort: None,
+        instructions: None,
     };
     assert_eq!(
         serde_json::to_string(&build_request(&provider::ZAI_CODING_CN, &zai, &history)).unwrap(),
@@ -116,8 +119,52 @@ fn a_provider_that_omits_thinking_sends_no_field() {
         provider: Some("zai-coding-cn".into()),
         model: "glm-5.3".into(),
         reasoning_effort: None,
+        instructions: None,
     };
     let json = serde_json::to_string(&build_request(&p, &meta, &[])).unwrap();
     assert!(!json.contains("\"thinking\""), "{json}");
     assert!(json.contains("\"reasoning_effort\":\"max\""), "{json}");
+}
+
+/// The session's project instructions go between the system prompt and the
+/// history: ahead of everything the session went on to say, and byte-for-byte
+/// what the meta stored.
+#[test]
+fn the_instructions_sit_between_the_system_prompt_and_the_history() {
+    let meta = SessionMeta {
+        instructions: Some("the framed instructions".into()),
+        ..test_meta()
+    };
+    let history = vec![Message::user("q1")];
+    let request = build_request(&provider::DEEPSEEK, &meta, &history);
+    assert_eq!(request.messages.len(), 3);
+    assert_eq!(request.messages[0].role, Role::System);
+    assert_eq!(request.messages[0].text().as_deref(), Some(SYSTEM_PROMPT));
+    assert_eq!(
+        request.messages[1],
+        Message::user("the framed instructions")
+    );
+    assert_eq!(request.messages[2], Message::user("q1"));
+}
+
+/// A session without instructions — one written before they were recorded, or
+/// started in a workspace without AGENTS.md — sends exactly what it always
+/// sent. This is the shape the frozen request above pins.
+#[test]
+fn a_session_without_instructions_sends_nothing_for_them() {
+    let history = vec![Message::user("q1")];
+    let request = build_request(&provider::DEEPSEEK, &test_meta(), &history);
+    assert_eq!(request.messages.len(), 2);
+    assert_eq!(request.messages[1], Message::user("q1"));
+}
+
+/// An empty stored value sends nothing: a message of air is a prefix of air.
+#[test]
+fn empty_instructions_are_not_sent() {
+    let meta = SessionMeta {
+        instructions: Some(String::new()),
+        ..test_meta()
+    };
+    let request = build_request(&provider::DEEPSEEK, &meta, &[]);
+    assert_eq!(request.messages.len(), 1);
 }

@@ -42,6 +42,7 @@ fn test_meta() -> SessionMeta {
         provider: Some("deepseek".into()),
         model: "deepseek-v4-flash".into(),
         reasoning_effort: Some("high".into()),
+        instructions: None,
     }
 }
 
