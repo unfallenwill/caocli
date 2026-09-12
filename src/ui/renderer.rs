@@ -24,6 +24,31 @@ use super::terminal::{RealTerminal, Terminal};
 
 const RESET: &str = "\x1b[0m";
 
+/// The SGR escape that opens `style`.
+///
+/// This is the plain front end's backend: the place where the semantic
+/// [`Style`] the cell carries becomes bytes on the wire. The cell module
+/// deliberately does not know about SGR -- a [`Style`] is a label, and the
+/// two front ends render it their own way. The TUI renders it through
+/// `paint::style_of` into ratatui's [`ratatui::style::Style`] and lets the
+/// backend decide; this one writes SGR directly because it owns its writer,
+/// not a ratatui frame.
+///
+/// Weight is chosen over hue for the painted styles: a terminal that has a
+/// readable idea of `bold` and a half-readable one of "yellow" is what this
+/// code sees, and weight reads on both the light background this palette was
+/// chosen for and the dark one it sometimes lands on, while red at its
+/// darkest on a dark background is a line a reader cannot read.
+fn style_code(style: Style) -> &'static str {
+    match style {
+        Style::Plain => "",
+        Style::Dim | Style::Reasoning => "\x1b[2m",
+        Style::Yellow => "\x1b[1;33m",
+        Style::Green => "\x1b[1;32m",
+        Style::Red => "\x1b[1;31m",
+    }
+}
+
 /// A text block being streamed.
 ///
 /// Deltas are written as they arrive rather than buffered, so the block is never
@@ -190,7 +215,7 @@ impl Renderer {
 
     /// The escape that opens `style`, empty when colors are off.
     fn open_style(&self, style: Style) -> &'static str {
-        if self.color { style.code() } else { "" }
+        if self.color { style_code(style) } else { "" }
     }
 
     /// The escape that closes a style, empty when colors are off.
@@ -460,5 +485,30 @@ impl Ui for Renderer {
         });
         self.status.record(usage);
         self.redraw_status_bar();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::style_code;
+    use crate::ui::cell::Style;
+
+    /// The plain front end's mapping: a semantic [`Style`] to the SGR escape
+    /// sequence it becomes when colors are enabled. The mapping lives here
+    /// rather than on the [`Style`] enum, on purpose: the cell is data and the
+    /// escape sequence is the renderer that owns the wire.
+    #[test]
+    fn styles_map_to_their_escape_sequences() {
+        assert_eq!(style_code(Style::Plain), "");
+        assert_eq!(style_code(Style::Dim), "\x1b[2m");
+        // The same weight as `Dim`, and deliberately: thinking is told apart from a
+        // tool result by the rule in its gutter, which the terminal cannot lose, not
+        // by a color it may or may not honor.
+        assert_eq!(style_code(Style::Reasoning), "\x1b[2m");
+        // Painted styles carry the weight as well as the color: the color comes
+        // from a palette the terminal chose for a background this code cannot see.
+        assert_eq!(style_code(Style::Yellow), "\x1b[1;33m");
+        assert_eq!(style_code(Style::Green), "\x1b[1;32m");
+        assert_eq!(style_code(Style::Red), "\x1b[1;31m");
     }
 }

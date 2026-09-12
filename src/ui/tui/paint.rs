@@ -43,8 +43,8 @@ pub(super) fn style_of(style: Style) -> RStyle {
         // Painted styles are bold as well as colored, and bold is the half that
         // does not depend on the terminal's theme: the color is a palette slot the
         // theme chose for a background this code cannot see, while the weight reads
-        // on a light background and a dark one alike. See `Style::code` for the
-        // same rule in the plain front end.
+        // on a light background and a dark one alike. The plain front end applies
+        // the same rule in its `style_code`.
         Style::Yellow => RStyle::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         Style::Green => RStyle::new().fg(Color::Green).add_modifier(Modifier::BOLD),
         Style::Red => RStyle::new().fg(Color::Red).add_modifier(Modifier::BOLD),
