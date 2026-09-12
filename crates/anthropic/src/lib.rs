@@ -68,8 +68,10 @@
 //! - **An error inside a stream is its own kind of failure.** The reference raises
 //!   a status error for an `error` event, carrying the *response's* status — which
 //!   is 200, because the answer had already started. A caller that branches on a
-//!   status would read that as success. Here it is [`Error::Stream`], with the
-//!   error type the endpoint named.
+//!   status would read that as success, and one that asks whether to try again
+//!   would be told no: `overloaded_error` arriving mid-answer is exactly the
+//!   failure the spec says to retry. Here it is [`Error::Stream`], with the error
+//!   type the endpoint named, and it is worth another attempt.
 //! - **A stalled write has no bound.** The reference's transport bounds reads,
 //!   writes and the pool at ten minutes and the connect at five; reqwest exposes a
 //!   read timeout and a connect timeout and no more, so those two are set and the
