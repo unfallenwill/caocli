@@ -257,8 +257,29 @@ The model list is what `/model` offers; naming one the table does not list is
 allowed, and up to the backend to accept or reject. The effort tiers are the
 same table's: `/effort` offers exactly the list `--effort` is checked against.
 
-Both speak the same `thinking` / `reasoning_content` protocol, so the request
-builder and stream parser are shared. Thinking is always on.
+Two wires are served: the OpenAI chat-completions shape, parsed here, and the
+Anthropic Messages shape, spoken by the `anthropic` crate — the standard
+protocol as types, a client and a typed event stream, with the events folded
+back into the same deltas the accumulator reads so that nothing downstream knows
+a second protocol exists. Thinking is always on.
+
+Three optional fields of the Anthropic protocol are modelled and sent, each only
+where the preset says the endpoint serves it — a field a gateway does not know
+is a 400 on *every* request, so the answer is the preset's, not the program's:
+
+| Field | What it does |
+|---|---|
+| `output_config.effort` | How hard the model works: the preset's tiers are read as effort levels rather than as a thinking switch |
+| `thinking.display` | Asks for the reasoning text itself, which the newest models withhold by default |
+| `cache_control` | Turns the prompt cache on with one automatic breakpoint that the server keeps moving to the end of the cacheable prefix |
+
+`MiniMax`'s answers to all three are unverified, so its preset sends none of
+them; `scripts/anthropic_probe.py` asks and reports what to set.
+
+Why an answer stopped is read too: `max_tokens` or an exhausted context window
+is reported to the front end, because an answer cut off mid-thought is otherwise
+indistinguishable from one that finished. A tool that failed says so in the
+`is_error` field the wire has for it.
 
 Both models take 1M tokens of context, so nothing here trims history. The
 "max answer" column is `max_tokens`, which is sent on every request: it bounds
@@ -392,10 +413,14 @@ wherever the answer is typed:
 ## Design notes
 
 - **One loop, deliberately minimal.** Providers are a static table, not a trait
-  or dynamic registry. The turn loop is an interpreter over a pure decision
+  or dynamic registry, and protocols are an enum of two rather than a plugin
+  interface. The turn loop is an interpreter over a pure decision
   function: `machine::next_action` folds the committed history and returns the
   next step (call the model / run the next declared tool / done). The loop
   itself carries no state — the session log is the only source of truth.
+  A third protocol is a variant of `Wire` and an arm wherever it is matched,
+  which the compiler finds for you; the protocol itself lives in the crate that
+  speaks it, so nothing downstream learns that a second one exists.
 - **The machine decides, it never executes.** Tool execution, streaming, and
   persistence live in the interpreter; the decision function is pure and
   table-testable. The `Ui` trait is the machine's notification vocabulary —
@@ -483,12 +508,23 @@ every session written before the field existed).
 
 ## Development
 
+The repo is a Cargo workspace: this crate is the agent, and `crates/anthropic`
+is the Anthropic wire (a client for the standard Messages API). Every gate takes
+`--workspace`, or the SDK's tests and coverage never run.
+
 ```bash
-cargo fmt                                  # CI runs --check
-cargo clippy --all-targets -- -D warnings  # CI gate
-cargo test
-cargo llvm-cov --fail-under-lines 90       # CI gate; needs cargo-llvm-cov + llvm-tools-preview
-cargo audit                                # CI runs rustsec/audit-check
+cargo fmt --check --all                          # CI runs --check
+cargo clippy --workspace --all-targets -- -D warnings  # CI gate
+cargo test --workspace
+cargo llvm-cov --workspace --fail-under-lines 90  # CI gate; needs cargo-llvm-cov + llvm-tools-preview
+cargo audit                                       # CI runs rustsec/audit-check
+```
+
+To ask an Anthropic-compatible endpoint which of the standard optional fields it
+serves (see [Providers](#providers)):
+
+```bash
+python3 scripts/anthropic_probe.py            # uses the key /login stored
 ```
 
 End-to-end smoke test (the primary self-check channel after a change):

@@ -10,9 +10,10 @@
 use anyhow::{Context, Result, bail};
 
 /// The wire protocol a provider speaks. Two shapes are served today: the
-/// OpenAI chat-completions body and SSE chunk stream, and the Anthropic
-/// messages body and event stream. The internal history is provider-agnostic;
-/// the request builder and the stream parser each branch on this.
+/// OpenAI chat-completions body and SSE chunk stream, parsed here, and the
+/// Anthropic Messages body and event stream, spoken by the `anthropic` crate.
+/// The internal history is provider-agnostic; the request builder and the
+/// stream each branch on this, and both wires arrive at the same deltas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wire {
     OpenAi,

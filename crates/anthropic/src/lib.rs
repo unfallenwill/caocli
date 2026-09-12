@@ -30,9 +30,32 @@
 //!
 //! # Shape
 //!
-//! A `Client` is built from a `Profile` — where the endpoint is, how to
-//! authenticate, which API version to name. Nothing is sent until a request is
-//! handed to it, and building either one cannot fail.
+//! ```
+//! // The crate's own name; a consumer may rename it in its manifest, and the
+//! // agent here does — it depends on it as `anthropic`.
+//! use caocli_anthropic::{Client, MessageParam, MessagesRequest, Profile};
+//!
+//! let profile = Profile::base("https://api.anthropic.com")
+//!     .with_bearer_token("sk-ant-…")
+//!     .with_beta("interleaved-thinking-2025-05-14");
+//! let client = Client::new(profile).expect("the endpoint parses");
+//!
+//! let request = MessagesRequest::new(
+//!     "claude-sonnet-5",
+//!     4096,
+//!     vec![MessageParam::user("say hello")],
+//! )
+//! .streaming()
+//! .with_automatic_cache();
+//!
+//! // let mut events = client.stream(&request).await?;
+//! // while let Some(event) = events.next_event().await? { … }
+//! ```
+//!
+//! Nothing is sent until [`Client::messages`] or [`Client::stream`] is called.
+//! The only way building a client fails is the endpoint: a URL that does not
+//! parse is [`Error::Config`], because it is a configuration mistake and not a
+//! network one.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

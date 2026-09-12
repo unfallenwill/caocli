@@ -3,7 +3,7 @@
 Short guide for AI agents. Code shape and design rationale live in source comments; user-facing docs live in `README.md`.
 
 ## Dev environment tips
-- Add deps by editing the top-level `Cargo.toml`; `cargo build` fetches them.
+- Add deps by editing the `Cargo.toml` of the crate that uses them: the top-level one for the agent, `crates/anthropic/Cargo.toml` for the Anthropic wire. `cargo build` fetches them.
 - CI plans live in `.github/workflows/`.
 - For a quick type check, prefer `cargo check` over `cargo build` (it skips codegen).
 
