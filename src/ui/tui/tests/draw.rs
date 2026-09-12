@@ -1,6 +1,8 @@
-//! Tests for `draw_if_changed`: the path that paints the screen only when
-//! something on it has moved, so a session that has not changed does not
-//! pay for a paint.
+//! Tests for `draw_if_changed` and the other draw branches: the path that
+//! paints the screen only when something on it has moved (so a session that
+//! has not changed does not pay for a paint), and the two cases nothing else
+//! covers -- a picker forcing the window to follow the end, and the cursor
+//! being clipped to the field when a long line pushes it past the right edge.
 
 use std::cell::Cell as CellCount;
 use std::convert::Infallible;
@@ -179,4 +181,112 @@ fn closing_a_turn_is_worth_a_draw() {
     let drawn = screen.state.revision;
     screen.commit();
     assert_ne!(screen.state.revision, drawn, "the draw cannot be skipped");
+}
+
+/// A picker always stands over the bottom of the transcript, and the window
+/// follows the end of the session while it does -- a reader who has scrolled
+/// back loses the scroll the moment a menu opens, because the menu is being
+/// chosen against the lines the picker sits on.
+///
+/// This is the `else` branch in `draw_at`: the window otherwise answers
+/// `state.window(...)`, but a non-empty picker takes the floor with
+/// `state.follow()`. The arithmetic is `total.saturating_sub(room)`, which
+/// becomes "the last `room` lines", regardless of where `state.scroll.back`
+/// was pointing before the menu opened.
+#[test]
+fn a_picker_forces_the_window_to_the_end_regardless_of_scroll() {
+    let mut screen = screen_for_test(40, 20);
+    let rows = super::transcript_rows(20, super::super::layout::BOX_ROWS, 0) as usize;
+    for i in 0..(rows * 3) {
+        screen
+            .state
+            .transcript
+            .push(crate::ui::cell::Cell::Notice(format!("line {i}")));
+    }
+    // The first draw is what teaches the scroll how many rows the transcript
+    // has to page over: without `drawn_rows`, a PageUp has nothing to clamp
+    // against and the scroll never moves.
+    screen.draw().unwrap();
+    for _ in 0..6 {
+        super::press(&mut screen.state, KeyCode::PageUp);
+    }
+    screen.draw().unwrap();
+    assert!(screen.state.scroll.back > 0, "the reader scrolled back");
+    assert!(
+        super::body(&screen, 0).contains("line"),
+        "and was reading a real line, not an edge report: {:?}",
+        super::all_rows(&screen)
+    );
+
+    // Open the picker: the scroll is dropped, the window pins to the end.
+    screen.state.open_choices(
+        super::super::picker::Choosing::Model,
+        super::super::picker::named_rows(vec![
+            ("deepseek/deepseek-chat".into(), "current".into()),
+            ("deepseek/deepseek-reasoner".into(), "$0.55/M".into()),
+        ]),
+    );
+    screen.draw().unwrap();
+    assert_eq!(
+        screen.state.scroll.back, 0,
+        "the picker pinned the window to the end"
+    );
+    // The newest line is the last one we put in, and the picker is the last
+    // thing on the screen -- they meet.
+    let last = screen.terminal.backend().buffer().area.height - 1;
+    let total = rows * 3;
+    assert!(
+        super::body(&screen, 0).contains(&format!("line {}", total - rows)),
+        "the window slid to the end: {:?}",
+        super::all_rows(&screen)
+    );
+    // And the menu's row is on the screen.
+    let rows = super::all_rows(&screen);
+    assert!(
+        rows.iter().any(|r| r.contains("deepseek/deepseek-chat")),
+        "the picker is somewhere in the draw: {rows:?}"
+    );
+    let _ = last;
+}
+
+/// The input box's cursor is the terminal's, and `place_cursor` puts it on the
+/// cell a character will land in. The cell is clipped to the field: a line
+/// longer than the box has the cursor fall off the right, and the terminal's
+/// caret has to stay inside the field or the next keystroke would land in a
+/// column nothing drew.
+///
+/// The test backend leaves `get_cursor_position` at the default until
+/// `set_cursor_position` is called on it, so a cursor the guard rejected is a
+/// cursor the backend never heard from -- the only observable proof.
+#[test]
+fn a_cursor_past_the_right_edge_of_the_box_is_clipped() {
+    let mut screen = screen_for_test(40, 20);
+    super::type_in(&mut screen.state, &"x".repeat(60));
+    screen.draw().unwrap();
+    let pos = screen.terminal.get_cursor_position().unwrap();
+    assert_eq!(
+        (pos.x, pos.y),
+        (0, 0),
+        "the long line put the textarea cursor past the field, and the guard \
+         kept `set_cursor_position` from being called: {pos:?}"
+    );
+
+    // The other side: a cursor that *is* inside the field does reach the backend.
+    let mut screen = screen_for_test(40, 20);
+    super::type_in(&mut screen.state, "hi");
+    screen.draw().unwrap();
+    let pos = screen.terminal.get_cursor_position().unwrap();
+    let top = super::box_top(&screen);
+    assert!(
+        pos.y >= top && pos.y < top + super::super::layout::BOX_ROWS,
+        "y={} inside the box rows {}..{}",
+        pos.y,
+        top,
+        top + super::super::layout::BOX_ROWS
+    );
+    assert!(
+        pos.x >= 3 && pos.x <= 5,
+        "the cursor sat past 'hi', past the marker, and inside the field: x={}",
+        pos.x
+    );
 }
