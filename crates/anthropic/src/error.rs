@@ -78,14 +78,15 @@ pub enum Error {
 impl Error {
     /// Whether trying the same request again could work.
     ///
-    /// A refusal with a 4xx status is the request's own fault and will fail
-    /// identically; 429 and 5xx are the endpoint asking for another moment,
-    /// and a transport failure never arrived at all. A misconfigured client is
-    /// not transient either: the same client sends the same wrong request.
+    /// The statuses the reference client retries: 408 (the request timed out),
+    /// 409 (a lock timed out), 429 (rate limited), and every 5xx. A refusal
+    /// with any other 4xx status is the request's own fault and will fail
+    /// identically, and a misconfigured client sends the same wrong request
+    /// whatever the status — none of those is worth a second attempt.
     pub fn is_transient(&self) -> bool {
         match self {
             Error::Transport(_) => true,
-            Error::Api(api) => api.status == 429 || api.status >= 500,
+            Error::Api(api) => matches!(api.status, 408 | 409 | 429) || api.status >= 500,
             // A stream error is the backend failing mid-answer: the same
             // request may well go through next time. The spec's own advice for
             // `overloaded_error` is to retry.
@@ -161,9 +162,10 @@ mod tests {
 
     #[test]
     fn only_a_failure_worth_retrying_is_transient() {
-        // The endpoint asking for another moment, or the backend failing
-        // mid-answer: the same request may go through.
-        for status in [429, 500, 529] {
+        // The endpoint asking for another moment (a rate limit, a lock or
+        // request that timed out), or the backend failing mid-answer: the same
+        // request may go through.
+        for status in [408, 409, 429, 500, 529] {
             assert!(
                 Error::Api(Api {
                     status,

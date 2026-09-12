@@ -1,12 +1,18 @@
 //! The event stream: Server-Sent Events in, [`Event`]s out.
 //!
-//! The framing rules are the spec's and nothing more: a line is data when it
-//! starts with `data:`, the event's *name* line carries nothing this crate needs
-//! because the payload names its own type, and every other line — blank,
-//! comment, `event:` — is skipped. A line that claims to be data and is not the
-//! JSON the spec describes fails the stream: a payload nobody can read is not
-//! something to skip past, since the answer being assembled would silently miss
-//! whatever it carried.
+//! The framing is the SSE specification's, line for line: a line ends at `\n`,
+//! `\r\n` or a lone `\r`; a line that begins with `:` is a comment and is
+//! dropped; other lines are a field name and a value, one leading space after
+//! the colon being the separator's own; and **an event is dispatched by the
+//! blank line that ends it**, with its `data:` lines joined by newlines. An
+//! event whose payload is not the JSON the spec describes fails the stream: a
+//! payload nobody can read is not something to skip past, since the answer being
+//! assembled would silently miss whatever it carried.
+//!
+//! The event's *name* line is read even though this API puts the type inside the
+//! payload — the two agree, and a stream that spells the type only in the name
+//! is still a stream this reads. The spec's `id` and `retry` fields are dropped:
+//! nothing here reconnects on its own, so there is nothing for them to steer.
 //!
 //! The stream is a sequence, not a session: [`EventStream::next_event`] hands
 //! over one event at a time, and the caller decides what a completed answer is.
@@ -28,7 +34,7 @@ pub type ByteStream = Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<By
 /// The events of one answer, arriving as they are written.
 pub struct EventStream {
     inner: ByteStream,
-    /// Bytes that arrived without a complete line in them yet.
+    /// Bytes that arrived without a complete event in them yet.
     buf: Vec<u8>,
     /// The wire said the answer was over (`message_stop`), or the connection
     /// closed. Either way there is nothing more to read.
@@ -67,14 +73,13 @@ impl EventStream {
     /// must not be read as one that finished.
     pub async fn next_event(&mut self) -> Result<Option<Event>, Error> {
         loop {
-            if let Some(line) = take_line(&mut self.buf) {
-                let Some(data) = data_of(&line) else {
+            if let Some(lines) = take_frame(&mut self.buf) {
+                // A frame the stream carried nothing in — a blank line, a
+                // comment, a keep-alive — is a boundary and not an event.
+                let Some(payload) = payload_of(&lines) else {
                     continue;
                 };
-                if data.trim().is_empty() {
-                    continue;
-                }
-                let event = decode(data)?;
+                let event = decode(&payload)?;
                 // A stream that reported its own failure is over, and what
                 // arrived before the report is not an answer: the caller learns
                 // it from the error rather than from an event it must remember
@@ -103,33 +108,142 @@ impl EventStream {
     }
 }
 
-/// Read one line's worth of JSON, turning the two failures worth telling apart
-/// into two errors.
-fn decode(data: &str) -> Result<Event, Error> {
-    serde_json::from_str(data).map_err(|source| Error::Decode {
-        what: "SSE event",
-        source,
+/// Take one complete event's lines out of the buffer, if one has arrived.
+///
+/// Nothing is taken until the **blank line** that ends the event is in the
+/// buffer, which is the spec's rule and the reason a terminator split across two
+/// reads cannot do damage: `…\r` alone is not a blank line, and waiting for the
+/// next byte is what tells `\r\n` from `\r\r`.
+fn take_frame(buf: &mut Vec<u8>) -> Option<Vec<String>> {
+    let end = frame_end(buf)?;
+    let frame: Vec<u8> = buf.drain(..end).collect();
+    Some(split_lines(&frame))
+}
+
+/// Where the first blank line ends, one past its last terminator byte. `None`
+/// while none of the three spellings — `\n\n`, `\r\n\r\n`, `\r\r` — has
+/// arrived.
+fn frame_end(buf: &[u8]) -> Option<usize> {
+    for (i, window) in buf.windows(2).enumerate() {
+        if window == b"\n\n" || window == b"\r\r" {
+            return Some(i + 2);
+        }
+        if window == b"\r\n" && buf[i + 2..].starts_with(b"\r\n") {
+            return Some(i + 4);
+        }
+    }
+    None
+}
+
+/// Cut one complete event into lines. All three terminators end a line, and the
+/// blank line that ended the event arrives as its empty last line.
+///
+/// The chunk is known to be complete — [`frame_end`] found its blank line — so
+/// a `\r` at the very end is a terminator here and not a prefix of something.
+fn split_lines(frame: &[u8]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < frame.len() {
+        match frame[i] {
+            b'\n' => {
+                lines.push(lossy(&frame[start..i]));
+                i += 1;
+                start = i;
+            }
+            b'\r' => {
+                lines.push(lossy(&frame[start..i]));
+                i += if frame.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    if start < frame.len() {
+        lines.push(lossy(&frame[start..]));
+    }
+    lines
+}
+
+fn lossy(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// One event's payload, as the frame's fields built it.
+struct Payload {
+    /// The `data:` lines joined by newlines, as the spec joins them.
+    data: String,
+    /// The event's name, when the stream carried one.
+    name: Option<String>,
+}
+
+/// The payload of one complete event, or `None` when it carried no data.
+///
+/// A line is a field name and a value, one leading space after the colon being
+/// the separator's own; a line beginning with `:` is a comment and is dropped;
+/// a line that is neither is nothing. The `id` and `retry` fields are read past:
+/// nothing here reconnects on its own, so there is nothing for them to steer.
+fn payload_of(lines: &[String]) -> Option<Payload> {
+    let mut name = None;
+    let mut data: Vec<&str> = Vec::new();
+    for line in lines {
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        let Some((field, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match field {
+            "event" => name = Some(value.to_string()),
+            "data" => data.push(value),
+            _ => {}
+        }
+    }
+    // A `data:` with nothing after it is a field with an empty value, which the
+    // join would turn into a payload with nothing in it. That is not JSON
+    // anyone could read, and it is not a failure either: the event was empty.
+    if data.iter().all(|line| line.trim().is_empty()) {
+        return None;
+    }
+    Some(Payload {
+        data: data.join("\n"),
+        name,
     })
 }
 
-/// Pull one line out of the buffer, as soon as `\n` is in it. A trailing `\r`
-/// (the separator `\r\n`, which the spec allows) is not part of the line, and
-/// `None` means no complete line has arrived yet.
-fn take_line(buf: &mut Vec<u8>) -> Option<String> {
-    let pos = buf.iter().position(|&b| b == b'\n')?;
-    let line: Vec<u8> = buf.drain(..=pos).collect();
-    let mut s = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
-    if s.ends_with('\r') {
-        s.pop();
+/// Read one payload's JSON into an event.
+///
+/// The name the stream carried stands in for a `type` the payload left out: the
+/// two are the same word written twice, and a stream that spells it once is
+/// still a stream this reads. The tolerant path runs only for a payload the
+/// strict one refused, so the common case parses once.
+fn decode(payload: &Payload) -> Result<Event, Error> {
+    let refused = match serde_json::from_str(&payload.data) {
+        Ok(event) => return Ok(event),
+        Err(source) => source,
+    };
+    if let Some(name) = &payload.name
+        && let Ok(serde_json::Value::Object(mut event)) =
+            serde_json::from_str::<serde_json::Value>(&payload.data)
+        && !event.contains_key("type")
+    {
+        event.insert("type".into(), serde_json::Value::String(name.clone()));
+        return serde_json::from_value(serde_json::Value::Object(event)).map_err(|source| {
+            Error::Decode {
+                what: "SSE event",
+                source,
+            }
+        });
     }
-    Some(s)
-}
-
-/// The payload of a data line: `data: x` and `data:x` both yield `x`; any other
-/// line (blank, comment, `event:`) yields `None`.
-fn data_of(line: &str) -> Option<&str> {
-    let data = line.strip_prefix("data:")?;
-    Some(data.strip_prefix(' ').unwrap_or(data))
+    Err(Error::Decode {
+        what: "SSE event",
+        source: refused,
+    })
 }
 
 #[cfg(test)]
@@ -272,22 +386,188 @@ mod tests {
     }
 
     #[test]
-    fn a_line_only_exists_once_its_newline_has_arrived() {
-        const PARTIAL: &str = "data: {\"type\":\"ping\"}";
-        let mut buf = PARTIAL.as_bytes().to_vec();
-        assert_eq!(take_line(&mut buf), None);
-        assert_eq!(buf.len(), PARTIAL.len(), "nothing was consumed");
-        buf.push(b'\n');
-        assert_eq!(take_line(&mut buf).as_deref(), Some(PARTIAL));
-        assert!(buf.is_empty());
+    fn a_frame_is_taken_only_once_the_blank_line_that_ends_it_arrived() {
+        // The three spellings of a blank line, and the same event written with
+        // each of them.
+        for blank in ["\n\n", "\r\n\r\n", "\r\r"] {
+            let mut buf = format!("event: ping{blank}").into_bytes();
+            assert_eq!(
+                take_frame(&mut buf),
+                Some(vec!["event: ping".to_string(), String::new()])
+            );
+            assert!(buf.is_empty(), "{blank:?} left {buf:?}");
+        }
+        // Half of one is not one: the bytes are held, not guessed at.
+        for partial in ["event: ping\n", "event: ping\r", "event: ping\r\n"] {
+            let mut buf = partial.as_bytes().to_vec();
+            assert_eq!(take_frame(&mut buf), None, "{partial:?}");
+            assert_eq!(buf, partial.as_bytes(), "{partial:?} consumed bytes");
+        }
     }
 
     #[test]
-    fn only_a_data_line_has_a_payload() {
-        assert_eq!(data_of("data: {\"a\":1}"), Some("{\"a\":1}"));
-        assert_eq!(data_of("data:{\"a\":1}"), Some("{\"a\":1}"));
-        assert_eq!(data_of("event: ping"), None);
-        assert_eq!(data_of(": a comment"), None);
-        assert_eq!(data_of(""), None);
+    fn a_frame_leaves_the_next_event_in_the_buffer() {
+        let mut buf = b"event: one\ndata: {}\n\nevent: two\n".to_vec();
+        assert_eq!(
+            take_frame(&mut buf).map(|lines| lines.len()),
+            Some(3),
+            "the event's fields, the blank line that ends it, and no more"
+        );
+        assert_eq!(buf, b"event: two\n", "the second event is still arriving");
+    }
+
+    #[test]
+    fn every_terminator_ends_a_line() {
+        // `\n`, `\r\n` and a lone `\r`, in one frame: three lines and the
+        // empty one that ended it.
+        assert_eq!(
+            split_lines(b"a\nb\r\nc\r"),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        // The empty line that ends an event is one of the lines of its frame,
+        // because it is the line that ends it.
+        assert_eq!(
+            split_lines(b"data: {}\n\n"),
+            vec!["data: {}".to_string(), String::new()]
+        );
+        // A frame that does not end on a terminator keeps its last line.
+        assert_eq!(split_lines(b"a\nb"), vec!["a".to_string(), "b".to_string()]);
+        // A byte that is not valid UTF-8 is not a failure to read the lines
+        // around it.
+        assert_eq!(
+            split_lines(b"a\xff\nb"),
+            vec!["a\u{fffd}".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_payload_is_the_data_lines_wherever_the_fields_fall() {
+        // The name may trail the data the spec wants it to describe, and a
+        // field nobody knows is nothing rather than a failure.
+        let lines: Vec<String> = [
+            "data: {}",
+            ": a comment",
+            "retry: 100",
+            "a line with no colon",
+            "event: ping",
+            "",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let payload = payload_of(&lines).expect("the frame carried data");
+        assert_eq!(payload.data, "{}");
+        assert_eq!(payload.name.as_deref(), Some("ping"));
+    }
+
+    #[test]
+    fn the_data_lines_of_one_event_are_joined_by_newlines() {
+        // The spec's rule, and the reason an event is dispatched by the blank
+        // line rather than by its first data line: a payload may be spread over
+        // as many lines as the server likes.
+        let lines = [
+            "data: {\"type\":\"content_block_delta\",",
+            "data: \"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}",
+            "",
+        ];
+        let payload = payload_of(&lines.map(str::to_string)).unwrap();
+        assert_eq!(
+            payload.data,
+            "{\"type\":\"content_block_delta\",\n\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}"
+        );
+    }
+
+    #[test]
+    fn a_frame_with_nothing_in_it_is_not_an_event() {
+        for lines in [
+            vec![String::new()],
+            vec![": keep-alive".into()],
+            vec!["data:".into()],
+        ] {
+            assert!(payload_of(&lines).is_none(), "{lines:?}");
+        }
+    }
+
+    /// A body of SSE bytes, read one event at a time.
+    async fn events_of(body: &str) -> Vec<Event> {
+        let mut stream = stream_of(body);
+        let mut seen = Vec::new();
+        while let Some(event) = stream.next_event().await.expect("the events read") {
+            seen.push(event);
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn an_event_spread_over_several_data_lines_is_one_event() {
+        let body = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\ndata: \"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n";
+        assert_eq!(
+            events_of(body).await,
+            vec![Event::ContentBlockDelta {
+                index: 0,
+                delta: crate::types::BlockDelta::TextDelta { text: "hi".into() },
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_events_name_stands_in_for_a_type_the_payload_left_out() {
+        // The name and the payload's type are the same word written twice. A
+        // stream that writes it once still reads.
+        assert_eq!(
+            events_of("event: ping\ndata: {}\n\n").await,
+            vec![Event::Ping]
+        );
+        // An event the name does not make known is carried as unknown, the
+        // same as one whose payload says so.
+        assert_eq!(
+            events_of("event: invented_later\ndata: {}\n\n").await,
+            vec![Event::Unknown]
+        );
+        // And a payload that names its own type is believed over the name: the
+        // field is the authority the spec points at.
+        assert_eq!(
+            events_of("event: content_block_stop\ndata: {\"type\":\"ping\"}\n\n").await,
+            vec![Event::Ping]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_comment_and_a_lone_blank_line_are_not_events() {
+        // Keep-alives: the server says nothing, so neither does this.
+        let body = ": keep-alive\n\n: another\n\ndata: {\"type\":\"ping\"}\n\n";
+        assert_eq!(events_of(body).await, vec![Event::Ping]);
+    }
+
+    #[tokio::test]
+    async fn a_stream_terminated_by_carriage_returns_reads_the_same() {
+        let body = "event: ping\r\ndata: {\"type\":\"ping\"}\r\n\r\n";
+        assert_eq!(events_of(body).await, vec![Event::Ping]);
+        // A lone `\r` as the terminator is the spec's third spelling.
+        let body = "event: ping\rdata: {\"type\":\"ping\"}\r\r";
+        assert_eq!(events_of(body).await, vec![Event::Ping]);
+    }
+
+    #[tokio::test]
+    async fn a_terminator_split_across_two_reads_does_not_split_the_event() {
+        // The `\r` ends one read and the `\n` opens the next: taken as two
+        // terminators that would be a blank line, and the event's own name
+        // would be an event with no payload in it.
+        for (first, second) in [
+            ("event: ping\r", "\ndata: {\"type\":\"ping\"}\r\n\r\n"),
+            ("event: ping\r", "\ndata: {\"type\":\"ping\"}\r\r"),
+        ] {
+            let chunks = vec![
+                Ok(Bytes::from(first.to_owned())),
+                Ok(Bytes::from(second.to_owned())),
+            ];
+            let mut stream = EventStream::new(Box::pin(futures_util::stream::iter(chunks)));
+            assert_eq!(
+                stream.next_event().await.unwrap(),
+                Some(Event::Ping),
+                "{first:?} + {second:?}"
+            );
+            assert_eq!(stream.next_event().await.unwrap(), None);
+        }
     }
 }

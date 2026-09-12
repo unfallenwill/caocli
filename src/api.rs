@@ -103,7 +103,7 @@ impl Client {
                 }))
             }
             (Backend::Anthropic(client), WireRequest::Anthropic(r)) => Ok(ChunkStream::Anthropic(
-                AnthropicStream::new(client.stream(r).await?),
+                Box::new(AnthropicStream::new(client.stream(r).await?)),
             )),
             _ => bail!("request shape does not match the provider's wire protocol"),
         }
@@ -114,8 +114,11 @@ impl Client {
 pub enum ChunkStream {
     /// The OpenAI wire's own SSE parser.
     OpenAi(SseStream),
-    /// The Anthropic wire, adapted from the SDK's typed events.
-    Anthropic(AnthropicStream),
+    /// The Anthropic wire, adapted from the SDK's typed events. Boxed: it
+    /// carries the stream's own buffers and the frame being read, and a variant
+    /// that much larger than its sibling would make every value of this enum
+    /// that size.
+    Anthropic(Box<AnthropicStream>),
 }
 
 impl std::fmt::Debug for ChunkStream {
@@ -538,8 +541,8 @@ mod tests {
     fn anthropic_stream(body: &str) -> ChunkStream {
         let bytes = bytes::Bytes::from(body.to_owned());
         let events = futures_util::stream::iter(vec![Ok(bytes)]);
-        ChunkStream::Anthropic(AnthropicStream::new(anthropic::EventStream::new(Box::pin(
-            events,
+        ChunkStream::Anthropic(Box::new(AnthropicStream::new(anthropic::EventStream::new(
+            Box::pin(events),
         ))))
     }
 

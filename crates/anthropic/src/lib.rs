@@ -24,9 +24,12 @@
 //! - **Tolerant in what it reads.** The spec adds event types and enum values
 //!   over time and tells clients to handle the unknown ones gracefully, so an
 //!   event this crate does not know is carried as [`Event::Unknown`] rather than
-//!   failing the stream. The one exception is an `error` event, which ends the
-//!   stream as an [`Error::Stream`]: a stream that reported its own failure must
-//!   never be read as an answer.
+//!   failing the stream. The same rule holds for the framing: an event's type
+//!   may be spelled only in the SSE name, an event's payload may be spread over
+//!   several `data:` lines, and a line may end any of the three ways the spec
+//!   allows. The one thing that is not tolerated is an `error` event, which ends
+//!   the stream as an [`Error::Stream`]: a stream that reported its own failure
+//!   must never be read as an answer.
 //!
 //! # Shape
 //!

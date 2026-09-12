@@ -7,11 +7,16 @@
 //! values may be added, so every enum has a catch-all and unknown object fields
 //! are ignored rather than refused.
 //!
-//! What is here is the whole vocabulary a caller can reach without a beta
-//! header, plus the fields this workspace sends. What is deliberately not here:
-//! server tools (`web_search`, `code_execution`), the batch and files APIs, and
-//! the tool-search fields (`defer_loading`, `allowed_callers`) — a call this
-//! crate cannot make is a type nobody can check.
+//! What is here is the request and response vocabulary a caller can reach
+//! without a beta header, and the fields this workspace sends. What is
+//! deliberately not here, with the reason: **server tools** (`web_search`,
+//! `code_execution`, tool search) and the fields that belong to them
+//! (`defer_loading`, `allowed_callers`, `toolset_name`, `caller`) — a call this
+//! crate cannot run is a type nobody can check; **containers**, which hold state
+//! this program does not keep; **structured outputs**
+//! (`output_config.format`), which is a feature of its own; and the batch and
+//! files APIs. A response carrying one of them still reads: every enum has a
+//! catch-all, and unknown object fields are ignored.
 
 use std::fmt;
 
@@ -63,12 +68,14 @@ pub struct MessagesRequest {
     /// Whether to answer as a stream of events.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
-    /// Sampling temperature. Unset is the model's own default.
+    /// Which capacity serves the request: priority where it is available, or
+    /// standard only.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-    /// Nucleus sampling. Unset is the model's own default.
+    pub service_tier: Option<ServiceTier>,
+    /// Where the request is processed. Naming a region overrides the
+    /// workspace's own default.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
+    pub inference_geo: Option<String>,
     /// Strings that end the answer when the model produces them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequences: Option<Vec<String>>,
@@ -91,8 +98,8 @@ impl MessagesRequest {
             output_config: None,
             cache_control: None,
             stream: None,
-            temperature: None,
-            top_p: None,
+            service_tier: None,
+            inference_geo: None,
             stop_sequences: None,
             metadata: None,
         }
@@ -137,7 +144,9 @@ impl MessagesRequest {
 
     /// How hard the model works.
     pub fn with_effort(mut self, effort: Effort) -> Self {
-        self.output_config = Some(OutputConfig { effort });
+        self.output_config = Some(OutputConfig {
+            effort: Some(effort),
+        });
         self
     }
 
@@ -153,6 +162,32 @@ impl MessagesRequest {
         self.metadata = Some(metadata);
         self
     }
+
+    /// Which capacity should serve the request.
+    pub fn with_service_tier(mut self, tier: ServiceTier) -> Self {
+        self.service_tier = Some(tier);
+        self
+    }
+
+    /// Where the request should be processed.
+    pub fn with_inference_geo(mut self, region: impl Into<String>) -> Self {
+        self.inference_geo = Some(region.into());
+        self
+    }
+}
+
+/// Which capacity serves a request.
+///
+/// The answer's own `usage.service_tier` is a different vocabulary
+/// (`standard`, `priority`, `batch`): this is what a caller *asks* for, and
+/// that is what it got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceTier {
+    /// Priority capacity where the workspace has it, standard otherwise.
+    Auto,
+    /// Standard capacity only.
+    StandardOnly,
 }
 
 /// Who the request is attributed to.
@@ -172,6 +207,9 @@ pub enum Role {
     User,
     /// The model.
     Assistant,
+    /// A turn of instructions inside the conversation, where a caller needs
+    /// one to sit in the history rather than in the top-level prompt.
+    System,
 }
 
 /// One turn of the conversation.
@@ -592,10 +630,11 @@ pub enum ThinkingDisplay {
 }
 
 /// `output_config`: how hard the model works on this request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputConfig {
-    /// The level.
-    pub effort: Effort,
+    /// The level. Absent leaves the model's own default in force.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Effort>,
 }
 
 /// How many tokens the model is willing to spend on the answer, thinking
@@ -809,9 +848,13 @@ pub struct Usage {
     /// The answer's own breakdown.
     #[serde(default)]
     pub output_tokens_details: Option<OutputTokensDetails>,
-    /// Which service tier served the request.
+    /// Which service tier served the request: `standard`, `priority` or
+    /// `batch` — the answer's vocabulary, not the request's.
     #[serde(default)]
     pub service_tier: Option<String>,
+    /// The region the request was processed in.
+    #[serde(default)]
+    pub inference_geo: Option<String>,
 }
 
 /// The cache writes of one request, by entry lifetime.
@@ -856,6 +899,7 @@ impl Usage {
             cache_creation,
             output_tokens_details,
             service_tier,
+            inference_geo,
         );
     }
 
@@ -1113,12 +1157,18 @@ mod tests {
             "output_config",
             "cache_control",
             "stream",
-            "temperature",
-            "top_p",
+            "service_tier",
+            "inference_geo",
             "stop_sequences",
             "metadata",
         ] {
             assert!(v.get(absent).is_none(), "{absent} was written: {v}");
+        }
+        // And the two a caller would reach for from an older client are not
+        // fields this wire has at all: sampling is the model's own business
+        // here, and a request that names a temperature is a 400.
+        for gone in ["temperature", "top_p"] {
+            assert!(v.get(gone).is_none(), "{gone} is not a field of this wire");
         }
     }
 
@@ -1202,6 +1252,48 @@ mod tests {
         assert_eq!(
             v["system"],
             json!([{"type": "text", "text": "first", "cache_control": {"type": "ephemeral"}}])
+        );
+    }
+
+    #[test]
+    fn a_message_may_be_a_system_turn_and_a_service_tier_names_its_capacity() {
+        // The role vocabulary runs to system turns as well as the two ends of
+        // the conversation.
+        let role: Role = serde_json::from_str(r#""system""#).unwrap();
+        assert_eq!(role, Role::System);
+        for (role, spelled) in [
+            (Role::User, "user"),
+            (Role::Assistant, "assistant"),
+            (Role::System, "system"),
+        ] {
+            assert_eq!(json_of(&role), json!(spelled));
+        }
+
+        // The request's own tier vocabulary: what it asks for.
+        for (tier, spelled) in [
+            (ServiceTier::Auto, "auto"),
+            (ServiceTier::StandardOnly, "standard_only"),
+        ] {
+            assert_eq!(json_of(&tier), json!(spelled));
+            let request = MessagesRequest::new("m", 1, vec![]).with_service_tier(tier);
+            assert_eq!(json_of(&request)["service_tier"], json!(spelled));
+        }
+
+        let request = MessagesRequest::new("m", 1, vec![]).with_inference_geo("eu");
+        assert_eq!(json_of(&request)["inference_geo"], json!("eu"));
+    }
+
+    #[test]
+    fn an_output_config_without_an_effort_is_a_field_with_nothing_in_it() {
+        // Every part of `output_config` is optional — `format` is the other
+        // field it carries — so a caller may send the object and no level, and
+        // the request is still a request the spec describes.
+        assert_eq!(json_of(&OutputConfig::default()), json!({}));
+        assert_eq!(
+            json_of(&OutputConfig {
+                effort: Some(Effort::Max)
+            }),
+            json!({"effort": "max"})
         );
     }
 
@@ -1444,6 +1536,31 @@ mod tests {
         total.merge(&later);
         assert_eq!(total.input_tokens, Some(36));
         assert_eq!(total.output_tokens, Some(12));
+    }
+
+    #[test]
+    fn usage_says_which_capacity_and_region_served_the_answer() {
+        let usage: Usage = serde_json::from_str(
+            r#"{"input_tokens":1,"output_tokens":2,"service_tier":"priority",
+                "inference_geo":"us","cache_creation":{"ephemeral_1h_input_tokens":7}}"#,
+        )
+        .unwrap();
+        assert_eq!(usage.service_tier.as_deref(), Some("priority"));
+        assert_eq!(usage.inference_geo.as_deref(), Some("us"));
+        assert_eq!(
+            usage.cache_creation.map(|c| c.ephemeral_1h_input_tokens),
+            Some(7)
+        );
+        // A later event that says nothing about the region keeps what the
+        // earlier one said, like every other count.
+        let mut merged = usage.clone();
+        merged.merge(&Usage::default());
+        assert_eq!(merged.inference_geo.as_deref(), Some("us"));
+        merged.merge(&Usage {
+            inference_geo: Some("eu".into()),
+            ..Usage::default()
+        });
+        assert_eq!(merged.inference_geo.as_deref(), Some("eu"));
     }
 
     #[test]
