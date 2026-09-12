@@ -43,6 +43,13 @@ pub use todos::{standing_todos, todo_gutter, todo_head_spans, todo_line_spans};
 /// method on this type -- a `Style::Yellow` here is the same value the plain
 /// front end's writer and the TUI's `style_of` start from, and the bytes it
 /// becomes are decided in only one place each.
+///
+/// The visual rules shared by both front ends -- the "looks dim" and "carries
+/// weight" properties a terminal or a theme cannot undo -- live on this type
+/// as [`Style::is_dim`] and [`Style::is_bold`]. Each front end still picks its
+/// own colour: that part is a palette the theme chose for a background this
+/// code cannot see, and the half that does not depend on the theme is the one
+/// the methods expose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Style {
     /// Unstyled text: body text.
@@ -65,6 +72,27 @@ pub enum Style {
     Green,
     /// Failures, written to stderr.
     Red,
+}
+
+impl Style {
+    /// Whether this style is rendered dim (no colour of its own).
+    ///
+    /// The one rule both front ends agree on without looking at the terminal:
+    /// thinking looks like a dim line, not because the colours match but because
+    /// the layout marks it as thinking in a way that does not depend on either.
+    pub fn is_dim(self) -> bool {
+        matches!(self, Style::Dim | Style::Reasoning)
+    }
+
+    /// Whether this style carries weight as well as a colour.
+    ///
+    /// Weight reads on both a light background and a dark one, while a colour
+    /// at its darkest on a dark background is a line a reader cannot read. The
+    /// plain front end's `style_code` and the TUI's `style_of` apply the same
+    /// rule, which is what this method is the one place for.
+    pub fn is_bold(self) -> bool {
+        matches!(self, Style::Yellow | Style::Green | Style::Red)
+    }
 }
 
 /// A styled run of text.
@@ -824,5 +852,31 @@ mod tests {
     fn the_user_marker_is_one_marker_wide() {
         assert_eq!(Cell::user("x").gutter().unwrap().head, USER_MARKER);
         assert_eq!(text::width(USER_MARKER), MARKER_COLUMNS);
+    }
+
+    /// The dim/bold rules both front ends build on. The contract is what keeps
+    /// the plain SGR mapping and the TUI's ratatui mapping in step: a `Style`
+    /// that is `is_dim` is dim in both, and one that is `is_bold` is bold in
+    /// both. Adding a new coloured style to one place without the other would
+    /// be a one-line oversight; this test is what makes it two.
+    #[test]
+    fn the_dim_and_bold_rules_are_what_both_front_ends_agree_on() {
+        // Dim and reasoning are the two styles that read as a line about the
+        // answer, not as the answer itself: rendered dim in both front ends,
+        // and the only styles that are.
+        for style in [Style::Dim, Style::Reasoning] {
+            assert!(style.is_dim(), "{style:?} is dim");
+            assert!(!style.is_bold(), "{style:?} carries no weight of its own");
+        }
+        // Body text is plain in both, and the rest of the styles are coloured
+        // and therefore bold -- weight being the half that survives a theme
+        // the terminal chose for a background this code cannot see.
+        let plain = Style::Plain;
+        assert!(!plain.is_dim(), "{plain:?} is not dim");
+        assert!(!plain.is_bold(), "{plain:?} carries no weight of its own");
+        for style in [Style::Yellow, Style::Green, Style::Red] {
+            assert!(!style.is_dim(), "{style:?} is not dim");
+            assert!(style.is_bold(), "{style:?} is bold");
+        }
     }
 }

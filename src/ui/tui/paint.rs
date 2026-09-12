@@ -31,24 +31,30 @@ pub(super) fn measure(width: usize) -> usize {
 
 /// Our style, as ratatui sees it. This is what [`Style`] being data buys: the
 /// mapping happens once per front end, instead of at every call site.
+///
+/// The dim/bold half comes from [`Style::is_dim`] and [`Style::is_bold`] -- the
+/// same methods the plain front end uses, so the two front ends cannot disagree
+/// on what a `Reasoning` line looks like. The colour is this front end's own,
+/// as a `Color` the framework hands to the theme: a palette the theme chose for
+/// a background this code cannot see.
 pub(super) fn style_of(style: Style) -> RStyle {
-    match style {
-        Style::Plain => RStyle::new(),
-        Style::Dim => RStyle::new().add_modifier(Modifier::DIM),
-        // Dim, the same as the line above, and deliberately: thinking is told
-        // apart from a tool result by the rule in its gutter, which is a
-        // difference in the layout and so one that does not depend on a terminal
-        // honoring SGR 2 or on a theme having a readable idea of what dim is.
-        Style::Reasoning => RStyle::new().add_modifier(Modifier::DIM),
-        // Painted styles are bold as well as colored, and bold is the half that
-        // does not depend on the terminal's theme: the color is a palette slot the
-        // theme chose for a background this code cannot see, while the weight reads
-        // on a light background and a dark one alike. The plain front end applies
-        // the same rule in its `style_code`.
-        Style::Yellow => RStyle::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        Style::Green => RStyle::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-        Style::Red => RStyle::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+    let mut s = RStyle::new();
+    if style.is_dim() {
+        s = s.add_modifier(Modifier::DIM);
     }
+    if style.is_bold() {
+        s = s.add_modifier(Modifier::BOLD);
+    }
+    let color = match style {
+        Style::Yellow => Some(Color::Yellow),
+        Style::Green => Some(Color::Green),
+        Style::Red => Some(Color::Red),
+        _ => None,
+    };
+    if let Some(c) = color {
+        s = s.fg(c);
+    }
+    s
 }
 
 /// The row that says how much of the transcript the window is not showing, drawn
