@@ -51,6 +51,15 @@ pub trait Ui {
     /// The turn was cancelled by the user (Ctrl-C): close the streaming block and
     /// print an interruption notice.
     fn interrupted(&mut self);
+    /// The backend stopped the answer before it was finished and `notice` says
+    /// why — it reached `max_tokens`, or the conversation outgrew the context
+    /// window.
+    ///
+    /// The sentence is written where the wire's vocabulary is known, so every
+    /// front end shows the same one. What this notice adds is the one fact an
+    /// answer cannot carry about itself: the answer that arrived is in the log
+    /// as it arrived, and nothing in it says the rest never came.
+    fn truncated(&mut self, notice: &str);
     /// Approval gate question: echo the tool and an argument summary and prompt
     /// y/N (the answer is read through the Input channel, not through this trait —
     /// a Notice never returns data).

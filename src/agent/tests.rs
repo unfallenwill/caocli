@@ -1136,6 +1136,9 @@ impl crate::ui::Ui for Hearing {
     }
     fn usage(&mut self, _usage: &crate::types::Usage, _stream: std::time::Duration) {}
     fn interrupted(&mut self) {}
+    fn truncated(&mut self, notice: &str) {
+        self.0.push(format!("truncated:{notice}"));
+    }
     fn approval_requested(&mut self, _name: &str, _args: &str) {}
 }
 
@@ -1184,6 +1187,47 @@ async fn mock_a_running_commands_output_reaches_the_front_end() {
     let text = tool_msg.text().unwrap();
     assert!(text.starts_with("exit_code: 0"), "{text}");
     assert!(text.contains("caocli-live-marker"), "{text}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An answer cut off at the ceiling is persisted as it arrived and reported:
+/// the one thing a reader must not do with a half-finished answer is take it
+/// for a whole one, and the reason the backend stopped is the one fact the
+/// answer itself cannot carry.
+#[tokio::test]
+async fn mock_a_cut_off_answer_is_persisted_and_reported() {
+    let server = MockServer::start().await;
+    let turn = [
+        sse(json!({"content":"Half a sen"}), None, None),
+        sse(json!({"content":""}), Some("length"), None),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    mount_chat(&server, turn, None).await;
+
+    let dir = tmpdir();
+    let mut agent = test_agent(&server, &dir);
+    let mut ui = Hearing::default();
+    agent
+        .turn(
+            "write me an essay",
+            &mut ui,
+            &mut NoCancel,
+            &mut Answer::denies(),
+            &mut NoQuestions,
+        )
+        .await
+        .unwrap();
+
+    // What arrived is in the log -- a half-written file is usually worth
+    // having -- and the front end was told why it stops mid-thought.
+    assert_eq!(
+        agent.session.messages[1].text().as_deref(),
+        Some("Half a sen")
+    );
+    assert_eq!(ui.0.len(), 1, "one notice, and it is this one: {:?}", ui.0);
+    assert!(ui.0[0].starts_with("truncated:"), "{:?}", ui.0);
+    assert!(ui.0[0].contains("max_tokens"), "{:?}", ui.0);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

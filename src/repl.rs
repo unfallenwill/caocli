@@ -496,6 +496,9 @@ mod tests {
         fn instructions(&mut self, _dir: &str) {}
         fn usage(&mut self, _u: &Usage, _stream: std::time::Duration) {}
         fn interrupted(&mut self) {}
+        fn truncated(&mut self, notice: &str) {
+            self.errors.push(notice.to_owned());
+        }
         fn approval_requested(&mut self, _name: &str, _args: &str) {}
     }
 

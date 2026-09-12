@@ -217,6 +217,105 @@ fn empty_instructions_are_not_sent() {
 // The Anthropic wire (MiniMax).
 // ---------------------------------------------------------------------------
 
+/// A preset of an endpoint that serves the spec as published: the same backend
+/// as MiniMax, with every standard optional field offered.
+fn standard_preset() -> provider::Provider {
+    provider::Provider {
+        anthropic: provider::AnthropicOptions {
+            effort: true,
+            display: true,
+            cache_control: true,
+        },
+        ..provider::MINIMAX
+    }
+}
+
+/// The standard optional fields are the preset's to offer. An endpoint nobody
+/// has asked sends the required shape and nothing else — a field a gateway does
+/// not know is a 400 on every request — and each one that is offered arrives in
+/// the form the spec spells.
+#[test]
+fn the_standard_optional_fields_are_sent_only_where_the_preset_offers_them() {
+    let history = vec![Message::user("hi")];
+    let standard = serde_json::to_value(anthropic_of(&build_request(
+        &standard_preset(),
+        &minimax_meta(Some("high")),
+        &history,
+    )))
+    .unwrap();
+    assert_eq!(
+        standard["output_config"],
+        serde_json::json!({"effort": "high"})
+    );
+    assert_eq!(
+        standard["cache_control"],
+        serde_json::json!({"type": "ephemeral"})
+    );
+    assert_eq!(
+        standard["thinking"],
+        serde_json::json!({"type": "adaptive", "display": "summarized"})
+    );
+
+    let quiet = serde_json::to_value(anthropic_of(&build_request(
+        &provider::MINIMAX,
+        &minimax_meta(Some("high")),
+        &history,
+    )))
+    .unwrap();
+    for absent in ["output_config", "cache_control"] {
+        assert!(quiet.get(absent).is_none(), "{absent} was sent: {quiet}");
+    }
+    assert_eq!(quiet["thinking"], serde_json::json!({"type": "adaptive"}));
+}
+
+/// An effort tier the spec has no word for is left unsent rather than guessed
+/// at, and thinking stays on: the endpoint's own tiers are its own, and a
+/// value it does not serve is a 400 the session cannot see the reason for.
+#[test]
+fn an_effort_with_no_standard_word_is_left_unsent() {
+    let request = serde_json::to_value(anthropic_of(&build_request(
+        &standard_preset(),
+        &minimax_meta(Some("off")),
+        &[],
+    )))
+    .unwrap();
+    assert!(request.get("output_config").is_none(), "{request}");
+    assert_eq!(
+        request["thinking"],
+        serde_json::json!({"type": "adaptive", "display": "summarized"})
+    );
+}
+
+/// A tool result that reports a failure says so where the wire has a field for
+/// it. A failure sent as an ordinary result reads to the model as an answer.
+#[test]
+fn a_failed_tool_result_is_marked_as_one() {
+    let history = vec![
+        Message::user("go"),
+        freeze_history()[1].clone(),
+        Message::tool("call_f1", "error: /nope: no such file"),
+        Message::user("try again"),
+        freeze_history()[1].clone(),
+        Message::tool("call_f1", "exit_code: 0"),
+    ];
+    let request = serde_json::to_value(anthropic_of(&build_request(
+        &provider::MINIMAX,
+        &minimax_meta(Some("on")),
+        &history,
+    )))
+    .unwrap();
+    assert_eq!(request["messages"][2]["content"][0]["is_error"], true);
+    // A result that is not a failure carries no field at all: the wire's
+    // default is what it means, and a field to read for nothing is a field the
+    // endpoint has to take.
+    assert!(
+        request["messages"][5]["content"][0]
+            .get("is_error")
+            .is_none(),
+        "{request}"
+    );
+}
+
 /// The project instructions go out on both wires. They were missing from this
 /// one: `meta.instructions` is frozen at session creation and sent from the
 /// meta, and only the OpenAI shape was reading it — so a MiniMax session was

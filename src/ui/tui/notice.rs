@@ -105,6 +105,9 @@ impl Ui for Notifier {
     fn interrupted(&mut self) {
         self.send(Notice::Interrupted);
     }
+    fn truncated(&mut self, notice: &str) {
+        self.send(Notice::Error(notice.to_owned()));
+    }
     fn approval_requested(&mut self, name: &str, args: &str) {
         self.send(Notice::Approval {
             name: name.to_owned(),
@@ -175,6 +178,7 @@ mod tests {
         notifier.tool_result("done");
         notifier.usage(&Usage::default(), Duration::from_secs(1));
         notifier.interrupted();
+        notifier.truncated("cut off");
         notifier.info("note");
         notifier.error("bad");
         notifier.set_model("glm-4.6");
@@ -192,6 +196,7 @@ mod tests {
             Notice::ToolResult("done".into()),
             Notice::Usage(Usage::default(), Duration::from_secs(1)),
             Notice::Interrupted,
+            Notice::Error("cut off".into()),
             Notice::Info("note".into()),
             Notice::Error("bad".into()),
             Notice::SetModel("glm-4.6".into()),

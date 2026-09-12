@@ -376,6 +376,13 @@ impl Front for Renderer {
 }
 
 impl Ui for Renderer {
+    fn truncated(&mut self, notice: &str) {
+        // The stream an error goes to: it survives a redirected stdout, and an
+        // answer that stops mid-thought is a failure the reader has to know
+        // about.
+        Front::error(self, notice);
+    }
+
     fn reasoning_delta(&mut self, s: &str) {
         self.open_block(Block::Reasoning);
         self.emit(s);

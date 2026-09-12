@@ -208,6 +208,11 @@ impl Turn<'_> {
         if let Some(usage) = &reply.usage {
             self.ui.usage(usage, reply.stream_time);
         }
+        // An answer that was cut off is in the log as it arrived, and the
+        // person watching is told why it stops mid-thought.
+        if let Some(cut) = reply.truncation() {
+            self.ui.truncated(&cut);
+        }
         Ok(Step::Again)
     }
 

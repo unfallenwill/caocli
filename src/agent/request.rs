@@ -153,29 +153,60 @@ fn anthropic_request(
             }
         }
     }
-    anthropic::MessagesRequest::new(meta.model.clone(), provider.max_tokens, messages)
-        .streaming()
-        .with_system(system.join("\n\n"))
-        .with_tools(
-            tools::definitions()
-                .into_iter()
-                .map(anthropic_tool)
-                .collect(),
-        )
-        .with_tool_choice(anthropic::ToolChoice::auto())
-        .with_thinking(anthropic_thinking(provider, meta))
+    let mut request =
+        anthropic::MessagesRequest::new(meta.model.clone(), provider.max_tokens, messages)
+            .streaming()
+            .with_system(system.join("\n\n"))
+            .with_tools(
+                tools::definitions()
+                    .into_iter()
+                    .map(anthropic_tool)
+                    .collect(),
+            )
+            .with_tool_choice(anthropic::ToolChoice::auto())
+            .with_thinking(anthropic_thinking(provider, meta));
+    // The standard optional fields, each one the preset's to offer. See
+    // `provider::AnthropicOptions` for why they are not simply always sent.
+    if provider.anthropic.effort
+        && let Some(effort) = anthropic::Effort::from_name(&effort_in_force(provider, meta))
+    {
+        request = request.with_effort(effort);
+    }
+    if provider.anthropic.cache_control {
+        // The automatic breakpoint: one field, and the server keeps the
+        // breakpoint at the end of the cacheable prefix itself, which is the
+        // form that suits a conversation that only ever grows.
+        request = request.with_automatic_cache();
+    }
+    request
 }
 
-/// The thinking configuration this provider gets: the effort slot is the
-/// thinking switch on this wire — MiniMax M3 has no effort tiers, only thinking
-/// on (`adaptive`) and off.
+/// The thinking configuration this provider gets.
+///
+/// The effort slot is the thinking switch on this wire — MiniMax M3 has no
+/// effort tiers, only thinking on (`adaptive`) and off — unless the preset says
+/// the endpoint serves the standard effort field, in which case the tier is
+/// that field's business and thinking is simply on.
+///
+/// `display` rides with it when the preset says the endpoint takes it: the
+/// field defaults to `omitted` on the models that have adaptive thinking, where
+/// the answer carries a signature and no words at all.
 fn anthropic_thinking(
     provider: &provider::Provider,
     meta: &SessionMeta,
 ) -> anthropic::ThinkingConfig {
-    match effort_in_force(provider, meta).as_str() {
-        "off" => anthropic::ThinkingConfig::disabled(),
-        _ => anthropic::ThinkingConfig::adaptive(),
+    let thinking = match (
+        provider.anthropic.effort,
+        effort_in_force(provider, meta).as_str(),
+    ) {
+        (true, _) => anthropic::ThinkingConfig::adaptive(),
+        (false, "off") => anthropic::ThinkingConfig::disabled(),
+        (false, _) => anthropic::ThinkingConfig::adaptive(),
+    };
+    if provider.anthropic.display {
+        thinking.summarized()
+    } else {
+        thinking
     }
 }
 
@@ -235,9 +266,14 @@ fn assistant_message(msg: &Message) -> anthropic::MessageParam {
 }
 
 fn tool_result_block(msg: &Message) -> anthropic::Block {
-    anthropic::Block::tool_result(
+    let text = msg.text().unwrap_or_default();
+    anthropic::Block::tool_result_full(
         msg.tool_call_id.clone().unwrap_or_default(),
-        msg.text().unwrap_or_default(),
+        anthropic::ToolResultContent::Text(text.clone()),
+        // A failure says so in its text, and this wire has a field for it: a
+        // failure reported as an ordinary result reads to the model as an
+        // answer to work from rather than a tool that did not do its job.
+        tools::reports_failure(&text),
     )
 }
 

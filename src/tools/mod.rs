@@ -111,6 +111,15 @@ pub fn file_path(args_json: &str) -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// Whether a tool's answer reports a failure, as this crate's tools write one:
+/// the text opens with `error: ` — the same opening every marker uses. The
+/// Anthropic wire has a field for this (`is_error`), and it is set from the text
+/// rather than recorded beside it: the log holds one statement of what happened,
+/// not two that can drift apart.
+pub fn reports_failure(output: &str) -> bool {
+    output.starts_with("error:")
+}
+
 /// Dispatch by name. Never returns Err: every failure (unknown tool, bad
 /// arguments, IO error) is passed back to the model as tool result text and the
 /// model decides what to do next.

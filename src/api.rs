@@ -340,7 +340,7 @@ impl AnthropicStream {
                 };
                 Some(chunk_with(delta))
             }
-            AnthropicEvent::MessageDelta { usage, .. } => {
+            AnthropicEvent::MessageDelta { delta, usage } => {
                 // The last event that carries anything. Its usage is folded in
                 // whole rather than read for the output count alone: on this
                 // wire it is where the prompt of a stream whose message_start
@@ -348,8 +348,21 @@ impl AnthropicStream {
                 if let Some(reported) = usage {
                     self.usage.merge(reported);
                 }
+                // Why the model stopped rides the same chunk the OpenAI wire
+                // reports its `finish_reason` on, in this wire's own word: the
+                // one thing a caller must not do with a `max_tokens` answer is
+                // take it for a whole one.
+                let choices = delta
+                    .stop_reason
+                    .map(|reason| {
+                        vec![crate::types::ChunkChoice {
+                            delta: None,
+                            finish_reason: Some(reason.as_str().to_string()),
+                        }]
+                    })
+                    .unwrap_or_default();
                 Some(ChatChunk {
-                    choices: Vec::new(),
+                    choices,
                     usage: Some(usage_report(&self.usage)),
                 })
             }
@@ -683,6 +696,33 @@ mod tests {
 
     /// A stream that ends without a message_delta reports nothing at all:
     /// usage is never invented from a stream that did not report it.
+    /// Why the model stopped reaches the caller in the field the OpenAI wire
+    /// reports its own reasons in, because an answer cut off at the ceiling is
+    /// the one thing a turn must not take for a whole one.
+    #[tokio::test]
+    async fn anthropic_stop_reason_rides_the_chunk_the_usage_does() {
+        let body = [
+            event(
+                "message_start",
+                serde_json::json!({"type":"message_start","message":{"id":"m1","usage":{"input_tokens":10}}}),
+            ),
+            event(
+                "message_delta",
+                serde_json::json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":9}}),
+            ),
+            event("message_stop", serde_json::json!({"type":"message_stop"})),
+        ]
+        .concat();
+        let mut sse = anthropic_stream(&body);
+        let chunk = sse.next_chunk().await.unwrap().unwrap();
+        assert_eq!(
+            chunk.choices[0].finish_reason.as_deref(),
+            Some("max_tokens")
+        );
+        assert!(chunk.usage.is_some(), "the counts ride the same chunk");
+        assert!(sse.next_chunk().await.unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn anthropic_stream_without_message_delta_reports_no_usage() {
         let body = [

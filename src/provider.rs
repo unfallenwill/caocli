@@ -63,10 +63,54 @@ pub struct Provider {
     /// Tier sent when no effort is stored. The backends' own defaults differ
     /// (DeepSeek high, GLM max, MiniMax thinking on), so the preset pins one
     /// explicitly — the only way to make them behave the same. On the
-    /// Anthropic wire the tier is not sent as an effort: the request builder
-    /// reads it as the thinking switch (`off` disables thinking, anything
-    /// else keeps it adaptive).
+    /// Anthropic wire the tier is a thinking switch (see [`AnthropicOptions`])
+    /// unless the preset says the endpoint serves the standard effort field.
     pub default_effort: &'static str,
+    /// Which of the standard Anthropic optional fields this preset's endpoint
+    /// serves. Meaningless on the OpenAI wire, where they do not exist.
+    pub anthropic: AnthropicOptions,
+}
+
+/// The standard optional fields of the Anthropic wire, as the endpoint's
+/// answers rather than the program's.
+///
+/// Each is a field the spec describes and a spec-conformant endpoint serves;
+/// none is required, and one a backend rejects is a 400 on *every* request.
+/// That is the same bargain `send_thinking` struck on the OpenAI wire: the
+/// preset carries the answer, the request builder obeys, and nothing else
+/// changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnthropicOptions {
+    /// Read this preset's effort tiers as [`output_config.effort`] — the
+    /// standard field for how hard the model works — instead of as a thinking
+    /// switch. A tier the spec has no word for is left unsent rather than
+    /// guessed at, so a preset that serves its own tiers keeps thinking on and
+    /// sends no effort.
+    ///
+    /// [`output_config.effort`]: https://platform.claude.com/en/api/messages
+    pub effort: bool,
+    /// Ask for the reasoning text itself (`thinking.display: "summarized"`).
+    /// Worth setting on every endpoint that takes it: the field defaults to
+    /// `omitted` on the newest models, where the answer carries a signature and
+    /// no words, and a front end that shows reasoning then has nothing to show.
+    pub display: bool,
+    /// Turn the prompt cache on with the automatic breakpoint. One field, and
+    /// the server keeps the breakpoint at the end of the cacheable prefix and
+    /// moves it forward as the conversation grows.
+    pub cache_control: bool,
+}
+
+impl AnthropicOptions {
+    /// None of them: the shape the spec requires and nothing beyond it.
+    ///
+    /// The starting point for an endpoint nobody has asked yet — a request that
+    /// carries an unknown field is a request some gateways refuse, and every
+    /// one of these can be turned on the moment a request says it is taken.
+    pub const NONE: Self = Self {
+        effort: false,
+        display: false,
+        cache_control: false,
+    };
 }
 
 impl Provider {
@@ -126,6 +170,8 @@ pub const DEEPSEEK: Provider = Provider {
     // DeepSeek's low still emits reasoning_content, unlike GLM's.
     efforts: &["low", "high", "max"],
     default_effort: "max",
+    // The OpenAI wire has none of these fields.
+    anthropic: AnthropicOptions::NONE,
 };
 
 /// Z.AI's coding endpoint for mainland China: OpenAI-compatible plus
@@ -144,6 +190,8 @@ pub const ZAI_CODING_CN: Provider = Provider {
     // GLM's low answers without emitting reasoning_content.
     efforts: &["low", "high", "max"],
     default_effort: "max",
+    // The OpenAI wire has none of these fields.
+    anthropic: AnthropicOptions::NONE,
 };
 
 /// MiniMax's Anthropic-compatible Messages endpoint (mainland-China host, the
@@ -164,6 +212,11 @@ pub const MINIMAX: Provider = Provider {
     send_thinking: false,
     efforts: &["on", "off"],
     default_effort: "on",
+    // Unverified against this endpoint. Every field below is standard, and a
+    // gateway that refuses a field it does not know would refuse every request
+    // with it; `scripts/anthropic_probe.py` asks the endpoint what it takes,
+    // and each answer that comes back yes is that field set to `true` here.
+    anthropic: AnthropicOptions::NONE,
 };
 
 pub const PROVIDERS: &[Provider] = &[DEEPSEEK, ZAI_CODING_CN, MINIMAX];

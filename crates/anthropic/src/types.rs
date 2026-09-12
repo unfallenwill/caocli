@@ -620,14 +620,35 @@ pub enum Effort {
 
 impl fmt::Display for Effort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let text = match self {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Effort {
+    /// The level as the wire spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
             Effort::Low => "low",
             Effort::Medium => "medium",
             Effort::High => "high",
             Effort::Xhigh => "xhigh",
             Effort::Max => "max",
-        };
-        f.write_str(text)
+        }
+    }
+
+    /// The level a name stands for, for a caller holding names — a configured
+    /// list of the levels an endpoint serves, say. `None` for a name this crate
+    /// does not know, which is a level to leave unsent rather than to guess at.
+    pub fn from_name(name: &str) -> Option<Self> {
+        [
+            Effort::Low,
+            Effort::Medium,
+            Effort::High,
+            Effort::Xhigh,
+            Effort::Max,
+        ]
+        .into_iter()
+        .find(|level| level.as_str() == name)
     }
 }
 
@@ -1277,12 +1298,18 @@ mod tests {
         ] {
             assert_eq!(json_of(&effort), json!(spelled));
             assert_eq!(effort.to_string(), spelled);
+            assert_eq!(Effort::from_name(spelled), Some(effort), "and reads back");
             let request = MessagesRequest::new("m", 1, vec![]).with_effort(effort);
             assert_eq!(
                 json_of(&request)["output_config"],
                 json!({"effort": spelled})
             );
         }
+        // A name this crate does not know is not a level to send: an endpoint
+        // that serves a tier the spec has no word for says so in its own list,
+        // and guessing here would be a 400.
+        assert_eq!(Effort::from_name("medium-high"), None);
+        assert_eq!(Effort::from_name("off"), None);
     }
 
     #[test]

@@ -22,7 +22,7 @@
 //! |---|---|---|
 //! | Input | landed (implicit) | UserLine (the `turn` argument), Delta (SSE stream), ToolFinished (execute return value) |
 //! | Command | partially landed | Cancel has landed (Ctrl-C during a turn; out-of-band, handled in the interpreter layer, never enters `next_action`); New / Resume / Exit have not |
-//! | Notice | landed | the seven methods of `ui::Ui` |
+//! | Notice | landed | the methods of `ui::Ui` — a notification that returns nothing, so its members are counted where they are declared |
 //! | Effect | landed, in the interpreter | one per [`Action`], run by `agent::turn`: a sub-request, one tool call (the step budget, then the gate, then the tool — or, for the question tool, the user's answer instead of the tool), and the cleanup a cancelled turn owes the log. The interpreter's own vocabulary (`Step`, `Ran`, `Gate`) describes what it did, never what to do next — the decision stays here |
 
 use std::collections::HashSet;
