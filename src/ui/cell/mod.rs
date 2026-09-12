@@ -91,7 +91,10 @@ pub struct DiffLine {
 }
 
 /// What a line of a change is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // the `Context` and `Hunk` variants are emitted by the new unified-diff
+// algorithm, which is wired into `diff_lines` in the follow-up commit; the
+// production `diff_lines` is unchanged in this commit
 pub enum DiffKind {
     /// A line the call takes out.
     Removed,
@@ -99,6 +102,24 @@ pub enum DiffKind {
     Added,
     /// Lines the cell does not show, and how many there are.
     Omitted(usize),
+    /// A line neither taken out nor put in: kept around the change so the reader
+    /// can see what surrounds it. Painted with a single leading space and the
+    /// plain color, not the call's yellow, because the line is not the call's
+    /// doing.
+    Context,
+    /// The header that opens a hunk: `@@ -old_start,old_count +new_start,new_count @@`.
+    ///
+    /// The four numbers are 1-based, the way unified diffs always are. A hunk
+    /// with no old lines (a pure addition) is `@@ -0,0 +N,M @@`; a hunk with
+    /// no new lines (a pure removal) is `@@ -N,M +0,0 @@`. The text field of the
+    /// `DiffLine` is empty for a header -- the rendered text is the four numbers
+    /// -- and the kind is what carries them.
+    Hunk {
+        old_start: usize,
+        old_count: usize,
+        new_start: usize,
+        new_count: usize,
+    },
 }
 
 /// One unit of transcript output.
@@ -330,12 +351,28 @@ impl Cell {
                 // A line of the change is a line of the cell, so it lands in the
                 // gutter's continuation columns and lines up under the call.
                 for line in diff {
-                    spans.push(match line.kind {
+                    spans.push(match &line.kind {
                         DiffKind::Removed => Span::new(Style::Red, format!("\n- {}", line.text)),
                         DiffKind::Added => Span::new(Style::Green, format!("\n+ {}", line.text)),
                         DiffKind::Omitted(n) => {
                             Span::new(Style::Dim, format!("\n… {n} more line(s)"))
                         }
+                        // Context: the same column the gutter's continuation
+                        // opens in, one space wide of indent so it does not
+                        // read as a removed line.
+                        DiffKind::Context => Span::new(Style::Plain, format!("\n {}", line.text)),
+                        // Hunk header: the line that says where in the file the
+                        // change is, dim so it does not compete with the lines
+                        // it heads.
+                        DiffKind::Hunk {
+                            old_start,
+                            old_count,
+                            new_start,
+                            new_count,
+                        } => Span::new(
+                            Style::Dim,
+                            format!("\n@@ -{old_start},{old_count} +{new_start},{new_count} @@"),
+                        ),
                     });
                 }
                 spans
@@ -496,6 +533,51 @@ mod tests {
         // One cell, so the spacing rule sees one thing to set off.
         assert!(cell.gap_after(false));
         assert!(!cell.is_text_block());
+    }
+
+    #[test]
+    fn a_tool_call_with_context_and_hunk_lines_renders_them() {
+        // The new variants of `DiffKind` are how a real unified diff is
+        // painted: context lines have a single leading space and the plain
+        // style, hunk headers name the line ranges in dim. The test pins the
+        // shape of both, since both front ends go through `spans()`.
+        let cell = Cell::ToolCall {
+            name: "Edit".into(),
+            hint: "a.rs".into(),
+            diff: vec![
+                DiffLine {
+                    kind: DiffKind::Hunk {
+                        old_start: 1,
+                        old_count: 3,
+                        new_start: 1,
+                        new_count: 3,
+                    },
+                    text: String::new(),
+                },
+                DiffLine {
+                    kind: DiffKind::Context,
+                    text: "fn a() {".into(),
+                },
+                DiffLine {
+                    kind: DiffKind::Removed,
+                    text: "    1".into(),
+                },
+                DiffLine {
+                    kind: DiffKind::Added,
+                    text: "    2".into(),
+                },
+            ],
+        };
+        assert_eq!(
+            cell.spans(),
+            vec![
+                Span::new(Style::Yellow, "Edit a.rs"),
+                Span::new(Style::Dim, "\n@@ -1,3 +1,3 @@"),
+                Span::new(Style::Plain, "\n fn a() {"),
+                Span::new(Style::Red, "\n-     1"),
+                Span::new(Style::Green, "\n+     2"),
+            ]
+        );
     }
 
     #[test]
