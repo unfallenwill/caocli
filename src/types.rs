@@ -255,11 +255,13 @@ pub struct ChatRequest {
 }
 
 // ============================================================================
-// Anthropic /v1/messages wire types (MiniMax). Same rule as above: field names
-// are the API's. The internal history is provider-agnostic; the request
-// builder maps it onto one of the two shapes, and the stream parser folds the
-// Anthropic event stream back into the same deltas the accumulator already
-// reads — a second protocol, not a second conversation.
+// The wire the request is carried on.
+//
+// The Anthropic shapes are the `anthropic` crate's: it speaks the standard
+// Messages protocol, so the request is built in its vocabulary and the JSON is
+// its business. What this crate keeps is the one enum that says which of the
+// two a request is — the internal history is provider-agnostic, and the request
+// builder maps it onto one shape or the other.
 // ============================================================================
 
 /// The request as the wire that carries it sees it. The client refuses to
@@ -268,121 +270,7 @@ pub struct ChatRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub enum WireRequest {
     OpenAi(ChatRequest),
-    Anthropic(AnthropicRequest),
-}
-
-/// Anthropic-style thinking switch: `adaptive` turns thinking on, `disabled`
-/// keeps it off. (The OpenAI wire's `enabled`/`disabled` values are a
-/// different vocabulary; only the shape is shared.)
-impl Thinking {
-    pub fn adaptive() -> Self {
-        Self {
-            r#type: "adaptive".into(),
-        }
-    }
-    pub fn disabled() -> Self {
-        Self {
-            r#type: "disabled".into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AnthropicRole {
-    User,
-    Assistant,
-}
-
-/// Message content: a plain string (what a plain text turn maps to) or the
-/// block array the structured turns need. Untagged, string tried first, so a
-/// mapped text turn is written as the string it mapped to.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum AnthropicContent {
-    Text(String),
-    Blocks(Vec<AnthropicBlock>),
-}
-
-/// One content block. The set the backend serves: text, image (M3),
-/// thinking, tool_use and tool_result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AnthropicBlock {
-    Text {
-        text: String,
-    },
-    Image {
-        source: AnthropicImageSource,
-    },
-    Thinking {
-        thinking: String,
-        signature: String,
-    },
-    ToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-    },
-    ToolResult {
-        tool_use_id: String,
-        content: String,
-    },
-}
-
-/// Where an image block reads its picture. An attached image is a `data:` URL
-/// internally; the request builder splits it into the base64 source the wire
-/// wants. Anything that is not a data URL is passed as a URL source.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AnthropicImageSource {
-    Base64 { media_type: String, data: String },
-    Url { url: String },
-}
-
-/// A tool definition, Anthropic shape: the JSON schema rides as
-/// `input_schema` instead of nested under `function`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AnthropicTool {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub input_schema: serde_json::Value,
-}
-
-/// Tool choice strategy: the endpoint serves `auto` and `none` only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AnthropicToolChoice {
-    Auto,
-    None,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AnthropicMessage {
-    pub role: AnthropicRole,
-    pub content: AnthropicContent,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AnthropicRequest {
-    pub model: String,
-    /// Ceiling on a single answer, from the provider preset. Always sent:
-    /// the endpoint's own default is far below what the model can emit.
-    pub max_tokens: u32,
-    /// The system prompt, a top-level field on this wire (not a message).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<String>,
-    pub messages: Vec<AnthropicMessage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<AnthropicTool>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<AnthropicToolChoice>,
-    pub stream: bool,
-    /// The thinking switch: `adaptive` (on) or `disabled`. Omitting it turns
-    /// thinking off for M3, so the on case is always sent explicitly.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub thinking: Option<Thinking>,
+    Anthropic(anthropic::MessagesRequest),
 }
 
 // ============================================================================
@@ -920,71 +808,23 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_request_serializes_in_wire_shape() {
-        let req = AnthropicRequest {
-            model: "MiniMax-M3".into(),
-            max_tokens: 131_072,
-            system: Some("sys".into()),
-            messages: vec![
-                AnthropicMessage {
-                    role: AnthropicRole::User,
-                    content: AnthropicContent::Text("hi".into()),
-                },
-                AnthropicMessage {
-                    role: AnthropicRole::Assistant,
-                    content: AnthropicContent::Blocks(vec![
-                        AnthropicBlock::Thinking {
-                            thinking: "hmm".into(),
-                            signature: "cafe".into(),
-                        },
-                        AnthropicBlock::ToolUse {
-                            id: "call_1".into(),
-                            name: "Bash".into(),
-                            input: serde_json::json!({"command": "ls"}),
-                        },
-                    ]),
-                },
-                AnthropicMessage {
-                    role: AnthropicRole::User,
-                    content: AnthropicContent::Blocks(vec![AnthropicBlock::ToolResult {
-                        tool_use_id: "call_1".into(),
-                        content: "out".into(),
-                    }]),
-                },
-            ],
-            tools: Some(vec![AnthropicTool {
-                name: "Bash".into(),
-                description: Some("run it".into()),
-                input_schema: serde_json::json!({"type": "object"}),
-            }]),
-            tool_choice: Some(AnthropicToolChoice::Auto),
-            stream: true,
-            thinking: Some(Thinking::adaptive()),
-        };
-        let v: serde_json::Value = serde_json::to_value(&req).unwrap();
-        assert_eq!(v["model"], "MiniMax-M3");
-        assert_eq!(v["max_tokens"], 131_072);
-        assert_eq!(v["system"], "sys");
-        assert_eq!(v["stream"], true);
-        assert_eq!(v["thinking"], serde_json::json!({"type": "adaptive"}));
-        assert_eq!(v["tool_choice"], serde_json::json!({"type": "auto"}));
-        assert_eq!(v["messages"][0]["content"], "hi");
-        let blocks = v["messages"][1]["content"].as_array().unwrap();
-        assert_eq!(blocks[0]["type"], "thinking");
-        assert_eq!(blocks[0]["signature"], "cafe");
-        assert_eq!(blocks[1]["type"], "tool_use");
-        assert_eq!(blocks[1]["input"]["command"], "ls");
-        assert_eq!(
-            v["messages"][2]["content"][0],
-            serde_json::json!({"type": "tool_result", "tool_use_id": "call_1", "content": "out"})
+    fn the_wire_enum_carries_the_sdks_own_request() {
+        // The Anthropic shape is the `anthropic` crate's, and its JSON is that
+        // crate's business — what this crate owes is the enum that says which
+        // of the two shapes a request is, and the shape it hands over.
+        let request = WireRequest::Anthropic(
+            anthropic::MessagesRequest::new("MiniMax-M3", 131_072, vec![])
+                .streaming()
+                .with_system("sys"),
         );
-        assert_eq!(v["tools"][0]["input_schema"]["type"], "object");
-        // The disabled switch is the same shape, other word.
-        let off = Thinking::disabled();
-        assert_eq!(
-            serde_json::to_value(&off).unwrap(),
-            serde_json::json!({"type": "disabled"})
-        );
+        match &request {
+            WireRequest::Anthropic(built) => {
+                assert_eq!(built.model, "MiniMax-M3");
+                assert_eq!(built.max_tokens, 131_072);
+                assert_eq!(built.stream, Some(true));
+            }
+            WireRequest::OpenAi(_) => panic!("expected the Anthropic shape"),
+        }
     }
 
     #[test]

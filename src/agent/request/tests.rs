@@ -8,9 +8,9 @@
 use crate::provider;
 use crate::session::SessionMeta;
 use crate::types::{
-    AnthropicBlock, AnthropicContent, AnthropicRequest, ChatRequest, Content, Message, Role,
-    Thinking, ThinkingBlock, ToolCall, ToolCallFunction, WireRequest,
+    ChatRequest, Content, Message, Role, ThinkingBlock, ToolCall, ToolCallFunction, WireRequest,
 };
+use anthropic::{Block, BlockKind, ImageSource, MessageContent, SystemPrompt, ThinkingConfig};
 
 use super::{SYSTEM_PROMPT, build_request};
 
@@ -33,7 +33,7 @@ fn openai_of(request: &WireRequest) -> ChatRequest {
     }
 }
 
-fn anthropic_of(request: &WireRequest) -> AnthropicRequest {
+fn anthropic_of(request: &WireRequest) -> anthropic::MessagesRequest {
     match request {
         WireRequest::Anthropic(r) => r.clone(),
         other => panic!("expected an Anthropic-shaped request, got {other:?}"),
@@ -217,6 +217,34 @@ fn empty_instructions_are_not_sent() {
 // The Anthropic wire (MiniMax).
 // ---------------------------------------------------------------------------
 
+/// The project instructions go out on both wires. They were missing from this
+/// one: `meta.instructions` is frozen at session creation and sent from the
+/// meta, and only the OpenAI shape was reading it — so a MiniMax session was
+/// started with no AGENTS.md in front of it at all, while the instructions of a
+/// directory discovered mid-session (which ride in the history) arrived as
+/// usual. The symptom read as a model that ignored what it had been told.
+#[test]
+fn anthropic_system_prompt_carries_the_project_instructions() {
+    let meta = SessionMeta {
+        instructions: Some("the house rules".into()),
+        ..minimax_meta(Some("on"))
+    };
+    let req = anthropic_of(&build_request(&provider::MINIMAX, &meta, &[]));
+    assert_eq!(
+        req.system,
+        Some(SystemPrompt::Text(format!(
+            "{SYSTEM_PROMPT}\n\nthe house rules"
+        )))
+    );
+    // And nothing is sent when there are no instructions to send.
+    let empty = SessionMeta {
+        instructions: Some(String::new()),
+        ..minimax_meta(Some("on"))
+    };
+    let req = anthropic_of(&build_request(&provider::MINIMAX, &empty, &[]));
+    assert_eq!(req.system, Some(SystemPrompt::Text(SYSTEM_PROMPT.into())));
+}
+
 fn minimax_meta(effort: Option<&str>) -> SessionMeta {
     SessionMeta {
         provider: Some("minimax".into()),
@@ -235,42 +263,36 @@ fn anthropic_request_maps_the_history_onto_blocks() {
         &history,
     ));
     // The system prompt is a top-level field, not a message.
-    assert_eq!(req.system.as_deref(), Some(SYSTEM_PROMPT));
+    assert_eq!(req.system, Some(SystemPrompt::Text(SYSTEM_PROMPT.into())));
     // user, assistant-with-call, user-with-result, user again.
     assert_eq!(req.messages.len(), 4);
     assert_eq!(
         req.messages[0].content,
-        AnthropicContent::Text("freeze".into())
+        MessageContent::Text("freeze".into())
     );
     // The call is a tool_use block; the result a tool_result block in the
     // user turn that follows it.
     assert_eq!(
         req.messages[1].content,
-        AnthropicContent::Blocks(vec![AnthropicBlock::ToolUse {
-            id: "call_f1".into(),
-            name: "Bash".into(),
-            input: serde_json::json!({"command": "true"}),
-        }])
+        MessageContent::Blocks(vec![Block::tool_use(
+            "call_f1",
+            "Bash",
+            serde_json::json!({"command": "true"}),
+        )])
     );
     assert_eq!(
         req.messages[2].content,
-        AnthropicContent::Blocks(vec![AnthropicBlock::ToolResult {
-            tool_use_id: "call_f1".into(),
-            content: "exit_code: 0".into(),
-        }])
+        MessageContent::Blocks(vec![Block::tool_result("call_f1", "exit_code: 0")])
     );
     assert_eq!(
         req.messages[3].content,
-        AnthropicContent::Text("again".into())
+        MessageContent::Text("again".into())
     );
     assert_eq!(req.model, "MiniMax-M3");
     assert_eq!(req.max_tokens, 131_072);
-    assert!(req.stream);
-    assert_eq!(
-        req.tool_choice,
-        Some(crate::types::AnthropicToolChoice::Auto)
-    );
-    assert_eq!(req.thinking, Some(Thinking::adaptive()));
+    assert_eq!(req.stream, Some(true));
+    assert_eq!(req.tool_choice, Some(anthropic::ToolChoice::auto()));
+    assert_eq!(req.thinking, Some(ThinkingConfig::adaptive()));
     // The tools arrive in the Anthropic shape, in the same fixed order.
     let tools = req.tools.as_ref().unwrap();
     assert_eq!(tools.len(), 7);
@@ -282,11 +304,11 @@ fn anthropic_request_maps_the_history_onto_blocks() {
 fn anthropic_effort_slot_is_the_thinking_switch() {
     let history = vec![Message::user("hi")];
     for (effort, expected) in [
-        (Some("on"), Thinking::adaptive()),
-        (Some("off"), Thinking::disabled()),
+        (Some("on"), ThinkingConfig::adaptive()),
+        (Some("off"), ThinkingConfig::disabled()),
         // A session that stored nothing sits at the preset's default, and
         // the default keeps thinking on.
-        (None, Thinking::adaptive()),
+        (None, ThinkingConfig::adaptive()),
     ] {
         let req = anthropic_of(&build_request(
             &provider::MINIMAX,
@@ -329,19 +351,10 @@ fn anthropic_request_replays_thinking_blocks_verbatim() {
     let assistant = &req.messages[1];
     assert_eq!(
         assistant.content,
-        AnthropicContent::Blocks(vec![
-            AnthropicBlock::Thinking {
-                thinking: "I should run it".into(),
-                signature: "sig-cafe".into(),
-            },
-            AnthropicBlock::Text {
-                text: "running".into(),
-            },
-            AnthropicBlock::ToolUse {
-                id: "call_x".into(),
-                name: "Bash".into(),
-                input: serde_json::json!({"command": "ls"}),
-            },
+        MessageContent::Blocks(vec![
+            Block::thinking("I should run it", "sig-cafe"),
+            Block::text("running"),
+            Block::tool_use("call_x", "Bash", serde_json::json!({"command": "ls"})),
         ])
     );
 }
@@ -366,9 +379,7 @@ fn anthropic_request_does_not_replay_openai_style_reasoning() {
     ));
     assert_eq!(
         req.messages[0].content,
-        AnthropicContent::Blocks(vec![AnthropicBlock::Text {
-            text: "done".into(),
-        }])
+        MessageContent::Blocks(vec![Block::text("done")])
     );
 }
 
@@ -403,16 +414,16 @@ fn anthropic_request_folds_consecutive_results_into_one_user_turn() {
     assert_eq!(req.messages.len(), 3, "{req:#?}");
     // Two calls in the assistant turn, both results in one user turn after.
     match &req.messages[1].content {
-        AnthropicContent::Blocks(blocks) => assert_eq!(blocks.len(), 2),
+        MessageContent::Blocks(blocks) => assert_eq!(blocks.len(), 2),
         other => panic!("expected blocks, got {other:?}"),
     }
     match &req.messages[2].content {
-        AnthropicContent::Blocks(blocks) => {
+        MessageContent::Blocks(blocks) => {
             assert_eq!(blocks.len(), 2);
             assert!(
                 blocks
                     .iter()
-                    .all(|b| matches!(b, AnthropicBlock::ToolResult { .. }),)
+                    .all(|b| matches!(b.kind, BlockKind::ToolResult { .. }),)
             );
         }
         other => panic!("expected blocks, got {other:?}"),
@@ -442,16 +453,12 @@ fn anthropic_request_splits_a_data_url_into_a_base64_image_source() {
     ));
     assert_eq!(
         req.messages[0].content,
-        AnthropicContent::Blocks(vec![
-            AnthropicBlock::Text {
-                text: "what is this?".into(),
-            },
-            AnthropicBlock::Image {
-                source: crate::types::AnthropicImageSource::Base64 {
-                    media_type: "image/png".into(),
-                    data: "Zm9vYmFy".into(),
-                },
-            },
+        MessageContent::Blocks(vec![
+            Block::text("what is this?"),
+            Block::image(ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "Zm9vYmFy".into(),
+            }),
         ])
     );
 }
@@ -487,8 +494,8 @@ fn anthropic_request_maps_an_unparseable_call_to_an_empty_input() {
         &history,
     ));
     match &req.messages[1].content {
-        AnthropicContent::Blocks(blocks) => match &blocks[0] {
-            AnthropicBlock::ToolUse { input, .. } => {
+        MessageContent::Blocks(blocks) => match &blocks[0].kind {
+            BlockKind::ToolUse { input, .. } => {
                 assert_eq!(*input, serde_json::json!({}));
             }
             other => panic!("expected a tool_use block, got {other:?}"),
@@ -514,13 +521,13 @@ fn the_anthropic_request_prefix_is_frozen() {
     for t in tools.iter_mut() {
         t.description = Some("…".into());
     }
-    let stripped = AnthropicRequest {
+    let stripped = anthropic::MessagesRequest {
         tools: Some(tools),
         ..req.clone()
     };
     assert_eq!(
         serde_json::to_string(&stripped).unwrap(),
-        r#"{"model":"MiniMax-M3","max_tokens":131072,"system":"You are caocli, a coding agent. You and the user share one workspace, and your job is to collaborate with them until their goal is genuinely handled. Keep answers concise. Tool routing: use Read to read a file, Edit to modify an existing file, Write to create or fully rewrite a file, and Bash for everything else (running programs, builds, tests, git, directories, bulk text processing). Prefer absolute paths: each Bash call starts a fresh shell, so cd does not persist.","messages":[{"role":"user","content":"freeze"},{"role":"assistant","content":[{"type":"tool_use","id":"call_f1","name":"Bash","input":{"command":"true"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_f1","content":"exit_code: 0"}]},{"role":"user","content":"again"}],"tools":[{"name":"Bash","description":"…","input_schema":{"properties":{"background":{"description":"start the command and return at once, its output going to the file the result names (default false)","type":"boolean"},"command":{"description":"the bash command to run","type":"string"},"timeout":{"description":"seconds to let the command run before it is killed (default 120, at most 1800); a background run returns at once and takes none","type":"integer"}},"required":["command"],"type":"object"}},{"name":"Read","description":"…","input_schema":{"properties":{"file_path":{"description":"path of the file to read","type":"string"},"limit":{"description":"how many lines to read; default all the way to the end","type":"integer"},"offset":{"description":"the 1-based line number to start reading at; default 1, the first line","type":"integer"}},"required":["file_path"],"type":"object"}},{"name":"Edit","description":"…","input_schema":{"properties":{"file_path":{"description":"path of the file to modify","type":"string"},"new_string":{"description":"the replacement text; an empty string deletes the matched text","type":"string"},"old_string":{"description":"the original text to replace; must occur exactly once in the file","type":"string"}},"required":["file_path","old_string","new_string"],"type":"object"}},{"name":"Write","description":"…","input_schema":{"properties":{"content":{"description":"the full contents to write","type":"string"},"file_path":{"description":"path of the file to write","type":"string"}},"required":["file_path","content"],"type":"object"}},{"name":"AskUserQuestion","description":"…","input_schema":{"properties":{"questions":{"description":"Questions to ask the user before continuing.","items":{"additionalProperties":true,"properties":{"header":{"description":"Optional short heading for the question, such as \"Confirm\" or \"Choose Mode\".","type":"string"},"id":{"description":"Stable id for this question; echoed in the answer.","type":"string"},"multi_select":{"description":"Whether the user may select more than one option. Defaults to false.","type":"boolean"},"options":{"description":"Optional choices to show the user. If you recommend one, put it first and append \"(Recommended)\" to that label.","items":{"additionalProperties":true,"properties":{"description":{"description":"One sentence explaining the tradeoff or impact.","type":"string"},"label":{"description":"Short user-facing option label.","type":"string"}},"required":["label"],"type":"object"},"type":"array"},"question":{"description":"The specific question to ask the user.","type":"string"}},"required":["id","question"],"type":"object"},"type":"array"}},"required":["questions"],"type":"object"}},{"name":"TodoWrite","description":"…","input_schema":{"properties":{"todos":{"description":"The whole list, in the order the work is done. Send an empty array to clear it.","items":{"additionalProperties":true,"properties":{"content":{"description":"What the task is, in the imperative: \"Add the parse function\".","type":"string"},"status":{"description":"Where the task stands. Defaults to pending.","enum":["pending","in_progress","completed"],"type":"string"}},"required":["content"],"type":"object"},"maxItems":20,"type":"array"}},"required":["todos"],"type":"object"}},{"name":"Glob","description":"…","input_schema":{"properties":{"path":{"description":"the directory searched, and the one the pattern's paths are relative to; default the working directory","type":"string"},"pattern":{"description":"the glob matched against each path below path; * and ? stop at a /, ** stands for any number of directories, and a pattern with no / is asked at any depth","type":"string"}},"required":["pattern"],"type":"object"}}],"tool_choice":{"type":"auto"},"stream":true,"thinking":{"type":"adaptive"}}"#
+        r#"{"model":"MiniMax-M3","max_tokens":131072,"messages":[{"role":"user","content":"freeze"},{"role":"assistant","content":[{"type":"tool_use","id":"call_f1","name":"Bash","input":{"command":"true"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_f1","content":"exit_code: 0"}]},{"role":"user","content":"again"}],"system":"You are caocli, a coding agent. You and the user share one workspace, and your job is to collaborate with them until their goal is genuinely handled. Keep answers concise. Tool routing: use Read to read a file, Edit to modify an existing file, Write to create or fully rewrite a file, and Bash for everything else (running programs, builds, tests, git, directories, bulk text processing). Prefer absolute paths: each Bash call starts a fresh shell, so cd does not persist.","tools":[{"name":"Bash","description":"…","input_schema":{"properties":{"background":{"description":"start the command and return at once, its output going to the file the result names (default false)","type":"boolean"},"command":{"description":"the bash command to run","type":"string"},"timeout":{"description":"seconds to let the command run before it is killed (default 120, at most 1800); a background run returns at once and takes none","type":"integer"}},"required":["command"],"type":"object"}},{"name":"Read","description":"…","input_schema":{"properties":{"file_path":{"description":"path of the file to read","type":"string"},"limit":{"description":"how many lines to read; default all the way to the end","type":"integer"},"offset":{"description":"the 1-based line number to start reading at; default 1, the first line","type":"integer"}},"required":["file_path"],"type":"object"}},{"name":"Edit","description":"…","input_schema":{"properties":{"file_path":{"description":"path of the file to modify","type":"string"},"new_string":{"description":"the replacement text; an empty string deletes the matched text","type":"string"},"old_string":{"description":"the original text to replace; must occur exactly once in the file","type":"string"}},"required":["file_path","old_string","new_string"],"type":"object"}},{"name":"Write","description":"…","input_schema":{"properties":{"content":{"description":"the full contents to write","type":"string"},"file_path":{"description":"path of the file to write","type":"string"}},"required":["file_path","content"],"type":"object"}},{"name":"AskUserQuestion","description":"…","input_schema":{"properties":{"questions":{"description":"Questions to ask the user before continuing.","items":{"additionalProperties":true,"properties":{"header":{"description":"Optional short heading for the question, such as \"Confirm\" or \"Choose Mode\".","type":"string"},"id":{"description":"Stable id for this question; echoed in the answer.","type":"string"},"multi_select":{"description":"Whether the user may select more than one option. Defaults to false.","type":"boolean"},"options":{"description":"Optional choices to show the user. If you recommend one, put it first and append \"(Recommended)\" to that label.","items":{"additionalProperties":true,"properties":{"description":{"description":"One sentence explaining the tradeoff or impact.","type":"string"},"label":{"description":"Short user-facing option label.","type":"string"}},"required":["label"],"type":"object"},"type":"array"},"question":{"description":"The specific question to ask the user.","type":"string"}},"required":["id","question"],"type":"object"},"type":"array"}},"required":["questions"],"type":"object"}},{"name":"TodoWrite","description":"…","input_schema":{"properties":{"todos":{"description":"The whole list, in the order the work is done. Send an empty array to clear it.","items":{"additionalProperties":true,"properties":{"content":{"description":"What the task is, in the imperative: \"Add the parse function\".","type":"string"},"status":{"description":"Where the task stands. Defaults to pending.","enum":["pending","in_progress","completed"],"type":"string"}},"required":["content"],"type":"object"},"maxItems":20,"type":"array"}},"required":["todos"],"type":"object"}},{"name":"Glob","description":"…","input_schema":{"properties":{"path":{"description":"the directory searched, and the one the pattern's paths are relative to; default the working directory","type":"string"},"pattern":{"description":"the glob matched against each path below path; * and ? stop at a /, ** stands for any number of directories, and a pattern with no / is asked at any depth","type":"string"}},"required":["pattern"],"type":"object"}}],"tool_choice":{"type":"auto"},"thinking":{"type":"adaptive"},"stream":true}"#
     );
     // The stored effort rides along but means the thinking switch here; the
     // frozen literal above pins `adaptive` for a non-off tier.
@@ -529,7 +536,7 @@ fn the_anthropic_request_prefix_is_frozen() {
         &minimax_meta(Some("off")),
         &history,
     ));
-    assert_eq!(off.thinking, Some(Thinking::disabled()));
+    assert_eq!(off.thinking, Some(ThinkingConfig::disabled()));
 }
 
 #[test]

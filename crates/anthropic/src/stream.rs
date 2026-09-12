@@ -21,7 +21,9 @@ use futures_util::StreamExt;
 use crate::error::Error;
 use crate::types::Event;
 
-type ByteStream = Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>;
+/// The bytes a stream reads from: whatever transport the caller has, as long as
+/// it is `Send` and says nothing until the answer arrives.
+pub type ByteStream = Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>;
 
 /// The events of one answer, arriving as they are written.
 pub struct EventStream {
@@ -45,9 +47,10 @@ impl std::fmt::Debug for EventStream {
 }
 
 impl EventStream {
-    /// The stream over a byte source. Not public in use: a caller gets one from
-    /// the client.
-    pub(crate) fn new(inner: ByteStream) -> Self {
+    /// The stream over a byte source: the client builds one from a response,
+    /// and a caller with a transport of its own — a test, a replay of a
+    /// recorded answer — builds one from that.
+    pub fn new(inner: ByteStream) -> Self {
         Self {
             inner,
             buf: Vec::new(),

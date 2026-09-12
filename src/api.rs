@@ -1,48 +1,49 @@
+use anthropic::{BlockDelta, BlockKind, Event as AnthropicEvent};
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::time::Duration;
 
 use crate::provider::{Provider, Wire};
 use crate::types::{ChatChunk, Delta, DeltaFunctionCall, DeltaToolCall, Usage, WireRequest};
 
 // ============================================================================
-// HTTP client + SSE streaming parsing.
-// parse_sse_line / take_line are pure functions and unit-testable;
-// SseStream::next_chunk yields one chunk at a time.
-// Streaming contract (OpenAI wire): delta.reasoning_content precedes
-// delta.content; `data: [DONE]` ends the stream; usage rides on the last
-// content block (there is no standalone usage block).
-// Streaming contract (Anthropic wire): every payload is a data line carrying
-// a typed event; the Transcoder folds the events into the same deltas the
-// accumulator reads, and the usage of message_start and message_delta is
-// merged so it is emitted once, complete.
+// The two wires, one conversation.
+//
+// The OpenAI wire is parsed here: `parse_sse_line` and `take_line` are pure
+// functions and unit-testable, and `SseStream` yields one chunk at a time.
+// Streaming contract: delta.reasoning_content precedes delta.content;
+// `data: [DONE]` ends the stream; usage rides on the last content block (there
+// is no standalone usage block).
+//
+// The Anthropic wire is the `anthropic` crate's: it speaks the standard
+// protocol and hands over typed events, and `AnthropicStream` folds those into
+// the very same deltas the accumulator reads. Nothing downstream learns that a
+// second protocol exists — the pieces the OpenAI wire has no field for ride
+// fields added for them (the signature that closes a thinking block, the usage
+// split across message_start and message_delta).
 // ============================================================================
 
 type ByteStream = Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>;
 
+/// The client for one provider: its endpoint, its key and its wire, paired so
+/// that one provider's key cannot be sent to another provider's endpoint.
 pub struct Client {
-    http: reqwest::Client,
-    api_key: String,
-    url: String,
-    wire: Wire,
+    backend: Backend,
+}
+
+enum Backend {
+    /// The OpenAI chat-completions wire, spoken from here.
+    OpenAi {
+        http: reqwest::Client,
+        api_key: String,
+        url: String,
+    },
+    /// The Anthropic wire, spoken by the SDK.
+    Anthropic(anthropic::Client),
 }
 
 impl Client {
-    pub fn new(api_key: String, url: String, wire: Wire) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .build()
-            .context("failed to build HTTP client")?;
-        Ok(Self {
-            http,
-            api_key,
-            url,
-            wire,
-        })
-    }
-
     /// The client for a provider: its endpoint, key and wire, paired in the
     /// one place that knows all three, so a caller cannot send one provider's
     /// key (or one wire's request shape) to another provider's URL.
@@ -50,48 +51,101 @@ impl Client {
         Self::new(key, provider.url.to_string(), provider.wire)
     }
 
-    /// The request bytes as the client's wire wants them. A shape handed to
-    /// the other wire's endpoint is refused here rather than serialized
-    /// across, which is the one misuse the WireRequest enum cannot prevent.
+    pub fn new(api_key: String, url: String, wire: Wire) -> Result<Self> {
+        let backend = match wire {
+            Wire::OpenAi => {
+                let http = reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(30))
+                    .build()
+                    .context("failed to build HTTP client")?;
+                Backend::OpenAi { http, api_key, url }
+            }
+            // The endpoint is the provider's own URL, path and all: an
+            // Anthropic-compatible gateway puts the messages where it likes.
+            Wire::Anthropic => Backend::Anthropic(anthropic::Client::new(
+                anthropic::Profile::endpoint(url).with_bearer_token(api_key),
+            )?),
+        };
+        Ok(Self { backend })
+    }
+
+    /// The OpenAI-wire request bytes. A shape handed to the other wire's
+    /// endpoint is refused here rather than serialized across, which is the one
+    /// misuse the WireRequest enum cannot prevent.
     fn body(&self, req: &WireRequest) -> Result<Vec<u8>> {
-        match (self.wire, req) {
-            (Wire::OpenAi, WireRequest::OpenAi(r)) => Ok(serde_json::to_vec(r)?),
-            (Wire::Anthropic, WireRequest::Anthropic(r)) => Ok(serde_json::to_vec(r)?),
+        match (&self.backend, req) {
+            (Backend::OpenAi { .. }, WireRequest::OpenAi(r)) => Ok(serde_json::to_vec(r)?),
             _ => bail!("request shape does not match the provider's wire protocol"),
         }
     }
 
-    pub async fn stream_chat(&self, req: &WireRequest) -> Result<SseStream> {
-        let resp = self
-            .http
-            .post(&self.url)
-            .bearer_auth(&self.api_key)
-            .header("Content-Type", "application/json")
-            .body(self.body(req)?)
-            .send()
-            .await
-            .context("request failed (network error)")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            bail!("API returned HTTP {status}\nresponse body: {body}");
+    /// Send one sub-request and hand back its stream.
+    pub async fn stream_chat(&self, req: &WireRequest) -> Result<ChunkStream> {
+        match (&self.backend, req) {
+            (Backend::OpenAi { http, api_key, url }, WireRequest::OpenAi(_)) => {
+                let resp = http
+                    .post(url)
+                    .bearer_auth(api_key)
+                    .header("Content-Type", "application/json")
+                    .body(self.body(req)?)
+                    .send()
+                    .await
+                    .context("request failed (network error)")?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    bail!("API returned HTTP {status}\nresponse body: {body}");
+                }
+                Ok(ChunkStream::OpenAi(SseStream {
+                    inner: Box::pin(resp.bytes_stream()),
+                    buf: Vec::new(),
+                    done: false,
+                }))
+            }
+            (Backend::Anthropic(client), WireRequest::Anthropic(r)) => Ok(ChunkStream::Anthropic(
+                AnthropicStream::new(client.stream(r).await?),
+            )),
+            _ => bail!("request shape does not match the provider's wire protocol"),
         }
-        Ok(SseStream {
-            inner: Box::pin(resp.bytes_stream()),
-            buf: Vec::new(),
-            done: false,
-            wire: self.wire,
-            transcoder: Transcoder::default(),
-        })
     }
 }
 
+/// One sub-request in flight, whichever wire carries it.
+pub enum ChunkStream {
+    /// The OpenAI wire's own SSE parser.
+    OpenAi(SseStream),
+    /// The Anthropic wire, adapted from the SDK's typed events.
+    Anthropic(AnthropicStream),
+}
+
+impl std::fmt::Debug for ChunkStream {
+    /// Which wire the stream is on, and not the bytes in it: a half-read event
+    /// printed to a log is noise, while the wire is what a reader is looking
+    /// for when something arrived in the wrong shape.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChunkStream::OpenAi(_) => f.write_str("ChunkStream::OpenAi(…)"),
+            ChunkStream::Anthropic(_) => f.write_str("ChunkStream::Anthropic(…)"),
+        }
+    }
+}
+
+impl ChunkStream {
+    /// None means the stream is over — the wire's end was reached or the
+    /// connection closed.
+    pub async fn next_chunk(&mut self) -> Result<Option<ChatChunk>> {
+        match self {
+            ChunkStream::OpenAi(sse) => sse.next_chunk().await,
+            ChunkStream::Anthropic(stream) => stream.next_chunk().await,
+        }
+    }
+}
+
+/// The OpenAI wire's event stream.
 pub struct SseStream {
     inner: ByteStream,
     buf: Vec<u8>,
     done: bool,
-    wire: Wire,
-    transcoder: Transcoder,
 }
 
 impl SseStream {
@@ -101,28 +155,13 @@ impl SseStream {
     pub async fn next_chunk(&mut self) -> Result<Option<ChatChunk>> {
         loop {
             if let Some(line) = take_line(&mut self.buf) {
-                match self.wire {
-                    Wire::OpenAi => match parse_sse_line(&line)? {
-                        SseLine::Chunk(c) => return Ok(Some(c)),
-                        SseLine::Done => {
-                            self.done = true;
-                            return Ok(None);
-                        }
-                        SseLine::Ignored => continue,
-                    },
-                    // On this wire even the event *name* lines are ignored:
-                    // every payload is a data line, and the transcoder reads
-                    // the type off the JSON itself. An event that folds into
-                    // no delta (a ping, a block boundary) continues the loop
-                    // rather than yielding an empty chunk.
-                    Wire::Anthropic => {
-                        if let Some(data) = data_of(&line)
-                            && let Some(chunk) = self.transcoder.event(data)?
-                        {
-                            return Ok(Some(chunk));
-                        }
-                        continue;
+                match parse_sse_line(&line)? {
+                    SseLine::Chunk(c) => return Ok(Some(c)),
+                    SseLine::Done => {
+                        self.done = true;
+                        return Ok(None);
                     }
+                    SseLine::Ignored => continue,
                 }
             }
             if self.done {
@@ -181,197 +220,163 @@ fn parse_sse_line(line: &str) -> Result<SseLine> {
 }
 
 // ============================================================================
-// The Anthropic transcoder: event stream in, deltas out.
+// The Anthropic wire: typed events in, the same deltas out.
 //
-// The two wires carry one conversation. A text_delta, a thinking_delta and an
-// input_json_delta shard mean exactly what delta.content,
-// delta.reasoning_content and a sharded tool_call mean on the OpenAI wire, so
-// they are translated and handed to the same accumulator; nothing downstream
-// learns that a second protocol exists. The pieces the OpenAI wire does not
-// have — the signature that closes a thinking block, the usage split across
-// message_start and message_delta — ride the fields added for them.
+// The SDK hands over the standard protocol's events one at a time; what is left
+// is the translation this crate's accumulator needs, and it is deliberately
+// small. Two things are the whole of it: a `tool_use` block is sharded by the
+// wire's *content-block* index while the accumulator shards calls by *ordinal*
+// among the calls, so the adapter is where an index becomes an ordinal; and the
+// usage the two ends report in different places is merged so it is emitted once,
+// complete.
 // ============================================================================
 
-#[derive(Default)]
-struct Transcoder {
-    /// The tool_use blocks declared so far, keyed by *content-block* index —
+/// The Anthropic wire's chunk stream: the SDK's events, adapted.
+pub struct AnthropicStream {
+    inner: anthropic::EventStream,
+    /// The `tool_use` blocks declared so far, keyed by *content-block* index —
     /// which is not the tool-call ordinal: thinking and text blocks take
     /// indexes too. The value is the block's ordinal (the order among
-    /// tool_use blocks), which is what the accumulator shards calls by; the
+    /// `tool_use` blocks), which is what the accumulator shards calls by; the
     /// id and name the start event carried went out with its delta.
     tool_uses: HashMap<u32, u32>,
     /// The ordinal the next tool_use block gets.
     next_tool: u32,
     /// What the stream has reported about the prompt so far; emitted with the
     /// output count, so usage lands once, complete.
-    usage: StreamUsage,
+    usage: anthropic::Usage,
 }
 
-#[derive(Default, Clone, Copy)]
-struct StreamUsage {
-    input_tokens: u64,
-    cache_read: u64,
-    cache_creation: u64,
-    output_tokens: u64,
-}
+impl AnthropicStream {
+    pub fn new(inner: anthropic::EventStream) -> Self {
+        Self {
+            inner,
+            tool_uses: HashMap::new(),
+            next_tool: 0,
+            usage: anthropic::Usage::default(),
+        }
+    }
 
-impl StreamUsage {
-    /// Fold one event's usage object: every count the event carries is taken,
-    /// and one it leaves out keeps the value an earlier event reported.
-    ///
-    /// Reading a field off whichever event carries it is the whole point,
-    /// because the two ends of this wire disagree about where the input lives:
-    /// Anthropic's own stream reports it in message_start and only the output
-    /// count in message_delta, while MiniMax reports *zeros* in message_start
-    /// and the prompt — cache reads included — in message_delta. Keying on the
-    /// event rather than on the field loses one of them: a stream whose
-    /// message_delta carries the cache gets reported as no caching at all,
-    /// which is what the status line is built from.
-    fn merge(&mut self, usage: &serde_json::Value) {
-        for (key, slot) in [
-            ("input_tokens", &mut self.input_tokens),
-            ("cache_read_input_tokens", &mut self.cache_read),
-            ("cache_creation_input_tokens", &mut self.cache_creation),
-            ("output_tokens", &mut self.output_tokens),
-        ] {
-            if let Some(v) = usage.get(key).and_then(as_u64) {
-                *slot = v;
+    /// None means the stream is over. An event that folds into no delta (a
+    /// ping, a block boundary) continues the loop rather than yielding an
+    /// empty chunk.
+    pub async fn next_chunk(&mut self) -> Result<Option<ChatChunk>> {
+        loop {
+            let Some(event) = self.inner.next_event().await? else {
+                return Ok(None);
+            };
+            if let Some(chunk) = self.fold(&event) {
+                return Ok(Some(chunk));
             }
         }
     }
 
-    /// The counts in the DeepSeek spelling: hit = tokens served from cache,
-    /// miss = the rest of the prompt (this turn's uncached input and what it
-    /// wrote into the cache), total = the whole request and answer.
-    fn report(&self) -> Usage {
-        let prompt = self.input_tokens + self.cache_read + self.cache_creation;
-        Usage {
-            prompt_tokens: prompt,
-            completion_tokens: self.output_tokens,
-            total_tokens: prompt + self.output_tokens,
-            prompt_cache_hit_tokens: self.cache_read,
-            prompt_cache_miss_tokens: self.input_tokens + self.cache_creation,
-            prompt_tokens_details: None,
-        }
-    }
-}
-
-impl Transcoder {
-    /// Fold one data line's event. None: nothing to hand downstream.
-    fn event(&mut self, data: &str) -> Result<Option<ChatChunk>> {
-        let ev: serde_json::Value = serde_json::from_str(data)
-            .with_context(|| format!("failed to parse SSE event: {data}"))?;
-        match ev.get("type").and_then(|t| t.as_str()) {
-            Some("message_start") => {
-                if let Some(u) = ev.pointer("/message/usage") {
-                    self.usage.merge(u);
-                }
-                Ok(None)
+    /// Fold one event. None: nothing to hand downstream.
+    fn fold(&mut self, event: &AnthropicEvent) -> Option<ChatChunk> {
+        match event {
+            AnthropicEvent::MessageStart { message } => {
+                self.usage.merge(&message.usage);
+                None
             }
-            Some("content_block_start") => {
-                let idx = block_index(&ev);
-                let block = &ev["content_block"];
-                if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                    // The accumulator shards tool calls by *ordinal* among
-                    // tool calls, not by content-block index, so the block is
-                    // given the next ordinal here and the argument shards
-                    // that follow are translated onto it.
-                    let ordinal = self.next_tool;
-                    self.next_tool += 1;
-                    let id = str_of(block, "id");
-                    let name = str_of(block, "name");
-                    self.tool_uses.insert(idx, ordinal);
-                    return Ok(Some(chunk_with(Delta {
-                        tool_calls: Some(vec![DeltaToolCall {
-                            index: ordinal,
-                            id: Some(id),
-                            function: Some(DeltaFunctionCall {
-                                name: Some(name),
-                                arguments: None,
-                            }),
-                        }]),
-                        ..Default::default()
-                    })));
-                }
-                Ok(None)
+            AnthropicEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => {
+                let BlockKind::ToolUse { id, name, .. } = &content_block.kind else {
+                    return None;
+                };
+                // The block is given the next ordinal here, and the argument
+                // shards that follow are translated onto it.
+                let ordinal = self.next_tool;
+                self.next_tool += 1;
+                self.tool_uses.insert(*index, ordinal);
+                Some(chunk_with(Delta {
+                    tool_calls: Some(vec![DeltaToolCall {
+                        index: ordinal,
+                        id: Some(id.clone()),
+                        function: Some(DeltaFunctionCall {
+                            name: Some(name.clone()),
+                            arguments: None,
+                        }),
+                    }]),
+                    ..Default::default()
+                }))
             }
-            Some("content_block_delta") => {
-                let idx = block_index(&ev);
-                let delta = &ev["delta"];
-                let d = match delta.get("type").and_then(|t| t.as_str()) {
-                    Some("text_delta") => Delta {
-                        content: Some(str_of(delta, "text")),
+            AnthropicEvent::ContentBlockDelta { index, delta } => {
+                let delta = match delta {
+                    BlockDelta::TextDelta { text } => Delta {
+                        content: Some(text.clone()),
                         ..Default::default()
                     },
-                    Some("thinking_delta") => Delta {
-                        reasoning_content: Some(str_of(delta, "thinking")),
+                    BlockDelta::ThinkingDelta { thinking } => Delta {
+                        reasoning_content: Some(thinking.clone()),
                         ..Default::default()
                     },
-                    Some("signature_delta") => Delta {
-                        signature: Some(str_of(delta, "signature")),
+                    BlockDelta::SignatureDelta { signature } => Delta {
+                        signature: Some(signature.clone()),
                         ..Default::default()
                     },
-                    Some("input_json_delta") => {
-                        // The shard lands on the call its block declared;
-                        // a shard for a block nobody started has nowhere
-                        // to go and is dropped.
-                        let Some(&ordinal) = self.tool_uses.get(&idx) else {
-                            return Ok(None);
-                        };
+                    BlockDelta::InputJsonDelta { partial_json } => {
+                        // The shard lands on the call its block declared; a
+                        // shard for a block nobody started has nowhere to go
+                        // and is dropped.
+                        let ordinal = *self.tool_uses.get(index)?;
                         Delta {
                             tool_calls: Some(vec![DeltaToolCall {
                                 index: ordinal,
                                 id: None,
                                 function: Some(DeltaFunctionCall {
                                     name: None,
-                                    arguments: Some(str_of(delta, "partial_json")),
+                                    arguments: Some(partial_json.clone()),
                                 }),
                             }]),
                             ..Default::default()
                         }
                     }
-                    // A delta kind nobody declared: nothing to fold, no reason
-                    // to fail a stream that is still speaking its own language.
-                    _ => return Ok(None),
+                    // A citation, or a delta kind the spec added later:
+                    // nothing to fold, and no reason to fail a stream that is
+                    // still speaking its own language.
+                    BlockDelta::CitationsDelta { .. } | BlockDelta::Unknown => return None,
                 };
-                Ok(Some(chunk_with(d)))
+                Some(chunk_with(delta))
             }
-            Some("message_delta") => {
-                // The last event that carries anything. Its usage object is
-                // folded in whole rather than read for the output count alone:
-                // on this wire it is where the prompt of a stream whose
-                // message_start carried zeros — MiniMax's — actually arrives.
-                if let Some(u) = ev.pointer("/usage") {
-                    self.usage.merge(u);
+            AnthropicEvent::MessageDelta { usage, .. } => {
+                // The last event that carries anything. Its usage is folded in
+                // whole rather than read for the output count alone: on this
+                // wire it is where the prompt of a stream whose message_start
+                // carried zeros actually arrives.
+                if let Some(reported) = usage {
+                    self.usage.merge(reported);
                 }
-                Ok(Some(ChatChunk {
+                Some(ChatChunk {
                     choices: Vec::new(),
-                    usage: Some(self.usage.report()),
-                }))
+                    usage: Some(usage_report(&self.usage)),
+                })
             }
-            // A stream that reports its own failure is a failure: the
-            // accumulator would otherwise finish an empty answer for a turn
-            // that never happened.
-            Some("error") => bail!("stream error event: {data}"),
-            // message_stop, ping, and anything new: nothing to fold.
-            _ => Ok(None),
+            // The block boundaries, the keep-alive, the end of the answer, and
+            // anything the spec adds later: nothing to fold. The stream's own
+            // failure never reaches here — the SDK ends the stream with an
+            // error instead.
+            _ => None,
         }
     }
 }
 
-fn as_u64(v: &serde_json::Value) -> Option<u64> {
-    v.as_u64()
-}
-
-fn str_of(v: &serde_json::Value, key: &str) -> String {
-    v.get(key)
-        .and_then(|x| x.as_str())
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn block_index(ev: &serde_json::Value) -> u32 {
-    ev.get("index").and_then(as_u64).unwrap_or(0) as u32
+/// The counts in this crate's spelling: hit = tokens served from cache,
+/// miss = the rest of the prompt (this turn's uncached input and what it wrote
+/// into the cache), total = the whole request and answer.
+fn usage_report(usage: &anthropic::Usage) -> Usage {
+    let prompt = usage.prompt_tokens();
+    let completion = usage.output_tokens.unwrap_or(0);
+    Usage {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: prompt + completion,
+        prompt_cache_hit_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+        prompt_cache_miss_tokens: usage.input_tokens.unwrap_or(0)
+            + usage.cache_creation_input_tokens.unwrap_or(0),
+        prompt_tokens_details: None,
+    }
 }
 
 fn chunk_with(delta: Delta) -> ChatChunk {
@@ -394,17 +399,6 @@ mod tests {
         format!(
             r#"{{"id":"1","choices":[{{"index":0,"delta":{{"content":"{s}"}},"finish_reason":null}}],"created":1,"model":"deepseek-v4-flash","object":"chat.completion.chunk"}}"#
         )
-    }
-
-    fn openai_stream(body: &str) -> SseStream {
-        let stream = futures_util::stream::iter(vec![Ok(bytes::Bytes::from(body.to_owned()))]);
-        SseStream {
-            inner: Box::pin(stream),
-            buf: Vec::new(),
-            done: false,
-            wire: Wire::OpenAi,
-            transcoder: Transcoder::default(),
-        }
     }
 
     #[test]
@@ -481,8 +475,6 @@ mod tests {
             inner: Box::pin(stream),
             buf: Vec::new(),
             done: false,
-            wire: Wire::OpenAi,
-            transcoder: Transcoder::default(),
         };
 
         let c1 = sse.next_chunk().await.unwrap().unwrap();
@@ -526,6 +518,16 @@ mod tests {
 
     fn event(name: &str, payload: serde_json::Value) -> String {
         format!("event: {name}\ndata: {payload}\n\n")
+    }
+
+    /// A body of SSE events as the SDK reads it, adapted by the stream the
+    /// interpreter folds: the same bytes a mock endpoint would answer with.
+    fn anthropic_stream(body: &str) -> ChunkStream {
+        let bytes = bytes::Bytes::from(body.to_owned());
+        let events = futures_util::stream::iter(vec![Ok(bytes)]);
+        ChunkStream::Anthropic(AnthropicStream::new(anthropic::EventStream::new(Box::pin(
+            events,
+        ))))
     }
 
     /// A full thinking-then-answer turn: what MiniMax-M3 streams for one
@@ -597,8 +599,7 @@ mod tests {
             event("message_stop", serde_json::json!({"type":"message_stop"})),
         ]
         .concat();
-        let mut sse = openai_stream(&body);
-        sse.wire = Wire::Anthropic;
+        let mut sse = anthropic_stream(&body);
 
         let mut acc = TurnAccumulator::default();
         let mut usage = None;
@@ -662,8 +663,7 @@ mod tests {
             event("message_stop", serde_json::json!({"type":"message_stop"})),
         ]
         .concat();
-        let mut sse = openai_stream(&body);
-        sse.wire = Wire::Anthropic;
+        let mut sse = anthropic_stream(&body);
         let mut usage = None;
         while let Some(chunk) = sse.next_chunk().await.unwrap() {
             if chunk.usage.is_some() {
@@ -693,8 +693,7 @@ mod tests {
             event("message_stop", serde_json::json!({"type":"message_stop"})),
         ]
         .concat();
-        let mut sse = openai_stream(&body);
-        sse.wire = Wire::Anthropic;
+        let mut sse = anthropic_stream(&body);
         while let Some(chunk) = sse.next_chunk().await.unwrap() {
             assert!(chunk.usage.is_none());
         }
@@ -714,8 +713,7 @@ mod tests {
             event("message_stop", serde_json::json!({"type":"message_stop"})),
         ]
         .concat();
-        let mut sse = openai_stream(&body);
-        sse.wire = Wire::Anthropic;
+        let mut sse = anthropic_stream(&body);
         let mut texts = Vec::new();
         while let Some(chunk) = sse.next_chunk().await.unwrap() {
             for choice in chunk.choices {
@@ -735,44 +733,38 @@ mod tests {
             "error",
             serde_json::json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}),
         );
-        let mut sse = openai_stream(&body);
-        sse.wire = Wire::Anthropic;
+        let mut sse = anthropic_stream(&body);
         let err = sse.next_chunk().await.unwrap_err().to_string();
         assert!(err.contains("overloaded_error"), "{err}");
     }
 
-    #[test]
-    fn a_request_shape_that_does_not_match_the_wire_is_refused() {
-        // No network is touched: the body is built before the request is
-        // sent, and the mismatch is found there.
+    #[tokio::test]
+    async fn a_request_shape_that_does_not_match_the_wire_is_refused() {
+        // No network is touched: the mismatch is found before anything is
+        // sent, which is the one misuse the WireRequest enum cannot prevent.
         let client =
             Client::new("k".into(), "http://127.0.0.1:1/never".into(), Wire::OpenAi).unwrap();
-        let wrong = WireRequest::Anthropic(crate::types::AnthropicRequest {
-            model: "MiniMax-M3".into(),
-            max_tokens: 131_072,
-            system: None,
-            messages: vec![],
-            tools: None,
-            tool_choice: None,
-            stream: true,
-            thinking: None,
-        });
-        let err = client.body(&wrong).unwrap_err().to_string();
-        assert!(err.contains("does not match"), "{err}");
-        // The provider's own preset builds the shape its wire speaks, and a
-        // client bound to that wire takes it.
-        let right = crate::agent::request::build_request(
-            &MINIMAX,
-            &crate::session::SessionMeta {
-                provider: Some("minimax".into()),
-                model: "MiniMax-M3".into(),
-                reasoning_effort: None,
-                instructions: None,
-            },
-            &[],
-        );
         let mini = Client::new("k".into(), MINIMAX.url.into(), Wire::Anthropic).unwrap();
-        assert!(mini.body(&right).is_ok());
-        assert!(client.body(&right).is_err());
+        let meta = crate::session::SessionMeta {
+            provider: Some("minimax".into()),
+            model: "MiniMax-M3".into(),
+            reasoning_effort: None,
+            instructions: None,
+        };
+        let anthropic_request = crate::agent::request::build_request(&MINIMAX, &meta, &[]);
+        let err = client.body(&anthropic_request).unwrap_err().to_string();
+        assert!(err.contains("does not match"), "{err}");
+
+        let mut deepseek_meta = meta.clone();
+        deepseek_meta.provider = Some("deepseek".into());
+        deepseek_meta.model = "deepseek-flash".into();
+        let openai_request =
+            crate::agent::request::build_request(&crate::provider::DEEPSEEK, &deepseek_meta, &[]);
+        let err = mini
+            .stream_chat(&openai_request)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match"), "{err}");
     }
 }
