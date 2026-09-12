@@ -53,10 +53,6 @@ use input::Submitted;
 use notice::{Notice, Notifier, drain};
 use picker::{Choosing, choice_rows};
 
-// ------------------------------------------------------------- activity ---
-
-// ---------------------------------------------------------------- notices ---
-
 // --------------------------------------------------------------- channels ---
 
 /// Cancellation as the event loop delivers it: Ctrl-C sets the watch and every
@@ -162,10 +158,6 @@ fn poll_key(timeout: Duration) -> io::Result<Option<Event>> {
         Ok(None)
     }
 }
-
-// ----------------------------------------------------------------- screen ---
-
-// ------------------------------------------------------------ scroll view ---
 
 // ------------------------------------------------------------ event loop ---
 
