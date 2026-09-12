@@ -241,10 +241,11 @@ impl Client {
 
     /// An answer as it is written, one event at a time.
     ///
-    /// The request is sent as a stream whatever its `stream` field says: the
-    /// field is part of the body the endpoint reads, so a caller that asks for
-    /// events through this call gets them, and one that wants a whole message
-    /// uses [`Client::messages`].
+    /// The body asks for a stream whether or not the request did: `stream: true`
+    /// is a field the endpoint reads, and a caller who reached for *this* call has
+    /// already asked for one. The reference client's own streaming helper puts it
+    /// in the body for the same reason — its non-streaming path takes whatever
+    /// the caller said, and this call is the one that means "stream".
     ///
     /// No `accept` header of its own goes with it: the `stream` field in the
     /// body is what asks for a stream. The usual `text/event-stream` is what a
@@ -253,7 +254,9 @@ impl Client {
     /// own `*/*` rides along and nothing more, which is exactly what the
     /// reference client's transport sends.
     pub async fn stream(&self, request: &MessagesRequest) -> Result<EventStream, Error> {
-        let body = self.body(request)?;
+        let mut asked = request.clone();
+        asked.stream = Some(true);
+        let body = self.body(&asked)?;
         self.retrying(|| async {
             let response = self
                 .post(body.clone())
@@ -350,7 +353,8 @@ fn refusal(status: u16, headers: &reqwest::header::HeaderMap, body: String) -> A
             _ => None,
         },
         // Milliseconds first, as the reference client reads them: an endpoint
-        // that sends both means the more precise one.
+        // that sends both means the more precise one. What was asked for is kept
+        // as it was; whether a client should obey it is the schedule's business.
         retry_after: text("retry-after-ms")
             .and_then(|ms| ms.parse::<f64>().ok())
             .map(|ms| Duration::from_secs_f64((ms / 1000.0).max(0.0)))
@@ -358,14 +362,19 @@ fn refusal(status: u16, headers: &reqwest::header::HeaderMap, body: String) -> A
                 text("retry-after")
                     .and_then(|s| s.parse::<f64>().ok())
                     .map(|s| Duration::from_secs_f64(s.max(0.0)))
-            })
-            .filter(|wait| *wait > Duration::ZERO && *wait <= MAX_RETRY_AFTER),
+            }),
     }
 }
 
 /// How long to wait before attempt number `made + 1`.
 fn retry_delay(made: u32, retry_after: Option<Duration>) -> Duration {
-    if let Some(asked) = retry_after {
+    // The endpoint's own answer first, when it is one a client should obey: a
+    // wait it asked for that is longer than this is a wait to come back after,
+    // not one to hold a turn open for.
+    if let Some(asked) = retry_after
+        && asked > Duration::ZERO
+        && asked <= MAX_RETRY_AFTER
+    {
         return asked;
     }
     let backoff = INITIAL_RETRY_DELAY
@@ -756,6 +765,32 @@ mod tests {
             "waited {:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_asks_the_endpoint_for_a_stream_whatever_the_request_said() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("data: {\"type\":\"message_stop\"}\n\n", "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Profile::endpoint("x"));
+
+        // A request that never mentioned streaming.
+        let plain = MessagesRequest::new("m", 16, vec![MessageParam::user("hi")]);
+        assert!(client.stream(&plain).await.is_ok());
+        // And one that said not to.
+        let mut declined = plain.clone();
+        declined.stream = Some(false);
+        assert!(client.stream(&declined).await.is_ok());
+
+        for request in server.received_requests().await.unwrap() {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["stream"], true, "the body is what asks for a stream");
+        }
     }
 
     #[tokio::test]

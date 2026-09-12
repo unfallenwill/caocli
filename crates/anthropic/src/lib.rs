@@ -57,6 +57,16 @@
 //!   room for fields it does not know; here they are ignored. The exception is a
 //!   whole block whose *kind* is unknown, which keeps the object it arrived in —
 //!   see [`Block::unmodelled`].
+//! - **An error inside a stream is its own kind of failure.** The reference raises
+//!   a status error for an `error` event, carrying the *response's* status — which
+//!   is 200, because the answer had already started. A caller that branches on a
+//!   status would read that as success. Here it is [`Error::Stream`], with the
+//!   error type the endpoint named.
+//! - **A stalled write has no bound.** The reference's transport bounds reads,
+//!   writes and the pool at ten minutes and the connect at five; reqwest exposes a
+//!   read timeout and a connect timeout and no more, so those two are set and the
+//!   other two cannot be. A request body that stops moving mid-write is not
+//!   something this crate can give up on.
 //! - **Nothing reconnects.** The spec's `id` and `retry` SSE fields are read past
 //!   rather than kept: a client that resumes a stream is a client with state, and
 //!   the reference client does not resume one either.
