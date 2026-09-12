@@ -19,6 +19,22 @@ const MESSAGES_PATH: &str = "/v1/messages";
 /// required, and a request without one is refused rather than defaulted.
 pub const API_VERSION: &str = "2023-06-01";
 
+/// How long a connection may take to open.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a stream may be silent before it is a failure.
+///
+/// A read timeout, not a total one: it resets after every byte that arrives, so
+/// a long answer is never cut off for being long, and a connection that has
+/// stopped delivering is given up on. The reference client bounds the same
+/// thing at ten minutes, and nothing bounds it here.
+const READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// What this crate calls itself to the endpoint. The reference client sends its
+/// own name and version the same way, and a request that arrives anonymously is
+/// a request nobody can account for.
+const USER_AGENT: &str = concat!("caocli-anthropic/", env!("CARGO_PKG_VERSION"));
+
 /// How the client proves who it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Auth {
@@ -148,7 +164,11 @@ impl Client {
             )));
         }
         let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
+            .connect_timeout(CONNECT_TIMEOUT)
+            // Read, not total: an answer is allowed to take as long as it
+            // takes, and only silence is a failure. A total timeout would cut
+            // off a long answer that is arriving perfectly well.
+            .read_timeout(READ_TIMEOUT)
             .build()
             .map_err(|e| Error::Config(format!("failed to build the HTTP client: {e}")))?;
         Ok(Self { profile, http })
@@ -188,14 +208,16 @@ impl Client {
     /// field is part of the body the endpoint reads, so a caller that asks for
     /// events through this call gets them, and one that wants a whole message
     /// uses [`Client::messages`].
+    ///
+    /// No `accept` header of its own goes with it: the `stream` field in the
+    /// body is what asks for a stream. The usual `text/event-stream` is what a
+    /// reader of the SSE specification would reach for, and neither the
+    /// published examples nor the reference client send it — the transport's
+    /// own `*/*` rides along and nothing more, which is exactly what the
+    /// reference client's transport sends.
     pub async fn stream(&self, request: &MessagesRequest) -> Result<EventStream, Error> {
         let body = self.body(request)?;
-        let response = self
-            .post(body)
-            .header("accept", "text/event-stream")
-            .send()
-            .await
-            .map_err(Error::Transport)?;
+        let response = self.post(body).send().await.map_err(Error::Transport)?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -212,6 +234,7 @@ impl Client {
         let mut request = self
             .http
             .post(&self.profile.endpoint)
+            .header("user-agent", USER_AGENT)
             .header("content-type", "application/json")
             .header("anthropic-version", &self.profile.api_version)
             .body(body);
@@ -341,6 +364,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_client_names_itself_and_asks_for_nothing_extra() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "m"})))
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Profile::endpoint("x"));
+        assert!(client.messages(&request()).await.is_ok());
+        let sent = server.received_requests().await.unwrap();
+        assert_eq!(
+            sent[0].headers.get("user-agent").unwrap(),
+            USER_AGENT,
+            "a request that arrives anonymously is one nobody can account for"
+        );
+        // The body's `stream` field is what asks for a stream. The transport's
+        // own default rides along — reqwest sends `*/*` here exactly as httpx
+        // does for the reference client — and the SSE spelling is not sent,
+        // because neither baseline sends it.
+        assert_eq!(sent[0].headers.get("accept").unwrap(), "*/*");
+    }
+
+    #[tokio::test]
     async fn a_profile_with_no_credential_sends_no_auth_header() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -427,7 +472,6 @@ mod tests {
         ]
         .concat();
         Mock::given(method("POST"))
-            .and(header("accept", "text/event-stream"))
             .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
             .mount(&server)
             .await;

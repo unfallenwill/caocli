@@ -379,8 +379,9 @@ pub enum BlockKind {
         #[serde(default)]
         name: String,
         /// The call's arguments. Empty at the block's start; they arrive as
-        /// argument shards.
-        #[serde(default)]
+        /// argument shards, and a block that never carried any stays an empty
+        /// object rather than becoming null.
+        #[serde(default = "empty_object")]
         input: Value,
     },
     /// The result of such a call, in the user turn that answers it.
@@ -434,6 +435,13 @@ pub enum ToolResultContent {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// An empty JSON object, where the wire means one and a missing field would
+/// otherwise be null: `value["key"]` on a null panics, and on an object it is
+/// what the caller asked for.
+fn empty_object() -> Value {
+    Value::Object(serde_json::Map::new())
 }
 
 /// Where an image block reads its picture. A `data:` URL's bytes are split out
@@ -764,6 +772,10 @@ pub struct Message {
     /// The stop sequence that ended it, when one did.
     #[serde(default)]
     pub stop_sequence: Option<String>,
+    /// What the endpoint attached to a refusal, carried through unread — the
+    /// same shape the `message_delta` of a stream carries.
+    #[serde(default)]
+    pub stop_details: Option<Value>,
     /// The token counts. On a stream this is the `message_start` report, which
     /// is not the whole story — see [`Usage`].
     #[serde(default)]
@@ -1441,6 +1453,7 @@ mod tests {
         assert_eq!(message.model, "claude-opus-5");
         assert_eq!(message.content, vec![Block::text("hi")]);
         assert_eq!(message.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(message.stop_details, None, "absent is absent");
         assert_eq!(message.usage.input_tokens, Some(5));
         assert_eq!(message.usage.output_tokens, Some(2));
     }
@@ -1464,6 +1477,26 @@ mod tests {
                 Block::text("after"),
             ]
         );
+    }
+
+    #[test]
+    fn an_unfinished_tool_call_reads_as_an_empty_object_rather_than_null() {
+        // A block that declared its call and no arguments yet. Indexing a null
+        // panics; an empty object is what the wire means by the absence.
+        let event = parse_event(
+            r#"{"type":"content_block_start","index":1,
+                "content_block":{"type":"tool_use","id":"toolu_1","name":"Read"}}"#,
+        );
+        let Event::ContentBlockStart { content_block, .. } = event else {
+            panic!("expected a block start");
+        };
+        match content_block.kind {
+            BlockKind::ToolUse { input, .. } => {
+                assert_eq!(input, json!({}));
+                assert_eq!(input["file_path"], json!(null), "and indexing it is safe");
+            }
+            other => panic!("expected a tool call, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1607,6 +1640,7 @@ mod tests {
                     content: vec![],
                     stop_reason: None,
                     stop_sequence: None,
+                    stop_details: None,
                     usage: Usage {
                         input_tokens: Some(100),
                         output_tokens: Some(1),
