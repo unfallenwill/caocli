@@ -263,6 +263,15 @@ protocol as types, a client and a typed event stream, with the events folded
 back into the same deltas the accumulator reads so that nothing downstream knows
 a second protocol exists. Thinking is always on.
 
+That crate is measured against the official client for the API
+(`anthropic-sdk-python`) and follows it: the fields it sends, the events it hands
+over, the failures it retries (twice by default, on the reference's own
+schedule), the headers it reads. The places it differs on purpose are listed at
+the top of `crates/anthropic/src/lib.rs`. One of them is a caller's choice: this
+program passes `max_retries: 0`, so a refused request fails where the person
+watching can see it instead of waiting through a backoff — pressing enter again
+is one keystroke.
+
 Three optional fields of the Anthropic protocol are modelled and sent, each only
 where the preset says the endpoint serves it — a field a gateway does not know
 is a 400 on *every* request, so the answer is the preset's, not the program's:

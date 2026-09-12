@@ -898,6 +898,11 @@ impl fmt::Display for StopReason {
 /// names it in `message_start`, another reports zeros there and the real
 /// figures in `message_delta` — so a reader that cannot tell "absent" from
 /// "zero" reads one of them as no caching at all.
+///
+/// The reference client marks the prompt and answer counts as required; this
+/// keeps every count optional on purpose, because the *merging* is what needs to
+/// tell a count that was reported from one that was merely left out. See the
+/// crate docs for the whole of the difference.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct Usage {
     /// The input tokens that were not served from cache.
