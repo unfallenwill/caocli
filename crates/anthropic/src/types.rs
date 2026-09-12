@@ -383,7 +383,10 @@ pub enum BlockKind {
     },
     /// A tool the model called.
     ToolUse {
-        /// The id the model gave the call, which its result quotes back.
+        /// The id the model gave the call, which its result quotes back. Empty
+        /// when the endpoint did not give one — an answer is not lost over a
+        /// name that was left out.
+        #[serde(default)]
         id: String,
         /// The tool's name.
         #[serde(default)]
@@ -796,7 +799,10 @@ pub enum Ttl {
 /// the right to add to an object.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Message {
-    /// The message's id, which a later request may refer to.
+    /// The message's id, which a later request may refer to. Empty when the
+    /// endpoint did not name one: a gateway that strips it is not a reason to
+    /// fail an answer that arrived whole.
+    #[serde(default)]
     pub id: String,
     /// The model that answered. On a routed endpoint this may differ from the
     /// one that was asked for.
@@ -1574,6 +1580,34 @@ mod tests {
             }
             other => panic!("expected a tool call, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_field_the_endpoint_left_out_reads_as_absent_rather_than_failing_the_answer() {
+        // A gateway that strips an id is not a reason to lose an answer. The
+        // reference client's construction is lenient everywhere; this is lenient
+        // where being lenient means reading less, and strict where it would mean
+        // reading something wrong (the `index` a delta is matched by).
+        let message: Message =
+            serde_json::from_str(r#"{"content":[{"type":"tool_use","name":"Read","input":{}}]}"#)
+                .expect("an answer without its id still reads");
+        assert_eq!(message.id, "");
+        assert_eq!(
+            message.content[0].kind,
+            BlockKind::ToolUse {
+                id: String::new(),
+                name: "Read".into(),
+                input: json!({}),
+            }
+        );
+        // The index is the exception: a delta whose block is a guess is a delta
+        // that lands on the wrong block.
+        assert!(
+            serde_json::from_str::<Event>(
+                r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

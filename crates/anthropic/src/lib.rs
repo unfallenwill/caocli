@@ -57,6 +57,14 @@
 //!   room for fields it does not know; here they are ignored. The exception is a
 //!   whole block whose *kind* is unknown, which keeps the object it arrived in —
 //!   see [`Block::unmodelled`].
+//! - **A payload is refused when reading it would mean reading it *wrongly*.**
+//!   The reference constructs an answer leniently everywhere: a field the spec
+//!   requires and the endpoint left out is simply absent on the object. This crate
+//!   draws the line at what a missing field would cost — an id, a count or a
+//!   block's kind defaults, because the worst that comes of it is reading *less*
+//!   than the endpoint sent, while the `index` that ties a delta to its block stays
+//!   required, because guessing it would quietly shard one block's text, or one
+//!   call's arguments, onto another.
 //! - **An error inside a stream is its own kind of failure.** The reference raises
 //!   a status error for an `error` event, carrying the *response's* status — which
 //!   is 200, because the answer had already started. A caller that branches on a
