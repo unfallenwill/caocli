@@ -313,7 +313,14 @@ impl Cell {
                 Some(Gutter::new("▸ ", "  ", Style::Yellow))
             }
             // The result and the output of the command it is the result of: one
-            // marker, because one is the other arriving early.
+            // marker, because one is the other arriving early. A result that
+            // is a failure is red, both in the content and in the marker --
+            // a dim `·` followed by a red message would be jarring, and the
+            // marker is what tells the eye which line of the transcript is
+            // the result in the first place.
+            Cell::ToolResult(text) if text.starts_with("error:") => {
+                Some(Gutter::new("· ", "  ", Style::Red))
+            }
             Cell::ToolResult(_) | Cell::ToolOutput(_) => Some(Gutter::new("· ", "  ", Style::Dim)),
             Cell::Notice(_) => Some(Gutter::new("  ", "  ", Style::Dim)),
             Cell::Failure(_) => Some(Gutter::new("  ", "  ", Style::Red)),
@@ -654,6 +661,14 @@ mod tests {
     fn a_tool_result_starting_with_error_is_red() {
         let spans = Cell::ToolResult("error: file not found".into()).spans();
         assert_eq!(spans, vec![Span::new(Style::Red, "error: file not found")]);
+        // The gutter follows the content: a dim marker in front of a red
+        // message would be a line that fights itself, and the marker is
+        // the only thing that says "this is a tool result".
+        let gutter = Cell::ToolResult("error: file not found".into())
+            .gutter()
+            .unwrap();
+        assert_eq!(gutter.style, Style::Red);
+        assert_eq!(gutter.head, "· ");
     }
 
     #[test]
