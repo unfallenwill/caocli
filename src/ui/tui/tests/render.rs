@@ -69,9 +69,12 @@ fn a_tool_call_that_changes_a_file_is_drawn_across_its_lines() {
     screen.draw().unwrap();
     let top = origin(&mut screen).y;
     assert_eq!(row(&screen, top), "▸ Edit a.rs");
-    assert_eq!(row(&screen, top + 1), "  - one");
-    assert_eq!(row(&screen, top + 2), "  - two");
-    assert_eq!(row(&screen, top + 3), "  + three");
+    // The hunk header comes first: it names the line ranges in the old
+    // and new files, the way `diff -u` does.
+    assert_eq!(row(&screen, top + 1), "  @@ -1,2 +1,1 @@");
+    assert_eq!(row(&screen, top + 2), "  - one");
+    assert_eq!(row(&screen, top + 3), "  - two");
+    assert_eq!(row(&screen, top + 4), "  + three");
 }
 
 #[test]
@@ -86,8 +89,10 @@ fn a_long_line_of_a_change_is_wrapped_like_any_other() {
     ));
     screen.draw().unwrap();
     let top = origin(&mut screen).y;
-    assert_eq!(row(&screen, top + 1), format!("  + {}", "x".repeat(16)));
-    assert_eq!(row(&screen, top + 2), format!("  {}", "x".repeat(14)));
+    // The hunk header is the first line after the call.
+    assert_eq!(row(&screen, top + 1), "  @@ -0,0 +1,1 @@");
+    assert_eq!(row(&screen, top + 2), format!("  + {}", "x".repeat(16)));
+    assert_eq!(row(&screen, top + 3), format!("  {}", "x".repeat(14)));
 }
 
 #[test]

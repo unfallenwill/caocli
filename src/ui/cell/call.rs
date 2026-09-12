@@ -45,54 +45,16 @@ pub(super) fn hint(args: &str) -> String {
 /// Columns of raw arguments kept when they cannot be summarized by name.
 const HINT_COLUMNS: usize = 80;
 
-/// How many lines of a change a tool call shows before it says how many are left.
-///
-/// A call is announced before it runs, and an edit can be hundreds of lines: what
-/// the announcement is for is seeing what is about to happen, not reading the
-/// whole file. The rest is one line, so a long change costs a screenful at most.
-const DIFF_LINES: usize = 12;
-
 /// The change a call makes, for the calls that make one.
 ///
-/// The arguments are the wire format of a tool call, which is also what replay
-/// reads out of the session log, so live and replayed turns show the same lines
-/// without a second source for either one.
+/// The arguments are the wire format of a tool call, which is also what
+/// replay reads out of the session log, so live and replayed turns show
+/// the same lines without a second source for either one. The shape of the
+/// change is a real unified diff: a `@@ -A,B +C,D @@` hunk header, the
+/// lines of context and change below it, and an `Omitted(N)` line at the
+/// end of a long change. The algorithm is in [`unified_diff_lines`].
 pub(super) fn diff_lines(name: &str, args: &str) -> Vec<DiffLine> {
-    let Ok(args) = serde_json::from_str::<serde_json::Value>(args) else {
-        return Vec::new();
-    };
-    let side = |key: &str, kind: &DiffKind| -> Vec<DiffLine> {
-        args.get(key)
-            .and_then(|s| s.as_str())
-            .map(|text| {
-                text.lines()
-                    .map(|line| DiffLine {
-                        kind: kind.clone(),
-                        text: line.to_owned(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let mut lines = match name {
-        // The order a diff is read in: what goes, then what arrives.
-        "Edit" => {
-            let mut lines = side("old_string", &DiffKind::Removed);
-            lines.extend(side("new_string", &DiffKind::Added));
-            lines
-        }
-        "Write" => side("content", &DiffKind::Added),
-        _ => return Vec::new(),
-    };
-    if lines.len() > DIFF_LINES {
-        let omitted = lines.len() - DIFF_LINES;
-        lines.truncate(DIFF_LINES);
-        lines.push(DiffLine {
-            kind: DiffKind::Omitted(omitted),
-            text: String::new(),
-        });
-    }
-    lines
+    unified_diff_lines(name, args)
 }
 
 /// One line of a result summary, what the transcript says about a tool
@@ -213,7 +175,6 @@ fn default_summary(result: &str) -> (Style, String) {
 /// `Write` of a 1000-line file does not need a real diff, just a "what is
 /// about to land here" view. Past the cap, the change is a wall of `+` lines
 /// either way.
-#[allow(dead_code)] // wired into `diff_lines` in the follow-up commit; covered by tests today
 const DIFF_LINE_CAP: usize = 256;
 
 /// Lines of context a hunk keeps on each side of every change.
@@ -222,13 +183,11 @@ const DIFF_LINE_CAP: usize = 256;
 /// the function the change is in, few enough that two nearby changes do not
 /// merge into a single screenful. A hunk of the whole file, when the file is
 /// the change, is what this produces -- and that is what it should.
-#[allow(dead_code)] // ditto `DIFF_LINE_CAP`
 const DIFF_CONTEXT: usize = 3;
 
 /// The line cap a cell applies to the *displayed* change, regardless of how
 /// long the call's strings are. Past the cap, the rest is one `Omitted`
 /// line, the way a long diff was shown before this one.
-#[allow(dead_code)] // ditto `DIFF_LINE_CAP`
 pub(super) const DIFF_DISPLAY_LINES: usize = 12;
 
 /// The change a call makes, computed as a real unified diff.
@@ -238,7 +197,6 @@ pub(super) const DIFF_DISPLAY_LINES: usize = 12;
 /// [`str::lines`] -- a trailing newline is not its own line -- and a call
 /// whose `old_string` and `new_string` are equal comes back with no lines,
 /// because nothing changed.
-#[allow(dead_code)] // ditto `DIFF_LINE_CAP`
 pub(super) fn unified_diff_lines(name: &str, args: &str) -> Vec<DiffLine> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
         return Vec::new();
@@ -303,7 +261,6 @@ pub(super) fn unified_diff_lines(name: &str, args: &str) -> Vec<DiffLine> {
 /// old line as removed, then every new line as added. No hunk header -- the
 /// shape of the view is what it was before unified diffs -- and the same
 /// display cap as the real one.
-#[allow(dead_code)] // ditto `DIFF_LINE_CAP`
 fn fallback_diff(old: &[&str], new: &[&str]) -> Vec<DiffLine> {
     let mut lines = Vec::with_capacity(old.len() + new.len());
     for line in old {
@@ -331,7 +288,6 @@ fn fallback_diff(old: &[&str], new: &[&str]) -> Vec<DiffLine> {
 
 /// One operation in a line-level diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // ditto `DIFF_LINE_CAP`
 enum Op {
     /// A line in `old` that is not in `new`.
     Remove,
@@ -350,7 +306,6 @@ enum Op {
 /// table is `usize`, so an entry is at most `min(m, n)`, and the table itself
 /// is `(m+1) * (n+1) * size_of::<usize>()` bytes -- the [`DIFF_LINE_CAP`]
 /// guard on the caller is what keeps that bounded.
-#[allow(dead_code)] // ditto `DIFF_LINE_CAP`
 fn diff_ops(old: &[&str], new: &[&str]) -> Vec<Op> {
     let m = old.len();
     let n = new.len();
@@ -400,7 +355,6 @@ fn diff_ops(old: &[&str], new: &[&str]) -> Vec<Op> {
 
 /// One hunk of a unified diff: the line ranges in the old and new files, and
 /// the lines of context and change that make up the hunk's body.
-#[allow(dead_code)] // ditto `DIFF_LINE_CAP`
 struct Hunk<'a> {
     /// 1-based line number in `old` of the first line the hunk touches.
     old_start: usize,
@@ -419,7 +373,6 @@ struct Hunk<'a> {
 /// from any `Remove`/`Add` is left out: a hunk is a region of the file the
 /// reader is meant to look at, and a screenful of context nobody is reading
 /// is not that.
-#[allow(dead_code)] // ditto `DIFF_LINE_CAP`
 fn to_hunks<'a>(ops: &[Op], old: &[&'a str], new: &[&'a str], context: usize) -> Vec<Hunk<'a>> {
     // First: mark which ops are included. A `Remove`/`Add` is always in; a
     // `Keep` is in if it sits within `context` ops of an `Remove`/`Add`. The
@@ -495,7 +448,6 @@ fn to_hunks<'a>(ops: &[Op], old: &[&'a str], new: &[&'a str], context: usize) ->
 
 /// Turn a contiguous run of included ops into one hunk, tracking the old
 /// and new line numbers against the run's start.
-#[allow(dead_code)] // ditto `DIFF_LINE_CAP`
 fn make_hunk<'a>(
     ops: &[Op],
     old: &[&'a str],
@@ -569,7 +521,6 @@ fn make_hunk<'a>(
 
 /// The new order of a hunk's lines: the lines themselves, with each run of
 /// `Add`/`Remove` ops reordered so the removes come first.
-#[allow(dead_code)] // ditto `DIFF_LINE_CAP`
 fn order_changes(raw: Vec<(Op, &str)>) -> Vec<(Op, &str)> {
     let mut out = Vec::with_capacity(raw.len());
     let mut pending: Vec<(Op, &str)> = Vec::new();
@@ -640,81 +591,6 @@ mod tests {
         let got = hint(&wide);
         assert_eq!(crate::ui::text::width(&got), HINT_COLUMNS);
         assert_eq!(got.chars().count(), HINT_COLUMNS / 2);
-    }
-
-    /// The arguments an edit arrives with, as the wire format spells them.
-    fn edit(old: &str, new: &str) -> String {
-        serde_json::json!({
-            "file_path": "src/main.rs",
-            "old_string": old,
-            "new_string": new,
-        })
-        .to_string()
-    }
-
-    #[test]
-    fn an_edit_shows_what_leaves_and_what_arrives() {
-        let lines = diff_lines("Edit", &edit("let a = 1;\nlet b = 2;", "let a = 3;"));
-        assert_eq!(
-            lines,
-            vec![
-                DiffLine {
-                    kind: DiffKind::Removed,
-                    text: "let a = 1;".into(),
-                },
-                DiffLine {
-                    kind: DiffKind::Removed,
-                    text: "let b = 2;".into(),
-                },
-                DiffLine {
-                    kind: DiffKind::Added,
-                    text: "let a = 3;".into(),
-                },
-            ],
-            "what goes is shown before what arrives"
-        );
-    }
-
-    #[test]
-    fn a_deletion_shows_only_what_goes() {
-        let lines = diff_lines("Edit", &edit("gone", ""));
-        assert_eq!(
-            lines,
-            vec![DiffLine {
-                kind: DiffKind::Removed,
-                text: "gone".into(),
-            }]
-        );
-    }
-
-    #[test]
-    fn a_write_shows_what_it_puts_there() {
-        let args = serde_json::json!({ "file_path": "a.txt", "content": "one\ntwo\n" }).to_string();
-        let lines = diff_lines("Write", &args);
-        assert_eq!(lines.len(), 2, "a trailing newline does not start a line");
-        assert!(lines.iter().all(|l| l.kind == DiffKind::Added));
-    }
-
-    #[test]
-    fn a_long_change_ends_in_a_count_of_the_rest() {
-        let many = (0..DIFF_LINES + 5)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let lines = diff_lines("Write", &serde_json::json!({ "content": many }).to_string());
-        assert_eq!(lines.len(), DIFF_LINES + 1, "the lines and the count");
-        assert_eq!(lines.last().unwrap().kind, DiffKind::Omitted(5));
-    }
-
-    #[test]
-    fn only_a_change_has_lines_to_show() {
-        assert!(diff_lines("Bash", r#"{"command":"ls"}"#).is_empty());
-        assert!(diff_lines("Read", r#"{"file_path":"x"}"#).is_empty());
-        assert!(diff_lines("Edit", "not json at all").is_empty());
-        assert!(
-            diff_lines("Edit", r#"{"file_path":"x"}"#).is_empty(),
-            "the strings are what makes it a change"
-        );
     }
 
     // ----- Unified diff ------------------------------------------------------
