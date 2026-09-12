@@ -7,16 +7,29 @@
 //! values may be added, so every enum has a catch-all and unknown object fields
 //! are ignored rather than refused.
 //!
-//! What is here is the request and response vocabulary a caller can reach
-//! without a beta header, and the fields this workspace sends. What is
-//! deliberately not here, with the reason: **server tools** (`web_search`,
-//! `code_execution`, tool search) and the fields that belong to them
-//! (`defer_loading`, `allowed_callers`, `toolset_name`, `caller`) — a call this
-//! crate cannot run is a type nobody can check; **containers**, which hold state
-//! this program does not keep; **structured outputs**
-//! (`output_config.format`), which is a feature of its own; and the batch and
-//! files APIs. A response carrying one of them still reads: every enum has a
-//! catch-all, and unknown object fields are ignored.
+//! What is here is the whole of the Messages API a caller can reach without a
+//! beta header: the request body field for field, the answer's blocks, the
+//! events, the token count, and the batch endpoints. Where the reference client
+//! types a family, this crate types the family — one `ServerTool` for the twenty
+//! dated versions of the endpoint's own tools, one variant per server-tool result
+//! block — so that a version added later is a constructor call rather than a
+//! release.
+//!
+//! What is here *carried* rather than modelled, with the reason: the body of a
+//! server tool's result (a result-or-error union this crate cannot act on), a
+//! citation's own shape, a caller (`direct`, or the tool that made the call),
+//! `output_config.format`'s schema (JSON Schema, which is not this crate's to
+//! interpret), and a container on an answer. Each is kept as it arrives, so
+//! nothing about them is lost; none is a field this crate reads.
+//!
+//! What is deliberately not here at all: the **beta** Messages fields
+//! (`context_management`, `mcp_servers`, `fallbacks`, `speed`, `diagnostics`,
+//! `betas` in the body), the **Files API**, and the platform's other resources
+//! — agents, sessions, environments, skills, memory stores, vaults. Those are
+//! either a feature with its own header or a different product; a call this
+//! crate cannot make is a type nobody can check, and an answer carrying one
+//! still reads, because every enum has a catch-all and unknown object fields are
+//! ignored.
 
 use std::fmt;
 
