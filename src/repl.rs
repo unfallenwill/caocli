@@ -85,6 +85,14 @@ pub async fn handle(
         "/login" => ui.info(&login_menu()),
         "/model" => ui.info(&model_menu(&agent.model_label())),
         "/effort" => ui.info(&effort_menu(&agent.provider(), agent.effort_label())),
+        // One line per server and one per warning, each its own notice: the
+        // front ends lay out a notice as a cell, and the report is what tells
+        // a user which of their servers answered and what the model can now do.
+        "/mcp" => {
+            for line in agent.mcp.report() {
+                ui.info(&line);
+            }
+        }
         _ if line.starts_with("/login ") => {
             login(agent, ui, argument(line)).await;
         }
@@ -416,6 +424,10 @@ pub const COMMANDS: &[Command] = &[
         description: "ask about an image: <path> [text]",
     },
     Command {
+        name: "/mcp",
+        description: "the MCP servers and the tools they offer",
+    },
+    Command {
         name: "/exit",
         description: "quit",
     },
@@ -637,6 +649,31 @@ mod tests {
         submit(&mut agent, &mut ui, &dir, "/sessions").await;
         assert_eq!(ui.info.len(), 1, "{:?}", ui.info);
         assert!(ui.info[0].contains(&agent.session.id), "{:?}", ui.info);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `/mcp` says which servers answered and what the model can call. The hub
+    /// is the session's, so a test can put one behind it without a
+    /// configuration file: this is about what the command prints.
+    #[tokio::test]
+    async fn mcp_reports_the_servers_the_session_has() {
+        let dir = tmpdir("mcp");
+        let mut agent = agent_in(&dir, "m");
+        let mut ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/mcp").await;
+        assert_eq!(ui.info.len(), 1, "{:?}", ui.info);
+        assert!(ui.info[0].contains("mcpServers"), "{:?}", ui.info);
+
+        let stub = crate::mcp::stub::Stub::new();
+        agent.mcp = std::sync::Arc::new(
+            crate::mcp::Hub::of_entries(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await,
+        );
+        ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/mcp").await;
+        assert_eq!(ui.info.len(), 2, "{:?}", ui.info);
+        assert!(ui.info[0].contains("1 tools"), "{:?}", ui.info);
+        assert!(ui.info[1].contains("mcp__stub__echo"), "{:?}", ui.info);
+        agent.mcp.shutdown().await;
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -361,10 +361,18 @@ impl Turn<'_> {
     /// output, and it goes where the result of that call will go a moment later: to
     /// the front end, as a notification and never as data. What the model reads is
     /// the result, and this changes nothing about it.
+    ///
+    /// A call to a server is dispatched here like the rest, and what answers it is
+    /// the hub the session holds: the interpreter never sees a server, only the
+    /// text that comes back from one.
     async fn run(&mut self, call: &ToolCall) -> Result<Step> {
         let mut watching = Watching(&mut *self.ui);
-        let invoked =
-            tools::execute_live(&call.function.name, &call.function.arguments, &mut watching);
+        let invoked = tools::execute_live(
+            &call.function.name,
+            &call.function.arguments,
+            &mut watching,
+            &self.agent.mcp,
+        );
         match race(self.cancel, invoked).await {
             Ran::Finished(tool_output) => {
                 self.settle(call, &tool_output)?;

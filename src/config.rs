@@ -173,6 +173,16 @@ pub fn stored_key(provider_id: &str) -> Result<Option<String>> {
         .filter(|k| !k.trim().is_empty()))
 }
 
+/// One top-level setting as the file writes it, for the parts of the
+/// application whose settings are their own.
+///
+/// The settings file is read in one place and parsed in one place; what a
+/// section of it means is the reader's business, and `mcpServers` is one whose
+/// reader is the MCP client.
+pub fn setting(name: &str) -> Result<Option<serde_json::Value>> {
+    Ok(load_settings()?.rest.get(name).cloned())
+}
+
 /// Remember a provider's key, keeping every other setting in the file.
 pub fn store_key(provider_id: &str, key: &str) -> Result<PathBuf> {
     let mut settings = load_settings()?;

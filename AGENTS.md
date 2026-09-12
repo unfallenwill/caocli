@@ -17,6 +17,8 @@ Short guide for AI agents. Code shape and design rationale live in source commen
   - `scripts/tui_smoke.py` — TUI front end (`SMOKE_LIVE=1` runs a live turn on screen)
   - `script -qec "..." /dev/null` for a one-off
   - **Rebuild before running** (`cargo build`) — a smoke run against a stale binary looks exactly like a bug in your change.
+- The MCP tests start a real server (`src/mcp/stub.rs`, a bash script the test
+  writes out and runs): they need `bash` on PATH, like the shell tool's tests.
 - Assert on the harness grid, not on stdout bytes — diff rendering only writes what changed, so an unchanged cell never appears in the byte stream at all.
 - Before touching `heal` or request construction, run `cargo test theorem_` (the `machine::is_request_valid` invariant).
 

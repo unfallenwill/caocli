@@ -24,21 +24,34 @@ pub const SYSTEM_PROMPT: &str = "You are caocli, a coding agent. You and the use
 /// stored, the tools, and the provider's wire profile.
 ///
 /// A free function rather than a method so its shape is testable without an
-/// Agent behind it — no client, no session file: it is pure in
-/// `(provider, meta, history)`. That is also the cache contract made visible:
-/// the same three inputs must produce the same bytes, because the backend's
-/// prefix cache matches on them.
+/// Agent behind it — no client, no session file, no server on a pipe: it is
+/// pure in `(provider, meta, history, mcp)`. That is also the cache contract
+/// made visible: the same four inputs must produce the same bytes, because the
+/// backend's prefix cache matches on them.
+///
+/// `mcp` is the tools of the servers the session connected to; they go after the
+/// built-in ones, which is the one place a tool list may grow without changing
+/// the prefix a session has already sent.
 pub fn build_request(
     provider: &provider::Provider,
     meta: &SessionMeta,
     history: &[Message],
+    mcp: &[ToolDef],
 ) -> WireRequest {
     match provider.wire {
-        Wire::OpenAi => WireRequest::OpenAi(Box::new(openai_request(provider, meta, history))),
+        Wire::OpenAi => WireRequest::OpenAi(Box::new(openai_request(provider, meta, history, mcp))),
         Wire::Anthropic => {
-            WireRequest::Anthropic(Box::new(anthropic_request(provider, meta, history)))
+            WireRequest::Anthropic(Box::new(anthropic_request(provider, meta, history, mcp)))
         }
     }
+}
+
+/// The tools the request offers: the built-in ones in the order they are named
+/// in — which is fixed — and the servers' after them.
+fn offered(mcp: &[ToolDef]) -> Vec<ToolDef> {
+    let mut tools = tools::definitions();
+    tools.extend_from_slice(mcp);
+    tools
 }
 
 /// The OpenAI chat-completions shape, built in the `openai` crate's vocabulary:
@@ -50,6 +63,7 @@ fn openai_request(
     provider: &provider::Provider,
     meta: &SessionMeta,
     history: &[Message],
+    mcp: &[ToolDef],
 ) -> openai::ChatCompletionRequest {
     let mut messages = Vec::with_capacity(history.len() + 2);
     messages.push(Message::system(SYSTEM_PROMPT));
@@ -87,7 +101,7 @@ fn openai_request(
         &meta.model,
         provider.max_tokens,
         &messages,
-        Some(&tools::definitions()),
+        Some(&offered(mcp)),
         Some("auto"),
         provider.send_thinking,
         Some(
@@ -106,6 +120,7 @@ fn anthropic_request(
     provider: &provider::Provider,
     meta: &SessionMeta,
     history: &[Message],
+    mcp: &[ToolDef],
 ) -> anthropic::MessagesRequest {
     // Specification tripwire, same as the OpenAI shape: the window
     // specification is wire-agnostic, so it is checked before the mapping.
@@ -163,12 +178,7 @@ fn anthropic_request(
         anthropic::MessagesRequest::new(meta.model.clone(), provider.max_tokens, messages)
             .streaming()
             .with_system(system.join("\n\n"))
-            .with_client_tools(
-                tools::definitions()
-                    .into_iter()
-                    .map(anthropic_tool)
-                    .collect(),
-            )
+            .with_client_tools(offered(mcp).into_iter().map(anthropic_tool).collect())
             .with_tool_choice(anthropic::ToolChoice::auto())
             .with_thinking(anthropic_thinking(provider, meta));
     // The standard optional fields, each one the preset's to offer. See

@@ -84,6 +84,11 @@ pub fn definitions() -> Vec<ToolDef> {
 /// nothing, looking for a file to read changes nothing either, and a todo list
 /// is a note to the user rather than a change to anything -- so putting a y/N in
 /// front of one of them would only teach the reader to answer without looking.
+///
+/// The tools of an MCP server are the ones nobody has decided about: what a
+/// server does with a call is the server's own, and a client that took its word
+/// for what is safe would be trusting whatever is on the other end of the pipe
+/// -- which is the one thing the protocol says not to do.
 pub fn changes_files(name: &str) -> bool {
     !matches!(name, READ_NAME | GLOB_NAME | TODO_NAME)
 }
@@ -131,13 +136,23 @@ pub fn reports_failure(output: &str) -> bool {
 /// never a panic and never a question nobody can answer.
 #[cfg(test)]
 pub async fn execute(name: &str, args_json: &str) -> String {
-    execute_live(name, args_json, &mut Silent).await
+    execute_live(name, args_json, &mut Silent, &crate::mcp::Hub::empty()).await
 }
 
 /// The same, with the output of a command that is still running streamed to `live`
 /// as it arrives: what the person watching reads while the model waits for the
 /// result. Only the one tool runs anything, so the sink reaches it and no other.
-pub async fn execute_live(name: &str, args_json: &str, live: &mut dyn Live) -> String {
+///
+/// `mcp` is where the tools of the servers this session connected to live. A
+/// name that carries their prefix is theirs whether or not a server is behind
+/// it, so that a log written when one was connected is answered with a sentence
+/// rather than with "unknown tool".
+pub async fn execute_live(
+    name: &str,
+    args_json: &str,
+    live: &mut dyn Live,
+    mcp: &crate::mcp::Hub,
+) -> String {
     match name {
         shell::NAME => shell::execute(args_json, live).await,
         fs::READ_NAME => fs::read(args_json),
@@ -148,6 +163,7 @@ pub async fn execute_live(name: &str, args_json: &str, live: &mut dyn Live) -> S
         ask::ASK_NAME => {
             format!("error: {ASK_NAME} is answered by the front end and cannot be executed here")
         }
+        other if crate::mcp::is_tool(other) => mcp.call(other, args_json).await,
         other => format!(
             "error: unknown tool {other:?}. Available tools: Bash, {}, {}, {}, {}, {}, {}",
             fs::READ_NAME,
@@ -195,7 +211,11 @@ pub(super) fn checked<T>(value: Result<T, String>, path: &str) -> Result<T, Stri
 
 /// Truncate at a byte limit, backing off to a UTF-8 character boundary so a
 /// multi-byte character is never cut in half.
-fn truncate(s: &str, max: usize) -> (String, bool) {
+///
+/// Shared with the MCP tools, whose results are the other place a great deal of
+/// text can arrive at once: one cap for both, so that what a result may carry is
+/// the same answer whichever tool produced it.
+pub(crate) fn truncate(s: &str, max: usize) -> (String, bool) {
     if s.len() <= max {
         return (s.to_owned(), false);
     }
@@ -253,8 +273,12 @@ mod tests {
             assert!(!changes_files(name), "{name} changes nothing to ask about");
         }
         // A tool nobody has decided about yet is asked about rather than run:
-        // the blacklist is the fail-safe direction.
+        // the blacklist is the fail-safe direction. A server's tools are
+        // exactly that — this client cannot know what one does — and the
+        // specification says as much beside its own annotations: a hint from a
+        // server is not a decision by the user.
         assert!(changes_files("SomeToolAddedLater"));
+        assert!(changes_files("mcp__filesystem__read_file"));
     }
 
     #[tokio::test]
@@ -295,6 +319,30 @@ mod tests {
         )
         .await;
         assert!(out.ends_with("Cargo.toml"), "{out}");
+    }
+
+    /// A name with the MCP prefix is a server's, whether or not one is behind
+    /// it: what comes back is the hub's answer, which is text either way.
+    #[tokio::test]
+    async fn dispatch_reaches_an_mcp_server() {
+        let stub = crate::mcp::stub::Stub::new();
+        let hub = crate::mcp::Hub::of_entries(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await;
+        let out = execute_live("mcp__stub__echo", r#"{"text":"hi"}"#, &mut Silent, &hub).await;
+        assert_eq!(out, "called with {text:hi}");
+        // A name the server does not offer, and one no server could: both are
+        // answered rather than dispatched to nothing.
+        let refused = execute_live("mcp__stub__nowhere", "{}", &mut Silent, &hub).await;
+        assert!(refused.starts_with("error: "), "{refused}");
+        assert!(refused.contains("no MCP tool named"), "{refused}");
+        let empty = execute_live(
+            "mcp__nobody__nothing",
+            "{}",
+            &mut Silent,
+            &crate::mcp::Hub::empty(),
+        )
+        .await;
+        assert!(empty.contains("no MCP tool named"), "{empty}");
+        hub.shutdown().await;
     }
 
     /// The todo tool is dispatched like the tools that touch the world, even

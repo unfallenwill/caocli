@@ -10,7 +10,9 @@ coding endpoint via `--provider zai-coding-cn`) and an Anthropic-compatible
 model's thinking (`reasoning_content`) in dim gray, then runs a tool loop over
 seven tools: `Bash`, `Read`, `Glob` (which finds files by name), `Edit`,
 `Write`, `AskUserQuestion` (which asks you rather than the filesystem) and
-`TodoWrite` (which writes the plan where you can see it while it works). Both
+`TodoWrite` (which writes the plan where you can see it while it works) — plus
+the tools of any [MCP servers](#mcp-servers) the session connects to, which are
+offered to the model beside them. Both
 backends see images, which are attached with `/image` or `--image` and travel
 inside the message itself. Project instructions in the workspace's `AGENTS.md`
 files are read when a session starts and sent with every request (see
@@ -55,6 +57,7 @@ place for a key to hide in.
 | `/model` | Choose a model, named `<provider id>/<modelid>` (`deepseek/deepseek-v4-pro`, `zai-coding-cn/glm-5.3`); it switches the model and, when the name carries another provider, the backend with it |
 | `/effort` | Choose the reasoning effort tier — the list is the provider in use's own (`low`, `high`, `max`), with the one in effect marked; the choice is stored in the session, so a resume keeps it |
 | `/image <path> [text]` | Ask about a picture: the image is read and sent with the text that follows the path (none is fine). A path with spaces in it may be quoted with `"` or `'` |
+| `/mcp` | Show the MCP servers of this session: which came up, what they call themselves, and the names their tools are offered under ([MCP servers](#mcp-servers)) |
 | `/exit`, `/quit`, `/q` | Quit |
 
 `/login` asks for the key as a question rather than as a line: the prompt is
@@ -348,6 +351,107 @@ the files have since changed or gone. A workspace with no readable
 `AGENTS.md` gives a session nothing to send, and a session that carries
 instructions says so in its banner.
 
+### MCP servers
+
+caocli speaks the Model Context Protocol, so a session can use tools it does not
+ship. Both transports the protocol defines are here: **stdio**, where the server
+is a program started as a subprocess, and **streamable HTTP**, where it is
+reached at a URL.
+
+Servers are declared under `mcpServers` — in `~/.caocli/settings.json` for the
+ones you want in every workspace, and in the workspace's `.mcp.json` for the
+ones that belong to a project (the file other clients read, and the one to keep
+in version control; the project wins for a name both files define):
+
+```json
+{
+  "mcpServers": {
+    "files": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      "env": { "LOG_LEVEL": "warn" }
+    },
+    "github": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": { "Authorization": "Bearer ${GITHUB_TOKEN}" }
+    }
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `command`, `args`, `env` | A server started as a subprocess. It inherits this process's environment, with these variables added to it. |
+| `url`, `headers` | A server reached over HTTP. |
+| `type` | `stdio` or `http`, when you want the entry to say out loud what the fields already say. |
+| `timeout` | Seconds one request to this server may take. It says nothing, and the client waits a minute for it to start and five minutes for one call — a server slow to come up is not usually slow to answer, and the other way round. |
+
+`${VAR}` in any of those values is resolved when the file is read, and
+`${VAR:-default}` falls back when the variable is not set; a reference with
+neither is left exactly as it was written and named in `/mcp`, so that a value
+turned into nothing is never what starts a server. An entry that names both a
+command and a url, names neither, or names a url that is not http is reported
+and skipped: one unusable entry does not cost you the servers that do work.
+
+A server's tools are named `mcp__<server>__<tool>`, and **`/mcp`** lists the
+servers that came up, what they call themselves, and the names the model sees. A
+server that did not come up is a warning rather than a failure: the session
+starts, the tools of the servers that answered are offered, and the banner says
+which one is missing and why. The tool list is part of every request, so a
+server's tools are appended after the built-in ones — a session's earlier
+requests stay a prefix of its later ones.
+
+Under `--ask`, a call to a server's tool always asks first. A server may describe
+its own tools as read-only, and the specification's own note is why that changes
+nothing: a hint from the server is not a decision by you, and a client that
+trusted it would be trusting whatever is on the other end of the pipe.
+
+A result comes back as the server's answer in words: text blocks as they are, and
+the blocks the model cannot read — an image, a clip, a link to a resource — named
+rather than dropped, because a result that lost half of itself reads as a tool
+that found nothing. It is cut at the same 10 KiB as any other tool's result, and
+a tool that failed (`isError`) comes back as `error: …`, the same text every
+failure is written in.
+
+A session starts its servers when it starts and closes them when it ends: a
+stdio server is closed by closing its input, which is the shutdown the protocol
+defines, and its process does not outlive the session that started it. This
+client serves no roots, sampling or elicitation of its own — it offers a server's
+tools to the model and runs them — and refuses those by name rather than leaving
+a server waiting for an answer that is not coming.
+
+What this client implements of the specification (the 2025-06-18 revision):
+
+- the JSON-RPC vocabulary as the spec defines it, including string ids;
+- the lifecycle: `initialize` / `notifications/initialized` / `tools/list` (with
+  pagination);
+- both transports: stdio (subprocess, line-framed JSON-RPC) and streamable
+  HTTP (POST with `application/json, application/json` or `text/event-stream`
+  responses, the `MCP-Protocol-Version` and `Mcp-Session-Id` headers,
+  `DELETE` to end the session, HTTP 404 closing the session);
+- every `tools/call` result block kind: text, image, audio, resource link,
+  embedded resource (text or base64 blob), and `structuredContent`;
+- the `isError: true` tool-execution failure path.
+
+What it does not implement, on purpose (and the README says so because the spec
+allows it):
+
+- **OAuth 2.1** for HTTP servers: a server that wants the discovery / dynamic
+  client registration dance the spec describes for protected resources
+  (`authorization.md`) will refuse a session without it. Static Bearer tokens
+  in `headers` work; that is how an HTTP server that needs auth is reached
+  from here today.
+- **Batched JSON-RPC**: removed from the protocol in 2025-06-18, never sent
+  here, and a response that arrived in a batch envelope would be read past.
+- **Server-emitted notifications** (`logging`, `progress`, `list_changed`,
+  `cancelled`, `message`): read past silently. Spec marks these all as
+  MAY/SHOULD rather than MUST on the client side; nothing this client does
+  depends on any of them.
+- **Resumability** across a broken HTTP stream (SSE `Last-Event-ID`): MAY
+  per spec; not implemented — when the stream breaks the connection is
+  marked dead and the next call gets the failure text.
+
 ### Environment
 
 | Variable | Description |
@@ -359,7 +463,9 @@ There are no API key variables: a key is only ever what `/login` stored.
 ## Tools
 
 The model can call seven tools. Tool results are always plain text: failures
-are returned to the model as text so it can recover, never as a hard error.
+are returned to the model as text so it can recover, never as a hard error. A
+session with [MCP servers](#mcp-servers) offers their tools beside these, and
+everything below holds for them too.
 
 | Tool | Behavior |
 |---|---|
@@ -476,15 +582,34 @@ wherever the answer is typed:
 - **Prefix-cache friendly.** `SYSTEM_PROMPT` is a compile-time constant and
   history is replayed byte-for-byte — no trimming, reordering, or
   compaction. Injecting volatile data (time, cwd) or changing the tool set
-  or its order invalidates the cache. The `tokens:` line after each turn
-  reports `hit`/`miss` prompt tokens from `usage`.
+  or its order invalidates the cache. That is why the servers' tools are
+  appended after the built-in ones: a session that grows a tool keeps every
+  request it has already sent as a prefix of the next one. The `tokens:` line
+  after each turn reports `hit`/`miss` prompt tokens from `usage`.
 - **Project instructions are frozen into the session.** The `AGENTS.md` files
   of the workspace are read once, at session creation, and stored in the
   session's meta; a subdirectory's own file is picked up on first touch and
   appended to the log, where a user message is legal. Requests replay both
   from the log byte-for-byte. Nothing on the request path reads the
-  filesystem, so a request stays pure in `(provider, meta, history)` and the
-  prefix cache keeps matching for the life of the session.
+  filesystem or starts a process, so a request stays pure in
+  `(provider, meta, history, tools)` — the tool list is the session's own,
+  settled when it starts — and the prefix cache keeps matching for the life
+  of the session.
+- **MCP is a client of two transports, not a plugin system.** The transports
+  are the two the specification defines, as an enum rather than a trait
+  object: the set is closed, and a closed set the compiler can see through is
+  what makes adding a third a decision rather than an accident. A server's
+  tools are named `mcp__<server>__<tool>`, so two servers may both offer a
+  `search` and the model can say which one it means; a name longer than the
+  64 characters every backend takes keeps its front and ends with a stable
+  hash of the whole, which is what keeps two long names from becoming one. A
+  server that does not come up costs nothing else, and every way a call can
+  fail — a name nobody offers, a server that died, a refusal from the far
+  end — is answered as text the model can act on, like every other tool. What
+  a call does is the server's own, so a call is one nobody has decided about:
+  it passes the approval gate like `Bash` does, and the specification's own
+  note about a server's annotations is why the server's word does not settle
+  it.
 - **Cache usage is normalized across providers.** DeepSeek reports flat
   `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`; GLM/OpenAI report
   nested `prompt_tokens_details.cached_tokens` (miss derived as

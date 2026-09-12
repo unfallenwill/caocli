@@ -6,6 +6,7 @@ mod config;
 mod history;
 mod image;
 mod machine;
+mod mcp;
 mod provider;
 mod repl;
 mod session;
@@ -14,6 +15,7 @@ mod types;
 mod ui;
 
 use std::io::IsTerminal;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -215,6 +217,14 @@ async fn run(cli: Cli) -> Result<()> {
 
     let mut agent = Agent::new(api, session, provider);
     agent.approval = Approval::from_flag(cli.ask);
+    // The servers this workspace and the user's settings name, connected before
+    // anything asks the model for a first answer: their tools are part of every
+    // request, and a session that offered some of them would offer a different
+    // prefix than the one it will send next.
+    let workspace = std::env::current_dir().context("cannot determine the working directory")?;
+    let mcp = mcp::Hub::connect(&workspace).await;
+    let mcp_notes = mcp.notes();
+    agent.mcp = Arc::new(mcp);
     ui.set_model(&agent.model_label());
     ui.set_effort(agent.effort_label());
 
@@ -231,6 +241,12 @@ async fn run(cli: Cli) -> Result<()> {
                 ""
             }
         ));
+        // What came up, and what did not: the one-shot run prints no banner,
+        // and a server that failed to start is worth knowing about before the
+        // model is asked for anything.
+        for note in &mcp_notes {
+            ui.info(note);
+        }
         let message = match image::user_message(prompt, &cli.image) {
             Ok(message) => message,
             Err(e) => {
@@ -255,6 +271,7 @@ async fn run(cli: Cli) -> Result<()> {
             ui.error(&format!("{e:#}"));
             std::process::exit(1);
         }
+        agent.mcp.shutdown().await;
         return Ok(());
     }
 
@@ -277,6 +294,12 @@ async fn run(cli: Cli) -> Result<()> {
     if agent.session.meta.instructions.is_some() {
         banner = format!("{banner}\nproject instructions: AGENTS.md");
     }
+    // What MCP brought to the session: which servers answered, and which did
+    // not. Part of the banner because the tool list is part of the request, and
+    // a session whose tools changed is a session a reader should know about.
+    for note in &mcp_notes {
+        banner = format!("{banner}\n{note}");
+    }
 
     // Interactive front end: it owns the terminal, so nothing may have been
     // printed before it and nothing may be printed after it while it runs.
@@ -288,6 +311,7 @@ async fn run(cli: Cli) -> Result<()> {
         // session; this is once, at startup.
         let history = agent.session.messages.clone();
         if tui::run(&mut agent, &sdir, &banner, &history).await? {
+            agent.mcp.shutdown().await;
             return Ok(());
         }
     }
@@ -350,6 +374,10 @@ async fn run(cli: Cli) -> Result<()> {
         }
     }
     let _ = rl.save_history(&hist_path);
+    // Every server this session started is ended here rather than left to be
+    // killed: closing its input is the shutdown the protocol asks for, and a
+    // program this one started should not outlive it.
+    agent.mcp.shutdown().await;
     ui.teardown();
     Ok(())
 }

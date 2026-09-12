@@ -1139,7 +1139,7 @@ mod tests {
             reasoning_effort: None,
             instructions: None,
         };
-        let anthropic_request = crate::agent::request::build_request(&MINIMAX, &meta, &[]);
+        let anthropic_request = crate::agent::request::build_request(&MINIMAX, &meta, &[], &[]);
         // Try to send the Anthropic request over the OpenAI client — refused.
         let err = openai
             .stream_chat(&anthropic_request)
@@ -1151,8 +1151,12 @@ mod tests {
         let mut deepseek_meta = meta.clone();
         deepseek_meta.provider = Some("deepseek".into());
         deepseek_meta.model = "deepseek-flash".into();
-        let openai_request =
-            crate::agent::request::build_request(&crate::provider::DEEPSEEK, &deepseek_meta, &[]);
+        let openai_request = crate::agent::request::build_request(
+            &crate::provider::DEEPSEEK,
+            &deepseek_meta,
+            &[],
+            &[],
+        );
         let err = mini
             .stream_chat(&openai_request)
             .await

@@ -1,3 +1,7 @@
 /target
 .firecrawl/
 scripts/__pycache__/
+# A workspace may carry its own .mcp.json, but the one at the project
+# root (next to Cargo.toml) is the author's local MCP setup, not part
+# of the project. Smoke runs and tests write these beside themselves.
+/.mcp.json

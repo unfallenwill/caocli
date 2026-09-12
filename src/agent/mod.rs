@@ -7,8 +7,11 @@
 //! does with that state is `turn`, what it sends is `request`, and what comes
 //! back is `stream`.
 
+use std::sync::Arc;
+
 use crate::api::Client;
 use crate::machine;
+use crate::mcp::Hub;
 use crate::provider;
 use crate::session::Session;
 use crate::types::WireRequest;
@@ -31,6 +34,14 @@ pub struct Agent {
     /// Per-turn tool step cap (product-level termination guarantee). The turn in
     /// flight counts against it (`turn::Turn`), and the next turn gets it whole.
     pub max_tool_steps: usize,
+    /// The MCP servers this session connected to, and the tools they offer.
+    ///
+    /// One hub for the session rather than one per request: what it holds is a
+    /// process on the other end of a pipe, and a connection per request would be
+    /// a server started and killed for every turn. It is also why the tool list
+    /// is in the request prefix rather than in the session — the session is the
+    /// log, and the log does not start programs.
+    pub mcp: Arc<Hub>,
 }
 
 /// Whether a tool call that changes something runs or is asked about first.
@@ -64,6 +75,10 @@ impl Agent {
             provider,
             approval: Approval::Trusted,
             max_tool_steps: machine::MAX_TOOL_STEPS,
+            // Nobody to talk to until the shell says otherwise: a session with
+            // no servers configured is a session with no MCP tools, and the
+            // same machine either way.
+            mcp: Arc::new(Hub::empty()),
         }
     }
 
@@ -109,7 +124,12 @@ impl Agent {
     }
 
     fn build_request(&self) -> WireRequest {
-        request::build_request(&self.provider, &self.session.meta, &self.session.messages)
+        request::build_request(
+            &self.provider,
+            &self.session.meta,
+            &self.session.messages,
+            self.mcp.definitions(),
+        )
     }
 }
 
