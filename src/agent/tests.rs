@@ -51,6 +51,7 @@ fn test_meta() -> SessionMeta {
 fn sse(delta: serde_json::Value, finish: Option<&str>, usage: Option<serde_json::Value>) -> String {
     let mut obj = json!({
         "id": "mock-1",
+        "created": 1,
         "model": "deepseek-v4-flash",
         "object": "chat.completion.chunk",
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
@@ -1514,7 +1515,7 @@ async fn stream_time_opens_at_the_first_delta() {
     let server = MockServer::start().await;
     // Usage alone: no delta ever lands, so the window never opens.
     let usage_only = [
-        r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+        r#"data: {"id":"m","created":1,"model":"m","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
         "\n\n",
         "data: [DONE]\n\n",
     ]

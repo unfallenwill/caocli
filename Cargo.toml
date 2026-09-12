@@ -15,6 +15,10 @@ repository = "https://github.com/unfallenwill/caocli"
 # protocol lives in one place and the agent is its first consumer (`anthropic`
 # is the name it answers to here; the package is `caocli-anthropic`).
 anthropic = { package = "caocli-anthropic", path = "crates/anthropic" }
+# The OpenAI Chat Completions wire is its own crate: DeepSeek and Z.AI both
+# speak the OpenAI shape with vendor extensions, and the SDK handles HTTP,
+# retries, and SSE framing so the agent's only job is the delta stream.
+openai = { package = "caocli-openai", path = "crates/openai" }
 anyhow = "1.0.104"
 bytes = "1.12.1"
 chrono = { version = "0.4.45", features = ["clock"] }

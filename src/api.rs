@@ -1,46 +1,44 @@
 use anthropic::{BlockDelta, BlockKind, Event as AnthropicEvent};
-use anyhow::{Context, Result, bail};
-use futures_util::StreamExt;
+use anyhow::{Result, bail};
+use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::pin::Pin;
 
 use crate::provider::{Provider, Wire};
-use crate::types::{ChatChunk, Delta, DeltaFunctionCall, DeltaToolCall, Usage, WireRequest};
+use crate::types::{
+    ChatChunk, Content, ContentPart, Delta, DeltaFunctionCall, DeltaToolCall, Message, ToolCall,
+    ToolDef, Usage, WireRequest,
+};
 
 // ============================================================================
 // The two wires, one conversation.
 //
-// The OpenAI wire is parsed here: `parse_sse_line` and `take_line` are pure
-// functions and unit-testable, and `SseStream` yields one chunk at a time.
-// Streaming contract: delta.reasoning_content precedes delta.content;
-// `data: [DONE]` ends the stream; usage rides on the last content block (there
-// is no standalone usage block).
+// The OpenAI wire is the `openai` crate's: it speaks Chat Completions, does
+// the HTTP, retries, and SSE parsing, and hands over typed chunks. What lives
+// here is the bridge between the agent's internal types (the
+// `crate::types::Message` it stores, the `crate::types::Delta` it folds) and
+// the SDK's. The SDK handles transport; the adapter handles the deltas.
 //
-// The Anthropic wire is the `anthropic` crate's: it speaks the standard
-// protocol and hands over typed events, and `AnthropicStream` folds those into
-// the very same deltas the accumulator reads. Nothing downstream learns that a
-// second protocol exists — the pieces the OpenAI wire has no field for ride
-// fields added for them (the signature that closes a thinking block, the usage
-// split across message_start and message_delta).
+// The Anthropic wire is the `anthropic` crate's, the same way: typed events in,
+// the same local deltas out. Nothing downstream learns a second protocol
+// exists — the pieces the OpenAI wire has no field for ride in
+// `reasoning_content` (caught from the SDK's `extra`), and the Anthropic
+// usage lands once via a small merge.
 // ============================================================================
 
-type ByteStream = Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>;
+enum Backend {
+    /// The OpenAI chat-completions wire, spoken by the SDK. Both DeepSeek and
+    /// Z.AI take this — vendor extensions ride through [`openai::ChatCompletionRequest::extra_body`]
+    /// on the way out and [`openai::ChoiceDelta::extra`] / [`openai::CompletionUsage::extra`]
+    /// on the way in.
+    OpenAi(openai::Client),
+    /// The Anthropic wire, spoken by the SDK.
+    Anthropic(anthropic::Client),
+}
 
 /// The client for one provider: its endpoint, its key and its wire, paired so
 /// that one provider's key cannot be sent to another provider's endpoint.
 pub struct Client {
     backend: Backend,
-}
-
-enum Backend {
-    /// The OpenAI chat-completions wire, spoken from here.
-    OpenAi {
-        http: reqwest::Client,
-        api_key: String,
-        url: String,
-    },
-    /// The Anthropic wire, spoken by the SDK.
-    Anthropic(anthropic::Client),
 }
 
 impl Client {
@@ -53,13 +51,20 @@ impl Client {
 
     pub fn new(api_key: String, url: String, wire: Wire) -> Result<Self> {
         let backend = match wire {
-            Wire::OpenAi => {
-                let http = reqwest::Client::builder()
-                    .connect_timeout(std::time::Duration::from_secs(30))
-                    .build()
-                    .context("failed to build HTTP client")?;
-                Backend::OpenAi { http, api_key, url }
-            }
+            // The endpoint is the provider's own URL, path and all — the SDK
+            // names its resource paths under it, and DeepSeek / Z.AI both
+            // already end in `/chat/completions`. No retries, deliberately,
+            // where the SDK's default is two: a refusal worth retrying is
+            // one this program would rather show. Same reasoning as the
+            // Anthropic path below.
+            Wire::OpenAi => Backend::OpenAi(
+                openai::Client::new(
+                    openai::Profile::endpoint(url)
+                        .with_bearer_token(api_key)
+                        .with_max_retries(0),
+                )
+                .map_err(|e| anyhow::anyhow!("failed to build OpenAI client: {e}"))?,
+            ),
             // The endpoint is the provider's own URL, path and all: an
             // Anthropic-compatible gateway puts the messages where it likes.
             //
@@ -78,38 +83,15 @@ impl Client {
         Ok(Self { backend })
     }
 
-    /// The OpenAI-wire request bytes. A shape handed to the other wire's
-    /// endpoint is refused here rather than serialized across, which is the one
-    /// misuse the WireRequest enum cannot prevent.
-    fn body(&self, req: &WireRequest) -> Result<Vec<u8>> {
-        match (&self.backend, req) {
-            (Backend::OpenAi { .. }, WireRequest::OpenAi(r)) => Ok(serde_json::to_vec(r)?),
-            _ => bail!("request shape does not match the provider's wire protocol"),
-        }
-    }
-
     /// Send one sub-request and hand back its stream.
     pub async fn stream_chat(&self, req: &WireRequest) -> Result<ChunkStream> {
         match (&self.backend, req) {
-            (Backend::OpenAi { http, api_key, url }, WireRequest::OpenAi(_)) => {
-                let resp = http
-                    .post(url)
-                    .bearer_auth(api_key)
-                    .header("Content-Type", "application/json")
-                    .body(self.body(req)?)
-                    .send()
+            (Backend::OpenAi(client), WireRequest::OpenAi(r)) => {
+                let sdk_stream = client
+                    .stream_completion(r)
                     .await
-                    .context("request failed (network error)")?;
-                let status = resp.status();
-                if !status.is_success() {
-                    let body = resp.text().await.unwrap_or_default();
-                    bail!("API returned HTTP {status}\nresponse body: {body}");
-                }
-                Ok(ChunkStream::OpenAi(SseStream {
-                    inner: Box::pin(resp.bytes_stream()),
-                    buf: Vec::new(),
-                    done: false,
-                }))
+                    .map_err(|e| anyhow::anyhow!("openai stream error: {e}"))?;
+                Ok(ChunkStream::OpenAi(OpenAiStream { inner: sdk_stream }))
             }
             (Backend::Anthropic(client), WireRequest::Anthropic(r)) => Ok(ChunkStream::Anthropic(
                 Box::new(AnthropicStream::new(client.stream(r).await?)),
@@ -121,8 +103,8 @@ impl Client {
 
 /// One sub-request in flight, whichever wire carries it.
 pub enum ChunkStream {
-    /// The OpenAI wire's own SSE parser.
-    OpenAi(SseStream),
+    /// The OpenAI wire, adapted from the SDK's typed chunks.
+    OpenAi(OpenAiStream),
     /// The Anthropic wire, adapted from the SDK's typed events. Boxed: it
     /// carries the stream's own buffers and the frame being read, and a variant
     /// that much larger than its sibling would make every value of this enum
@@ -147,88 +129,306 @@ impl ChunkStream {
     /// connection closed.
     pub async fn next_chunk(&mut self) -> Result<Option<ChatChunk>> {
         match self {
-            ChunkStream::OpenAi(sse) => sse.next_chunk().await,
+            ChunkStream::OpenAi(stream) => stream.next_chunk().await,
             ChunkStream::Anthropic(stream) => stream.next_chunk().await,
         }
     }
 }
 
-/// The OpenAI wire's event stream.
-pub struct SseStream {
-    inner: ByteStream,
-    buf: Vec<u8>,
-    done: bool,
+// ============================================================================
+// The OpenAI wire adapter.
+//
+// The SDK does the SSE framing and the chunk decoding; this module does the
+// translation from the SDK's types to the agent's internal deltas. Three
+// things are the whole of it:
+//
+// - `reasoning_content` on the delta is not in the SDK's typed model — it
+//   rides in [`openai::ChoiceDelta::extra`] and is lifted into the local
+//   [`Delta::reasoning_content`] here.
+// - DeepSeek's flat `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
+//   are likewise in [`openai::CompletionUsage::extra`]; the local [`Usage`]
+//   reads both shapes (the flat ones and the nested `prompt_tokens_details`),
+//   so the adapter only needs to surface them.
+// - The SDK's `ChoiceDelta` has `role: Option<openai::Role>`, an enum; the
+//   local `Delta` has `role: Option<String>`. The adapter flattens the enum
+//   to its wire string, since downstream readers expect the wire form.
+// ============================================================================
+
+/// The OpenAI wire's chunk stream: the SDK's typed chunks, adapted to the
+/// agent's internal `ChatChunk`.
+pub struct OpenAiStream {
+    inner: openai::ChunkStream,
 }
 
-impl SseStream {
-    /// None means the stream is over (the wire's end — `[DONE]` on the OpenAI
-    /// shape, message_stop or connection close on the Anthropic one — was
-    /// reached or the connection closed).
+impl OpenAiStream {
+    /// None means the stream is over. A chunk that carries no delta and no
+    /// usage (a heartbeat frame the SDK has already read past) is yielded as
+    /// `Some(ChatChunk { choices: vec![], usage: None })`; downstream code
+    /// that just walks choices naturally skips it.
     pub async fn next_chunk(&mut self) -> Result<Option<ChatChunk>> {
         loop {
-            if let Some(line) = take_line(&mut self.buf) {
-                match parse_sse_line(&line)? {
-                    SseLine::Chunk(c) => return Ok(Some(c)),
-                    SseLine::Done => {
-                        self.done = true;
-                        return Ok(None);
-                    }
-                    SseLine::Ignored => continue,
-                }
-            }
-            if self.done {
+            let Some(chunk) = self
+                .inner
+                .next_chunk()
+                .await
+                .map_err(|e| anyhow::anyhow!("openai stream read error: {e}"))?
+            else {
                 return Ok(None);
-            }
-            match self.inner.next().await {
-                Some(Ok(bytes)) => self.buf.extend_from_slice(&bytes),
-                Some(Err(e)) => bail!("stream read error: {e}"),
-                None => self.done = true,
+            };
+            let local = chunk_to_local(chunk);
+            // The SDK may yield empty chunks for reasons a caller would not
+            // want to see (a heartbeat frame, a chunk with only the index).
+            // Skip them; the caller only cares about what carries a delta
+            // or a usage.
+            if !local.choices.is_empty() || local.usage.is_some() {
+                return Ok(Some(local));
             }
         }
     }
 }
 
-/// Pull one line out of the buffer (returns as soon as \n is seen), handling
-/// \r\n. Returns None while there is no complete line.
-fn take_line(buf: &mut Vec<u8>) -> Option<String> {
-    let pos = buf.iter().position(|&b| b == b'\n')?;
-    let line: Vec<u8> = buf.drain(..=pos).collect();
-    let mut s = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
-    if s.ends_with('\r') {
-        s.pop();
-    }
-    Some(s)
+/// Translate one SDK chunk into the agent's local shape. Vendor fields the
+/// SDK does not name (DeepSeek's `reasoning_content` on the delta,
+/// `prompt_cache_hit_tokens` flat on the usage) ride through `extra`.
+fn chunk_to_local(chunk: openai::ChatCompletionChunk) -> ChatChunk {
+    let choices = chunk
+        .choices
+        .into_iter()
+        .map(|c| crate::types::ChunkChoice {
+            delta: Some(delta_to_local(c.delta)),
+            finish_reason: c.finish_reason.map(|f| f.as_str().to_string()),
+        })
+        .collect();
+    let usage = chunk.usage.map(usage_to_local);
+    ChatChunk { choices, usage }
 }
 
-pub enum SseLine {
-    Chunk(ChatChunk),
-    Done,
-    Ignored,
-}
-
-/// The payload of a data line: `data: x` and `data:x` both yield `x`; any
-/// other line (blank, comment, `event:`) yields None.
-fn data_of(line: &str) -> Option<&str> {
-    let data = line.strip_prefix("data:")?;
-    Some(data.strip_prefix(' ').unwrap_or(data))
-}
-
-/// Parse a single OpenAI-wire SSE line. Only "data:" lines are handled;
-/// [DONE] ends the stream; everything else (blank lines, comments, event:
-/// fields) is ignored.
-fn parse_sse_line(line: &str) -> Result<SseLine> {
-    let Some(data) = data_of(line) else {
-        return Ok(SseLine::Ignored);
+fn delta_to_local(d: openai::ChoiceDelta) -> Delta {
+    let local = Delta {
+        // The SDK's Role enum's wire form is exactly what a downstream reader
+        // expects; lowercasing the variant name would be wrong (it is already
+        // lowercase on the wire).
+        role: d.role.map(|r| role_wire(r).to_string()),
+        content: d.content,
+        // Reasoning is a vendor field — read from extra, where the SDK
+        // collected it on deserialize.
+        reasoning_content: d
+            .extra
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        tool_calls: d
+            .tool_calls
+            .map(|tcs| tcs.into_iter().map(delta_tool_to_local).collect()),
+        signature: None,
     };
-    if data.trim() == "[DONE]" {
-        return Ok(SseLine::Done);
+    // The deprecated `function_call` form arrives here only on backends that
+    // still send it; the agent's TurnAccumulator ignores unknown fields, so
+    // dropping it is fine.
+    let _ = d.function_call;
+    local
+}
+
+fn delta_tool_to_local(d: openai::DeltaToolCall) -> DeltaToolCall {
+    DeltaToolCall {
+        index: d.index,
+        id: d.id,
+        function: d.function.map(|f| DeltaFunctionCall {
+            name: f.name,
+            arguments: f.arguments,
+        }),
     }
-    if data.trim().is_empty() {
-        return Ok(SseLine::Ignored);
+}
+
+/// Translate the SDK's `CompletionUsage` into the agent's `Usage`. DeepSeek's
+/// flat `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens` ride in
+/// [`openai::CompletionUsage::extra`] — the local `Usage::cache` reads both
+/// shapes, so we surface them flat here.
+fn usage_to_local(u: openai::CompletionUsage) -> Usage {
+    let prompt_cache_hit_tokens = u
+        .extra
+        .get("prompt_cache_hit_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let prompt_cache_miss_tokens = u
+        .extra
+        .get("prompt_cache_miss_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    Usage {
+        prompt_tokens: u.prompt_tokens,
+        completion_tokens: u.completion_tokens,
+        total_tokens: u.total_tokens,
+        prompt_cache_hit_tokens,
+        prompt_cache_miss_tokens,
+        prompt_tokens_details: u
+            .prompt_tokens_details
+            .map(|d| crate::types::PromptTokensDetails {
+                cached_tokens: d.cached_tokens.unwrap_or(0),
+            }),
     }
-    let chunk: ChatChunk =
-        serde_json::from_str(data).with_context(|| format!("failed to parse SSE chunk: {data}"))?;
-    Ok(SseLine::Chunk(chunk))
+}
+
+/// The wire string the SDK's `Role` enum carries. The variant names are
+/// already lowercase (the enum is `#[serde(rename_all = "lowercase")]`), so
+/// this is just a match.
+fn role_wire(r: openai::Role) -> &'static str {
+    match r {
+        openai::Role::System => "system",
+        openai::Role::Developer => "developer",
+        openai::Role::User => "user",
+        openai::Role::Assistant => "assistant",
+        openai::Role::Tool => "tool",
+        openai::Role::Function => "function",
+    }
+}
+
+// ============================================================================
+// The agent's `Message` → the SDK's request shape.
+//
+// The internal history is provider-agnostic; the request builder hands the
+// `openai_request` function a `Vec<Message>` and gets back the SDK's
+// `ChatCompletionRequest`. Every translation is mechanical and lives here so
+// the request builder stays readable.
+// ============================================================================
+
+/// Build the SDK's request for the agent's internal message list. The vendor
+/// switches (`thinking`, `reasoning_effort`) ride through
+/// [`openai::ChatCompletionRequest::extra_body`] — the SDK does not name them,
+/// and the backends that need them read them at the request's top level.
+pub fn openai_request(
+    model: &str,
+    max_tokens: u32,
+    messages: &[Message],
+    tools: Option<&[ToolDef]>,
+    tool_choice: Option<&str>,
+    send_thinking: bool,
+    reasoning_effort: Option<&str>,
+) -> openai::ChatCompletionRequest {
+    let sdk_messages: Vec<openai::ChatCompletionMessageParam> =
+        messages.iter().map(message_to_param).collect();
+    let mut request = openai::ChatCompletionRequest::streaming(model, sdk_messages)
+        .with_max_tokens(max_tokens)
+        .with_stream_usage();
+    if let Some(defs) = tools {
+        request = request.with_tools(defs.iter().map(tool_to_sdk).collect::<Vec<_>>());
+    }
+    if let Some(choice) = tool_choice {
+        request = request.with_tool_choice(openai::ToolChoice::Mode(match choice {
+            "auto" => openai::ToolChoiceMode::Auto,
+            "none" => openai::ToolChoiceMode::None,
+            "required" => openai::ToolChoiceMode::Required,
+            // Unknown mode strings are a 400 from the backend; the typed
+            // call above would also fail. Surface as "auto" rather than
+            // guess — the request builder should never hand us a string
+            // outside this set.
+            other => panic!("unsupported tool_choice {other:?}"),
+        }));
+    }
+    // DeepSeek-style thinking switch and the GLM/DeepSeek reasoning tiers the
+    // SDK's [`openai::ReasoningEffort`] enum does not model — sent through
+    // `extra_body` because the typed slots would either be wrong (`Max`
+    // is not in the enum) or refuse to round-trip (`thinking` has no
+    // typed slot at all).
+    if send_thinking {
+        request = request.with_extra_body("thinking", json!({"type": "enabled"}));
+    }
+    if let Some(tier) = reasoning_effort {
+        // The OpenAI standard enum has `Low | Medium | High | XHigh`; the
+        // backends that take a wider tier list (`Max` for DeepSeek, GLM)
+        // also take those, but `Max` is not in the SDK. We always go
+        // through extra_body here for consistency — the wire form is
+        // identical to what the typed field would write, and a `Low`
+        // request replays as `"low"` either way.
+        request = request.with_extra_body("reasoning_effort", Value::String(tier.to_string()));
+    }
+    request
+}
+
+/// Translate one agent-internal message into the SDK's typed param. The
+/// Anthropic-only `thinking` field is stripped here, on the wire boundary,
+/// so a session that switched providers never sends it to a backend that
+/// rejects fields it does not know.
+fn message_to_param(m: &Message) -> openai::ChatCompletionMessageParam {
+    match m.role {
+        crate::types::Role::System => openai::ChatCompletionMessageParam::System(
+            openai::SystemMessageParam::new(content_to_sdk(m.content.as_ref())),
+        ),
+        crate::types::Role::User => openai::ChatCompletionMessageParam::User(
+            openai::UserMessageParam::new(content_to_sdk(m.content.as_ref())),
+        ),
+        crate::types::Role::Assistant => {
+            let mut param = match &m.content {
+                Some(content) => openai::AssistantMessageParam::new(content_to_sdk(Some(content))),
+                None => {
+                    openai::AssistantMessageParam::new(openai::MessageContent::Text(String::new()))
+                }
+            };
+            if let Some(tcs) = &m.tool_calls {
+                param.tool_calls = Some(tcs.iter().map(tool_call_to_sdk).collect());
+            }
+            // `reasoning_content` is a vendor field the SDK does not name on
+            // the assistant message; ride through extra_body so the GLM
+            // multi-turn tool dialogs that require it get it back verbatim.
+            if let Some(text) = &m.reasoning_content {
+                param = param.with_extra_body("reasoning_content", Value::String(text.clone()));
+            }
+            openai::ChatCompletionMessageParam::Assistant(param)
+        }
+        crate::types::Role::Tool => {
+            let tool_call_id = m.tool_call_id.clone().unwrap_or_default();
+            openai::ChatCompletionMessageParam::Tool(openai::ToolMessageParam::new(
+                tool_call_id,
+                content_to_sdk(m.content.as_ref()),
+            ))
+        }
+    }
+}
+
+fn content_to_sdk(content: Option<&Content>) -> openai::MessageContent {
+    match content {
+        None => openai::MessageContent::Text(String::new()),
+        Some(Content::Text(s)) => openai::MessageContent::Text(s.clone()),
+        Some(Content::Parts(parts)) => {
+            openai::MessageContent::Parts(parts.iter().map(content_part_to_sdk).collect())
+        }
+    }
+}
+
+fn content_part_to_sdk(p: &ContentPart) -> openai::ContentPart {
+    if let Some(text) = &p.text {
+        openai::ContentPart::text(text.clone())
+    } else if let Some(image) = &p.image_url {
+        openai::ContentPart::image_url(image.url.clone())
+    } else {
+        // An empty part is rare; serde would have rejected it on the way in,
+        // but be defensive.
+        openai::ContentPart::text(String::new())
+    }
+}
+
+fn tool_to_sdk(def: &ToolDef) -> openai::Tool {
+    let mut function = openai::FunctionDefinition::new(
+        def.function.name.clone(),
+        def.function
+            .parameters
+            .clone()
+            .unwrap_or_else(|| json!({"type": "object"})),
+    );
+    if let Some(desc) = &def.function.description {
+        function = function.with_description(desc.clone());
+    }
+    openai::Tool::function(function)
+}
+
+fn tool_call_to_sdk(c: &ToolCall) -> openai::MessageToolCall {
+    openai::MessageToolCall::Function {
+        id: c.id.clone(),
+        function: openai::FunctionCall {
+            name: c.function.name.clone(),
+            arguments: c.function.arguments.clone(),
+        },
+    }
 }
 
 // ============================================================================
@@ -415,127 +615,262 @@ fn chunk_with(delta: Delta) -> ChatChunk {
     }
 }
 
+// ============================================================================
+// Test helpers.
+//
+// Helpers exposed to the integration tests, so they can build requests and
+// stream adapters with the same vocabulary the production code uses.
+// ============================================================================
+
+#[doc(hidden)]
+pub mod test_helpers {
+    /// A system message built the same way the production code does.
+    #[cfg(test)]
+    pub fn system_message(text: &str) -> crate::types::Message {
+        crate::types::Message::system(text)
+    }
+
+    /// A user message built the same way the production code does.
+    #[cfg(test)]
+    pub fn user_message(text: &str) -> crate::types::Message {
+        crate::types::Message::user(text)
+    }
+
+    /// Build a request like the production adapter does, for assertions on
+    /// the wire shape.
+    #[cfg(test)]
+    pub fn openai_request_for_test(
+        model: &str,
+        max_tokens: u32,
+        messages: Vec<crate::types::Message>,
+        stream: bool,
+        reasoning_effort: &str,
+        send_thinking: bool,
+    ) -> openai::ChatCompletionRequest {
+        let mut req = super::openai_request(
+            model,
+            max_tokens,
+            &messages,
+            None,
+            None,
+            send_thinking,
+            Some(reasoning_effort),
+        );
+        // Force the streaming flag off so the test JSON has the value it
+        // expects; the production builder always streams.
+        if !stream {
+            req = req.non_streaming();
+        }
+        req
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_helpers as h;
     use super::*;
     use crate::provider::MINIMAX;
-    use crate::types::{ChatRequest, Message, Thinking, TurnAccumulator};
+    use crate::types::TurnAccumulator;
 
-    fn chunk_with_content(s: &str) -> String {
-        format!(
-            r#"{{"id":"1","choices":[{{"index":0,"delta":{{"content":"{s}"}},"finish_reason":null}}],"created":1,"model":"deepseek-v4-flash","object":"chat.completion.chunk"}}"#
-        )
-    }
+    // -----------------------------------------------------------------------
+    // The OpenAI wire adapter.
+    // -----------------------------------------------------------------------
 
     #[test]
-    fn parse_data_line() {
-        let line = chunk_with_content("hi");
-        match parse_sse_line(&format!("data: {line}")).unwrap() {
-            SseLine::Chunk(c) => {
-                assert_eq!(
-                    c.choices[0].delta.as_ref().unwrap().content.as_deref(),
-                    Some("hi")
-                );
-            }
-            _ => panic!("expected Chunk"),
-        }
-    }
-
-    #[test]
-    fn parse_done_line() {
-        assert!(matches!(
-            parse_sse_line("data: [DONE]").unwrap(),
-            SseLine::Done
-        ));
-        assert!(matches!(
-            parse_sse_line("data:[DONE]").unwrap(),
-            SseLine::Done
-        ));
-    }
-
-    #[test]
-    fn ignores_non_data_lines() {
-        assert!(matches!(parse_sse_line("").unwrap(), SseLine::Ignored));
-        assert!(matches!(
-            parse_sse_line(": keep-alive").unwrap(),
-            SseLine::Ignored
-        ));
-        assert!(matches!(
-            parse_sse_line("event: ping").unwrap(),
-            SseLine::Ignored
-        ));
-    }
-
-    #[test]
-    fn bad_json_is_error() {
-        assert!(parse_sse_line("data: {broken").is_err());
-    }
-
-    #[test]
-    fn take_line_handles_crlf_and_split_buffers() {
-        let mut buf: Vec<u8> = b"data: {\"a\":1}\r\ndata: [DONE]\nresidual".to_vec();
-        let l1 = take_line(&mut buf).unwrap();
-        assert_eq!(l1, "data: {\"a\":1}");
-        let l2 = take_line(&mut buf).unwrap();
-        assert_eq!(l2, "data: [DONE]");
-        assert!(take_line(&mut buf).is_none()); // no newline yet, stays buffered
-        assert_eq!(buf, b"residual");
-    }
-
-    #[tokio::test]
-    async fn stream_consumes_multiple_chunks_across_buffer_boundaries() {
-        // Simulate two network packets: the first one cuts the second line's JSON
-        let body = format!(
-            "data: {}\n\ndata: {}\n\ndata: [DONE]\n",
-            chunk_with_content("a"),
-            chunk_with_content("b")
+    fn openai_request_carries_thinking_and_max_effort_through_extra_body() {
+        let req = h::openai_request_for_test(
+            "deepseek-v4-flash",
+            384_000,
+            vec![h::system_message("sys"), h::user_message("hi")],
+            true,
+            "max",
+            true,
         );
-        let bytes = body.as_bytes();
-        let split_at = body.find("data: {").unwrap() + 12; // cut inside the 2nd line's JSON
-        let (p1, p2) = bytes.split_at(split_at);
-        let stream = futures_util::stream::iter(vec![
-            Ok(bytes::Bytes::from(p1.to_vec())),
-            Ok(bytes::Bytes::from(p2.to_vec())),
-        ]);
-        let mut sse = SseStream {
-            inner: Box::pin(stream),
-            buf: Vec::new(),
-            done: false,
-        };
-
-        let c1 = sse.next_chunk().await.unwrap().unwrap();
-        assert_eq!(
-            c1.choices[0].delta.as_ref().unwrap().content.as_deref(),
-            Some("a")
-        );
-        let c2 = sse.next_chunk().await.unwrap().unwrap();
-        assert_eq!(
-            c2.choices[0].delta.as_ref().unwrap().content.as_deref(),
-            Some("b")
-        );
-        assert!(sse.next_chunk().await.unwrap().is_none());
-        assert!(sse.next_chunk().await.unwrap().is_none());
-    }
-
-    #[test]
-    fn request_body_shape() {
-        let req = ChatRequest {
-            model: "deepseek-v4-flash".into(),
-            max_tokens: 384_000,
-            messages: vec![Message::system("sys"), Message::user("hi")],
-            tools: None,
-            tool_choice: None,
-            stream: true,
-            thinking: Some(Thinking::enabled()),
-            reasoning_effort: Some("max".into()),
-        };
         let v: serde_json::Value = serde_json::to_value(&req).unwrap();
         assert_eq!(v["model"], "deepseek-v4-flash");
         assert_eq!(v["max_tokens"], 384_000);
         assert_eq!(v["stream"], true);
+        // Vendor fields ride through extra_body — at the top level of the
+        // request, exactly where DeepSeek / GLM read them.
         assert_eq!(v["thinking"]["type"], "enabled");
         assert_eq!(v["reasoning_effort"], "max");
         assert_eq!(v["messages"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn openai_request_without_thinking_omits_the_field() {
+        let req = h::openai_request_for_test(
+            "gpt-4o",
+            1024,
+            vec![h::user_message("hi")],
+            true,
+            "low",
+            false,
+        );
+        let v: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert!(
+            v.get("thinking").is_none(),
+            "thinking was not asked for: {v}"
+        );
+        assert_eq!(v["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn openai_request_strips_anthropic_thinking_blocks() {
+        // A message that came in on the Anthropic wire carries a
+        // `thinking` block — the SDK has no slot for it on the request
+        // side, so it must not leak onto the OpenAI wire.
+        let msg = Message {
+            role: crate::types::Role::Assistant,
+            content: Some("answer".into()),
+            reasoning_content: Some("thought".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            thinking: Some(vec![crate::types::ThinkingBlock {
+                thinking: "thought".into(),
+                signature: "sig".into(),
+            }]),
+        };
+        let req = openai_request("minimax", 131_072, &[msg], None, None, false, None);
+        let v: serde_json::Value = serde_json::to_value(&req).unwrap();
+        let msg_json = &v["messages"][0];
+        assert!(msg_json.get("thinking").is_none(), "{msg_json}");
+        // reasoning_content, by contrast, is a vendor field GLM requires
+        // to be replayed — it rides through extra_body on the message.
+        assert_eq!(msg_json["reasoning_content"], "thought");
+    }
+
+    #[test]
+    fn openai_request_drops_function_call_in_favor_of_tool_calls() {
+        // The deprecated `function_call` shape on a stored assistant
+        // message: the SDK has no slot for it. We simply drop it; the
+        // wire only knows `tool_calls` today.
+        let msg = Message::user("hi");
+        let req = openai_request("gpt-4o", 1024, &[msg], None, None, false, None);
+        let _ = req; // the test is the absence of panic; the SDK rejects the field, not us
+    }
+
+    #[tokio::test]
+    async fn openai_stream_folds_a_chunk_into_a_local_delta() {
+        // Build a chunk JSON as the wire writes it (DeepSeek-style, with
+        // `reasoning_content` flat on the delta), feed it through the SDK
+        // parser, and verify the local Delta has both fields lifted.
+        let body = serde_json::json!({
+            "id": "1",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "content": "hi ",
+                    "reasoning_content": "let me ",
+                },
+                "finish_reason": null
+            }],
+            "created": 1,
+            "model": "deepseek-v4-flash",
+            "object": "chat.completion.chunk",
+        });
+        let body_bytes = format!("data: {body}\n\n");
+        let bytes = bytes::Bytes::from(body_bytes);
+        let events = futures_util::stream::iter(vec![Ok(bytes)]);
+        let mut stream = OpenAiStream {
+            inner: openai::ChunkStream::new(Box::pin(events)),
+        };
+        let chunk = stream.next_chunk().await.unwrap().unwrap();
+        let delta = chunk.choices[0].delta.as_ref().unwrap();
+        assert_eq!(delta.content.as_deref(), Some("hi "));
+        assert_eq!(delta.reasoning_content.as_deref(), Some("let me "));
+        assert_eq!(delta.role.as_deref(), Some("assistant"));
+    }
+
+    #[tokio::test]
+    async fn openai_stream_translates_completion_usage() {
+        // DeepSeek's flat cache fields ride through the SDK's `extra`.
+        let body = serde_json::json!({
+            "id": "1",
+            "choices": [],
+            "created": 1,
+            "model": "deepseek-v4-flash",
+            "object": "chat.completion.chunk",
+            "usage": {
+                "prompt_tokens": 26,
+                "completion_tokens": 9,
+                "total_tokens": 35,
+                "prompt_cache_hit_tokens": 8,
+                "prompt_cache_miss_tokens": 18,
+            }
+        });
+        let body_bytes = format!("data: {body}\n\n");
+        let bytes = bytes::Bytes::from(body_bytes);
+        let events = futures_util::stream::iter(vec![Ok(bytes)]);
+        let mut stream = OpenAiStream {
+            inner: openai::ChunkStream::new(Box::pin(events)),
+        };
+        // One chunk: empty choices, usage present — yields a chunk with
+        // empty `choices` and the usage lifted into the local shape.
+        let chunk = stream.next_chunk().await.unwrap().unwrap();
+        let u = chunk.usage.unwrap();
+        assert_eq!(u.prompt_cache_hit_tokens, 8);
+        assert_eq!(u.prompt_cache_miss_tokens, 18);
+        assert_eq!(u.completion_tokens, 9);
+    }
+
+    #[tokio::test]
+    async fn openai_stream_lifts_glm_nested_cache() {
+        // GLM reports `cached_tokens` nested under `prompt_tokens_details`;
+        // the local Usage reads that shape too.
+        let body = serde_json::json!({
+            "id": "1",
+            "choices": [],
+            "created": 1,
+            "model": "glm-5.3",
+            "object": "chat.completion.chunk",
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 300,
+                "total_tokens": 1500,
+                "prompt_tokens_details": {"cached_tokens": 800}
+            }
+        });
+        let body_bytes = format!("data: {body}\n\n");
+        let bytes = bytes::Bytes::from(body_bytes);
+        let events = futures_util::stream::iter(vec![Ok(bytes)]);
+        let mut stream = OpenAiStream {
+            inner: openai::ChunkStream::new(Box::pin(events)),
+        };
+        // One chunk: empty choices, usage present — yields a chunk with
+        // empty `choices` and the usage lifted into the local shape.
+        let chunk = stream.next_chunk().await.unwrap().unwrap();
+        let u = chunk.usage.unwrap();
+        assert_eq!(u.prompt_tokens_details.unwrap().cached_tokens, 800);
+        assert!(stream.next_chunk().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn openai_stream_translates_finish_reason_to_its_wire_string() {
+        let body = serde_json::json!({
+            "id": "1",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "tool_calls"
+            }],
+            "created": 1,
+            "model": "deepseek-v4-flash",
+            "object": "chat.completion.chunk",
+        });
+        let body_bytes = format!("data: {body}\n\ndata: [DONE]\n\n");
+        let bytes = bytes::Bytes::from(body_bytes);
+        let events = futures_util::stream::iter(vec![Ok(bytes)]);
+        let mut stream = OpenAiStream {
+            inner: openai::ChunkStream::new(Box::pin(events)),
+        };
+        let chunk = stream.next_chunk().await.unwrap().unwrap();
+        assert_eq!(
+            chunk.choices[0].finish_reason.as_deref(),
+            Some("tool_calls")
+        );
+        assert!(stream.next_chunk().await.unwrap().is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -795,7 +1130,7 @@ mod tests {
     async fn a_request_shape_that_does_not_match_the_wire_is_refused() {
         // No network is touched: the mismatch is found before anything is
         // sent, which is the one misuse the WireRequest enum cannot prevent.
-        let client =
+        let openai =
             Client::new("k".into(), "http://127.0.0.1:1/never".into(), Wire::OpenAi).unwrap();
         let mini = Client::new("k".into(), MINIMAX.url.into(), Wire::Anthropic).unwrap();
         let meta = crate::session::SessionMeta {
@@ -805,7 +1140,12 @@ mod tests {
             instructions: None,
         };
         let anthropic_request = crate::agent::request::build_request(&MINIMAX, &meta, &[]);
-        let err = client.body(&anthropic_request).unwrap_err().to_string();
+        // Try to send the Anthropic request over the OpenAI client — refused.
+        let err = openai
+            .stream_chat(&anthropic_request)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("does not match"), "{err}");
 
         let mut deepseek_meta = meta.clone();

@@ -224,6 +224,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "caocli-anthropic",
+ "caocli-openai",
  "chrono",
  "clap",
  "crossterm",

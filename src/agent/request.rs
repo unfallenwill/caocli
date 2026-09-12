@@ -8,11 +8,12 @@
 
 use serde_json::json;
 
+use crate::api;
 use crate::machine;
 use crate::provider::{self, Wire};
 use crate::session::SessionMeta;
 use crate::tools;
-use crate::types::{ChatRequest, Message, Thinking, ToolDef, WireRequest};
+use crate::types::{Message, ToolDef, WireRequest};
 
 /// Participates in the request prefix (KVCache). Injecting time, cwd, a random
 /// id or any other dynamic content is forbidden, or every request would have a
@@ -33,17 +34,23 @@ pub fn build_request(
     history: &[Message],
 ) -> WireRequest {
     match provider.wire {
-        Wire::OpenAi => WireRequest::OpenAi(openai_request(provider, meta, history)),
-        Wire::Anthropic => WireRequest::Anthropic(anthropic_request(provider, meta, history)),
+        Wire::OpenAi => WireRequest::OpenAi(Box::new(openai_request(provider, meta, history))),
+        Wire::Anthropic => {
+            WireRequest::Anthropic(Box::new(anthropic_request(provider, meta, history)))
+        }
     }
 }
 
-/// The OpenAI chat-completions shape, as it has always been sent.
+/// The OpenAI chat-completions shape, built in the `openai` crate's vocabulary:
+/// the request is a `ChatCompletionRequest`, the history is `ChatCompletionMessageParam`,
+/// the tools are `Tool::function(FunctionDefinition)`. The vendor switches the
+/// SDK does not model (`thinking`, `reasoning_effort`) are written through the
+/// SDK's `extra_body` passthrough in [`api::openai_request`].
 fn openai_request(
     provider: &provider::Provider,
     meta: &SessionMeta,
     history: &[Message],
-) -> ChatRequest {
+) -> openai::ChatCompletionRequest {
     let mut messages = Vec::with_capacity(history.len() + 2);
     messages.push(Message::system(SYSTEM_PROMPT));
     // The session's project instructions, frozen into the meta at creation and
@@ -73,23 +80,22 @@ fn openai_request(
         machine::is_request_valid(&messages),
         "request history violates the tool_calls window specification: {messages:?}"
     );
-    ChatRequest {
-        model: meta.model.clone(),
-        max_tokens: provider.max_tokens,
-        messages,
-        tools: Some(tools::definitions()),
-        tool_choice: Some("auto".into()),
-        stream: true,
-        // The thinking switch and the effort fallback are the provider's:
-        // a preset that omits one or defaults differently says so in the
-        // table, and nothing here needs to know which.
-        thinking: provider.send_thinking.then(Thinking::enabled),
-        reasoning_effort: Some(
+    // The thinking switch and the effort fallback are the provider's:
+    // a preset that omits one or defaults differently says so in the
+    // table, and nothing here needs to know which.
+    api::openai_request(
+        &meta.model,
+        provider.max_tokens,
+        &messages,
+        Some(&tools::definitions()),
+        Some("auto"),
+        provider.send_thinking,
+        Some(
             meta.reasoning_effort
-                .clone()
-                .unwrap_or_else(|| provider.default_effort.to_string()),
+                .as_deref()
+                .unwrap_or(provider.default_effort),
         ),
-    }
+    )
 }
 
 /// The Anthropic messages shape, built in the `anthropic` crate's vocabulary:

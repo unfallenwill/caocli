@@ -6,9 +6,13 @@ use serde::{Deserialize, Serialize};
 // only for r#type). KVCache prefix matching requires history messages to be
 // replayed byte-for-byte, so the string fields of Message are sent exactly as
 // stored: no trim/normalize/clipping on the send path.
-// ============================================================================
+//
+// The OpenAI wire's request body is the `openai` crate's `ChatCompletionRequest`
+// — see [`WireRequest`] below. What stays in this file is the agent's own
+// vocabulary: the messages as it stores them, the streaming deltas it folds,
+// and the tool definitions it hands to the request builder.
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     #[default]
@@ -16,21 +20,6 @@ pub enum Role {
     User,
     Assistant,
     Tool,
-}
-
-/// Thinking switch. Thinking is always on; this exists only to send an explicit
-/// `{"type":"enabled"}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Thinking {
-    pub r#type: String,
-}
-
-impl Thinking {
-    pub fn enabled() -> Self {
-        Self {
-            r#type: "enabled".into(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -235,42 +224,27 @@ impl Message {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ChatRequest {
-    pub model: String,
-    /// Ceiling on a single answer, taken from the provider preset. Always sent:
-    /// the backends' own default is far below what these models can emit, and a
-    /// long `Write` cut off mid-file is a failure the model cannot see.
-    pub max_tokens: u32,
-    pub messages: Vec<Message>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<ToolDef>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<String>,
-    pub stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub thinking: Option<Thinking>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<String>,
-}
-
 // ============================================================================
 // The wire the request is carried on.
 //
-// The Anthropic shapes are the `anthropic` crate's: it speaks the standard
-// Messages protocol, so the request is built in its vocabulary and the JSON is
-// its business. What this crate keeps is the one enum that says which of the
-// two a request is — the internal history is provider-agnostic, and the request
-// builder maps it onto one shape or the other.
+// The two shapes are the SDK crates': `openai` speaks Chat Completions for
+// DeepSeek and Z.AI, and `anthropic` speaks Messages for MiniMax. Both put
+// the protocol in one place and give us typed requests to send, which is the
+// reason this crate has no request struct of its own — the internal history
+// is provider-agnostic, and the request builder maps it onto one SDK shape
+// or the other.
 // ============================================================================
 
 /// The request as the wire that carries it sees it. The client refuses to
-/// serialize one shape onto the other wire, so a preset and a request can
-/// never disagree silently.
+/// send one shape onto the other wire, so a preset and a request can never
+/// disagree silently.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WireRequest {
-    OpenAi(ChatRequest),
-    Anthropic(anthropic::MessagesRequest),
+    /// OpenAI: the SDK's request type, boxed because it carries an
+    /// `extra_body` map and a long `messages` vector that would make every
+    /// value of `WireRequest` that size otherwise.
+    OpenAi(Box<openai::ChatCompletionRequest>),
+    Anthropic(Box<anthropic::MessagesRequest>),
 }
 
 // ============================================================================
@@ -630,21 +604,27 @@ mod tests {
     }
 
     #[test]
-    fn request_serializes_thinking_and_effort() {
-        let req = ChatRequest {
-            model: "deepseek-v4-flash".into(),
-            max_tokens: 384_000,
-            messages: vec![Message::user("hi")],
-            tools: None,
-            tool_choice: None,
-            stream: true,
-            thinking: Some(Thinking::enabled()),
-            reasoning_effort: Some("high".into()),
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains(r#""thinking":{"type":"enabled"}"#));
-        assert!(json.contains(r#""reasoning_effort":"high""#));
-        assert!(json.contains(r#""stream":true"#));
+    fn wire_request_carries_the_two_sdk_shapes() {
+        // The two wires are the SDK crates' own types — the request is built
+        // in their vocabulary and the JSON is their business. What this
+        // crate owes is the enum that names which of the two a request is.
+        let openai = WireRequest::OpenAi(Box::new(openai::ChatCompletionRequest::new(
+            "deepseek-flash",
+            vec![openai::ChatCompletionMessageParam::user("hi")],
+        )));
+        match &openai {
+            WireRequest::OpenAi(built) => assert_eq!(built.model, "deepseek-flash"),
+            _ => panic!("expected the OpenAI shape"),
+        }
+        let anthropic = WireRequest::Anthropic(Box::new(anthropic::MessagesRequest::new(
+            "MiniMax-M3",
+            131_072,
+            vec![],
+        )));
+        match &anthropic {
+            WireRequest::Anthropic(built) => assert_eq!(built.model, "MiniMax-M3"),
+            _ => panic!("expected the Anthropic shape"),
+        }
     }
 
     #[test]
@@ -812,11 +792,11 @@ mod tests {
         // The Anthropic shape is the `anthropic` crate's, and its JSON is that
         // crate's business — what this crate owes is the enum that says which
         // of the two shapes a request is, and the shape it hands over.
-        let request = WireRequest::Anthropic(
+        let request = WireRequest::Anthropic(Box::new(
             anthropic::MessagesRequest::new("MiniMax-M3", 131_072, vec![])
                 .streaming()
                 .with_system("sys"),
-        );
+        ));
         match &request {
             WireRequest::Anthropic(built) => {
                 assert_eq!(built.model, "MiniMax-M3");
