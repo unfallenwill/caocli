@@ -11,7 +11,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{Api, Error};
 use crate::stream::EventStream;
-use crate::types::{CountTokensRequest, CountTokensResponse, Message, MessagesRequest};
+use crate::types::{
+    BatchPage, BatchRequest, BatchResult, CountTokensRequest, CountTokensResponse,
+    DeletedMessageBatch, Message, MessageBatch, MessagesRequest,
+};
 
 /// The path the Messages API answers at, under a base URL.
 const MESSAGES_PATH: &str = "/v1/messages";
@@ -19,6 +22,10 @@ const MESSAGES_PATH: &str = "/v1/messages";
 /// The path a token count answers at, hung off the messages path: the count is
 /// about a prompt, and the prompt is what the messages path describes.
 const COUNT_TOKENS_PATH: &str = "/count_tokens";
+
+/// The path batches answer at, hung off the messages path for the same reason:
+/// a batch is many of those requests.
+const BATCHES_PATH: &str = "/batches";
 
 /// The API version this crate speaks. Requests name it — the header is
 /// required, and a request without one is refused rather than defaulted.
@@ -240,26 +247,9 @@ impl Client {
     /// of the call.
     pub async fn messages(&self, request: &MessagesRequest) -> Result<Message, Error> {
         let body = self.body(request)?;
-        self.retrying(|| async {
-            let response = self
-                .post(body.clone())
-                .send()
-                .await
-                .map_err(Error::Transport)?;
-            let status = response.status();
-            // What the headers said is read before the body takes the response.
-            let headers = response.headers().clone();
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                return Err(Error::Api(refusal(status.as_u16(), &headers, body)));
-            }
-            let bytes = response.bytes().await.map_err(Error::Transport)?;
-            serde_json::from_slice(&bytes).map_err(|source| Error::Decode {
-                what: "message",
-                source,
-            })
-        })
-        .await
+        let endpoint = self.profile.endpoint.clone();
+        self.answer("message", || self.post(&endpoint, body.clone()))
+            .await
     }
 
     /// An answer as it is written, one event at a time.
@@ -280,9 +270,10 @@ impl Client {
         let mut asked = request.clone();
         asked.stream = Some(true);
         let body = self.body(&asked)?;
+        let endpoint = self.profile.endpoint.clone();
         self.retrying(|| async {
             let response = self
-                .post(body.clone())
+                .post(&endpoint, body.clone())
                 .send()
                 .await
                 .map_err(Error::Transport)?;
@@ -306,38 +297,108 @@ impl Client {
     /// window a conversation is holding.
     pub async fn count_tokens(&self, request: &MessagesRequest) -> Result<u64, Error> {
         let body = self.body(&CountTokensRequest::of(request))?;
-        let endpoint = format!("{}{COUNT_TOKENS_PATH}", self.profile.endpoint);
+        let url = self.path(COUNT_TOKENS_PATH);
         let answer: CountTokensResponse = self
+            .answer("token count", || self.post(&url, body.clone()))
+            .await?;
+        Ok(answer.input_tokens)
+    }
+
+    /// Send many requests at once and be told about them later.
+    ///
+    /// A batch is the out-of-band way to ask: the endpoint answers each request
+    /// on its own time, and [`Client::batch_results`] collects them. Useful for
+    /// work nobody is waiting for — not for a turn, which is a conversation.
+    pub async fn batch_create(&self, requests: Vec<BatchRequest>) -> Result<MessageBatch, Error> {
+        let body =
+            serde_json::to_vec(&serde_json::json!({ "requests": requests })).map_err(|source| {
+                Error::Decode {
+                    what: "batch request",
+                    source,
+                }
+            })?;
+        let url = self.path(BATCHES_PATH);
+        self.answer("batch", || self.post(&url, body.clone())).await
+    }
+
+    /// How one batch is doing.
+    pub async fn batch_retrieve(&self, batch_id: &str) -> Result<MessageBatch, Error> {
+        let url = self.path(&format!("{BATCHES_PATH}/{batch_id}"));
+        self.answer("batch", || self.request(reqwest::Method::GET, &url))
+            .await
+    }
+
+    /// A page of batches, the newest first unless a caller says otherwise.
+    ///
+    /// One page: `after_id` asks for the page that follows the one whose last id
+    /// this is, and the page says whether there is more.
+    pub async fn batch_list(
+        &self,
+        after_id: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<BatchPage, Error> {
+        let mut url = self.path(BATCHES_PATH);
+        let mut query: Vec<String> = Vec::new();
+        if let Some(after_id) = after_id {
+            query.push(format!("after_id={after_id}"));
+        }
+        if let Some(limit) = limit {
+            query.push(format!("limit={limit}"));
+        }
+        if !query.is_empty() {
+            url = format!("{url}?{}", query.join("&"));
+        }
+        self.answer("batch page", || self.request(reqwest::Method::GET, &url))
+            .await
+    }
+
+    /// A batch's answers, once it has ended.
+    ///
+    /// Served as JSON Lines rather than as JSON: one result per line, in no
+    /// particular order, which is why this returns them as a list rather than
+    /// preserving anything about how they arrived.
+    pub async fn batch_results(&self, batch_id: &str) -> Result<Vec<BatchResult>, Error> {
+        let url = self.path(&format!("{BATCHES_PATH}/{batch_id}/results"));
+        let text = self
             .retrying(|| async {
                 let response = self
-                    .http
-                    .post(&endpoint)
-                    .header("user-agent", USER_AGENT)
-                    .header("content-type", "application/json")
-                    .header("anthropic-version", &self.profile.api_version)
-                    .body(body.clone());
-                let response = match &self.profile.auth {
-                    Auth::Bearer(token) => response.bearer_auth(token),
-                    Auth::ApiKey(key) => response.header("x-api-key", key),
-                    Auth::None => response,
-                }
-                .send()
-                .await
-                .map_err(Error::Transport)?;
+                    .request(reqwest::Method::GET, &url)
+                    .send()
+                    .await
+                    .map_err(Error::Transport)?;
                 let status = response.status();
                 let headers = response.headers().clone();
                 if !status.is_success() {
                     let body = response.text().await.unwrap_or_default();
                     return Err(Error::Api(refusal(status.as_u16(), &headers, body)));
                 }
-                let bytes = response.bytes().await.map_err(Error::Transport)?;
-                serde_json::from_slice(&bytes).map_err(|source| Error::Decode {
-                    what: "token count",
+                response.text().await.map_err(Error::Transport)
+            })
+            .await?;
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line).map_err(|source| Error::Decode {
+                    what: "batch result",
                     source,
                 })
             })
-            .await?;
-        Ok(answer.input_tokens)
+            .collect()
+    }
+
+    /// Ask for a batch to stop. Requests already answered keep their answers.
+    pub async fn batch_cancel(&self, batch_id: &str) -> Result<MessageBatch, Error> {
+        let url = self.path(&format!("{BATCHES_PATH}/{batch_id}/cancel"));
+        self.answer("batch", || self.post(&url, Vec::new())).await
+    }
+
+    /// Throw a batch away. Its answers go with it.
+    pub async fn batch_delete(&self, batch_id: &str) -> Result<DeletedMessageBatch, Error> {
+        let url = self.path(&format!("{BATCHES_PATH}/{batch_id}"));
+        self.answer("deleted batch", || {
+            self.request(reqwest::Method::DELETE, &url)
+        })
+        .await
     }
 
     /// Run one attempt, and another one while the failure is worth another one.
@@ -371,15 +432,14 @@ impl Client {
         }
     }
 
-    /// The request itself: the profile's headers, and the body verbatim.
-    fn post(&self, body: Vec<u8>) -> reqwest::RequestBuilder {
+    /// A request with everything this profile puts on every one of them.
+    fn request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
         let mut request = self
             .http
-            .post(&self.profile.endpoint)
+            .request(method, url)
             .header("user-agent", USER_AGENT)
             .header("content-type", "application/json")
-            .header("anthropic-version", &self.profile.api_version)
-            .body(body);
+            .header("anthropic-version", &self.profile.api_version);
         request = match &self.profile.auth {
             Auth::Bearer(token) => request.bearer_auth(token),
             Auth::ApiKey(key) => request.header("x-api-key", key),
@@ -395,6 +455,41 @@ impl Client {
             request = request.header("anthropic-user-profile-id", user_profile_id);
         }
         request
+    }
+
+    /// A POST of a body, to a path of the endpoint.
+    fn post(&self, url: &str, body: Vec<u8>) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::POST, url).body(body)
+    }
+
+    /// Send a request and read the JSON answer, retrying what is worth retrying.
+    ///
+    /// One place for the shape every call has: build, send, read what the
+    /// headers said before the body takes the response, and decode. `what` names
+    /// the payload in a decode failure, because a batch that cannot be read and a
+    /// message that cannot be read are worth telling apart in a log.
+    async fn answer<T, F>(&self, what: &'static str, attempt: F) -> Result<T, Error>
+    where
+        T: serde::de::DeserializeOwned,
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        self.retrying(|| async {
+            let response = attempt().send().await.map_err(Error::Transport)?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(Error::Api(refusal(status.as_u16(), &headers, body)));
+            }
+            let bytes = response.bytes().await.map_err(Error::Transport)?;
+            serde_json::from_slice(&bytes).map_err(|source| Error::Decode { what, source })
+        })
+        .await
+    }
+
+    /// The path a sub-resource of the messages endpoint lives at.
+    fn path(&self, tail: &str) -> String {
+        format!("{}{tail}", self.profile.endpoint)
     }
 
     /// A request's body, as the endpoint reads it. Generic over the request type
@@ -670,6 +765,125 @@ mod tests {
         assert_eq!(
             sent[0].headers.get("anthropic-beta").unwrap(),
             "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_made_read_and_collected_on_its_own_paths() {
+        let server = MockServer::start().await;
+        let batch = json!({
+            "id": "msgbatch_1", "type": "message_batch", "processing_status": "in_progress",
+            "request_counts": {"processing": 1, "succeeded": 0, "errored": 0,
+                               "canceled": 0, "expired": 0},
+            "created_at": "2026-01-01T00:00:00Z", "expires_at": "2026-01-02T00:00:00Z",
+            "ended_at": null, "cancel_initiated_at": null, "results_url": null,
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&batch))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/messages/batches/msgbatch_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&batch))
+            .mount(&server)
+            .await;
+        // A page of them, which is what a list answers with.
+        Mock::given(method("GET"))
+            .and(path("/v1/messages/batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [batch], "has_more": false,
+                "first_id": "msgbatch_1", "last_id": "msgbatch_1",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/batches/msgbatch_1/cancel"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&batch))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/messages/batches/msgbatch_1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"id": "msgbatch_1", "type": "message_batch_deleted"})),
+            )
+            .mount(&server)
+            .await;
+        // The results are JSON Lines, one result per line.
+        Mock::given(method("GET"))
+            .and(path("/v1/messages/batches/msgbatch_1/results"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                concat!(
+                    r#"{"custom_id":"a","result":{"type":"succeeded","message":{"id":"msg_1","content":[{"type":"text","text":"four"}]}}}"#,
+                    "\n",
+                    r#"{"custom_id":"b","result":{"type":"errored","error":{"type":"invalid_request_error","message":"nope"}}}"#,
+                    "\n",
+                ),
+            ))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server, Profile::endpoint("x"));
+        let made = client
+            .batch_create(vec![BatchRequest {
+                custom_id: "a".into(),
+                params: request(),
+            }])
+            .await
+            .expect("the batch is made");
+        assert_eq!(made.id, "msgbatch_1");
+        assert_eq!(
+            made.processing_status,
+            Some(crate::types::BatchStatus::InProgress)
+        );
+        assert_eq!(made.request_counts.unwrap().processing, 1);
+
+        let fetched = client.batch_retrieve("msgbatch_1").await.unwrap();
+        assert_eq!(fetched.id, made.id);
+        assert_eq!(
+            client
+                .batch_list(Some("msgbatch_1"), Some(1))
+                .await
+                .unwrap()
+                .data
+                .len(),
+            1
+        );
+        assert_eq!(client.batch_cancel("msgbatch_1").await.unwrap().id, made.id);
+        assert_eq!(client.batch_delete("msgbatch_1").await.unwrap().id, made.id);
+
+        let results = client.batch_results("msgbatch_1").await.unwrap();
+        assert_eq!(results.len(), 2, "one per line, and the blank one ignored");
+        assert_eq!(results[0].custom_id, "a");
+        match &results[0].result {
+            crate::types::BatchOutcome::Succeeded { message } => {
+                assert_eq!(message.content, vec![crate::types::Block::text("four")]);
+            }
+            other => panic!("expected an answer, got {other:?}"),
+        }
+        assert!(matches!(
+            results[1].result,
+            crate::types::BatchOutcome::Errored { .. }
+        ));
+
+        // The list is asked with its paging in the query, where the endpoint
+        // reads it.
+        let sent = server.received_requests().await.unwrap();
+        let listed = sent
+            .iter()
+            .find(|request| {
+                request.url.path() == "/v1/messages/batches"
+                    && request.method == reqwest::Method::GET
+            })
+            .expect("the list was asked for");
+        assert!(
+            listed.url.query().unwrap().contains("after_id=msgbatch_1"),
+            "{listed:?}"
+        );
+        assert!(
+            listed.url.query().unwrap().contains("limit=1"),
+            "{listed:?}"
         );
     }
 

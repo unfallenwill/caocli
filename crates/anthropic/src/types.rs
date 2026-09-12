@@ -1496,6 +1496,169 @@ impl Usage {
 }
 
 // ============================================================================
+// Batches: many requests, answered out of band
+// ============================================================================
+
+/// One request in a batch: the caller's own name for it, and the request.
+///
+/// Sent, never read back: what a batch answers with is a result per request,
+/// not the requests again.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BatchRequest {
+    /// The caller's name for this request. It comes back with the result, which
+    /// is how a caller tells one answer from another — the endpoint does not.
+    pub custom_id: String,
+    /// The request itself. A batch is answered out of band, so its requests do
+    /// not stream: a streaming request has no batch answer to give.
+    pub params: MessagesRequest,
+}
+
+/// A batch of requests, as the endpoint tracks it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct MessageBatch {
+    /// The batch's id, which every call about it names.
+    pub id: String,
+    /// What kind of object this is. One value is defined: `message_batch`.
+    #[serde(default)]
+    pub r#type: String,
+    /// How far along it is.
+    #[serde(default)]
+    pub processing_status: Option<BatchStatus>,
+    /// How many of its requests are in each state.
+    #[serde(default)]
+    pub request_counts: Option<RequestCounts>,
+    /// When it was made, as the endpoint spells the time.
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// When it stops being worked on.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// When it finished.
+    #[serde(default)]
+    pub ended_at: Option<String>,
+    /// When its cancellation was asked for.
+    #[serde(default)]
+    pub cancel_initiated_at: Option<String>,
+    /// Where the results are, as a path the endpoint serves.
+    #[serde(default)]
+    pub results_url: Option<String>,
+}
+
+/// How far along a batch is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchStatus {
+    /// Being worked on.
+    InProgress,
+    /// Cancellation asked for, results still coming.
+    Canceling,
+    /// Finished, one way or another.
+    Ended,
+    /// A status this crate does not know, carried as the endpoint's word.
+    #[serde(other)]
+    Other,
+}
+
+impl BatchStatus {
+    /// The status as the wire spells it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BatchStatus::InProgress => "in_progress",
+            BatchStatus::Canceling => "canceling",
+            BatchStatus::Ended => "ended",
+            BatchStatus::Other => "other",
+        }
+    }
+}
+
+/// How many of a batch's requests are in each state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct RequestCounts {
+    /// Still being worked on.
+    #[serde(default)]
+    pub processing: u64,
+    /// Answered.
+    #[serde(default)]
+    pub succeeded: u64,
+    /// Refused, each with its own error.
+    #[serde(default)]
+    pub errored: u64,
+    /// Cancelled before an answer.
+    #[serde(default)]
+    pub canceled: u64,
+    /// Past the batch's expiry before an answer.
+    #[serde(default)]
+    pub expired: u64,
+}
+
+/// One page of batches.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct BatchPage {
+    /// The batches on this page.
+    #[serde(default)]
+    pub data: Vec<MessageBatch>,
+    /// Whether another page follows.
+    #[serde(default)]
+    pub has_more: bool,
+    /// The first of these batches.
+    #[serde(default)]
+    pub first_id: Option<String>,
+    /// The last of these batches, which is what a next page is asked after.
+    #[serde(default)]
+    pub last_id: Option<String>,
+}
+
+/// A batch's answer to a request for its results.
+///
+/// The endpoint serves these as JSON Lines — one result per line, in no
+/// particular order — so a caller gets the parsed lines and not the text.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct BatchResult {
+    /// The name the caller gave this request, which is the only thing that ties
+    /// the answer to the question.
+    pub custom_id: String,
+    /// What became of it.
+    pub result: BatchOutcome,
+}
+
+/// What became of one request in a batch.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BatchOutcome {
+    /// The endpoint answered it. The message is boxed because it is the whole
+    /// of an answer and the other outcomes are a word: a variant that much
+    /// bigger than its siblings would make every result that size.
+    Succeeded {
+        /// The answer, as a whole message.
+        message: Box<Message>,
+    },
+    /// The endpoint refused it, this request alone.
+    Errored {
+        /// The refusal, carried as it arrives: the same shapes a request sent on
+        /// its own would be refused with.
+        #[serde(default)]
+        error: Value,
+    },
+    /// Cancelled before it was answered.
+    Canceled,
+    /// Past the batch's expiry before it was answered.
+    Expired,
+    /// An outcome this crate does not know.
+    #[serde(other)]
+    Other,
+}
+
+/// What a deleted batch answers with.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct DeletedMessageBatch {
+    /// The batch that no longer exists.
+    pub id: String,
+    /// What kind of object this is: `message_batch_deleted`.
+    #[serde(default)]
+    pub r#type: String,
+}
+
+// ============================================================================
 // Counting a prompt
 // ============================================================================
 
