@@ -60,7 +60,7 @@ fn anything_else_runs_as_a_turn_and_not_as_a_menu() {
 #[tokio::test]
 async fn a_cancel_between_two_waits_is_not_lost() {
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    let mut cancel = super::super::CtrlC(cancel_rx);
+    let mut cancel = super::super::channels::CtrlC(cancel_rx);
 
     // The first wait is polled once and dropped, which is what the end of a
     // select does with it.

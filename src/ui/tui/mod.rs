@@ -16,127 +16,39 @@
 //! applies them and redraws, and both channels above are answered from the same
 //! loop. Nothing on the machine's side ever touches the terminal.
 
-use std::future::Future;
 use std::io::{self, Stdout};
 use std::path::Path;
-use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use crossterm::event::Event;
-use tokio::sync::{mpsc, oneshot, watch};
+use ratatui::backend::CrosstermBackend;
+use tokio::sync::{mpsc, watch};
 
 use crate::agent::Agent;
 use crate::config;
 use crate::history;
 use crate::repl;
 use crate::session;
-use crate::tools::ask::{Answer, Question};
-use crate::types::{Message, ToolCall};
-use crate::ui::{Approve, Ask, Cancel, Verdict};
+use crate::types::Message;
+use crate::ui::cell::{self, Cell};
 
-use super::cell::{self, Cell};
-
+mod channels;
 mod input;
 pub(crate) mod layout;
 mod notice;
 mod panel;
-mod screen;
-
-use ratatui::backend::CrosstermBackend;
-use screen::Screen;
 mod picker;
 mod render;
+mod screen;
 mod state;
 
+use channels::Channels;
 use input::Submitted;
-use notice::{Notice, Notifier, drain};
+use notice::{Notifier, drain};
 use picker::{Choosing, choice_rows};
+use screen::Screen;
 
-// --------------------------------------------------------------- channels ---
-
-/// Cancellation as the event loop delivers it: Ctrl-C sets the watch and every
-/// await point in the turn races against [`CtrlC::wait`].
-///
-/// This is why the cancel channel is a parameter of `Agent::turn`: in raw mode
-/// there is no SIGINT to subscribe to, so a key event is the only source there is.
-struct CtrlC(watch::Receiver<bool>);
-
-impl Cancel for CtrlC {
-    fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
-        let rx = &mut self.0;
-        Box::pin(async move {
-            // `borrow_and_update` first: a cancel that arrived before this wait
-            // was created must still be seen, which a bare `changed()` would miss.
-            while !*rx.borrow_and_update() {
-                if rx.changed().await.is_err() {
-                    // The front end is gone; never fire again.
-                    std::future::pending::<()>().await;
-                }
-            }
-        })
-    }
-}
-
-/// The approval gate, answered from the input box.
-///
-/// The question goes to the event loop as a reply handle; the next line the user
-/// submits is the answer. Denial is the default, including when the front end has
-/// gone away mid-ask.
-struct Gate {
-    tx: mpsc::UnboundedSender<oneshot::Sender<Verdict>>,
-}
-
-impl Approve for Gate {
-    fn approve(&mut self, _call: &ToolCall) -> Pin<Box<dyn Future<Output = Verdict> + '_>> {
-        Box::pin(async move {
-            let (reply, answer) = oneshot::channel();
-            if self.tx.send(reply).is_err() {
-                // The front end is gone: denying is the answer that runs nothing.
-                return Verdict::Denied;
-            }
-            answer.await.unwrap_or(Verdict::Denied)
-        })
-    }
-}
-
-/// The question tool, answered from the event loop.
-///
-/// The questions go to the loop as a panel to put up, and the reply handle travels
-/// with them: the answers are not a value this object ever sees, they are what the
-/// panel sends when the last question has been answered. A front end that has gone
-/// away -- the channel closed, or the panel dropped with the turn -- answers
-/// nothing, which is the dismissal the interpreter writes down as a marker.
-struct Questions {
-    tx: mpsc::UnboundedSender<Asked>,
-}
-
-/// What the loop is asked to put on the screen: the questions, and where the
-/// answers go.
-struct Asked {
-    questions: Vec<Question>,
-    reply: oneshot::Sender<Option<Vec<Answer>>>,
-}
-
-impl Ask for Questions {
-    fn ask(
-        &mut self,
-        questions: &[Question],
-    ) -> Pin<Box<dyn Future<Output = Option<Vec<Answer>>> + '_>> {
-        let (reply, answers) = oneshot::channel();
-        let asked = Asked {
-            questions: questions.to_vec(),
-            reply,
-        };
-        Box::pin(async move {
-            if self.tx.send(asked).is_err() {
-                return None;
-            }
-            // A dropped sender is the same answer as a closed channel: nobody
-            // answered, and the model is told so rather than left waiting.
-            answers.await.unwrap_or(None)
-        })
-    }
-}
+// ----------------------------------------------------------------- polling ---
 
 /// How long the loop will wait for a key before looking at everything else.
 ///
@@ -309,19 +221,6 @@ fn offer_menu(
     }
 }
 
-/// The channels the event loop reads and answers while it runs.
-///
-/// The machine's notifications arrive on one, the gate's questions on another and
-/// the question tool's on a third; the sender of each of the last two is what the
-/// machine holds while it waits.
-struct Channels {
-    notices: mpsc::UnboundedReceiver<Notice>,
-    gates: mpsc::UnboundedReceiver<oneshot::Sender<Verdict>>,
-    gate_tx: mpsc::UnboundedSender<oneshot::Sender<Verdict>>,
-    questions: mpsc::UnboundedReceiver<Asked>,
-    question_tx: mpsc::UnboundedSender<Asked>,
-}
-
 /// Draw and wait at the prompt until the user submits a line. `None` says they
 /// asked to leave.
 fn idle_line(
@@ -366,11 +265,11 @@ async fn run_turn(
     line: &str,
 ) -> anyhow::Result<anyhow::Result<repl::Outcome>> {
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let mut interrupt = CtrlC(cancel_rx);
-    let mut approve = Gate {
+    let mut interrupt = channels::CtrlC(cancel_rx);
+    let mut approve = channels::Gate {
         tx: channels.gate_tx.clone(),
     };
-    let mut ask = Questions {
+    let mut ask = channels::Questions {
         tx: channels.question_tx.clone(),
     };
     let turn = repl::handle(
