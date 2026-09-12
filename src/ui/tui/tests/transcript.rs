@@ -55,13 +55,20 @@ fn paging_back_moves_the_window_and_paging_forward_returns_it() {
     }
     screen.draw().unwrap();
     let last = rows * 3;
-    // A screen back: the window is the one above the end.
+    // A screen back: the window is the one above the end, and the two rows the
+    // reports take are the first and the last of it.
     press(&mut screen.state, KeyCode::PageUp);
     screen.draw().unwrap();
-    assert_eq!(body(&screen, 0), format!("line {}", last - rows * 2));
+    let first = last - rows * 2 + 1;
+    assert_eq!(body(&screen, 0), format!("{first} lines above"));
+    assert_eq!(body(&screen, 1), format!("line {first}"));
+    assert_eq!(
+        body(&screen, rows as u16 - 2),
+        format!("line {}", last - rows - 2)
+    );
     assert_eq!(
         body(&screen, rows as u16 - 1),
-        format!("line {}", last - rows - 1)
+        format!("{} lines below", rows + 1)
     );
     // Forward again, one page at a time.
     press(&mut screen.state, KeyCode::PageDown);
@@ -91,9 +98,11 @@ fn a_wheel_notch_moves_the_window_three_lines() {
         Submitted::Nothing
     ));
     screen.draw().unwrap();
+    let first = last - rows - WHEEL_LINES as usize + 1;
+    assert_eq!(body(&screen, 0), format!("{first} lines above"));
     assert_eq!(
-        body(&screen, rows as u16 - 1),
-        format!("line {}", last - 1 - WHEEL_LINES as usize)
+        body(&screen, rows as u16 - 2),
+        format!("line {}", last - 2 - WHEEL_LINES as usize)
     );
     // Down: back to where the writing ends, and no further, since there is
     // nothing past the end for the window to show.
@@ -386,5 +395,50 @@ fn a_window_is_the_same_lines_as_the_transcript_it_is_a_window_on() {
         render_mod::window_lines(&screen.state, 3, 9, &[], &[]),
         whole[3..9].to_vec(),
         "and a window in the middle of one cell"
+    );
+}
+
+#[test]
+fn a_window_away_from_the_end_reports_what_it_is_not_showing() {
+    // A reader who has scrolled is reading one row, not the shape of the region:
+    // how much of the session is on the other side of that row is a count, and
+    // the two rows the counts take are the window's own -- so a report is never
+    // a line out. At the end of the session nothing is reported at all: the
+    // newest line is the one being watched, and the top being off the screen is
+    // the ordinary state of a long session.
+    let mut screen = screen_for_test(40, 20);
+    let rows = transcript_rows(20, BOX_ROWS, 0) as usize;
+    for i in 0..(rows * 3) {
+        screen
+            .state
+            .transcript
+            .push(Cell::Notice(format!("line {i}")));
+    }
+    screen.draw().unwrap();
+    let total = rows * 3;
+    assert_eq!(body(&screen, 0), format!("line {}", total - rows));
+
+    // One line back: both ends report, and each count covers the row the report
+    // itself stands on as well as the lines beyond it.
+    screen.state.scroll.by(-1, total, rows);
+    screen.draw().unwrap();
+    assert_eq!(
+        row(&screen, 0),
+        format!("\u{22ee} {} lines above", total - rows)
+    );
+    assert_eq!(body(&screen, 1), format!("line {}", total - rows));
+    assert_eq!(
+        body(&screen, rows as u16 - 2),
+        format!("line {}", total - 3)
+    );
+    assert_eq!(row(&screen, rows as u16 - 1), "\u{22ee} 2 lines below");
+
+    // The very top has nothing above it, and reports nothing there.
+    screen.state.scroll.by(-(total as isize), total, rows);
+    screen.draw().unwrap();
+    assert_eq!(body(&screen, 0), "line 0");
+    assert_eq!(
+        row(&screen, rows as u16 - 1),
+        format!("\u{22ee} {} lines below", total - rows + 1)
     );
 }

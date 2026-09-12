@@ -12,9 +12,9 @@ use tokio::sync::watch;
 use super::super::input::Submitted;
 use super::super::state::State;
 use super::ctrl_j;
-use super::origin;
 use super::press;
 use super::row;
+use super::transcript_top;
 use super::type_in;
 use super::type_while_working;
 
@@ -155,7 +155,7 @@ fn a_submitted_line_is_drawn_above_what_the_turn_says() {
         .transcript
         .push(crate::ui::cell::Cell::Content("on it".into()));
     screen.draw().unwrap();
-    let top = origin(&mut screen).y;
+    let top = transcript_top(&screen, 2);
     assert_eq!(row(&screen, top), "› look at src/main.rs");
     assert_eq!(row(&screen, top + 1), "on it");
 }

@@ -32,15 +32,25 @@ pub(super) fn todo_style(status: Status) -> Style {
     }
 }
 
+/// The head of a task list: how far it has got, in the line the model is
+/// answered with.
+///
+/// Its own function because two things are drawn from it -- the cell, and the
+/// cell with the tasks left to the block that stands -- and a second
+/// `format!` of the same sentence is a second answer to what the list is doing.
+pub fn todo_head_spans(todos: &[Todo]) -> Vec<Span> {
+    vec![Span::new(
+        Style::Yellow,
+        format!("{} {}", crate::tools::TODO_NAME, todo::summary(todos)),
+    )]
+}
+
 /// The todo tool's cell: how far the list has got, then the list.
 ///
 /// The head is the same line the model is answered with, so what the reader is
 /// shown and what the model was told cannot disagree about the same list.
 pub(super) fn todo_spans(todos: &[Todo]) -> Vec<Span> {
-    let mut spans = vec![Span::new(
-        Style::Yellow,
-        format!("{} {}", crate::tools::TODO_NAME, todo::summary(todos)),
-    )];
+    let mut spans = todo_head_spans(todos);
     // The tasks are lines of this one block, so the mark is written in front of
     // each of them rather than set in a gutter of its own: the block already
     // carries the cell's gutter, and a second one inside it would be columns the

@@ -10,7 +10,7 @@
 use ratatui::style::{Color, Modifier, Style as RStyle};
 use ratatui::text::{Line, Span as RSpan};
 
-use crate::ui::cell::{Cell, Gutter, Span, Style};
+use crate::ui::cell::{self, Cell, Gutter, Span, Style};
 use crate::ui::text;
 
 /// The widest a line of the transcript is laid out, however wide the terminal is.
@@ -51,6 +51,27 @@ pub(super) fn style_of(style: Style) -> RStyle {
     }
 }
 
+/// The row that says how much of the transcript the window is not showing, drawn
+/// on the edge it was cut at.
+///
+/// The transcript is the one block with no cap of its own: it is as long as the
+/// session has been, and a window over it is cut at both ends. The two counts are
+/// the same shape, so each says which end it is at rather than leaving the reader
+/// to work it out from where the row landed -- a reader who has just scrolled is
+/// reading one row, not the shape of the region.
+///
+/// The marker is the transcript's own two columns, so the count starts in the
+/// column the cells' text does and cannot be mistaken for a cell.
+///
+/// The count covers the row the report stands on as well as the lines beyond it:
+/// the report is one row of the transcript that is not drawn, and a count that
+/// left its own row out would be a line short. So the smallest either end can
+/// say is two lines, and there is no singular form here.
+pub(super) fn edge_line(above: bool, n: usize) -> Line<'static> {
+    let side = if above { "above" } else { "below" };
+    Line::styled(format!("\u{22ee} {n} lines {side}"), style_of(Style::Dim))
+}
+
 /// The row that says how many rows a window is not showing, at the end it was cut
 /// at.
 ///
@@ -74,6 +95,23 @@ pub(super) fn more_line(lead: &str, n: usize) -> Line<'static> {
 /// session log, which is where the durable copy lives either way.
 pub(super) const THINKING_LINES: usize = 12;
 
+/// The spans a cell is drawn from, given what the screen shows elsewhere.
+///
+/// One case so far: the tasks of a `TodoWrite` call. The list they belong to
+/// stands in the pinned block for as long as it is the list that is true, and the
+/// same list twice on one screen spends the block's rows on saying nothing -- so
+/// the transcript keeps the head, which is the line the model was answered with,
+/// and the block keeps the tasks. Every `TodoWrite` cell folds, and not only the
+/// list that stands: a cell is laid out once for one width and never revisited,
+/// so a rule that changed with a later cell would rewrite history on the next
+/// resize rather than on the draw that made the list stand.
+fn spans_of(cell: &Cell) -> Vec<Span> {
+    match cell {
+        Cell::Todo(todos) => cell::todo_head_spans(todos),
+        _ => cell.spans(),
+    }
+}
+
 /// The lines one cell occupies at `width`.
 ///
 /// One function, because the transcript on screen, the window over it and the
@@ -90,11 +128,11 @@ pub(super) fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
     let width = measure(width);
     let Some(gutter) = cell.gutter() else {
         // The answer: the one cell that starts at the left edge.
-        return wrapped_lines(&cell.spans(), width);
+        return wrapped_lines(&spans_of(cell), width);
     };
     // Wrapped into what the gutter leaves, so a line of a set-in cell carries as
     // much as a line of the answer rather than two columns more.
-    let mut lines = wrapped_under(&cell.spans(), width, gutter);
+    let mut lines = wrapped_under(&spans_of(cell), width, gutter);
     // A long think folds to its head and a count. The rule lives in this layer
     // rather than in the cell because it is a budget of the screen, like the
     // wrapping width is: the plain front end has no screen to keep one on, and

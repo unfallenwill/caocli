@@ -122,6 +122,9 @@ result summaries as they were rendered live (full tool output is not replayed).
 By default caocli takes the whole screen. The transcript fills it, and the last
 rows are the pinned region: the standing task list when there is one, the queue,
 the input box, and under it the status line.
+A session shorter than the screen starts at the bottom of it rather than at the
+top: the newest line is the one next to the box, where the eye already is, and
+the room the session does not use is above it.
 The box is as tall as what is in it — `Ctrl-J` adds a line and room for it — and
 the transcript takes those rows back when the line is submitted. It is ruled off
 above and below rather than boxed in, so a line of the session and a line being
@@ -177,7 +180,11 @@ zai-coding-cn/glm-5.3 · effort max · cache 95.3% · hit 846912 · miss 41538
   notch, rather than as the `Up` and `Down` a terminal sends in its place — which
   the box reads as its own history. What that costs is the terminal's own
   selection: hold `Shift` to select text, as with any full-screen program that
-  takes the mouse.
+  takes the mouse. A window scrolled away from the end says so: its first and
+  last rows count what they are standing in for — `⋮ 12 lines above`,
+  `⋮ 4 lines below` — and each count takes its own row from the window it
+  counts. At the end nothing is reported, because being at the end is what the
+  window is for.
 - **Ctrl-C** stops a running turn; the model is told it was stopped. What was
   queued behind it runs next rather than being lost.
 - **A question is answered from the panel it puts up**, or by typing in the box;
@@ -497,6 +504,13 @@ of those same arguments:
 
 - **In the transcript**, as the call's own cell: a head line saying how far the
   list has got, then one line per task — `☐` not started, `▸` in hand, `✔` done.
+  That is the whole of what the plain front end draws, having no block to stand
+  the list in. The screen front end draws the head and leaves the tasks to the
+  block a few rows below, which is showing the same list: the same tasks twice on
+  one screen spend its rows on saying nothing. Every write folds and not only the
+  list that stands, because a cell is laid out once per width — a rule that
+  changed with a later cell would rewrite the transcript on the next resize rather
+  than on the draw that made the list stand.
 - **Above the input box**, in the screen front end, for as long as the list
   stands: the transcript gives up the rows, and the box gives up rows to it when
   the screen is short. A list too long for the block follows the task in hand and

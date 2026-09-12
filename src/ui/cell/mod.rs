@@ -36,7 +36,7 @@ use todos::todo_spans;
 // helper that needs them; the re-export is what keeps `cell::` working as
 // the entry point for the data layer.
 pub use replay::from_messages;
-pub use todos::{standing_todos, todo_gutter, todo_line_spans};
+pub use todos::{standing_todos, todo_gutter, todo_head_spans, todo_line_spans};
 
 /// A text style, held as data. Whether it becomes an escape sequence is decided
 /// by the front end that renders it, which is why there is no escape-sequence

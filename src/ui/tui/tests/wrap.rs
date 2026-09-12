@@ -107,10 +107,11 @@ fn a_wide_terminal_keeps_a_line_of_text_to_the_measure() {
         "laid out to the measure: {widest} columns"
     );
     assert!(widest > MEASURE - 10, "and the measure is used: {widest}");
-    assert!(
-        transcript[0].starts_with("word word"),
-        "the left edge is kept"
-    );
+    let first = transcript
+        .iter()
+        .find(|row| !row.trim().is_empty())
+        .expect("the text is drawn");
+    assert!(first.starts_with("word word"), "the left edge is kept");
 }
 
 #[test]

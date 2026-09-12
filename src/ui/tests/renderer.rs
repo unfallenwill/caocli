@@ -476,8 +476,8 @@ fn a_cells_own_line_breaks_are_set_in_too() {
     );
     let drawn = buf_of(&buf);
     assert!(
-        drawn.contains("▸ Edit a.txt\n  @@ -1,1 +1,1 @@\n  - one\n  + two"),
-        "a change is set in under its call, with a hunk header between them: {drawn:?}"
+        drawn.contains("▸ Edit a.txt\n  - one\n  + two"),
+        "a change is set in under its call, in the columns the call's lines are: {drawn:?}"
     );
 
     let (mut r, buf) = with_buffer(false);

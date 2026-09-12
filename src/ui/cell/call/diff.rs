@@ -74,16 +74,23 @@ pub(crate) fn unified_diff_lines(name: &str, args: &str) -> Vec<DiffLine> {
     }
     let hunks = to_hunks(&ops, &old, &new, DIFF_CONTEXT);
     let mut lines = Vec::new();
+    // The header is what tells the hunks of one change apart -- four numbers
+    // saying where in the file each of them picks up. A change that is one hunk
+    // has nothing to tell apart, and the numbers are then four columns of the
+    // reader's attention spent on the one shape of change nobody needs them for.
+    let headers = hunks.len() > 1;
     for hunk in &hunks {
-        lines.push(DiffLine {
-            kind: DiffKind::Hunk {
-                old_start: hunk.old_start,
-                old_count: hunk.old_count,
-                new_start: hunk.new_start,
-                new_count: hunk.new_count,
-            },
-            text: String::new(),
-        });
+        if headers {
+            lines.push(DiffLine {
+                kind: DiffKind::Hunk {
+                    old_start: hunk.old_start,
+                    old_count: hunk.old_count,
+                    new_start: hunk.new_start,
+                    new_count: hunk.new_count,
+                },
+                text: String::new(),
+            });
+        }
         for (op, text) in &hunk.lines {
             lines.push(DiffLine {
                 kind: match op {
@@ -534,18 +541,10 @@ mod tests {
         })
         .to_string();
         let lines = unified_diff_lines("Edit", &args);
+        // One hunk, so no header: the lines are the change.
         assert_eq!(
             lines,
             vec![
-                DiffLine {
-                    kind: DiffKind::Hunk {
-                        old_start: 0,
-                        old_count: 0,
-                        new_start: 1,
-                        new_count: 3,
-                    },
-                    text: String::new(),
-                },
                 DiffLine {
                     kind: DiffKind::Added,
                     text: "alpha".into(),
@@ -572,16 +571,7 @@ mod tests {
         })
         .to_string();
         let lines = unified_diff_lines("Edit", &args);
-        assert_eq!(
-            lines[0].kind,
-            DiffKind::Hunk {
-                old_start: 1,
-                old_count: 2,
-                new_start: 0,
-                new_count: 0
-            }
-        );
-        assert!(lines[1..].iter().all(|l| l.kind == DiffKind::Removed));
+        assert!(lines.iter().all(|l| l.kind == DiffKind::Removed));
     }
 
     /// An edit whose `old_string` and `new_string` are equal: nothing
@@ -609,20 +599,9 @@ mod tests {
         })
         .to_string();
         let lines = unified_diff_lines("Edit", &args);
-        // First line: the hunk header, naming the line ranges in old and new.
-        let header = &lines[0];
-        assert!(matches!(
-            header.kind,
-            DiffKind::Hunk {
-                old_start: 1,
-                old_count: 5,
-                new_start: 1,
-                new_count: 5
-            }
-        ));
-        // What is left: two context lines, the removed, the added, two more
-        // context lines, then the closing brace.
-        let text_kinds: Vec<(&str, &str)> = lines[1..]
+        // One hunk, so no header: two context lines, the removed, the added, two
+        // more context lines, then the closing brace.
+        let text_kinds: Vec<(&str, &str)> = lines
             .iter()
             .map(|l| (label(&l.kind), l.text.as_str()))
             .collect();
@@ -691,21 +670,52 @@ mod tests {
         })
         .to_string();
         let lines = unified_diff_lines("Write", &args);
-        assert_eq!(
-            lines[0].kind,
-            DiffKind::Hunk {
-                old_start: 0,
-                old_count: 0,
-                new_start: 1,
-                new_count: 2
-            }
-        );
-        assert!(lines[1..].iter().all(|l| l.kind == DiffKind::Added));
+        // A write has nothing to compare against, so its change is one hunk of
+        // added lines and no header to separate it from anything.
+        assert!(lines.iter().all(|l| l.kind == DiffKind::Added));
     }
 
     /// Tools that do not make a change (Bash, Read, Glob, ...) come back
     /// with no lines: the diff is what a call changes, and a call that does
     /// not change anything has nothing to diff.
+    /// Two changes far enough apart to be two hunks: the header is then what
+    /// says where the second one picks up, so it stays.
+    #[test]
+    fn unified_diff_lines_keeps_a_header_between_two_hunks() {
+        let old: Vec<String> = (0..20).map(|i| format!("L{i}")).collect();
+        let mut new = old.clone();
+        new[1] = "L1 changed".into();
+        new[18] = "L18 changed".into();
+        let args = serde_json::json!({
+            "file_path": "f.rs",
+            "old_string": old.join("\n"),
+            "new_string": new.join("\n"),
+        })
+        .to_string();
+        let lines = unified_diff_lines("Edit", &args);
+        let headers: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| matches!(l.kind, DiffKind::Hunk { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(headers.len(), 2, "one per hunk: {lines:#?}");
+        assert!(headers[0] < headers[1]);
+        // Each header's own row is empty -- the four numbers of a hunk header
+        // are its kind rather than its text -- and each is followed by the lines
+        // it stands over.
+        for (i, header) in headers.iter().enumerate() {
+            assert!(lines[*header].text.is_empty());
+            let next = headers.get(i + 1).copied().unwrap_or(lines.len());
+            assert!(
+                lines[header + 1..next]
+                    .iter()
+                    .any(|l| matches!(l.kind, DiffKind::Added | DiffKind::Removed)),
+                "hunk {i} is followed by its lines"
+            );
+        }
+    }
+
     #[test]
     fn unified_diff_lines_is_empty_for_non_changing_calls() {
         assert!(unified_diff_lines("Bash", r#"{"command":"ls"}"#).is_empty());

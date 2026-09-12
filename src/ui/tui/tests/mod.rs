@@ -63,6 +63,17 @@ pub(super) fn unset(drawn: &str) -> String {
     drawn.chars().skip(cell::MARKER_COLUMNS).collect()
 }
 
+/// The row the transcript's own text starts on, when the session is `lines`
+/// rows long.
+///
+/// The window hangs from the bottom of its region, so a session shorter than the
+/// region starts lower down than the region does: the rows it does not fill are
+/// above it. `drawn_rows` is the region's height as the last draw saw it, which
+/// is the layout's answer rather than a copy of its arithmetic.
+pub(super) fn transcript_top(screen: &Screen<ratatui::backend::TestBackend>, lines: u16) -> u16 {
+    (screen.state.drawn_rows as u16).saturating_sub(lines)
+}
+
 /// Where the drawn area is. A full screen starts at the origin, and a test
 /// asks rather than assumes: the frame is what says where the rows are.
 pub(super) fn origin(screen: &mut Screen<ratatui::backend::TestBackend>) -> Rect {

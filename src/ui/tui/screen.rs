@@ -16,7 +16,7 @@ use ratatui_textarea::ScreenCursor;
 
 use crate::ui::cell::{self, Style};
 use crate::ui::tui::layout::{box_field, box_marker, screen_rows, todo_rows};
-use crate::ui::tui::paint::style_of;
+use crate::ui::tui::paint::{self, style_of};
 use crate::ui::tui::picker::PICKER_ROWS;
 use crate::ui::tui::render;
 use crate::ui::tui::state::State;
@@ -256,7 +256,34 @@ impl<B: Backend> Screen<B> {
                 total.saturating_sub(room)
             };
             let last = (first + room).min(total);
-            let transcript = Text::from(render::window_lines(state, first, last, &live, &question));
+            // A window that is cut says so on the row it was cut at -- but only
+            // while the reader is somewhere other than the end: at the end the
+            // newest line is the one being watched, and the top being off the
+            // screen is the ordinary state of a long session rather than something
+            // to report.
+            let cut = state.scroll.back > 0;
+            let above = cut && first > 0;
+            let below = cut && last < total;
+            // The two counts take their rows from the window they stand for, so
+            // that neither report is a line out: a row that hides a line it does
+            // not count is a window lying about how much there is.
+            let first = first + usize::from(above);
+            let last = last - usize::from(below);
+            // A session shorter than the window starts at the bottom of it: the
+            // newest line belongs next to the box, where the eye already is,
+            // rather than at the top of a screen with a gap under it. A cut window
+            // fills the region and has nothing to pad with.
+            let taken = usize::from(above) + usize::from(below);
+            let mut lines: Vec<Line> =
+                vec![Line::default(); room.saturating_sub(last - first + taken)];
+            if above {
+                lines.push(paint::edge_line(true, first));
+            }
+            lines.extend(render::window_lines(state, first, last, &live, &question));
+            if below {
+                lines.push(paint::edge_line(false, total - last));
+            }
+            let transcript = Text::from(lines);
 
             frame.render_widget(Paragraph::new(transcript), rows[0]);
             draw_over(frame, &picker, rows[0], PICKER_ROWS);

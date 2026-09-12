@@ -21,10 +21,10 @@ use super::super::render as render_mod;
 use super::super::render::SPINNER;
 use super::super::state::State;
 use super::all_rows;
-use super::origin;
 use super::rendered;
 use super::row;
 use super::screen_for_test;
+use super::transcript_top;
 use crate::types::Usage;
 
 #[test]
@@ -67,14 +67,14 @@ fn a_tool_call_that_changes_a_file_is_drawn_across_its_lines() {
         r#"{"file_path":"a.rs","old_string":"one\ntwo","new_string":"three"}"#,
     ));
     screen.draw().unwrap();
-    let top = origin(&mut screen).y;
+    let top = transcript_top(&screen, 4);
     assert_eq!(row(&screen, top), "▸ Edit a.rs");
-    // The hunk header comes first: it names the line ranges in the old
-    // and new files, the way `diff -u` does.
-    assert_eq!(row(&screen, top + 1), "  @@ -1,2 +1,1 @@");
-    assert_eq!(row(&screen, top + 2), "  - one");
-    assert_eq!(row(&screen, top + 3), "  - two");
-    assert_eq!(row(&screen, top + 4), "  + three");
+    // One hunk and no header: the change is the lines, and the `@@ … @@` that
+    // says where in the file they are is only worth its row when there is more
+    // than one hunk to tell apart.
+    assert_eq!(row(&screen, top + 1), "  - one");
+    assert_eq!(row(&screen, top + 2), "  - two");
+    assert_eq!(row(&screen, top + 3), "  + three");
 }
 
 #[test]
@@ -88,11 +88,9 @@ fn a_long_line_of_a_change_is_wrapped_like_any_other() {
         &format!(r#"{{"file_path":"a.txt","content":"{long}"}}"#),
     ));
     screen.draw().unwrap();
-    let top = origin(&mut screen).y;
-    // The hunk header is the first line after the call.
-    assert_eq!(row(&screen, top + 1), "  @@ -0,0 +1,1 @@");
-    assert_eq!(row(&screen, top + 2), format!("  + {}", "x".repeat(16)));
-    assert_eq!(row(&screen, top + 3), format!("  {}", "x".repeat(14)));
+    let top = transcript_top(&screen, 3);
+    assert_eq!(row(&screen, top + 1), format!("  + {}", "x".repeat(16)));
+    assert_eq!(row(&screen, top + 2), format!("  {}", "x".repeat(14)));
 }
 
 #[test]
@@ -107,7 +105,7 @@ fn thinking_is_set_in_behind_a_rule_of_its_own() {
     screen.state.transcript.push(Cell::Reasoning("hmm".into()));
     screen.state.transcript.push(Cell::Content("answer".into()));
     screen.draw().unwrap();
-    let top = origin(&mut screen).y;
+    let top = transcript_top(&screen, 2);
     let buf = screen.terminal.backend().buffer();
     assert_eq!(row(&screen, top), "┆ hmm");
     assert_eq!(
@@ -142,7 +140,7 @@ fn an_attached_image_is_drawn_under_the_line_it_came_with() {
         .transcript
         .push(Cell::Content("a picture".into()));
     screen.draw().unwrap();
-    let top = origin(&mut screen).y;
+    let top = transcript_top(&screen, 3);
     assert_eq!(row(&screen, top), "› what is this?");
     assert_eq!(row(&screen, top + 1), "  [image png · 6 bytes]");
     assert_eq!(row(&screen, top + 2), "a picture");
@@ -159,7 +157,7 @@ fn a_wrapped_think_keeps_the_rule_on_every_line() {
         .push(Cell::Reasoning("aaaa bbbb cccc".into()));
     screen.state.transcript.push(Cell::Content("answer".into()));
     screen.draw().unwrap();
-    let top = origin(&mut screen).y;
+    let top = transcript_top(&screen, 3);
     assert_eq!(row(&screen, top), "┆ aaaa bbbb");
     assert_eq!(row(&screen, top + 1), "┆ cccc");
     assert_eq!(row(&screen, top + 2), "answer");
@@ -179,7 +177,7 @@ fn a_long_think_folds_to_its_head_and_a_count() {
     screen.state.transcript.push(Cell::Reasoning(think));
     screen.state.transcript.push(Cell::Content("answer".into()));
     screen.draw().unwrap();
-    let top = origin(&mut screen).y;
+    let top = transcript_top(&screen, THINKING_LINES as u16 + 2);
     for i in 0..THINKING_LINES {
         assert_eq!(row(&screen, top + i as u16), format!("┆ line {i}"));
     }

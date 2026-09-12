@@ -22,6 +22,7 @@ use super::box_top;
 use super::ctrl_j;
 use super::row;
 use super::screen_for_test;
+use super::transcript_top;
 use super::type_in;
 use super::written;
 
@@ -88,8 +89,16 @@ fn the_queue_is_drawn_above_the_box_until_it_is_run() {
     screen.state.submit("first");
     assert_eq!(screen.state.dequeue().as_deref(), Some("first"));
     screen.draw().unwrap();
-    assert_eq!(row(&screen, 0), "› first", "the transcript has it now");
-    assert_eq!(row(&screen, last - 5), "", "the row it gave back");
+    assert_eq!(
+        row(&screen, transcript_top(&screen, 1)),
+        "› first",
+        "the transcript has it now"
+    );
+    assert_eq!(
+        transcript_top(&screen, 1),
+        last - 5,
+        "and the row it gave back is the transcript's own"
+    );
     assert_eq!(
         row(&screen, last - 4),
         "› second",
@@ -98,7 +107,10 @@ fn the_queue_is_drawn_above_the_box_until_it_is_run() {
     assert_eq!(row(&screen, last), "m-1 · cache 0.0% · hit 0 · miss 0");
     let buf = screen.terminal.backend().buffer();
     assert!(
-        !buf[(2, 0)].style().add_modifier.contains(Modifier::DIM),
+        !buf[(2, transcript_top(&screen, 1))]
+            .style()
+            .add_modifier
+            .contains(Modifier::DIM),
         "the line that ran reads as the session's, not as something waiting"
     );
     assert!(
@@ -186,6 +198,41 @@ fn the_standing_list_is_the_last_one_written_and_nothing_when_none_is() {
         render::todo_lines(&state, 40).is_empty(),
         "a cleared list is not one to keep in view"
     );
+}
+
+#[test]
+fn the_standing_list_is_drawn_by_the_block_and_not_by_the_cell_too() {
+    // The same tasks twice on one screen spend the block's rows saying nothing:
+    // the cell keeps the head -- the line the model was answered with -- and the
+    // block, which is where the list stands, keeps the tasks. Every write folds
+    // and not only the list that stands, because a cell is laid out once for one
+    // width: a rule that changed with a later cell would rewrite the transcript
+    // on the next resize rather than on the draw that made the list stand.
+    let mut screen = screen_for_test(60, 20);
+    screen
+        .state
+        .transcript
+        .push(written(serde_json::json!({"todos": [
+            {"content": "Read the failing test", "status": "completed"},
+            {"content": "Fix the parser", "status": "in_progress"}
+        ]})));
+    screen.state.transcript.push(Cell::Content("on it".into()));
+    screen.draw().unwrap();
+
+    let top = transcript_top(&screen, 2);
+    assert_eq!(row(&screen, top), "▸ TodoWrite 1/2 done");
+    assert_eq!(row(&screen, top + 1), "on it");
+
+    let boxed = box_top(&screen);
+    assert_eq!(row(&screen, boxed - 1), "▸ Fix the parser");
+    assert_eq!(row(&screen, boxed - 2), "✔ Read the failing test");
+    assert_eq!(row(&screen, boxed - 3), "· todos · 1/2 done");
+
+    let copies = super::all_rows(&screen)
+        .iter()
+        .filter(|r| r.contains("Read the failing test"))
+        .count();
+    assert_eq!(copies, 1, "the list is drawn once");
 }
 
 #[test]
