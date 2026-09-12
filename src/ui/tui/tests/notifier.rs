@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::super::notice::{Notice, Notifier};
-use super::super::{Menu, menu_for};
+use super::super::picker::{Menu, menu_for};
 use crate::ui::Renderer;
 use crate::ui::{Cancel, Front, Ui};
 

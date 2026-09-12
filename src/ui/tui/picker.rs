@@ -5,14 +5,21 @@
 //! screen to stand on; the commands themselves are the same, and a chosen row
 //! is submitted as the very line the plain prompt would have been given.
 
+use std::io::Stdout;
+use std::path::Path;
+
+use ratatui::backend::CrosstermBackend;
 use ratatui::style::{Modifier, Style as RStyle};
 use ratatui::text::{Line, Span as RSpan};
 
+use crate::agent::Agent;
+use crate::config;
 use crate::repl;
 use crate::session;
 use crate::ui::text;
 
 use super::layout::picker_window;
+use super::screen::Screen;
 use super::state::State;
 use crate::ui::paint::more_line;
 
@@ -262,5 +269,59 @@ impl State {
             lines.push(more_line(" ", window.below));
         }
         lines
+    }
+}
+
+/// The menus the front end can offer where the plain front end can only print.
+///
+/// `/resume` with nothing to resume is a request for the list rather than a
+/// command to run; `/login`, `/model` and `/effort` are commands whose argument
+/// is a row of a menu. The chosen row is submitted as the very line the plain
+/// prompt would have been given, so the switching itself is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Menu {
+    /// The sessions there are to switch to.
+    Sessions,
+    /// The providers a key can be stored for.
+    Login,
+    /// The models the session can switch to.
+    Model,
+    /// The reasoning effort tiers the provider in use accepts.
+    Effort,
+}
+
+/// The command a line names whose answer is a menu rather than a turn.
+pub(super) fn menu_for(line: &str) -> Option<Menu> {
+    match line.trim() {
+        "/resume" => Some(Menu::Sessions),
+        "/login" => Some(Menu::Login),
+        "/model" => Some(Menu::Model),
+        "/effort" => Some(Menu::Effort),
+        _ => None,
+    }
+}
+
+/// Open the menu a command asked for. `Ok(true)` says the menu is up and the
+/// answer comes from the keyboard; `Ok(false)` says there was nothing to offer
+/// -- an empty session directory -- and the line runs as it would have.
+pub(super) fn offer_menu(
+    screen: &mut Screen<CrosstermBackend<Stdout>>,
+    menu: Menu,
+    agent: &Agent,
+    sdir: &Path,
+) -> anyhow::Result<bool> {
+    match menu {
+        Menu::Sessions => Ok(screen.state.open_sessions(&session::list(sdir)?)),
+        Menu::Login => Ok(screen
+            .state
+            .open_choices(Choosing::Provider, choice_rows(config::provider_choices()))),
+        Menu::Model => Ok(screen.state.open_choices(
+            Choosing::Model,
+            choice_rows(config::model_menu(&agent.model_label())),
+        )),
+        Menu::Effort => Ok(screen.state.open_choices(
+            Choosing::Effort,
+            choice_rows(config::effort_menu(&agent.provider(), agent.effort_label())),
+        )),
     }
 }

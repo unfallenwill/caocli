@@ -25,10 +25,8 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::{mpsc, watch};
 
 use crate::agent::Agent;
-use crate::config;
 use crate::history;
 use crate::repl;
-use crate::session;
 use crate::types::Message;
 use crate::ui::cell::{self, Cell};
 
@@ -45,7 +43,7 @@ mod state;
 use channels::Channels;
 use input::Submitted;
 use notice::{Notifier, drain};
-use picker::{Choosing, choice_rows};
+use picker::{menu_for, offer_menu};
 use screen::Screen;
 
 // ----------------------------------------------------------------- polling ---
@@ -165,60 +163,6 @@ pub async fn run(
     }
     result?;
     Ok(true)
-}
-
-/// The menus the front end can offer where the plain front end can only print.
-///
-/// `/resume` with nothing to resume is a request for the list rather than a
-/// command to run; `/login`, `/model` and `/effort` are commands whose argument
-/// is a row of a menu. The chosen row is submitted as the very line the plain
-/// prompt would have been given, so the switching itself is unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Menu {
-    /// The sessions there are to switch to.
-    Sessions,
-    /// The providers a key can be stored for.
-    Login,
-    /// The models the session can switch to.
-    Model,
-    /// The reasoning effort tiers the provider in use accepts.
-    Effort,
-}
-
-/// The command a line names whose answer is a menu rather than a turn.
-fn menu_for(line: &str) -> Option<Menu> {
-    match line.trim() {
-        "/resume" => Some(Menu::Sessions),
-        "/login" => Some(Menu::Login),
-        "/model" => Some(Menu::Model),
-        "/effort" => Some(Menu::Effort),
-        _ => None,
-    }
-}
-
-/// Open the menu a command asked for. `Ok(true)` says the menu is up and the
-/// answer comes from the keyboard; `Ok(false)` says there was nothing to offer
-/// -- an empty session directory -- and the line runs as it would have.
-fn offer_menu(
-    screen: &mut Screen<CrosstermBackend<Stdout>>,
-    menu: Menu,
-    agent: &Agent,
-    sdir: &Path,
-) -> anyhow::Result<bool> {
-    match menu {
-        Menu::Sessions => Ok(screen.state.open_sessions(&session::list(sdir)?)),
-        Menu::Login => Ok(screen
-            .state
-            .open_choices(Choosing::Provider, choice_rows(config::provider_choices()))),
-        Menu::Model => Ok(screen.state.open_choices(
-            Choosing::Model,
-            choice_rows(config::model_menu(&agent.model_label())),
-        )),
-        Menu::Effort => Ok(screen.state.open_choices(
-            Choosing::Effort,
-            choice_rows(config::effort_menu(&agent.provider(), agent.effort_label())),
-        )),
-    }
 }
 
 /// Draw and wait at the prompt until the user submits a line. `None` says they
