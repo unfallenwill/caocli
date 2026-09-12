@@ -272,7 +272,7 @@ pub enum SystemPrompt {
 /// The breakpoint is a field of the block rather than of its kind because that
 /// is where the wire puts it — any cacheable block may carry one, and a block
 /// that carries one is a place the server may cut the cached prefix at.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Block {
     /// What the block is.
     #[serde(flatten)]
@@ -280,6 +280,15 @@ pub struct Block {
     /// A prompt cache breakpoint after this block. Four per request at most.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
+    /// The object the block arrived in, kept whole, when [`BlockKind::Unknown`]
+    /// says this crate does not model its kind.
+    ///
+    /// `Some` exactly when the kind is unknown, and `None` otherwise. It is never
+    /// sent: a request is built from blocks this crate made, and a block whose
+    /// kind it does not model is not one of them. The reference client keeps the
+    /// same fields, on a model with room for them; this is where they fit here.
+    #[serde(skip)]
+    pub unmodelled: Option<Value>,
 }
 
 impl Block {
@@ -346,6 +355,7 @@ impl Block {
         Self {
             kind,
             cache_control: None,
+            unmodelled: None,
         }
     }
 
@@ -413,12 +423,14 @@ pub enum BlockKind {
         #[serde(default)]
         data: String,
     },
-    /// A block this crate does not model, from a message it parsed.
+    /// A block this crate does not model, from a message it parsed. The object
+    /// it arrived in is on the [`Block`] that carries it, in
+    /// [`Block::unmodelled`].
     ///
     /// Never produced by a request: what is not modelled here is not sent from
     /// here either. It exists so that an answer carrying a block type the spec
-    /// added later is read as the blocks around it, rather than failing the
-    /// whole message.
+    /// added later is read as the blocks around it rather than failing the whole
+    /// message — and so that what it was is still readable.
     #[serde(other)]
     Unknown,
 }
@@ -699,6 +711,33 @@ impl Effort {
     }
 }
 
+/// The same shape as [`Block`] minus the kept object, so that serde's own derive
+/// does the variant work: `#[serde(other)]` takes no payload, which is why the
+/// value is held beside the kind rather than inside it.
+#[derive(Deserialize)]
+struct RawBlock {
+    #[serde(flatten)]
+    kind: BlockKind,
+    #[serde(default)]
+    cache_control: Option<CacheControl>,
+}
+
+impl<'de> Deserialize<'de> for Block {
+    /// Read a block, keeping the whole of one whose kind this crate does not
+    /// model.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let value = Value::deserialize(d)?;
+        let raw = RawBlock::deserialize(&value).map_err(D::Error::custom)?;
+        let unmodelled = matches!(raw.kind, BlockKind::Unknown).then_some(value);
+        Ok(Self {
+            kind: raw.kind,
+            cache_control: raw.cache_control,
+            unmodelled,
+        })
+    }
+}
+
 /// A prompt cache breakpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheControl {
@@ -784,10 +823,11 @@ pub struct Message {
 
 /// Why the model stopped.
 ///
-/// The values are the endpoint's, so a value this crate does not know is
-/// [`StopReason::Other`] rather than a parse failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// The values are the endpoint's, so a value this crate does not know is kept as
+/// [`StopReason::Other`] — **with the word the endpoint used**. A reason a client
+/// threw away is a reason nobody can act on, and a new one is exactly what a
+/// caller would want to see in a log.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopReason {
     /// It finished answering.
     EndTurn,
@@ -805,14 +845,32 @@ pub enum StopReason {
     Refusal,
     /// The conversation no longer fits the model's context window.
     ModelContextWindowExceeded,
-    /// A reason this crate does not know.
-    #[serde(other)]
-    Other,
+    /// A reason this crate does not know, as the endpoint spelled it.
+    Other(String),
+}
+
+impl<'de> Deserialize<'de> for StopReason {
+    /// A string in, a reason out: the enum's variants are what this crate can
+    /// name, and everything else is the endpoint's own word, kept whole.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let spelled = String::deserialize(d)?;
+        Ok(match spelled.as_str() {
+            "end_turn" => StopReason::EndTurn,
+            "max_tokens" => StopReason::MaxTokens,
+            "stop_sequence" => StopReason::StopSequence,
+            "tool_use" => StopReason::ToolUse,
+            "pause_turn" => StopReason::PauseTurn,
+            "refusal" => StopReason::Refusal,
+            "model_context_window_exceeded" => StopReason::ModelContextWindowExceeded,
+            _ => StopReason::Other(spelled),
+        })
+    }
 }
 
 impl StopReason {
-    /// The reason as the wire spells it.
-    pub fn as_str(&self) -> &'static str {
+    /// The reason as the wire spells it — for a reason this crate does not know,
+    /// the word the endpoint used.
+    pub fn as_str(&self) -> &str {
         match self {
             StopReason::EndTurn => "end_turn",
             StopReason::MaxTokens => "max_tokens",
@@ -821,7 +879,7 @@ impl StopReason {
             StopReason::PauseTurn => "pause_turn",
             StopReason::Refusal => "refusal",
             StopReason::ModelContextWindowExceeded => "model_context_window_exceeded",
-            StopReason::Other => "other",
+            StopReason::Other(spelled) => spelled,
         }
     }
 }
@@ -1476,15 +1534,20 @@ mod tests {
             ]}"#,
         )
         .expect("a message with an unknown block still parses");
+        assert_eq!(message.content.len(), 2);
+        // The block is read as unknown, and the object it arrived in is kept:
+        // what the spec added later is something a caller can look at, not a
+        // hole where a block used to be.
+        let unknown = &message.content[0];
+        assert_eq!(unknown.kind, BlockKind::Unknown);
         assert_eq!(
-            message.content,
-            vec![
-                Block {
-                    kind: BlockKind::Unknown,
-                    cache_control: None,
-                },
-                Block::text("after"),
-            ]
+            unknown.unmodelled,
+            Some(json!({"type":"server_tool_use","id":"s1","name":"web_search","input":{}}))
+        );
+        assert_eq!(message.content[1], Block::text("after"));
+        assert_eq!(
+            message.content[1].unmodelled, None,
+            "a block whose kind is known keeps nothing beside it"
         );
     }
 
@@ -1536,9 +1599,13 @@ mod tests {
             assert_eq!(reason.as_str(), spelled);
             assert_eq!(reason.to_string(), spelled);
         }
+        // A reason this crate does not know keeps the word the endpoint used:
+        // a reason thrown away is a reason nobody can act on, and a new one is
+        // exactly what belongs in a log.
         let future: StopReason = serde_json::from_str("\"invented_later\"").unwrap();
-        assert_eq!(future, StopReason::Other);
-        assert_eq!(future.to_string(), "other");
+        assert_eq!(future, StopReason::Other("invented_later".into()));
+        assert_eq!(future.as_str(), "invented_later");
+        assert_eq!(future.to_string(), "invented_later");
     }
 
     // ------------------------------------------------------------------ usage

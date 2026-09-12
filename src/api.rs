@@ -357,6 +357,7 @@ impl AnthropicStream {
                 // take it for a whole one.
                 let choices = delta
                     .stop_reason
+                    .as_ref()
                     .map(|reason| {
                         vec![crate::types::ChunkChoice {
                             delta: None,
