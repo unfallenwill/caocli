@@ -230,6 +230,15 @@ fn standard_preset() -> provider::Provider {
     }
 }
 
+/// The same backend with none of them offered: what an endpoint nobody has
+/// asked looks like, and what MiniMax itself looked like before it was asked.
+fn unasked_preset() -> provider::Provider {
+    provider::Provider {
+        anthropic: provider::AnthropicOptions::NONE,
+        ..provider::MINIMAX
+    }
+}
+
 /// The standard optional fields are the preset's to offer. An endpoint nobody
 /// has asked sends the required shape and nothing else — a field a gateway does
 /// not know is a 400 on every request — and each one that is offered arrives in
@@ -256,8 +265,10 @@ fn the_standard_optional_fields_are_sent_only_where_the_preset_offers_them() {
         serde_json::json!({"type": "adaptive", "display": "summarized"})
     );
 
+    // The same request against an endpoint nobody has asked: the required shape
+    // and nothing else.
     let quiet = serde_json::to_value(anthropic_of(&build_request(
-        &provider::MINIMAX,
+        &unasked_preset(),
         &minimax_meta(Some("high")),
         &history,
     )))
@@ -266,6 +277,26 @@ fn the_standard_optional_fields_are_sent_only_where_the_preset_offers_them() {
         assert!(quiet.get(absent).is_none(), "{absent} was sent: {quiet}");
     }
     assert_eq!(quiet["thinking"], serde_json::json!({"type": "adaptive"}));
+
+    // What MiniMax was asked and answered: it takes the cache breakpoint and the
+    // `display` field, and both were measured in effect — a repeated prefix read
+    // back from the cache, the reasoning text streamed. Its tiers are a thinking
+    // switch, so no effort is sent, and `display` rides on the switch.
+    let minimax = serde_json::to_value(anthropic_of(&build_request(
+        &provider::MINIMAX,
+        &minimax_meta(Some("high")),
+        &history,
+    )))
+    .unwrap();
+    assert!(minimax.get("output_config").is_none(), "{minimax}");
+    assert_eq!(
+        minimax["cache_control"],
+        serde_json::json!({"type": "ephemeral"})
+    );
+    assert_eq!(
+        minimax["thinking"],
+        serde_json::json!({"type": "adaptive", "display": "summarized"})
+    );
 }
 
 /// An effort tier the spec has no word for is left unsent rather than guessed
@@ -391,7 +422,8 @@ fn anthropic_request_maps_the_history_onto_blocks() {
     assert_eq!(req.max_tokens, 131_072);
     assert_eq!(req.stream, Some(true));
     assert_eq!(req.tool_choice, Some(anthropic::ToolChoice::auto()));
-    assert_eq!(req.thinking, Some(ThinkingConfig::adaptive()));
+    // Thinking on, with the reasoning text asked for: MiniMax takes `display`.
+    assert_eq!(req.thinking, Some(ThinkingConfig::adaptive().summarized()));
     // The tools arrive in the Anthropic shape, in the same fixed order.
     let tools = req.tools.as_ref().unwrap();
     assert_eq!(tools.len(), 7);
@@ -403,11 +435,12 @@ fn anthropic_request_maps_the_history_onto_blocks() {
 fn anthropic_effort_slot_is_the_thinking_switch() {
     let history = vec![Message::user("hi")];
     for (effort, expected) in [
-        (Some("on"), ThinkingConfig::adaptive()),
+        (Some("on"), ThinkingConfig::adaptive().summarized()),
         (Some("off"), ThinkingConfig::disabled()),
         // A session that stored nothing sits at the preset's default, and
-        // the default keeps thinking on.
-        (None, ThinkingConfig::adaptive()),
+        // the default keeps thinking on. `display` rides on every tier that
+        // thinks: `disabled` has no reasoning text to ask for.
+        (None, ThinkingConfig::adaptive().summarized()),
     ] {
         let req = anthropic_of(&build_request(
             &provider::MINIMAX,
@@ -626,7 +659,7 @@ fn the_anthropic_request_prefix_is_frozen() {
     };
     assert_eq!(
         serde_json::to_string(&stripped).unwrap(),
-        r#"{"model":"MiniMax-M3","max_tokens":131072,"messages":[{"role":"user","content":"freeze"},{"role":"assistant","content":[{"type":"tool_use","id":"call_f1","name":"Bash","input":{"command":"true"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_f1","content":"exit_code: 0"}]},{"role":"user","content":"again"}],"system":"You are caocli, a coding agent. You and the user share one workspace, and your job is to collaborate with them until their goal is genuinely handled. Keep answers concise. Tool routing: use Read to read a file, Edit to modify an existing file, Write to create or fully rewrite a file, and Bash for everything else (running programs, builds, tests, git, directories, bulk text processing). Prefer absolute paths: each Bash call starts a fresh shell, so cd does not persist.","tools":[{"name":"Bash","description":"…","input_schema":{"properties":{"background":{"description":"start the command and return at once, its output going to the file the result names (default false)","type":"boolean"},"command":{"description":"the bash command to run","type":"string"},"timeout":{"description":"seconds to let the command run before it is killed (default 120, at most 1800); a background run returns at once and takes none","type":"integer"}},"required":["command"],"type":"object"}},{"name":"Read","description":"…","input_schema":{"properties":{"file_path":{"description":"path of the file to read","type":"string"},"limit":{"description":"how many lines to read; default all the way to the end","type":"integer"},"offset":{"description":"the 1-based line number to start reading at; default 1, the first line","type":"integer"}},"required":["file_path"],"type":"object"}},{"name":"Edit","description":"…","input_schema":{"properties":{"file_path":{"description":"path of the file to modify","type":"string"},"new_string":{"description":"the replacement text; an empty string deletes the matched text","type":"string"},"old_string":{"description":"the original text to replace; must occur exactly once in the file","type":"string"}},"required":["file_path","old_string","new_string"],"type":"object"}},{"name":"Write","description":"…","input_schema":{"properties":{"content":{"description":"the full contents to write","type":"string"},"file_path":{"description":"path of the file to write","type":"string"}},"required":["file_path","content"],"type":"object"}},{"name":"AskUserQuestion","description":"…","input_schema":{"properties":{"questions":{"description":"Questions to ask the user before continuing.","items":{"additionalProperties":true,"properties":{"header":{"description":"Optional short heading for the question, such as \"Confirm\" or \"Choose Mode\".","type":"string"},"id":{"description":"Stable id for this question; echoed in the answer.","type":"string"},"multi_select":{"description":"Whether the user may select more than one option. Defaults to false.","type":"boolean"},"options":{"description":"Optional choices to show the user. If you recommend one, put it first and append \"(Recommended)\" to that label.","items":{"additionalProperties":true,"properties":{"description":{"description":"One sentence explaining the tradeoff or impact.","type":"string"},"label":{"description":"Short user-facing option label.","type":"string"}},"required":["label"],"type":"object"},"type":"array"},"question":{"description":"The specific question to ask the user.","type":"string"}},"required":["id","question"],"type":"object"},"type":"array"}},"required":["questions"],"type":"object"}},{"name":"TodoWrite","description":"…","input_schema":{"properties":{"todos":{"description":"The whole list, in the order the work is done. Send an empty array to clear it.","items":{"additionalProperties":true,"properties":{"content":{"description":"What the task is, in the imperative: \"Add the parse function\".","type":"string"},"status":{"description":"Where the task stands. Defaults to pending.","enum":["pending","in_progress","completed"],"type":"string"}},"required":["content"],"type":"object"},"maxItems":20,"type":"array"}},"required":["todos"],"type":"object"}},{"name":"Glob","description":"…","input_schema":{"properties":{"path":{"description":"the directory searched, and the one the pattern's paths are relative to; default the working directory","type":"string"},"pattern":{"description":"the glob matched against each path below path; * and ? stop at a /, ** stands for any number of directories, and a pattern with no / is asked at any depth","type":"string"}},"required":["pattern"],"type":"object"}}],"tool_choice":{"type":"auto"},"thinking":{"type":"adaptive"},"stream":true}"#
+        r#"{"model":"MiniMax-M3","max_tokens":131072,"messages":[{"role":"user","content":"freeze"},{"role":"assistant","content":[{"type":"tool_use","id":"call_f1","name":"Bash","input":{"command":"true"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_f1","content":"exit_code: 0"}]},{"role":"user","content":"again"}],"system":"You are caocli, a coding agent. You and the user share one workspace, and your job is to collaborate with them until their goal is genuinely handled. Keep answers concise. Tool routing: use Read to read a file, Edit to modify an existing file, Write to create or fully rewrite a file, and Bash for everything else (running programs, builds, tests, git, directories, bulk text processing). Prefer absolute paths: each Bash call starts a fresh shell, so cd does not persist.","tools":[{"name":"Bash","description":"…","input_schema":{"properties":{"background":{"description":"start the command and return at once, its output going to the file the result names (default false)","type":"boolean"},"command":{"description":"the bash command to run","type":"string"},"timeout":{"description":"seconds to let the command run before it is killed (default 120, at most 1800); a background run returns at once and takes none","type":"integer"}},"required":["command"],"type":"object"}},{"name":"Read","description":"…","input_schema":{"properties":{"file_path":{"description":"path of the file to read","type":"string"},"limit":{"description":"how many lines to read; default all the way to the end","type":"integer"},"offset":{"description":"the 1-based line number to start reading at; default 1, the first line","type":"integer"}},"required":["file_path"],"type":"object"}},{"name":"Edit","description":"…","input_schema":{"properties":{"file_path":{"description":"path of the file to modify","type":"string"},"new_string":{"description":"the replacement text; an empty string deletes the matched text","type":"string"},"old_string":{"description":"the original text to replace; must occur exactly once in the file","type":"string"}},"required":["file_path","old_string","new_string"],"type":"object"}},{"name":"Write","description":"…","input_schema":{"properties":{"content":{"description":"the full contents to write","type":"string"},"file_path":{"description":"path of the file to write","type":"string"}},"required":["file_path","content"],"type":"object"}},{"name":"AskUserQuestion","description":"…","input_schema":{"properties":{"questions":{"description":"Questions to ask the user before continuing.","items":{"additionalProperties":true,"properties":{"header":{"description":"Optional short heading for the question, such as \"Confirm\" or \"Choose Mode\".","type":"string"},"id":{"description":"Stable id for this question; echoed in the answer.","type":"string"},"multi_select":{"description":"Whether the user may select more than one option. Defaults to false.","type":"boolean"},"options":{"description":"Optional choices to show the user. If you recommend one, put it first and append \"(Recommended)\" to that label.","items":{"additionalProperties":true,"properties":{"description":{"description":"One sentence explaining the tradeoff or impact.","type":"string"},"label":{"description":"Short user-facing option label.","type":"string"}},"required":["label"],"type":"object"},"type":"array"},"question":{"description":"The specific question to ask the user.","type":"string"}},"required":["id","question"],"type":"object"},"type":"array"}},"required":["questions"],"type":"object"}},{"name":"TodoWrite","description":"…","input_schema":{"properties":{"todos":{"description":"The whole list, in the order the work is done. Send an empty array to clear it.","items":{"additionalProperties":true,"properties":{"content":{"description":"What the task is, in the imperative: \"Add the parse function\".","type":"string"},"status":{"description":"Where the task stands. Defaults to pending.","enum":["pending","in_progress","completed"],"type":"string"}},"required":["content"],"type":"object"},"maxItems":20,"type":"array"}},"required":["todos"],"type":"object"}},{"name":"Glob","description":"…","input_schema":{"properties":{"path":{"description":"the directory searched, and the one the pattern's paths are relative to; default the working directory","type":"string"},"pattern":{"description":"the glob matched against each path below path; * and ? stop at a /, ** stands for any number of directories, and a pattern with no / is asked at any depth","type":"string"}},"required":["pattern"],"type":"object"}}],"tool_choice":{"type":"auto"},"thinking":{"type":"adaptive","display":"summarized"},"cache_control":{"type":"ephemeral"},"stream":true}"#
     );
     // The stored effort rides along but means the thinking switch here; the
     // frozen literal above pins `adaptive` for a non-off tier.

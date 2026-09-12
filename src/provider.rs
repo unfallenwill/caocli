@@ -213,11 +213,21 @@ pub const MINIMAX: Provider = Provider {
     send_thinking: false,
     efforts: &["on", "off"],
     default_effort: "on",
-    // Unverified against this endpoint. Every field below is standard, and a
-    // gateway that refuses a field it does not know would refuse every request
-    // with it; `scripts/anthropic_probe.py` asks the endpoint what it takes,
-    // and each answer that comes back yes is that field set to `true` here.
-    anthropic: AnthropicOptions::NONE,
+    // Verified against this endpoint with `scripts/anthropic_probe.py`: it takes
+    // all three, and the two that are on are on because their *effect* was
+    // measured, not because the request was accepted — a repeated long prefix
+    // came back with the second request's prompt read from the cache, and the
+    // reasoning text streamed as deltas.
+    anthropic: AnthropicOptions {
+        // Off, and not because the endpoint refuses it: this preset's tiers are
+        // a thinking switch (`on`/`off`), not the standard levels, so there is
+        // no effort to send. Saying `true` here would turn `/effort off` from
+        // "do not think" into "think", which is the opposite of what the tier
+        // means.
+        effort: false,
+        display: true,
+        cache_control: true,
+    },
 };
 
 pub const PROVIDERS: &[Provider] = &[DEEPSEEK, ZAI_CODING_CN, MINIMAX];

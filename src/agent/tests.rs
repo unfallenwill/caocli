@@ -587,7 +587,12 @@ async fn mock_anthropic_loop_replays_thinking_blocks_verbatim() {
     assert_eq!(body["model"], "MiniMax-M3");
     assert_eq!(body["max_tokens"], 131_072);
     assert_eq!(body["stream"], true);
-    assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+    // Thinking on, with the reasoning text asked for: MiniMax takes `display`,
+    // and the preset says so because it was measured there.
+    assert_eq!(
+        body["thinking"],
+        json!({"type": "adaptive", "display": "summarized"})
+    );
     assert_eq!(body["tool_choice"], json!({"type": "auto"}));
     assert_eq!(body["tools"][0]["name"], "Bash");
     assert!(
