@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/anthropic"]
+resolver = "3"
+
 [package]
 name = "caocli"
 version = "0.1.3"
@@ -7,6 +11,10 @@ license = "MIT"
 repository = "https://github.com/unfallenwill/caocli"
 
 [dependencies]
+# The Anthropic wire is its own crate: a standard Messages API client, so the
+# protocol lives in one place and the agent is its first consumer (`anthropic`
+# is the name it answers to here; the package is `caocli-anthropic`).
+anthropic = { package = "caocli-anthropic", path = "crates/anthropic" }
 anyhow = "1.0.104"
 bytes = "1.12.1"
 chrono = { version = "0.4.45", features = ["clock"] }

@@ -223,6 +223,7 @@ version = "0.1.3"
 dependencies = [
  "anyhow",
  "bytes",
+ "caocli-anthropic",
  "chrono",
  "clap",
  "crossterm",
@@ -236,6 +237,19 @@ dependencies = [
  "serde_json",
  "tokio",
  "unicode-width",
+ "wiremock",
+]
+
+[[package]]
+name = "caocli-anthropic"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
  "wiremock",
 ]
 
