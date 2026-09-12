@@ -77,6 +77,8 @@ pub struct Profile {
     auth: Auth,
     betas: Vec<String>,
     max_retries: u32,
+    workspace_id: Option<String>,
+    user_profile_id: Option<String>,
 }
 
 impl Profile {
@@ -95,6 +97,8 @@ impl Profile {
             auth: Auth::None,
             betas: Vec::new(),
             max_retries: DEFAULT_MAX_RETRIES,
+            workspace_id: None,
+            user_profile_id: None,
         }
     }
 
@@ -128,6 +132,21 @@ impl Profile {
     /// one header, comma-separated.
     pub fn with_beta(mut self, beta: impl Into<String>) -> Self {
         self.betas.push(beta.into());
+        self
+    }
+
+    /// Name the workspace the request runs in, in the `anthropic-workspace-id`
+    /// header. Required by a key that belongs to more than one workspace, and
+    /// ignored by the others.
+    pub fn with_workspace_id(mut self, workspace_id: impl Into<String>) -> Self {
+        self.workspace_id = Some(workspace_id.into());
+        self
+    }
+
+    /// Name the user profile the request is made on behalf of, in the
+    /// `anthropic-user-profile-id` header.
+    pub fn with_user_profile_id(mut self, user_profile_id: impl Into<String>) -> Self {
+        self.user_profile_id = Some(user_profile_id.into());
         self
     }
 
@@ -324,6 +343,12 @@ impl Client {
         if !self.profile.betas.is_empty() {
             request = request.header("anthropic-beta", self.profile.betas.join(","));
         }
+        if let Some(workspace_id) = &self.profile.workspace_id {
+            request = request.header("anthropic-workspace-id", workspace_id);
+        }
+        if let Some(user_profile_id) = &self.profile.user_profile_id {
+            request = request.header("anthropic-user-profile-id", user_profile_id);
+        }
         request
     }
 
@@ -455,6 +480,38 @@ mod tests {
         assert!(!err.is_transient());
         let err = Client::new(Profile::endpoint("file:///tmp/x")).unwrap_err();
         assert!(err.to_string().contains("http or https"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_workspace_and_profile_headers_go_out_when_a_caller_names_them() {
+        // A key that belongs to more than one workspace has to say which, and a
+        // request made on somebody's behalf has to say whose.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("anthropic-workspace-id", "wrkspc_01"))
+            .and(header("anthropic-user-profile-id", "prof_01"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "m"})))
+            .mount(&server)
+            .await;
+        let client = client_for(
+            &server,
+            Profile::endpoint("x")
+                .with_workspace_id("wrkspc_01")
+                .with_user_profile_id("prof_01"),
+        );
+        assert!(client.messages(&request()).await.is_ok());
+
+        // And a profile that names neither sends neither.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "m"})))
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Profile::endpoint("x"));
+        assert!(client.messages(&request()).await.is_ok());
+        let sent = server.received_requests().await.unwrap();
+        assert!(sent[0].headers.get("anthropic-workspace-id").is_none());
+        assert!(sent[0].headers.get("anthropic-user-profile-id").is_none());
     }
 
     #[tokio::test]

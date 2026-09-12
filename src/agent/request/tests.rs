@@ -10,7 +10,9 @@ use crate::session::SessionMeta;
 use crate::types::{
     ChatRequest, Content, Message, Role, ThinkingBlock, ToolCall, ToolCallFunction, WireRequest,
 };
-use anthropic::{Block, BlockKind, ImageSource, MessageContent, SystemPrompt, ThinkingConfig};
+use anthropic::{
+    Block, BlockKind, ImageSource, MessageContent, SystemPrompt, ThinkingConfig, ToolUnion,
+};
 
 use super::{SYSTEM_PROMPT, build_request};
 
@@ -427,8 +429,11 @@ fn anthropic_request_maps_the_history_onto_blocks() {
     // The tools arrive in the Anthropic shape, in the same fixed order.
     let tools = req.tools.as_ref().unwrap();
     assert_eq!(tools.len(), 7);
-    assert_eq!(tools[0].name, "Bash");
-    assert_eq!(tools[0].input_schema["type"], "object");
+    let ToolUnion::Client(bash) = &tools[0] else {
+        panic!("every tool this program sends is its own: {:?}", tools[0]);
+    };
+    assert_eq!(bash.name, "Bash");
+    assert_eq!(bash.input_schema["type"], "object");
 }
 
 #[test]
@@ -650,8 +655,11 @@ fn the_anthropic_request_prefix_is_frozen() {
         &history,
     ));
     let mut tools = req.tools.clone().unwrap();
-    for t in tools.iter_mut() {
-        t.description = Some("…".into());
+    for tool in tools.iter_mut() {
+        let ToolUnion::Client(tool) = tool else {
+            panic!("every tool this program sends is its own");
+        };
+        tool.description = Some("…".into());
     }
     let stripped = anthropic::MessagesRequest {
         tools: Some(tools),

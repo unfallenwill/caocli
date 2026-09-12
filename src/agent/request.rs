@@ -157,7 +157,7 @@ fn anthropic_request(
         anthropic::MessagesRequest::new(meta.model.clone(), provider.max_tokens, messages)
             .streaming()
             .with_system(system.join("\n\n"))
-            .with_tools(
+            .with_client_tools(
                 tools::definitions()
                     .into_iter()
                     .map(anthropic_tool)

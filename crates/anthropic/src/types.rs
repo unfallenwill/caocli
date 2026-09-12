@@ -46,9 +46,9 @@ pub struct MessagesRequest {
     /// The system prompt: a top-level field on this wire, not a message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<SystemPrompt>,
-    /// The tools the model may call.
+    /// The tools the model may call, its own and the endpoint's.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<Tool>>,
+    pub tools: Option<Vec<ToolUnion>>,
     /// How the model should use those tools.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
@@ -60,6 +60,11 @@ pub struct MessagesRequest {
     /// token, thinking and tool arguments included.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<OutputConfig>,
+    /// A container to run the request in, by id or as a description of one.
+    /// Containers are the endpoint's state, not this crate's: a caller names one
+    /// it made elsewhere, or names none at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<ContainerParam>,
     /// Prompt cache, the automatic form: one breakpoint that the server keeps
     /// at the end of the cacheable prefix and moves forward as the conversation
     /// grows. It costs one of the four breakpoint slots a request may have.
@@ -94,6 +99,7 @@ impl MessagesRequest {
             system: None,
             tools: None,
             tool_choice: None,
+            container: None,
             thinking: None,
             output_config: None,
             cache_control: None,
@@ -125,8 +131,20 @@ impl MessagesRequest {
     }
 
     /// The tools the model may call.
-    pub fn with_tools(mut self, tools: Vec<Tool>) -> Self {
+    pub fn with_tools(mut self, tools: Vec<ToolUnion>) -> Self {
         self.tools = Some(tools);
+        self
+    }
+
+    /// The tools, all of them the caller's own.
+    pub fn with_client_tools(mut self, tools: Vec<Tool>) -> Self {
+        self.tools = Some(tools.into_iter().map(ToolUnion::Client).collect());
+        self
+    }
+
+    /// A container to run the request in.
+    pub fn with_container(mut self, container: ContainerParam) -> Self {
+        self.container = Some(container);
         self
     }
 
@@ -146,6 +164,16 @@ impl MessagesRequest {
     pub fn with_effort(mut self, effort: Effort) -> Self {
         self.output_config = Some(OutputConfig {
             effort: Some(effort),
+            format: None,
+        });
+        self
+    }
+
+    /// Ask for an answer shaped by a schema.
+    pub fn with_format(mut self, format: JsonOutputFormat) -> Self {
+        self.output_config = Some(OutputConfig {
+            effort: self.output_config.and_then(|config| config.effort),
+            format: Some(format),
         });
         self
     }
@@ -188,6 +216,40 @@ pub enum ServiceTier {
     Auto,
     /// Standard capacity only.
     StandardOnly,
+}
+
+/// A container to run a request in: either the id of one the endpoint already
+/// made, or a description of one to make.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ContainerParam {
+    /// A container that already exists, by id.
+    Id(String),
+    /// A container to make, or one to configure.
+    Config(ContainerConfig),
+}
+
+/// What a container should hold.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContainerConfig {
+    /// The container to use, by id, when it is one that exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Skills to load into it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<SkillParam>>,
+}
+
+/// A skill to load into a container.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillParam {
+    /// The skill, by id.
+    pub skill_id: String,
+    /// Whose skill it is: the endpoint's own, or the caller's.
+    #[serde(rename = "type")]
+    pub r#type: String,
+    /// Which version of it.
+    pub version: String,
 }
 
 /// Who the request is attributed to.
@@ -294,7 +356,10 @@ pub struct Block {
 impl Block {
     /// A block of text.
     pub fn text(text: impl Into<String>) -> Self {
-        Self::of(BlockKind::Text { text: text.into() })
+        Self::of(BlockKind::Text {
+            text: text.into(),
+            citations: None,
+        })
     }
 
     /// An image, from a base64 payload or a URL.
@@ -333,6 +398,30 @@ impl Block {
             tool_use_id: tool_use_id.into(),
             content: Some(content),
             is_error,
+        })
+    }
+
+    /// A document the model may read.
+    pub fn document(source: DocumentSource) -> Self {
+        Self::of(BlockKind::Document {
+            source,
+            title: None,
+            context: None,
+            citations: None,
+        })
+    }
+
+    /// A result the model may cite.
+    pub fn search_result(
+        source: impl Into<String>,
+        title: impl Into<String>,
+        content: Vec<Block>,
+    ) -> Self {
+        Self::of(BlockKind::SearchResult {
+            source: source.into(),
+            title: title.into(),
+            content,
+            citations: None,
         })
     }
 
@@ -375,6 +464,117 @@ pub enum BlockKind {
         /// The text. Empty at a block's start; the words arrive as deltas.
         #[serde(default)]
         text: String,
+        /// Citations attached to the text — sent by a caller that knows where
+        /// its words came from, and read back from an answer that cited its.
+        /// Carried as it arrives: the citation shapes are the endpoint's, and a
+        /// reader that wants them has the whole object.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        citations: Option<Value>,
+    },
+    /// A document the model may read, which on this wire means a PDF as often
+    /// as it means text.
+    Document {
+        /// Where the document is, and what kind of thing it is.
+        source: DocumentSource,
+        /// What to call it, for an answer that refers to it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// What the caller says it is, which is context the model reads.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<String>,
+        /// Whether the answer may cite it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        citations: Option<CitationsConfig>,
+    },
+    /// A result a caller wants citable: a document-like block whose text the
+    /// model may quote with a citation.
+    SearchResult {
+        /// Where the result came from.
+        source: String,
+        /// What to call it.
+        title: String,
+        /// The result's own text, as blocks.
+        content: Vec<Block>,
+        /// Whether the answer may cite it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        citations: Option<CitationsConfig>,
+    },
+    /// A tool the *endpoint* ran, on the answer's side of the conversation.
+    ServerToolUse {
+        /// The id the endpoint gave the call.
+        id: String,
+        /// The tool's name: `web_search`, `code_execution`, and so on.
+        #[serde(default)]
+        name: String,
+        /// The call's arguments.
+        #[serde(default = "empty_object")]
+        input: Value,
+        /// Who ran it, when the endpoint says: `direct`, or another tool that
+        /// did. Carried as it arrives.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<Value>,
+    },
+    /// What a server tool produced. The result-or-error union inside is carried
+    /// as it arrives: it is the endpoint's own shape, and this crate cannot act
+    /// on one either way.
+    WebSearchToolResult {
+        /// The call this answers.
+        tool_use_id: String,
+        /// The results, or the error that stands in for them.
+        #[serde(default)]
+        content: Value,
+        /// Who ran it, when the endpoint says.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<Value>,
+    },
+    /// What web fetch produced, in the same shape.
+    WebFetchToolResult {
+        /// The call this answers.
+        tool_use_id: String,
+        /// The result, or the error that stands in for it.
+        #[serde(default)]
+        content: Value,
+        /// Who ran it, when the endpoint says.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<Value>,
+    },
+    /// What code execution produced, in the same shape.
+    CodeExecutionToolResult {
+        /// The call this answers.
+        tool_use_id: String,
+        /// The result, or the error that stands in for it.
+        #[serde(default)]
+        content: Value,
+    },
+    /// What a bash call the endpoint ran produced.
+    BashCodeExecutionToolResult {
+        /// The call this answers.
+        tool_use_id: String,
+        /// The result, or the error that stands in for it.
+        #[serde(default)]
+        content: Value,
+    },
+    /// What a text-editor call the endpoint ran produced.
+    TextEditorCodeExecutionToolResult {
+        /// The call this answers.
+        tool_use_id: String,
+        /// The result, or the error that stands in for it.
+        #[serde(default)]
+        content: Value,
+    },
+    /// What a tool search produced.
+    ToolSearchToolResult {
+        /// The call this answers.
+        tool_use_id: String,
+        /// The result, or the error that stands in for it.
+        #[serde(default)]
+        content: Value,
+    },
+    /// A file the endpoint put in its own container.
+    ContainerUpload {
+        /// The file, by the id the endpoint gave it.
+        #[serde(default)]
+        file_id: String,
     },
     /// An image.
     Image {
@@ -459,6 +659,64 @@ fn empty_object() -> Value {
     Value::Object(serde_json::Map::new())
 }
 
+/// Where a document block reads its document.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DocumentSource {
+    /// A PDF, base64-encoded.
+    Base64 {
+        /// The document's media type. `application/pdf`, the only one.
+        media_type: String,
+        /// The base64 payload.
+        data: String,
+    },
+    /// Plain text, sent as a document. The wire's own word for it is `text`,
+    /// which is what the variant is renamed to: a document written as
+    /// `plain_text` is a document the endpoint refuses.
+    #[serde(rename = "text")]
+    PlainText {
+        /// The document's media type. `text/plain`, the only one.
+        media_type: String,
+        /// The text itself.
+        data: String,
+    },
+    /// A document built from content blocks, so that a caller can hand over
+    /// text it has already shaped.
+    Content {
+        /// The blocks, as a string or an array of text blocks.
+        content: Value,
+    },
+    /// A PDF the endpoint fetches.
+    Url {
+        /// Where the document is.
+        url: String,
+    },
+    /// A file the endpoint already has.
+    File {
+        /// The file's id, from the Files API.
+        file_id: String,
+    },
+}
+
+/// Whether the answer may cite a block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CitationsConfig {
+    /// Whether citations are on for this block.
+    pub enabled: bool,
+}
+
+impl CitationsConfig {
+    /// Citations on.
+    pub fn enabled() -> Self {
+        Self { enabled: true }
+    }
+
+    /// Citations off.
+    pub fn disabled() -> Self {
+        Self { enabled: false }
+    }
+}
+
 /// Where an image block reads its picture. A `data:` URL's bytes are split out
 /// by the caller; the endpoint takes either form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -482,7 +740,33 @@ pub enum ImageSource {
 // Tools
 // ============================================================================
 
-/// A tool the model may call.
+/// A tool in a request: one the caller runs, or one the endpoint does.
+///
+/// The two are told apart by shape rather than by a tag, as they are on the
+/// wire: a tool of the caller's own carries the schema its arguments must
+/// satisfy, and a tool of the endpoint's does not.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ToolUnion {
+    /// A tool this program runs when the model calls it.
+    Client(Tool),
+    /// A tool the endpoint runs, and whose result arrives as a block.
+    Server(ServerTool),
+}
+
+impl From<Tool> for ToolUnion {
+    fn from(tool: Tool) -> Self {
+        ToolUnion::Client(tool)
+    }
+}
+
+impl From<ServerTool> for ToolUnion {
+    fn from(tool: ServerTool) -> Self {
+        ToolUnion::Server(tool)
+    }
+}
+
+/// A tool the model may call, which the caller runs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tool {
     /// The tool's name, matching `^[a-zA-Z0-9_-]{1,128}$`.
@@ -493,6 +777,10 @@ pub struct Tool {
     pub description: Option<String>,
     /// The JSON schema of the arguments the model may produce.
     pub input_schema: Value,
+    /// The kind of tool. One value is defined, `custom`, and omitting it means
+    /// the same thing.
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
     /// Example argument objects, to show the shape rather than describe it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_examples: Option<Vec<Value>>,
@@ -500,10 +788,152 @@ pub struct Tool {
     /// schema rather than merely asking for them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
+    /// Who may call this tool: `direct` for the model, or another tool. Sent as
+    /// the endpoint spells it, because a value this crate has no word for must
+    /// still be sendable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_callers: Option<Vec<String>>,
+    /// Whether the definition is held back until a tool search finds it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defer_loading: Option<bool>,
+    /// Whether the call's arguments stream as they are written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eager_input_streaming: Option<bool>,
     /// A cache breakpoint after this tool definition — where a long tool list
     /// belongs, since it is the same bytes on every request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
+}
+
+/// A tool the *endpoint* runs: web search, code execution, and the rest.
+///
+/// One type for the whole family, because that is what the wire has — a
+/// `type` naming a tool and a dated version (`web_search_20260318`), plus the
+/// fields that version happens to take. The constructors name the current
+/// versions; a caller with a version this crate has never heard of writes the
+/// string itself, and a field it does not model goes out through
+/// [`ServerTool::unmodelled`] rather than being refused.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServerTool {
+    /// What the tool is, with the version the endpoint dates it to.
+    #[serde(rename = "type")]
+    pub r#type: String,
+    /// The tool's own name, where the endpoint expects one (`web_search`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// What it does, for a tool the endpoint does not otherwise describe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The schema of the arguments, for a server tool that takes a caller's
+    /// own shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<Value>,
+    /// How many times the model may call it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<u32>,
+    /// Only these domains may be searched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
+    /// These domains may not be searched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_domains: Option<Vec<String>>,
+    /// Where the caller is, for a search that means something by it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_location: Option<Value>,
+    /// Whether the results come back in the answer at all, or only their effect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_inclusion: Option<String>,
+    /// Whether the endpoint constrains arguments to the schema.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+    /// Who may call it. Sent as the endpoint spells it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_callers: Option<Vec<String>>,
+    /// Whether the definition is held back until a tool search finds it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defer_loading: Option<bool>,
+    /// A cache breakpoint after it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+    /// Fields this crate does not model, sent and read as they are. What keeps
+    /// "any tool the endpoint serves" true for a version that added one.
+    #[serde(flatten)]
+    pub unmodelled: serde_json::Map<String, Value>,
+}
+
+impl ServerTool {
+    /// A tool the endpoint runs, named by its dated type.
+    pub fn of_type(r#type: impl Into<String>) -> Self {
+        Self {
+            r#type: r#type.into(),
+            name: None,
+            description: None,
+            input_schema: None,
+            max_uses: None,
+            allowed_domains: None,
+            blocked_domains: None,
+            user_location: None,
+            response_inclusion: None,
+            strict: None,
+            allowed_callers: None,
+            defer_loading: None,
+            cache_control: None,
+            unmodelled: serde_json::Map::new(),
+        }
+    }
+
+    /// The endpoint searches the web for the model.
+    pub fn web_search() -> Self {
+        Self::of_type("web_search_20260318").named("web_search")
+    }
+
+    /// The endpoint fetches a page for the model.
+    pub fn web_fetch() -> Self {
+        Self::of_type("web_fetch_20260318").named("web_fetch")
+    }
+
+    /// The endpoint runs code in its own sandbox.
+    pub fn code_execution() -> Self {
+        Self::of_type("code_execution_20260521")
+    }
+
+    /// The endpoint runs shell commands in its own sandbox.
+    pub fn bash() -> Self {
+        Self::of_type("bash_20250124").named("bash")
+    }
+
+    /// The endpoint edits files in its own sandbox.
+    pub fn text_editor() -> Self {
+        Self::of_type("text_editor_20250728").named("str_replace_based_edit_tool")
+    }
+
+    /// The model searches the tool list before it is given every definition.
+    pub fn tool_search() -> Self {
+        Self::of_type("tool_search_tool_regex_20251119").named("tool_search_tool_regex")
+    }
+
+    fn named(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// How many times the model may call it.
+    pub fn with_max_uses(mut self, max_uses: u32) -> Self {
+        self.max_uses = Some(max_uses);
+        self
+    }
+
+    /// Only these domains may be searched.
+    pub fn with_allowed_domains(mut self, domains: Vec<String>) -> Self {
+        self.allowed_domains = Some(domains);
+        self
+    }
+
+    /// A cache breakpoint after it.
+    pub fn with_cache_control(mut self, cache_control: CacheControl) -> Self {
+        self.cache_control = Some(cache_control);
+        self
+    }
 }
 
 impl Tool {
@@ -517,8 +947,12 @@ impl Tool {
             name: name.into(),
             description: Some(description.into()),
             input_schema,
+            r#type: None,
             input_examples: None,
             strict: None,
+            allowed_callers: None,
+            defer_loading: None,
+            eager_input_streaming: None,
             cache_control: None,
         }
     }
@@ -652,12 +1086,38 @@ pub enum ThinkingDisplay {
     Omitted,
 }
 
-/// `output_config`: how hard the model works on this request.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// `output_config`: how hard the model works on this request, and what shape
+/// the answer takes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OutputConfig {
     /// The level. Absent leaves the model's own default in force.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
+    /// A schema the answer must be valid against. The schema is carried as it
+    /// is written: it is a JSON Schema, and this crate has no business
+    /// interpreting one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<JsonOutputFormat>,
+}
+
+/// A schema the answer is constrained to, for a caller that wants to read the
+/// answer as data rather than as prose.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JsonOutputFormat {
+    /// The kind of format. One value is defined: `json_schema`.
+    pub r#type: String,
+    /// The schema itself, as JSON Schema.
+    pub schema: Value,
+}
+
+impl JsonOutputFormat {
+    /// A JSON Schema the answer must satisfy.
+    pub fn json_schema(schema: Value) -> Self {
+        Self {
+            r#type: "json_schema".into(),
+            schema,
+        }
+    }
 }
 
 /// How many tokens the model is willing to spend on the answer, thinking
@@ -817,10 +1277,14 @@ pub struct Message {
     /// The stop sequence that ended it, when one did.
     #[serde(default)]
     pub stop_sequence: Option<String>,
-    /// What the endpoint attached to a refusal, carried through unread — the
-    /// same shape the `message_delta` of a stream carries.
+    /// What the endpoint attached to a refusal — the same shape the
+    /// `message_delta` of a stream carries.
     #[serde(default)]
-    pub stop_details: Option<Value>,
+    pub stop_details: Option<StopDetails>,
+    /// The container the answer ran in, when it ran in one. Carried: it is the
+    /// endpoint's state, and a caller that asked for it has the id.
+    #[serde(default)]
+    pub container: Option<Value>,
     /// The token counts. On a stream this is the `message_start` report, which
     /// is not the whole story — see [`Usage`].
     #[serde(default)]
@@ -936,6 +1400,20 @@ pub struct Usage {
     /// The region the request was processed in.
     #[serde(default)]
     pub inference_geo: Option<String>,
+    /// How many requests the endpoint's own tools made.
+    #[serde(default)]
+    pub server_tool_use: Option<ServerToolUsage>,
+}
+
+/// What the endpoint's own tools did on this request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct ServerToolUsage {
+    /// How many pages the endpoint fetched for the model.
+    #[serde(default)]
+    pub web_fetch_requests: u64,
+    /// How many searches the endpoint ran for the model.
+    #[serde(default)]
+    pub web_search_requests: u64,
 }
 
 /// The cache writes of one request, by entry lifetime.
@@ -981,6 +1459,7 @@ impl Usage {
             output_tokens_details,
             service_tier,
             inference_geo,
+            server_tool_use,
         );
     }
 
@@ -1095,10 +1574,28 @@ pub struct MessageDeltaBody {
     /// The stop sequence that ended it.
     #[serde(default)]
     pub stop_sequence: Option<String>,
-    /// Anything else the endpoint attached to the stop reason, carried through
-    /// unread.
+    /// What the endpoint attached to the stop reason.
     #[serde(default)]
-    pub stop_details: Option<Value>,
+    pub stop_details: Option<StopDetails>,
+    /// The container the answer ran in, when the endpoint says.
+    #[serde(default)]
+    pub container: Option<Value>,
+}
+
+/// What the endpoint said about why it stopped, beyond the reason itself — a
+/// refusal's category and its explanation.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct StopDetails {
+    /// The kind of detail. One value is defined: `refusal`.
+    #[serde(rename = "type")]
+    pub r#type: String,
+    /// How the refusal was classified, when the endpoint classified it. Sent as
+    /// it arrives: a category this crate has no word for is not a parse error.
+    #[serde(default)]
+    pub category: Option<String>,
+    /// The endpoint's own words about it.
+    #[serde(default)]
+    pub explanation: Option<String>,
 }
 
 /// What a `content_block_delta` added to its block.
@@ -1191,7 +1688,7 @@ mod tests {
         )
         .streaming()
         .with_system("system prompt")
-        .with_tools(vec![Tool::new(
+        .with_client_tools(vec![Tool::new(
             "Read",
             "read a file",
             json!({"type": "object"}),
@@ -1381,10 +1878,189 @@ mod tests {
         assert_eq!(json_of(&OutputConfig::default()), json!({}));
         assert_eq!(
             json_of(&OutputConfig {
-                effort: Some(Effort::Max)
+                effort: Some(Effort::Max),
+                format: None,
             }),
             json!({"effort": "max"})
         );
+    }
+
+    #[test]
+    fn a_tool_the_endpoint_runs_is_written_the_way_it_is_asked_for() {
+        // Both kinds of tool ride in one list, told apart by shape: the
+        // caller's carries the schema its arguments must satisfy, the
+        // endpoint's does not.
+        let request = MessagesRequest::new("m", 1, vec![]).with_tools(vec![
+            Tool::new("Read", "read a file", json!({"type": "object"})).into(),
+            ServerTool::web_search().with_max_uses(5).into(),
+        ]);
+        assert_eq!(
+            json_of(&request)["tools"],
+            json!([
+                {"name": "Read", "description": "read a file", "input_schema": {"type": "object"}},
+                {"type": "web_search_20260318", "name": "web_search", "max_uses": 5},
+            ])
+        );
+        // And a field this crate does not model is still sendable: what keeps
+        // "any tool the endpoint serves" true for a version that added one.
+        let mut future = ServerTool::of_type("invented_tool_20270101");
+        future
+            .unmodelled
+            .insert("brand_new_knob".into(), json!(true));
+        let request = MessagesRequest::new("m", 1, vec![]).with_tools(vec![future.into()]);
+        assert_eq!(
+            json_of(&request)["tools"],
+            json!([{"type": "invented_tool_20270101", "brand_new_knob": true}])
+        );
+    }
+
+    #[test]
+    fn a_document_says_where_it_is_in_the_way_that_place_has() {
+        for (source, spelled) in [
+            (
+                DocumentSource::Base64 {
+                    media_type: "application/pdf".into(),
+                    data: "JVBERi0=".into(),
+                },
+                json!({"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}),
+            ),
+            (
+                DocumentSource::PlainText {
+                    media_type: "text/plain".into(),
+                    data: "the notes".into(),
+                },
+                json!({"type": "text", "media_type": "text/plain", "data": "the notes"}),
+            ),
+            (
+                DocumentSource::Url {
+                    url: "https://x/y.pdf".into(),
+                },
+                json!({"type": "url", "url": "https://x/y.pdf"}),
+            ),
+            (
+                DocumentSource::File {
+                    file_id: "file_1".into(),
+                },
+                json!({"type": "file", "file_id": "file_1"}),
+            ),
+            (
+                DocumentSource::Content {
+                    content: json!("already shaped"),
+                },
+                json!({"type": "content", "content": "already shaped"}),
+            ),
+        ] {
+            assert_eq!(json_of(&Block::document(source)), {
+                let mut block = json!({"type": "document", "source": spelled});
+                block["source"] = spelled;
+                block
+            });
+        }
+        // A document may be titled, given context, and opened to citations.
+        let mut block = Block::document(DocumentSource::File {
+            file_id: "f1".into(),
+        });
+        if let BlockKind::Document {
+            title,
+            context,
+            citations,
+            ..
+        } = &mut block.kind
+        {
+            *title = Some("the spec".into());
+            *context = Some("what we agreed".into());
+            *citations = Some(CitationsConfig::enabled());
+        }
+        let v = json_of(&block);
+        assert_eq!(v["title"], json!("the spec"));
+        assert_eq!(v["context"], json!("what we agreed"));
+        assert_eq!(v["citations"], json!({"enabled": true}));
+    }
+
+    #[test]
+    fn a_search_result_carries_the_text_it_may_be_cited_for() {
+        let block = Block::search_result("docs", "the manual", vec![Block::text("turn it off")]);
+        assert_eq!(
+            json_of(&block),
+            json!({
+                "type": "search_result",
+                "source": "docs",
+                "title": "the manual",
+                "content": [{"type": "text", "text": "turn it off"}],
+            })
+        );
+    }
+
+    #[test]
+    fn a_container_is_named_or_described() {
+        let by_id =
+            MessagesRequest::new("m", 1, vec![]).with_container(ContainerParam::Id("c1".into()));
+        assert_eq!(json_of(&by_id)["container"], json!("c1"));
+
+        let described = MessagesRequest::new("m", 1, vec![]).with_container(
+            ContainerParam::Config(ContainerConfig {
+                id: None,
+                skills: Some(vec![SkillParam {
+                    skill_id: "skill_1".into(),
+                    r#type: "anthropic".into(),
+                    version: "1".into(),
+                }]),
+            }),
+        );
+        assert_eq!(
+            json_of(&described)["container"],
+            json!({"skills": [{"skill_id": "skill_1", "type": "anthropic", "version": "1"}]})
+        );
+    }
+
+    #[test]
+    fn an_answer_can_be_asked_for_as_data() {
+        let request =
+            MessagesRequest::new("m", 1, vec![]).with_format(JsonOutputFormat::json_schema(
+                json!({"type": "object", "properties": {"answer": {"type": "string"}}}),
+            ));
+        assert_eq!(
+            json_of(&request)["output_config"],
+            json!({"format": {"type": "json_schema",
+                "schema": {"type": "object", "properties": {"answer": {"type": "string"}}}}})
+        );
+        // And the two fields of `output_config` are independent: asking for a
+        // shape does not throw away the effort a caller already set.
+        let both = request.with_effort(Effort::Low);
+        assert_eq!(
+            json_of(&both)["output_config"]["effort"],
+            json!("low"),
+            "the level survives asking for a shape"
+        );
+    }
+
+    #[test]
+    fn a_refusal_says_how_it_was_classified() {
+        let message: Message = serde_json::from_str(
+            r#"{"id":"m","stop_reason":"refusal","stop_details":
+                {"type":"refusal","category":"cyber","explanation":"asked for an exploit"},
+                "usage":{"input_tokens":1,"output_tokens":2,
+                         "server_tool_use":{"web_search_requests":2,"web_fetch_requests":1}}}"#,
+        )
+        .unwrap();
+        assert_eq!(message.stop_reason, Some(StopReason::Refusal));
+        let details = message.stop_details.expect("the details came with it");
+        assert_eq!(details.r#type, "refusal");
+        assert_eq!(details.category.as_deref(), Some("cyber"));
+        assert_eq!(details.explanation.as_deref(), Some("asked for an exploit"));
+        // And what the endpoint's own tools cost is part of the usage.
+        assert_eq!(
+            message.usage.server_tool_use,
+            Some(ServerToolUsage {
+                web_search_requests: 2,
+                web_fetch_requests: 1,
+            })
+        );
+        // A category this crate has no word for is not a parse error: it is the
+        // endpoint's classification, carried.
+        let future: StopDetails =
+            serde_json::from_str(r#"{"type":"refusal","category":"invented"}"#).unwrap();
+        assert_eq!(future.category.as_deref(), Some("invented"));
     }
 
     #[test]
@@ -1510,9 +2186,12 @@ mod tests {
     // --------------------------------------------------------------- response
 
     #[test]
-    fn a_message_parses_with_fields_this_crate_does_not_model() {
-        // The spec reserves the right to add to an object; a reader that fails
-        // on the addition is a reader that breaks on the endpoint's release.
+    fn a_message_parses_with_the_idle_fields_and_the_constants_around_them() {
+        // The spec reserves the right to add to an object, and an object carries
+        // fields that say nothing a reader needs: `type` and `role` here are
+        // constants of a message, and ignoring them is what reading them as
+        // optional is for. A field that says something — the container — is
+        // carried.
         let message: Message = serde_json::from_str(
             r#"{
                 "id": "msg_1",
@@ -1532,6 +2211,11 @@ mod tests {
         assert_eq!(message.content, vec![Block::text("hi")]);
         assert_eq!(message.stop_reason, Some(StopReason::EndTurn));
         assert_eq!(message.stop_details, None, "absent is absent");
+        assert_eq!(
+            message.container,
+            Some(json!({"id": "c1"})),
+            "the container the answer ran in is carried, not dropped"
+        );
         assert_eq!(message.usage.input_tokens, Some(5));
         assert_eq!(message.usage.output_tokens, Some(2));
     }
@@ -1540,7 +2224,7 @@ mod tests {
     fn a_response_block_kind_this_crate_does_not_model_does_not_fail_the_message() {
         let message: Message = serde_json::from_str(
             r#"{"id":"m","content":[
-                {"type":"server_tool_use","id":"s1","name":"web_search","input":{}},
+                {"type":"invented_later_20270101","id":"s1","thing":{"deep":true}},
                 {"type":"text","text":"after"}
             ]}"#,
         )
@@ -1553,13 +2237,64 @@ mod tests {
         assert_eq!(unknown.kind, BlockKind::Unknown);
         assert_eq!(
             unknown.unmodelled,
-            Some(json!({"type":"server_tool_use","id":"s1","name":"web_search","input":{}}))
+            Some(json!({"type":"invented_later_20270101","id":"s1","thing":{"deep":true}}))
         );
         assert_eq!(message.content[1], Block::text("after"));
         assert_eq!(
             message.content[1].unmodelled, None,
             "a block whose kind is known keeps nothing beside it"
         );
+    }
+
+    #[test]
+    fn a_block_the_endpoint_ran_is_read_as_its_own_kind() {
+        // The server tools a caller may hand the model: their calls and their
+        // results are blocks of the answer, and reading them as unknown ones
+        // would be losing the fact that they ran at all.
+        let message: Message = serde_json::from_str(
+            r#"{"id":"m","content":[
+                {"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"rust"}},
+                {"type":"web_search_tool_result","tool_use_id":"srvtoolu_1",
+                 "content":[{"type":"web_search_result","title":"Rust","url":"https://rust-lang.org",
+                             "encrypted_content":"…"}]},
+                {"type":"container_upload","file_id":"file_1"}
+            ]}"#,
+        )
+        .expect("an answer from a server tool parses");
+        assert_eq!(
+            message.content[0].kind,
+            BlockKind::ServerToolUse {
+                id: "srvtoolu_1".into(),
+                name: "web_search".into(),
+                input: json!({"query": "rust"}),
+                caller: None,
+            }
+        );
+        match &message.content[1].kind {
+            BlockKind::WebSearchToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "srvtoolu_1");
+                // The result-or-error union inside is carried as it arrived:
+                // reading it is the endpoint's business, not this crate's.
+                assert_eq!(content[0]["title"], json!("Rust"));
+            }
+            other => panic!("expected a web search result, got {other:?}"),
+        }
+        assert_eq!(
+            message.content[2].kind,
+            BlockKind::ContainerUpload {
+                file_id: "file_1".into()
+            }
+        );
+        for block in &message.content {
+            assert_eq!(
+                block.unmodelled, None,
+                "a kind this crate knows keeps nothing"
+            );
+        }
     }
 
     #[test]
@@ -1756,6 +2491,7 @@ mod tests {
                     stop_reason: None,
                     stop_sequence: None,
                     stop_details: None,
+                    container: None,
                     usage: Usage {
                         input_tokens: Some(100),
                         output_tokens: Some(1),
@@ -1794,6 +2530,7 @@ mod tests {
                     stop_reason: Some(StopReason::ToolUse),
                     stop_sequence: None,
                     stop_details: None,
+                    container: None,
                 },
                 usage: Some(Usage {
                     output_tokens: Some(89),
