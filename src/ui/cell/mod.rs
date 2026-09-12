@@ -92,9 +92,6 @@ pub struct DiffLine {
 
 /// What a line of a change is.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // the `Context` and `Hunk` variants are emitted by the new unified-diff
-// algorithm, which is wired into `diff_lines` in the follow-up commit; the
-// production `diff_lines` is unchanged in this commit
 pub enum DiffKind {
     /// A line the call takes out.
     Removed,

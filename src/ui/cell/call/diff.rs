@@ -1,49 +1,12 @@
-//! What a tool call shows: the argument summary and the change it makes.
+//! The change a call makes, as a real unified diff.
 //!
-//! These are the only pieces of a tool call that are derived from the wire
-//! format the model sent -- the name and the call itself are already in the
-//! arguments. Everything in here is *projection*, not interpretation: a call
-//! whose arguments cannot be parsed is still a call, just one with nothing to
-//! show.
-//!
-//! Kept out of [`Cell`] on purpose: a [`Cell::ToolCall`] is a value, and these
-//! helpers are how the cell is built from the raw arguments. The argument
-//! vocabulary belongs to the tools, not to the cell model, and moving it
-//! here means the cell never has to know what shape a Bash call's JSON is.
+//! The arguments are the wire format of a tool call, which is also what replay
+//! reads out of the session log, so live and replayed turns show the same lines
+//! without a second source for either one. The change is an LCS walk
+//! ([`diff_ops`]) folded into hunks ([`to_hunks`]) and read through
+//! [`diff_lines`].
 
-use crate::ui::cell::{DiffKind, DiffLine, Style};
-use crate::ui::text;
-
-/// The argument summary shown for a tool call: the interesting argument when the
-/// call carries one, otherwise the raw arguments clipped to one line's worth of
-/// columns.
-///
-/// A glob call is the one whose interesting arguments are not `command` or
-/// `file_path`: the pattern is the question and the directory is where it is
-/// asked, and both are shown, because a pattern asked of the wrong tree is the
-/// one thing about the call a reader can catch before it runs.
-pub(super) fn hint(args: &str) -> String {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
-        return text::truncate(args, HINT_COLUMNS).to_owned();
-    };
-    if let Some(named) = v
-        .get("command")
-        .or_else(|| v.get("file_path"))
-        .and_then(|c| c.as_str())
-    {
-        return named.to_owned();
-    }
-    if let Some(pattern) = v.get("pattern").and_then(|p| p.as_str()) {
-        return match v.get("path").and_then(|p| p.as_str()) {
-            Some(dir) => format!("{pattern} in {dir}"),
-            None => pattern.to_owned(),
-        };
-    }
-    text::truncate(args, HINT_COLUMNS).to_owned()
-}
-
-/// Columns of raw arguments kept when they cannot be summarized by name.
-const HINT_COLUMNS: usize = 80;
+use crate::ui::cell::{DiffKind, DiffLine};
 
 /// The change a call makes, for the calls that make one.
 ///
@@ -53,123 +16,9 @@ const HINT_COLUMNS: usize = 80;
 /// change is a real unified diff: a `@@ -A,B +C,D @@` hunk header, the
 /// lines of context and change below it, and an `Omitted(N)` line at the
 /// end of a long change. The algorithm is in [`unified_diff_lines`].
-pub(super) fn diff_lines(name: &str, args: &str) -> Vec<DiffLine> {
+pub(crate) fn diff_lines(name: &str, args: &str) -> Vec<DiffLine> {
     unified_diff_lines(name, args)
 }
-
-/// One line of a result summary, what the transcript says about a tool
-/// returning. The text is the first interesting line and the size is the
-/// bytes -- the result the model reads is the whole result, but the line
-/// the reader sees is the shape of it, and the shape of "1234 bytes of
-/// `error: cannot read /etc/shadow`" is the file the call asked for, not
-/// the third stack frame.
-///
-/// Each tool's success message starts with a prefix that names it, so the
-/// dispatch is by the result text alone: Bash says `exit_code:`, Write
-/// says `ok: wrote`, Edit says `ok: replaced`, and a failure in any tool
-/// says `error:`. A reader who does not recognize the prefix sees the
-/// default: the first line and the byte count.
-///
-/// The text is what the cell paints, the style is the color the front end
-/// reaches for. Two values because one function returns both: the cell
-/// always carries the result string, the style is a label the front end
-/// maps to its own palette.
-pub(super) fn result_summary(result: &str) -> (Style, String) {
-    // A failure is a failure in every tool: the text starts with `error:`,
-    // the style is the one reserved for it, and the per-prefix parsing
-    // stops here. The body of the message is the part after the prefix,
-    // trimmed, so `error:  cannot read /etc/shadow` reads as
-    // `error: cannot read /etc/shadow`.
-    if let Some(rest) = result.strip_prefix("error:") {
-        return (Style::Red, format!("error: {}", rest.trim_start()));
-    }
-    if let Some(code) = bash_exit_code(result) {
-        return bash_summary(code);
-    }
-    if let Some(line) = write_summary(result) {
-        return (Style::Dim, line);
-    }
-    if let Some(line) = edit_summary(result) {
-        return (Style::Dim, line);
-    }
-    default_summary(result)
-}
-
-/// The exit code at the head of a Bash result, if the result is a Bash
-/// result. The line is `exit_code: N` and the parsing stops if it does not
-/// parse as an integer -- a tool that put `exit_code: foo` in its result
-/// is not Bash, and the default summary is the right thing to fall back
-/// to.
-fn bash_exit_code(result: &str) -> Option<i64> {
-    result
-        .lines()
-        .next()
-        .and_then(|line| line.strip_prefix("exit_code:"))
-        .and_then(|n| n.trim().parse::<i64>().ok())
-}
-
-/// The Bash summary once we know the exit code: just `exit_code: N`.
-///
-/// The first line of stdout is *not* shown, even though it would tell a
-/// reader what the command produced: the result is what the model reads,
-/// and a Bash result can carry anything in stdout -- a secret, a path the
-/// user did not consent to be in the transcript. The transcript's rule is
-/// that the summary is metadata, never the result's content; the size of
-/// the result has the same problem at a smaller scale, and is dropped
-/// for the same reason. The exit code is the whole of it.
-fn bash_summary(code: i64) -> (Style, String) {
-    (Style::Dim, format!("exit_code: {code}"))
-}
-
-/// The first interesting line of a Write result, or `None` when the
-/// result is not a Write success. The two Write successes are
-/// `ok: wrote PATH (N bytes)` and
-/// `ok: PATH already has exactly this content (N bytes); left unchanged`,
-/// and they differ in whether anything was written.
-fn write_summary(result: &str) -> Option<String> {
-    if let Some(rest) = result
-        .strip_prefix("ok: wrote ")
-        .and_then(|r| r.strip_suffix(')'))
-        && let Some((path, bytes)) = rest.rsplit_once(" (")
-    {
-        return Some(format!("wrote {path} · {bytes}"));
-    }
-    if let Some(rest) = result.strip_prefix("ok: ") {
-        // `PATH already has exactly this content (N bytes); left unchanged`
-        // The path is the text between `ok: ` and ` already`, the rest is
-        // a description of why the call did not need to do anything.
-        if let Some(boundary) = rest.find(" already has exactly this content") {
-            let path = &rest[..boundary];
-            return Some(format!("unchanged {path}"));
-        }
-    }
-    None
-}
-
-/// The first interesting line of an Edit result, or `None` when the
-/// result is not an Edit success. The success message names the path and
-/// the new size; that is what a reader wants, not the raw success line.
-fn edit_summary(result: &str) -> Option<String> {
-    let rest = result.strip_prefix("ok: replaced 1 occurrence; ")?;
-    let (path, bytes) = rest.rsplit_once(" is now ")?;
-    Some(format!("replaced in {path} · now {bytes}"))
-}
-
-/// The summary every other tool gets: the first line of the result and
-/// its byte count. A Read of a Cargo.toml shows `[package] · 312 bytes`;
-/// a Glob of `**/*.rs` shows the first match and the total bytes; that
-/// is the shape of the result, and the shape is what a reader can act on.
-fn default_summary(result: &str) -> (Style, String) {
-    (
-        Style::Dim,
-        format!(
-            "{} · {} bytes",
-            result.lines().next().unwrap_or(""),
-            result.len()
-        ),
-    )
-}
-
 /// The width above which the line-level diff falls back to showing the call's
 /// old and new strings verbatim: an LCS table is `O(m*n)` in memory, and a
 /// `Write` of a 1000-line file does not need a real diff, just a "what is
@@ -188,7 +37,7 @@ const DIFF_CONTEXT: usize = 3;
 /// The line cap a cell applies to the *displayed* change, regardless of how
 /// long the call's strings are. Past the cap, the rest is one `Omitted`
 /// line, the way a long diff was shown before this one.
-pub(super) const DIFF_DISPLAY_LINES: usize = 12;
+const DIFF_DISPLAY_LINES: usize = 12;
 
 /// The change a call makes, computed as a real unified diff.
 ///
@@ -197,7 +46,7 @@ pub(super) const DIFF_DISPLAY_LINES: usize = 12;
 /// [`str::lines`] -- a trailing newline is not its own line -- and a call
 /// whose `old_string` and `new_string` are equal comes back with no lines,
 /// because nothing changed.
-pub(super) fn unified_diff_lines(name: &str, args: &str) -> Vec<DiffLine> {
+pub(crate) fn unified_diff_lines(name: &str, args: &str) -> Vec<DiffLine> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
         return Vec::new();
     };
@@ -556,44 +405,17 @@ fn order_changes(raw: Vec<(Op, &str)>) -> Vec<(Op, &str)> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn hint_prefers_command_then_file_path() {
-        assert_eq!(hint(r#"{"command":"ls -la"}"#), "ls -la");
-        assert_eq!(hint(r#"{"file_path":"/a/b.txt"}"#), "/a/b.txt");
-        // command wins when both are present
-        assert_eq!(hint(r#"{"command":"ls","file_path":"/a"}"#), "ls");
+    /// A short label for a `DiffKind`, so a failing assertion can name the
+    /// variant it expected without re-implementing the `Debug` mapping.
+    fn label(kind: &DiffKind) -> &'static str {
+        match kind {
+            DiffKind::Removed => "remove",
+            DiffKind::Added => "add",
+            DiffKind::Context => "context",
+            DiffKind::Omitted(_) => "omitted",
+            DiffKind::Hunk { .. } => "hunk",
+        }
     }
-
-    /// A glob's line is what it asks for, and of where: the pattern alone when
-    /// the call takes the working directory, both when it names one.
-    #[test]
-    fn hint_reads_a_glob_as_the_question_it_is() {
-        assert_eq!(hint(r#"{"pattern":"**/*.rs"}"#), "**/*.rs");
-        assert_eq!(
-            hint(r#"{"pattern":"**/*.rs","path":"/a/src"}"#),
-            "**/*.rs in /a/src"
-        );
-    }
-
-    #[test]
-    fn hint_falls_back_to_clipped_raw_arguments() {
-        assert_eq!(hint("not json at all"), "not json at all");
-        assert_eq!(hint(r#"{"other":"x"}"#), r#"{"other":"x"}"#);
-        // a long raw argument is clipped to one line's worth of columns
-        let long = "x".repeat(HINT_COLUMNS + 40);
-        assert_eq!(hint(&long).chars().count(), HINT_COLUMNS);
-    }
-
-    #[test]
-    fn hint_clips_wide_characters_by_column() {
-        // 60 ideographs are 120 columns but only 60 chars; the clip keeps 40
-        let wide = "\u{6df1}".repeat(60);
-        let got = hint(&wide);
-        assert_eq!(crate::ui::text::width(&got), HINT_COLUMNS);
-        assert_eq!(got.chars().count(), HINT_COLUMNS / 2);
-    }
-
-    // ----- Unified diff ------------------------------------------------------
 
     /// `diff_ops` is the LCS walk. An empty side becomes a run of one op.
     #[test]
@@ -889,91 +711,5 @@ mod tests {
         assert!(unified_diff_lines("Bash", r#"{"command":"ls"}"#).is_empty());
         assert!(unified_diff_lines("Read", r#"{"file_path":"x"}"#).is_empty());
         assert!(unified_diff_lines("Edit", "not json at all").is_empty());
-    }
-
-    // ----- Result summary ---------------------------------------------------
-
-    /// A Bash result is just the exit code, dim. The first line of stdout
-    /// is content, and the transcript's rule is that the summary is metadata.
-    #[test]
-    fn result_summary_for_bash_is_just_the_exit_code() {
-        assert_eq!(
-            result_summary("exit_code: 0"),
-            (Style::Dim, "exit_code: 0".to_string())
-        );
-        assert_eq!(
-            result_summary("exit_code: 3\n--- stdout ---\nsecret"),
-            (Style::Dim, "exit_code: 3".to_string())
-        );
-        // Failed-to-start: a `127` with no stdout.
-        assert_eq!(
-            result_summary("exit_code: 127\n--- stderr ---\nfailed to start"),
-            (Style::Dim, "exit_code: 127".to_string())
-        );
-    }
-
-    /// A Write success: path and size. The path may contain spaces.
-    #[test]
-    fn result_summary_for_write_names_the_path_and_size() {
-        assert_eq!(
-            result_summary("ok: wrote /tmp/x.txt (42 bytes)"),
-            (Style::Dim, "wrote /tmp/x.txt · 42 bytes".to_string())
-        );
-        // An idempotent write -- nothing was written, but the path is.
-        assert_eq!(
-            result_summary(
-                "ok: /tmp/x.txt already has exactly this content (42 bytes); left unchanged"
-            ),
-            (Style::Dim, "unchanged /tmp/x.txt".to_string())
-        );
-    }
-
-    /// An Edit success: the path and the new size.
-    #[test]
-    fn result_summary_for_edit_names_the_path_and_new_size() {
-        assert_eq!(
-            result_summary("ok: replaced 1 occurrence; /tmp/x.rs is now 512 bytes"),
-            (
-                Style::Dim,
-                "replaced in /tmp/x.rs · now 512 bytes".to_string()
-            )
-        );
-    }
-
-    /// Any tool can fail; the failure is always red.
-    #[test]
-    fn result_summary_for_a_failure_is_red() {
-        let (style, text) = result_summary("error: file not found");
-        assert_eq!(style, Style::Red);
-        assert_eq!(text, "error: file not found");
-        // Whitespace after the prefix is trimmed.
-        let (style, text) = result_summary("error:   cannot read /etc/shadow");
-        assert_eq!(style, Style::Red);
-        assert_eq!(text, "error: cannot read /etc/shadow");
-    }
-
-    /// Read, Glob, TodoWrite, and other tools fall back to the default
-    /// summary: first line and byte count.
-    #[test]
-    fn result_summary_defaults_to_first_line_and_size() {
-        let (style, text) = result_summary("[package]\nname = \"caocli\"");
-        assert_eq!(style, Style::Dim);
-        assert_eq!(text, "[package] · 25 bytes");
-        // An empty result: empty first line, zero bytes.
-        let (style, text) = result_summary("");
-        assert_eq!(style, Style::Dim);
-        assert_eq!(text, " · 0 bytes");
-    }
-
-    /// A short label for a `DiffKind`, so a failing assertion can name the
-    /// variant it expected without re-implementing the `Debug` mapping.
-    fn label(kind: &DiffKind) -> &'static str {
-        match kind {
-            DiffKind::Removed => "remove",
-            DiffKind::Added => "add",
-            DiffKind::Context => "context",
-            DiffKind::Omitted(_) => "omitted",
-            DiffKind::Hunk { .. } => "hunk",
-        }
     }
 }
