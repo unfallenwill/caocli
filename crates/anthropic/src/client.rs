@@ -11,10 +11,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{Api, Error};
 use crate::stream::EventStream;
-use crate::types::{Message, MessagesRequest};
+use crate::types::{CountTokensRequest, CountTokensResponse, Message, MessagesRequest};
 
 /// The path the Messages API answers at, under a base URL.
 const MESSAGES_PATH: &str = "/v1/messages";
+
+/// The path a token count answers at, hung off the messages path: the count is
+/// about a prompt, and the prompt is what the messages path describes.
+const COUNT_TOKENS_PATH: &str = "/count_tokens";
 
 /// The API version this crate speaks. Requests name it — the header is
 /// required, and a request without one is refused rather than defaulted.
@@ -295,6 +299,47 @@ impl Client {
         .await
     }
 
+    /// How many tokens a prompt is, by the endpoint's own count.
+    ///
+    /// The count is the tokenizer's answer, not an estimate: useful before
+    /// sending something large, and the only way to see how much of a context
+    /// window a conversation is holding.
+    pub async fn count_tokens(&self, request: &MessagesRequest) -> Result<u64, Error> {
+        let body = self.body(&CountTokensRequest::of(request))?;
+        let endpoint = format!("{}{COUNT_TOKENS_PATH}", self.profile.endpoint);
+        let answer: CountTokensResponse = self
+            .retrying(|| async {
+                let response = self
+                    .http
+                    .post(&endpoint)
+                    .header("user-agent", USER_AGENT)
+                    .header("content-type", "application/json")
+                    .header("anthropic-version", &self.profile.api_version)
+                    .body(body.clone());
+                let response = match &self.profile.auth {
+                    Auth::Bearer(token) => response.bearer_auth(token),
+                    Auth::ApiKey(key) => response.header("x-api-key", key),
+                    Auth::None => response,
+                }
+                .send()
+                .await
+                .map_err(Error::Transport)?;
+                let status = response.status();
+                let headers = response.headers().clone();
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(Error::Api(refusal(status.as_u16(), &headers, body)));
+                }
+                let bytes = response.bytes().await.map_err(Error::Transport)?;
+                serde_json::from_slice(&bytes).map_err(|source| Error::Decode {
+                    what: "token count",
+                    source,
+                })
+            })
+            .await?;
+        Ok(answer.input_tokens)
+    }
+
     /// Run one attempt, and another one while the failure is worth another one.
     ///
     /// The schedule is the reference client's: the endpoint's own `retry-after`
@@ -352,7 +397,9 @@ impl Client {
         request
     }
 
-    fn body(&self, request: &MessagesRequest) -> Result<Vec<u8>, Error> {
+    /// A request's body, as the endpoint reads it. Generic over the request type
+    /// because a count is a request of its own shape.
+    fn body<T: serde::Serialize>(&self, request: &T) -> Result<Vec<u8>, Error> {
         serde_json::to_vec(request).map_err(|source| Error::Decode {
             what: "request",
             source,

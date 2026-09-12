@@ -1496,6 +1496,69 @@ impl Usage {
 }
 
 // ============================================================================
+// Counting a prompt
+// ============================================================================
+
+/// What a count request carries: the prompt, and nothing that would only matter
+/// to an answer.
+///
+/// Built from a message request by [`CountTokensRequest::of`], because the
+/// counting fields are a subset of the sending ones and a caller should not have
+/// to keep two requests in step by hand.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CountTokensRequest {
+    /// The model the prompt would be sent to: the tokenizer is its own.
+    pub model: String,
+    /// The conversation.
+    pub messages: Vec<MessageParam>,
+    /// The system prompt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system: Option<SystemPrompt>,
+    /// The tools the model would be given. Their definitions are prompt too.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolUnion>>,
+    /// How the model would choose among them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+    /// The thinking configuration, which the endpoint renders into the prompt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+    /// The output configuration, which the endpoint renders into the prompt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
+    /// The cache breakpoint, which does not change the count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+impl CountTokensRequest {
+    /// The counting half of a message request.
+    ///
+    /// `max_tokens` and `stream` are left out deliberately: neither is part of
+    /// a prompt, and an endpoint that refuses a field it does not know is a
+    /// reason to leave them out rather than to hope.
+    pub fn of(request: &MessagesRequest) -> Self {
+        Self {
+            model: request.model.clone(),
+            messages: request.messages.clone(),
+            system: request.system.clone(),
+            tools: request.tools.clone(),
+            tool_choice: request.tool_choice.clone(),
+            thinking: request.thinking.clone(),
+            output_config: request.output_config.clone(),
+            cache_control: request.cache_control,
+        }
+    }
+}
+
+/// How many tokens a prompt is, by the endpoint's own count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct CountTokensResponse {
+    /// The tokens the prompt would take.
+    pub input_tokens: u64,
+}
+
+// ============================================================================
 // The event stream
 // ============================================================================
 

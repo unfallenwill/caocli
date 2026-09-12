@@ -123,9 +123,9 @@ pub use error::{Api, Error, StreamError};
 pub use stream::EventStream;
 pub use types::{
     Block, BlockDelta, BlockKind, CacheControl, CacheCreation, CacheType, CitationsConfig,
-    ContainerConfig, ContainerParam, DocumentSource, Effort, Event, ImageSource, JsonOutputFormat,
-    Message, MessageContent, MessageDeltaBody, MessageParam, MessagesRequest, Metadata,
-    OutputConfig, OutputTokensDetails, Role, ServerTool, ServerToolUsage, SkillParam, StopDetails,
-    StopReason, SystemPrompt, ThinkingConfig, ThinkingDisplay, Tool, ToolChoice, ToolResultContent,
-    ToolUnion, Ttl, Usage,
+    ContainerConfig, ContainerParam, CountTokensRequest, CountTokensResponse, DocumentSource,
+    Effort, Event, ImageSource, JsonOutputFormat, Message, MessageContent, MessageDeltaBody,
+    MessageParam, MessagesRequest, Metadata, OutputConfig, OutputTokensDetails, Role, ServerTool,
+    ServerToolUsage, SkillParam, StopDetails, StopReason, SystemPrompt, ThinkingConfig,
+    ThinkingDisplay, Tool, ToolChoice, ToolResultContent, ToolUnion, Ttl, Usage,
 };
