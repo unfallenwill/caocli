@@ -44,7 +44,7 @@
 //! assert!(request.stream);
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -317,6 +317,14 @@ pub struct AssistantMessageParam {
     /// of the same role.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub name: Option<String>,
+    /// Extra fields to ship on this message — vendor extensions the SDK does
+    /// not name. The same asymmetric contract as
+    /// [`ChatCompletionRequest::extra_body`]: a key here must not also be a
+    /// typed field (serde panics on duplicates at serialize time); at
+    /// deserialize time the typed fields take priority, and a value the type
+    /// rejects is a parse error rather than a fallback to this map.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_body: BTreeMap<String, Value>,
 }
 
 impl AssistantMessageParam {
@@ -328,6 +336,7 @@ impl AssistantMessageParam {
             function_call: None,
             refusal: None,
             name: None,
+            extra_body: BTreeMap::new(),
         }
     }
 
@@ -339,12 +348,20 @@ impl AssistantMessageParam {
             function_call: None,
             refusal: None,
             name: None,
+            extra_body: BTreeMap::new(),
         }
     }
 
     /// Name this participant.
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
+        self
+    }
+
+    /// Add one entry to [`Self::extra_body`]. See that field for the
+    /// contract: a key here must not also be a typed field on this struct.
+    pub fn with_extra_body(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.extra_body.insert(key.into(), value.into());
         self
     }
 }
@@ -1443,6 +1460,34 @@ pub struct ChatCompletionRequest {
     /// Options for the streaming response, when `stream` is true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
+
+    /// Extra top-level fields to ship on the request body. For an
+    /// OpenAI-compatible backend that extends the spec with its own — the
+    /// DeepSeek-style `{"thinking":{"type":"enabled"}}`, a tier of
+    /// `reasoning_effort` outside the [`ReasoningEffort`] enum, or any other
+    /// vendor field — this is the seam: the caller hands in the JSON value
+    /// shaped like the field it wants, and the SDK ships it at the top
+    /// level as if it were its own.
+    ///
+    /// `BTreeMap` for sorted, deterministic output; the field is flattened
+    /// onto the request so its entries share the request's top level. The
+    /// **contract**:
+    ///
+    /// - **Serialize**: a key here must not also be a typed field on this
+    ///   struct — serde panics on duplicates. The caller who needs to
+    ///   override a typed field sends it through here and leaves the typed
+    ///   slot `None`.
+    /// - **Deserialize**: typed fields take priority. A key that has a typed
+    ///   slot (e.g. `reasoning_effort`) is matched against that slot's
+    ///   type, and a value the type does not accept is a deserialize
+    ///   error — it does not fall through to this map. Fields the struct
+    ///   does not name (e.g. `thinking`) do land here.
+    ///
+    /// In other words: this map is the serialize-side passthrough for any
+    /// field the SDK does not model, and the deserialize-side passthrough
+    /// for fields the SDK does not model *and* has no typed slot for.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_body: BTreeMap<String, Value>,
 }
 
 impl ChatCompletionRequest {
@@ -1486,6 +1531,7 @@ impl ChatCompletionRequest {
             metadata: None,
             stream: false,
             stream_options: None,
+            extra_body: BTreeMap::new(),
         }
     }
 
@@ -1722,6 +1768,13 @@ impl ChatCompletionRequest {
     pub fn with_stream_usage(mut self) -> Self {
         self.stream = true;
         self.stream_options = Some(StreamOptions::with_usage());
+        self
+    }
+
+    /// Add one entry to [`Self::extra_body`]. See that field for the
+    /// contract: the key must not also be a typed field on this struct.
+    pub fn with_extra_body(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.extra_body.insert(key.into(), value.into());
         self
     }
 }
@@ -2079,6 +2132,12 @@ pub struct ChoiceDelta {
     /// `function_call` form.
     #[serde(default)]
     pub function_call: Option<DeltaFunctionCall>,
+    /// Vendor fields the spec does not describe. DeepSeek and GLM stream the
+    /// model's reasoning under `reasoning_content`; the SDK does not name it
+    /// (it is not in the spec) and the caller who needs it reads it from
+    /// here.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
 }
 
 /// A tool call delta on a streamed chunk.
@@ -2168,6 +2227,12 @@ pub struct CompletionUsage {
     /// A breakdown of completion tokens, when the endpoint reports one.
     #[serde(default)]
     pub completion_tokens_details: Option<CompletionTokensDetails>,
+    /// Vendor fields the spec does not describe. DeepSeek reports
+    /// `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens` flat; the
+    /// SDK does not name them (they are not in the spec) and the caller
+    /// who needs them reads them from here.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
 }
 
 // ============================================================================
@@ -2280,6 +2345,34 @@ mod tests {
         // Back to itself: the wire form is the same shape the endpoint reads.
         let back: ChatCompletionRequest = serde_json::from_value(value).unwrap();
         assert_eq!(back, request);
+    }
+
+    /// Vendor fields the spec does not describe — DeepSeek's
+    /// `thinking` and an `extra_body` map keyed by field name — land at
+    /// the top level of the request body. The contract: a key here must
+    /// not also be a typed field, or serde panics on the duplicate.
+    #[test]
+    fn extra_body_flattens_to_the_request_top_level() {
+        let request = ChatCompletionRequest::streaming(
+            "deepseek-v4",
+            vec![ChatCompletionMessageParam::user("hi")],
+        )
+        .with_extra_body("thinking", json!({"type": "enabled"}));
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["thinking"], json!({"type": "enabled"}));
+        // `thinking` is not a typed field, so it round-trips through extra.
+        let back: ChatCompletionRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(back, request);
+    }
+
+    /// An empty `extra_body` is not written: a request that has nothing
+    /// vendor-specific carries no `extra_body` key on the wire.
+    #[test]
+    fn extra_body_skips_when_empty() {
+        let request = ChatCompletionRequest::new("gpt-4o", vec![]);
+        let value = serde_json::to_value(&request).unwrap();
+        assert!(value.get("extra_body").is_none(), "{value}");
+        assert!(value.as_object().unwrap().keys().all(|k| k != "extra_body"));
     }
 
     #[test]
@@ -2428,6 +2521,40 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(usage.prompt_tokens_details.unwrap().cached_tokens, Some(8));
+    }
+
+    /// DeepSeek reports `prompt_cache_hit_tokens` and
+    /// `prompt_cache_miss_tokens` flat on the usage block — not in any
+    /// typed slot. The passthrough catches them so a caller reading cache
+    /// hit/miss has them in `extra`.
+    #[test]
+    fn usage_extra_captures_deepseek_flat_cache_fields() {
+        let usage: CompletionUsage = serde_json::from_value(json!({
+            "prompt_tokens": 17,
+            "completion_tokens": 9,
+            "total_tokens": 26,
+            "prompt_cache_hit_tokens": 8,
+            "prompt_cache_miss_tokens": 9,
+        }))
+        .unwrap();
+        assert_eq!(usage.extra.get("prompt_cache_hit_tokens"), Some(&json!(8)));
+        assert_eq!(usage.extra.get("prompt_cache_miss_tokens"), Some(&json!(9)));
+    }
+
+    /// DeepSeek/GLM stream reasoning under `reasoning_content` on the
+    /// delta; the SDK does not name the field (it is not on the spec) and
+    /// the caller reads it from `extra`.
+    #[test]
+    fn delta_extra_captures_reasoning_content() {
+        let delta: ChoiceDelta = serde_json::from_value(json!({
+            "reasoning_content": "let me think…"
+        }))
+        .unwrap();
+        assert_eq!(
+            delta.extra.get("reasoning_content"),
+            Some(&json!("let me think…"))
+        );
+        assert!(delta.content.is_none());
     }
 
     #[test]
