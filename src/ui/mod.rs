@@ -1,4 +1,4 @@
-//! The plain front end, in its parts.
+//! The front ends, in their parts.
 //!
 //! Two of the parts are not about writing anything at all. `contract` is what
 //! every front end must offer the machine and the application -- it is the only
@@ -8,15 +8,23 @@
 //! from. Everything above that seam is arithmetic over those facts, which is why
 //! the decisions built on them are tested without one.
 //!
-//! The rest is what this front end writes: the `banner` a session opens with,
-//! the `cell`s the transcript is made of, the status line's `status` (what it
-//! says) and `status_bar` (where it goes), the `text` measurements both of them
-//! are laid out with, and `renderer`, which turns notifications into cells and
-//! writes them.
+//! Three layers write what a session shows:
 //!
-//! The front end that owns the whole screen lives in `tui`, next to this one
-//! rather than under it: the two are mutually exclusive, and neither is a
-//! fallback for the other at the level of a single line of output.
+//! - [`cell`](self::cell) holds the content: what a cell *is*, terminal-agnostic
+//!   data with a [`Style`](self::cell::Style) that is a label rather than an
+//!   escape sequence and a [`Gutter`](self::cell::Gutter) that names its own
+//!   columns. Cells know nothing about the wire or the screen.
+//! - [`paint`](self::paint) holds how a cell is *drawn*: pure functions that
+//!   take cells, spans and widths, and produce the terminal lines a front end
+//!   hands to its backend. The TUI uses this layer directly; the plain front
+//!   end writes its own bytes because leaving wrapping to the terminal is the
+//!   right thing for a stream with no fixed-width region.
+//! - The two front ends: the plain `renderer` that writes SGR to a `Write`,
+//!   and the full-screen `tui` front end with the input box, the standing
+//!   task list, the queue, and the question panel.
+//!
+//! The two front ends are mutually exclusive, and neither is a fallback for
+//! the other at the level of a single line of output.
 
 mod answers;
 mod banner;
@@ -24,6 +32,7 @@ mod cell;
 mod contract;
 #[cfg(test)]
 pub(crate) mod doubles;
+pub(crate) mod paint;
 mod renderer;
 mod status;
 mod status_bar;

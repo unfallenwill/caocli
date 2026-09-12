@@ -14,7 +14,7 @@ use crate::ui::cell::Cell;
 
 use super::super::input::IDLE_PLACEHOLDER;
 use super::super::layout::{
-    BOX_ROWS, PINNED_ROWS, TODO_HEADS, TODO_ROWS, screen_rows, todo_rows, todo_window,
+    BOX_ROWS, PINNED_ROWS, QUEUE_ROWS, TODO_HEADS, TODO_ROWS, screen_rows, todo_rows, todo_window,
 };
 use super::super::render;
 use super::super::state::{Scroll, State};
@@ -130,12 +130,12 @@ fn the_queue_is_capped_and_keeps_its_end() {
     // one of the rows the cap allows, so that three rows of a longer queue do
     // not read as the whole queue.
     let mut state = State::default();
-    for i in 0..(super::super::render::QUEUE_ROWS + 2) {
+    for i in 0..(QUEUE_ROWS + 2) {
         state.enqueue(format!("line {i}"));
     }
     assert_eq!(
         render::queue_lines(&state, 40).len(),
-        super::super::render::QUEUE_ROWS,
+        QUEUE_ROWS,
         "capped, in rows"
     );
     assert_eq!(

@@ -15,8 +15,8 @@ use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use ratatui_textarea::ScreenCursor;
 
 use crate::ui::cell::{self, Style};
+use crate::ui::paint::{self, style_of};
 use crate::ui::tui::layout::{box_field, box_marker, screen_rows, todo_rows};
-use crate::ui::tui::paint::{self, style_of};
 use crate::ui::tui::picker::PICKER_ROWS;
 use crate::ui::tui::render;
 use crate::ui::tui::state::State;

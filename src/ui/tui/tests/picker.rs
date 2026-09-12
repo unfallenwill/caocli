@@ -308,7 +308,7 @@ fn the_queue_counts_the_rows_it_is_not_showing() {
     // one of the rows the cap allows: the queue never costs more than three.
     screen.state.queued.push_back("/help".into());
     let drawn = super::rendered(&super::super::render::queue_lines(&screen.state, 60));
-    assert_eq!(drawn.len(), super::super::render::QUEUE_ROWS, "{drawn:?}");
+    assert_eq!(drawn.len(), super::super::layout::QUEUE_ROWS, "{drawn:?}");
     assert!(drawn[0].0.contains("… 2 more"), "{drawn:?}");
     assert!(drawn[1].0.contains("/model"), "{drawn:?}");
     assert!(drawn[2].0.contains("/help"), "{drawn:?}");

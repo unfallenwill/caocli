@@ -14,9 +14,9 @@ use ratatui::style::{Color, Modifier};
 
 use crate::ui::cell::Cell;
 
+use super::super::super::paint::THINKING_LINES;
 use super::super::layout::{BOX_GUTTER, BOX_ROWS, PINNED_ROWS, box_field, box_rows, screen_rows};
 use super::super::notice::Notice;
-use super::super::paint::THINKING_LINES;
 use super::super::render as render_mod;
 use super::super::render::SPINNER;
 use super::super::state::State;

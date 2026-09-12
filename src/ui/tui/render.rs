@@ -1,10 +1,15 @@
 //! The view layer: turning [`State`] into the ratatui lines the screen draws.
 //!
 //! Every function here reads [`State`] (sometimes mutably, to maintain the
-//! laid cache) and produces a `Line`, a `Block`, a `String`, or a `Vec<Line>`
-//! that the screen hands to ratatui. The split from [`State`] is on purpose:
-//! state holds what is true of the session, render holds what is drawn from
-//! it, and the two no longer share methods.
+//! laid cache) and produces a `Line`, a `Block`, or a `Vec<Line>` that the
+//! screen hands to ratatui. Pure cell-to-line rendering lives one layer down
+//! in [`crate::ui::paint`]; what is here is the state-aware composition --
+//! which cells go on screen, which lines of them fit the window, and what the
+//! box's border says while a turn runs.
+//!
+//! The split is on purpose: state holds what is true of the session, render
+//! holds what is drawn from it, and the painter holds what a cell becomes --
+//! three layers, each with one job.
 //!
 //! The one bit of state render does mutate is the laid cache (`laid`,
 //! `laid_width`, `laid_cells`). The invariant it keeps is that `laid` is a
@@ -22,12 +27,9 @@ use ratatui::style::{Modifier, Style as RStyle};
 use ratatui::text::Line;
 use ratatui::widgets::Block;
 
-use crate::tools::todo::{self, Todo};
-use crate::ui::cell::{self, Span, Style};
-use crate::ui::tui::layout::{self, BOX_BORDERS};
-use crate::ui::tui::paint::{
-    cell_lines, measure, more_line, style_of, wrapped_lines, wrapped_under,
-};
+use crate::ui::cell;
+use crate::ui::paint::{cell_lines, standing_todo_lines};
+use crate::ui::tui::layout::BOX_BORDERS;
 use crate::ui::tui::state::State;
 
 /// The frames the working spinner cycles through while a turn runs, one per
@@ -43,13 +45,6 @@ pub(super) const SPINNER_MS: u128 = 80;
 /// The live speed estimate appears once the turn has run this many seconds:
 /// before that the cumulative average swings too much to be worth reading.
 pub(super) const SPEED_AFTER_SECS: u64 = 3;
-
-/// The rows the queue is allowed to take from the transcript.
-///
-/// Three lines: enough to read the head and the count without reading so much
-/// that the answer is pushed off the screen. A queue longer than that -- more
-/// lines, or longer ones -- costs the transcript those rows and no more.
-pub(super) const QUEUE_ROWS: usize = 3;
 
 // --------------------------------------------------------------------- laid -
 
@@ -148,93 +143,26 @@ pub(super) fn question_lines(state: &State, width: usize) -> Vec<Line<'static>> 
     }
 }
 
-/// The heading of the standing task list: what the block is, and how far it has
-/// got.
-///
-/// Dim, and marked with the same `·` a note carries: the block is pinned under
-/// the transcript for the whole of a turn, and its one job when nothing has
-/// changed is to not be read. The tasks below it carry the attention.
-///
-/// The count is [`todo::summary`], the same string the cell's head and the model's
-/// result carry, so the three cannot say different things about one list.
-pub(super) fn todo_title(todos: &[Todo]) -> Line<'static> {
-    Line::styled(
-        format!("· todos · {}", todo::summary(todos)),
-        style_of(Style::Dim),
-    )
-}
-
-/// The standing task list, laid out, or nothing when no call has written one
-/// or the last one cleared it.
+/// The standing task list as the screen draws it: nothing when no call has
+/// written one or the last one cleared it.
 ///
 /// A fold over the transcript and not a copy of it: what is standing is the
-/// last list a call wrote, which is a cell like any other, so a resumed session
-/// keeps exactly the list in view that the session watched live had. There is
-/// nothing here to keep in step with anything, which is the whole reason the
-/// tool writes the list into the log instead of holding it somewhere.
-///
-/// Each task is wrapped on its own: the block has a fixed number of rows to
-/// give, and a task long enough to wrap must cost its own rows rather than
-/// push the tasks behind it out of the block. The tasks drawn are the window
-/// [`layout::todo_window`] picks, so the task in hand is one of them.
+/// last list a call wrote, which is a cell like any other, so a resumed
+/// session keeps exactly the list in view that the session watched live had.
+/// The drawing itself lives in [`crate::ui::paint::standing_todo_lines`]; this
+/// layer only finds the list.
 pub(super) fn todo_lines(state: &State, width: usize) -> Vec<Line<'static>> {
     let Some(todos) = cell::standing_todos(&state.transcript) else {
         return Vec::new();
     };
-    let width = measure(width);
-    let room = layout::TODO_ROWS.saturating_sub(layout::TODO_HEADS);
-    let active = todos
-        .iter()
-        .position(|todo| todo.status == todo::Status::InProgress);
-    let window = layout::todo_window(todos.len(), active, room);
-    // The blank row first, so that the block cannot be read as the tail of the
-    // transcript above it, then the title.
-    let mut lines = vec![Line::default(), todo_title(todos)];
-    if window.above > 0 {
-        lines.push(more_line("  ", window.above));
-    }
-    for todo in &todos[window.first..window.last] {
-        // Through the cell's own wrapping, with the task's own gutter: a task
-        // is one row until its words run out of columns, and the rows it then
-        // takes are its own -- the ones behind it keep theirs.
-        lines.extend(wrapped_under(
-            &cell::todo_line_spans(todo),
-            width,
-            cell::todo_gutter(todo),
-        ));
-    }
-    if window.below > 0 {
-        lines.push(more_line("  ", window.below));
-    }
-    lines
+    standing_todo_lines(todos, width)
 }
 
-/// The queued lines, laid out, capped at [`QUEUE_ROWS`].
-///
-/// The cap is a budget of the screen, not the queue: a queue longer than that
-/// -- more lines, or longer ones -- costs the transcript those rows and no
-/// more. What the end of the window keeps is the newest line, which is the
-/// one just typed and the one being waited for; what it is not showing is
-/// counted rather than dropped, the rule the picker keeps to as well, so
-/// that a queue running past the cap does not read as a queue of three. The
-/// count is drawn on one of the rows the cap allows rather than on a row of
-/// its own: the cap is what the transcript is paying.
+/// The queued lines as the screen draws them. The drawing itself lives in
+/// [`crate::ui::paint::queued_lines`]; this layer only hands the queue over.
 pub(super) fn queue_lines(state: &State, width: usize) -> Vec<Line<'static>> {
-    let width = measure(width);
-    let mut lines = Vec::new();
-    for line in &state.queued {
-        lines.extend(wrapped_lines(
-            &[Span::new(Style::Dim, format!("› {line}"))],
-            width,
-        ));
-    }
-    if lines.len() <= QUEUE_ROWS {
-        return lines;
-    }
-    let hidden = lines.len() - (QUEUE_ROWS - 1);
-    let mut window = vec![more_line("  ", hidden)];
-    window.extend(lines.split_off(hidden));
-    window
+    let queued: Vec<String> = state.queued.iter().cloned().collect();
+    crate::ui::paint::queued_lines(&queued, width)
 }
 
 /// The whole transcript as lines, in draw order: the session's finished cells,

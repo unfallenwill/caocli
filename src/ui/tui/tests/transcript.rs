@@ -9,9 +9,9 @@
 
 use crossterm::event::{KeyCode, MouseButton, MouseEventKind};
 
+use super::super::super::paint::cell_lines;
 use super::super::input::Submitted;
 use super::super::layout::{BOX_ROWS, Window, picker_window};
-use super::super::paint::cell_lines;
 use super::super::picker::PICKER_ROWS;
 use super::super::render as render_mod;
 use crate::ui::cell::Cell;

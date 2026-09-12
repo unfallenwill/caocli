@@ -21,13 +21,20 @@ pub(super) const PINNED_ROWS: u16 = 1;
 /// have: it is worth enough of them to show a plan, and not enough to become the
 /// screen. A list that does not fit in this is a list the model was asked not to
 /// write.
-pub(super) const TODO_ROWS: usize = 8;
+pub(crate) const TODO_ROWS: usize = 8;
 
 /// The rows of that budget the block spends on its own two ends before it reaches
 /// its first task: the blank row that sets it off from the transcript, so that it
 /// cannot be mistaken for the tail of one, and the title that says what it is and
 /// how far it has got. What is left over is the room the tasks get.
-pub(super) const TODO_HEADS: usize = 2;
+pub(crate) const TODO_HEADS: usize = 2;
+
+/// The rows the queue is allowed to take from the transcript.
+///
+/// Three lines: enough to read the head and the count without reading so much
+/// that the answer is pushed off the screen. A queue longer than that -- more
+/// lines, or longer ones -- costs the transcript those rows and no more.
+pub(crate) const QUEUE_ROWS: usize = 3;
 
 /// The rows the standing task list takes: what it laid out, capped at
 /// [`TODO_ROWS`].
@@ -109,15 +116,15 @@ pub(super) fn screen_rows(area: Rect, todos: u16, input: u16, queued: u16) -> Rc
 /// A window over a list of rows: the run of them it draws, and how many it leaves
 /// behind at each end -- which is also what says whether that end carries a count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Window {
+pub(crate) struct Window {
     /// The run drawn, as the first row and the one after the last.
-    pub(super) first: usize,
-    pub(super) last: usize,
+    pub(crate) first: usize,
+    pub(crate) last: usize,
     /// Rows left out above the run, and below it, as the count drawn at that end
     /// says. Both are zero when there was no room for the counts at all -- the one
     /// case a cut window is drawn without them.
-    pub(super) above: usize,
-    pub(super) below: usize,
+    pub(crate) above: usize,
+    pub(crate) below: usize,
 }
 
 /// The window a list of `total` rows is seen through, for a selection at
@@ -180,7 +187,7 @@ pub(super) fn picker_window(total: usize, selected: usize, room: usize) -> Windo
 /// when there is room for the count and a row of the list besides, and when there
 /// is not, the count is what gives way. Here the row that cannot give way is the
 /// task in hand.
-pub(super) fn todo_window(total: usize, active: Option<usize>, room: usize) -> Window {
+pub(crate) fn todo_window(total: usize, active: Option<usize>, room: usize) -> Window {
     let room = room.max(1);
     let total = total.max(1);
     let active = active.filter(|at| *at < total);

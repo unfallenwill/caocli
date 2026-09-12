@@ -13,8 +13,8 @@
 use crate::ui::cell::{Cell, Span, Style};
 use crate::ui::text;
 
+use super::super::super::paint::{MEASURE, wrapped_lines};
 use super::super::layout::BOX_ROWS;
-use super::super::paint::{MEASURE, wrapped_lines};
 use super::all_rows;
 use super::rendered;
 use super::screen_for_test;

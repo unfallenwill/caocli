@@ -1,17 +1,42 @@
-//! The painter: cells and styled spans turned into the terminal lines the
-//! screen is drawn from.
+//! The painter: cells, spans and screen elements turned into the terminal
+//! lines the screen is drawn from.
 //!
-//! One layer, because the transcript on screen, the window over it and the
-//! session log folded back into cells are three places the same cells are laid
-//! out, and a session that reads differently in any of them is a session that
-//! was not really one transcript. Everything here is a pure function of its
-//! arguments: nothing owns state, touches the terminal, or reads the clock.
+//! One layer for everything a cell becomes -- the transcript on screen, the
+//! window over it, the session log folded back into cells, the standing task
+//! list pinned under the transcript, the queue waiting to run, and the
+//! question panel standing over the box. A session that reads differently in
+//! any of them is a session that was not really one transcript, and that is
+//! what a single painter buys.
+//!
+//! Three things are kept apart on purpose:
+//!
+//! - [`crate::ui::cell`] holds what a cell *is*: terminal-agnostic data, with
+//!   a [`Style`] that is a label rather than an escape sequence and a
+//!   [`Gutter`] that names its own columns. The painter reaches for both;
+//!   the cell never reaches back for the painter.
+//! - This module holds how a cell is *drawn*: the pure functions that take
+//!   cells, spans and widths, and produce the `ratatui` [`Line`]s the screen
+//!   hands to its backend. Nothing here owns state, touches the terminal, or
+//!   reads the clock.
+//! - [`crate::ui::tui`] holds *what* is drawn from: the screen, the
+//!   transcript, the input box and the state a notice or a key changes. The
+//!   painter answers `&State` questions; it does not ask them.
+//!
+//! The plain front end writes its own bytes (see [`crate::ui::renderer`]),
+//! because leaving wrapping to the terminal is the right thing for a stream
+//! that has no fixed-width region to fit in. The two front ends share the
+//! cell layer; they do not share this one -- the painter is the TUI's, with
+//! no backend-agnostic detour through a `RenderedSpan` the plain front end
+//! would only translate back.
 
 use ratatui::style::{Color, Modifier, Style as RStyle};
 use ratatui::text::{Line, Span as RSpan};
 
+use crate::tools::ask::Question;
+use crate::tools::todo::{self, Todo};
 use crate::ui::cell::{self, Cell, Gutter, Span, Style};
 use crate::ui::text;
+use crate::ui::tui::layout;
 
 /// The widest a line of the transcript is laid out, however wide the terminal is.
 ///
@@ -21,11 +46,11 @@ use crate::ui::text;
 /// start of. 100 columns is about as wide as a line of monospaced text stays
 /// comfortable, and it is wider than the 80-column terminal most of this is read
 /// on -- so the measure only ever shortens a line on the screens that need it.
-pub(super) const MEASURE: usize = 100;
+pub(crate) const MEASURE: usize = 100;
 
 /// The columns text is laid out in inside a region `width` wide: as wide as the
 /// region, and no wider than [`MEASURE`].
-pub(super) fn measure(width: usize) -> usize {
+pub(crate) fn measure(width: usize) -> usize {
     width.min(MEASURE)
 }
 
@@ -37,7 +62,7 @@ pub(super) fn measure(width: usize) -> usize {
 /// on what a `Reasoning` line looks like. The colour is this front end's own,
 /// as a `Color` the framework hands to the theme: a palette the theme chose for
 /// a background this code cannot see.
-pub(super) fn style_of(style: Style) -> RStyle {
+pub(crate) fn style_of(style: Style) -> RStyle {
     let mut s = RStyle::new();
     if style.is_dim() {
         s = s.add_modifier(Modifier::DIM);
@@ -73,7 +98,7 @@ pub(super) fn style_of(style: Style) -> RStyle {
 /// the report is one row of the transcript that is not drawn, and a count that
 /// left its own row out would be a line short. So the smallest either end can
 /// say is two lines, and there is no singular form here.
-pub(super) fn edge_line(above: bool, n: usize) -> Line<'static> {
+pub(crate) fn edge_line(above: bool, n: usize) -> Line<'static> {
     let side = if above { "above" } else { "below" };
     Line::styled(format!("\u{22ee} {n} lines {side}"), style_of(Style::Dim))
 }
@@ -86,7 +111,7 @@ pub(super) fn edge_line(above: bool, n: usize) -> Line<'static> {
 /// queue. Dim, like everything else that is not the thing being chosen; `lead` is
 /// the marker column the row it stands in for would carry, so that the count lines
 /// up with what it counts.
-pub(super) fn more_line(lead: &str, n: usize) -> Line<'static> {
+pub(crate) fn more_line(lead: &str, n: usize) -> Line<'static> {
     Line::styled(format!("{lead}… {n} more"), style_of(Style::Dim))
 }
 
@@ -99,7 +124,7 @@ pub(super) fn more_line(lead: &str, n: usize) -> Line<'static> {
 /// the window that pins to the newest line; folded to its head and a count it
 /// costs a dozen rows instead of a screenful. The full text stays in the
 /// session log, which is where the durable copy lives either way.
-pub(super) const THINKING_LINES: usize = 12;
+pub(crate) const THINKING_LINES: usize = 12;
 
 /// The spans a cell is drawn from, given what the screen shows elsewhere.
 ///
@@ -127,8 +152,8 @@ fn spans_of(cell: &Cell) -> Vec<Span> {
 ///
 /// One cell at a time, because a cell is what a draw can keep: it is the unit the
 /// session's output arrives in and it does not change once it is pushed, so it is
-/// also the unit [`State`] lays out and remembers.
-pub(super) fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
+/// also the unit [`State`](crate::ui::tui::state::State) lays out and remembers.
+pub(crate) fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
     // Never wider than the measure, however wide the region is: the gutter is
     // inside it, so the answer and the machinery around it end in the same column.
     let width = measure(width);
@@ -179,30 +204,7 @@ pub(super) fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
 /// Progress is guaranteed even when a single character is wider than the whole
 /// field: the first character is taken regardless, so a narrow terminal degrades
 /// to a clipped wide glyph rather than looping forever.
-/// Wrap `spans` to `width`, opening every line in a gutter's columns: the head
-/// for the first line, the rest for the ones after it.
-///
-/// The rule that keeps a wrapped block on one left edge, and the reason it lives
-/// here rather than in the cell: only the layer that does the wrapping knows where
-/// the lines fall. A cell reaches it through [`cell_lines`], and the standing task
-/// list through it directly -- a block that is pinned is not a cell, but a task
-/// whose wrapped rows came back to column zero would still read as a task of its
-/// own.
-pub(super) fn wrapped_under(spans: &[Span], width: usize, gutter: Gutter) -> Vec<Line<'static>> {
-    wrapped_lines(spans, width.saturating_sub(gutter.width()))
-        .into_iter()
-        .enumerate()
-        .map(|(i, line)| {
-            let lead = if i == 0 { gutter.head } else { gutter.rest };
-            let mut spans = vec![RSpan::styled(lead, style_of(gutter.style))];
-            spans.extend(line.spans);
-            Line::from(spans)
-        })
-        .collect()
-}
-
-/// Wrap `spans` into lines, breaking at spaces where it can.
-pub(super) fn wrapped_lines(spans: &[Span], width: usize) -> Vec<Line<'static>> {
+pub(crate) fn wrapped_lines(spans: &[Span], width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut current: Vec<RSpan<'static>> = Vec::new();
@@ -289,6 +291,25 @@ pub(super) fn wrapped_lines(spans: &[Span], width: usize) -> Vec<Line<'static>> 
     lines
 }
 
+/// The rule that keeps a wrapped block on one left edge, and the reason it lives
+/// here rather than in the cell: only the layer that does the wrapping knows where
+/// the lines fall. A cell reaches it through [`cell_lines`], and the standing task
+/// list through it directly -- a block that is pinned is not a cell, but a task
+/// whose wrapped rows came back to column zero would still read as a task of its
+/// own.
+fn wrapped_under(spans: &[Span], width: usize, gutter: Gutter) -> Vec<Line<'static>> {
+    wrapped_lines(spans, width.saturating_sub(gutter.width()))
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let lead = if i == 0 { gutter.head } else { gutter.rest };
+            let mut spans = vec![RSpan::styled(lead, style_of(gutter.style))];
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
 /// Where a line ends inside `piece`: what stays, what the next line starts with,
 /// and whether the line is finished.
 ///
@@ -309,7 +330,7 @@ pub(super) fn wrapped_lines(spans: &[Span], width: usize) -> Vec<Line<'static>> 
 ///
 /// The flag says whether the line is finished: a break at a space finishes it at
 /// once, while text that fits leaves it open for whatever comes next.
-pub(super) fn break_line(piece: &str, room: usize, width: usize) -> (&str, &str, bool) {
+fn break_line(piece: &str, room: usize, width: usize) -> (&str, &str, bool) {
     let fits = text::truncate(piece, room);
     if fits.len() == piece.len() {
         return (fits, "", false);
@@ -338,4 +359,221 @@ pub(super) fn break_line(piece: &str, room: usize, width: usize) -> (&str, &str,
     // The word moves down whole: the next line starts at the word itself, which is
     // this piece from just past the space the break is taken at.
     (cut, &piece[start..], true)
+}
+
+// ============================================================ standing tasks =
+
+/// The heading of the standing task list: what the block is, and how far it has
+/// got.
+///
+/// Dim, and marked with the same `·` a note carries: the block is pinned under
+/// the transcript for the whole of a turn, and its one job when nothing has
+/// changed is to not be read. The tasks below it carry the attention.
+///
+/// The count is [`todo::summary`], the same string the cell's head and the model's
+/// result carry, so the three cannot say different things about one list.
+pub(crate) fn todo_title(todos: &[Todo]) -> Line<'static> {
+    Line::styled(
+        format!("· todos · {}", todo::summary(todos)),
+        style_of(Style::Dim),
+    )
+}
+
+/// The standing task list as it is drawn: a blank line first so the block cannot
+/// read as the tail of the transcript above it, then the title, then a window of
+/// the tasks. A list that does not fit in the block folds to a count, the way
+/// the window over the transcript folds when it is scrolled.
+///
+/// The tasks drawn are the window [`layout::todo_window`] picks, so the task in
+/// hand is one of them: a block pinned to the head would hide exactly the row
+/// being worked on.
+pub(crate) fn standing_todo_lines(todos: &[Todo], width: usize) -> Vec<Line<'static>> {
+    let width = measure(width);
+    let room = layout::TODO_ROWS.saturating_sub(layout::TODO_HEADS);
+    let active = todos
+        .iter()
+        .position(|todo| todo.status == todo::Status::InProgress);
+    let window = layout::todo_window(todos.len(), active, room);
+    // The blank row first, so that the block cannot be read as the tail of the
+    // transcript above it, then the title.
+    let mut lines = vec![Line::default(), todo_title(todos)];
+    if window.above > 0 {
+        lines.push(more_line("  ", window.above));
+    }
+    for todo in &todos[window.first..window.last] {
+        // Through the cell's own wrapping, with the task's own gutter: a task
+        // is one row until its words run out of columns, and the rows it then
+        // takes are its own -- the ones behind it keep theirs.
+        lines.extend(wrapped_under(
+            &cell::todo_line_spans(todo),
+            width,
+            cell::todo_gutter(todo),
+        ));
+    }
+    if window.below > 0 {
+        lines.push(more_line("  ", window.below));
+    }
+    lines
+}
+
+// ================================================================ queue ======
+
+/// The queued lines, laid out, capped at [`layout::QUEUE_ROWS`].
+///
+/// The cap is a budget of the screen, not the queue: a queue longer than that
+/// -- more lines, or longer ones -- costs the transcript those rows and no
+/// more. What the end of the window keeps is the newest line, which is the
+/// one just typed and the one being waited for; what it is not showing is
+/// counted rather than dropped, the rule the picker keeps to as well, so
+/// that a queue running past the cap does not read as a queue of three. The
+/// count is drawn on one of the rows the cap allows rather than on a row of
+/// its own: the cap is what the transcript is paying.
+pub(crate) fn queued_lines(queued: &[String], width: usize) -> Vec<Line<'static>> {
+    let width = measure(width);
+    let mut lines = Vec::new();
+    for line in queued {
+        lines.extend(wrapped_lines(
+            &[Span::new(Style::Dim, format!("› {line}"))],
+            width,
+        ));
+    }
+    if lines.len() <= layout::QUEUE_ROWS {
+        return lines;
+    }
+    let hidden = lines.len() - (layout::QUEUE_ROWS - 1);
+    let mut window = vec![more_line("  ", hidden)];
+    window.extend(lines.split_off(hidden));
+    window
+}
+
+// ============================================================ question panel =
+
+/// The columns that open a row of the question panel: where the cursor is, and
+/// which options are chosen. One marker per question kind, so that a row is
+/// never saying two things in one column -- a cursor sitting on a chosen option
+/// still shows both.
+const PANEL_CURSOR: &str = "❯ ";
+const PANEL_CHOSEN: &str = "✓ ";
+const PANEL_BLANK: &str = "  ";
+
+/// Lines the panel shows under the options. The keys are the whole of what a
+/// reader has to learn here, and the panel is where they are learnt.
+const PANEL_MOVE: &str = "↑/↓ move";
+const PANEL_TOGGLE: &str = "space toggles";
+const PANEL_TYPE: &str = "type to answer in your own words";
+const PANEL_CONFIRM: &str = "Enter confirms";
+const PANEL_SKIP: &str = "Esc skips";
+
+/// The question tool's panel as it is drawn: which question of how many, the
+/// question itself, its options with the cursor on one of them, and the keys.
+///
+/// Wrapped, never clipped: it is drawn over the transcript, so an over-long
+/// line would be cut at the edge of the region instead of folded, which is the
+/// one thing the terminal cannot be left to fix.
+///
+/// `questions` is the full list, `at` the index of the question being answered,
+/// `cursor` the option the cursor is on, `chosen` the labels picked so far per
+/// question. The panel state itself is the caller's -- the painter only reads
+/// what the question, the cursor and the chosen labels say.
+pub(crate) fn panel_lines(
+    questions: &[Question],
+    at: usize,
+    cursor: usize,
+    chosen: &[Vec<String>],
+    width: usize,
+) -> Vec<Line<'static>> {
+    let question = &questions[at];
+    let width = measure(width);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if !question.header.is_empty() || questions.len() > 1 {
+        let mut heading = String::new();
+        if !question.header.is_empty() {
+            heading.push_str(&question.header);
+            heading.push_str(" · ");
+        }
+        heading.push_str(&format!("question {} of {}", at + 1, questions.len()));
+        lines.extend(wrapped_lines(&[Span::new(Style::Dim, heading)], width));
+    }
+    let mut ask = vec![Span::new(Style::Yellow, question.question.clone())];
+    if question.multi_select {
+        ask.push(Span::new(Style::Dim, " · choose any"));
+    }
+    lines.extend(wrapped_lines(&ask, width));
+    // Every option is drawn: the call allows four of them, so there is
+    // nothing here to window -- and an option nobody can see is an option
+    // nobody can choose.
+    for option_at in 0..question.options.len() {
+        lines.extend(option_lines(
+            question,
+            &chosen[at],
+            option_at,
+            cursor,
+            width,
+        ));
+    }
+    lines.extend(wrapped_lines(
+        &[Span::new(Style::Dim, footer(question))],
+        width,
+    ));
+    lines
+}
+
+/// One option as the panel draws it, the cursor's row set in reverse.
+fn option_lines(
+    question: &Question,
+    chosen: &[String],
+    at: usize,
+    cursor: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let option = &question.options[at];
+    let cursor_marker = if at == cursor {
+        PANEL_CURSOR
+    } else {
+        PANEL_BLANK
+    };
+    let mut spans = Vec::new();
+    if question.multi_select {
+        let is_chosen = chosen.contains(&option.label);
+        spans.push(Span::new(
+            Style::Dim,
+            format!(
+                "{cursor_marker}{}",
+                if is_chosen { PANEL_CHOSEN } else { PANEL_BLANK }
+            ),
+        ));
+    } else {
+        spans.push(Span::new(Style::Dim, cursor_marker));
+    }
+    spans.push(Span::new(Style::Dim, format!("{}. ", at + 1)));
+    spans.push(Span::new(Style::Plain, option.label.clone()));
+    if !option.description.is_empty() {
+        spans.push(Span::new(Style::Dim, format!(" — {}", option.description)));
+    }
+    let mut lines = wrapped_lines(&spans, width);
+    if at == cursor {
+        // The row the next key acts on is the one reversed, the way the picker
+        // marks the row `Enter` would take.
+        for line in &mut lines {
+            for span in &mut line.spans {
+                span.style = span.style.add_modifier(Modifier::REVERSED);
+            }
+        }
+    }
+    lines
+}
+
+/// What the panel says the keys do, under the options it is offering.
+fn footer(question: &Question) -> String {
+    if question.options.is_empty() {
+        return format!("{PANEL_TYPE} · {PANEL_CONFIRM} · {PANEL_SKIP}");
+    }
+    let mut keys = vec![PANEL_MOVE];
+    if question.multi_select {
+        keys.push(PANEL_TOGGLE);
+    }
+    format!(
+        "{} · {PANEL_TYPE} · {PANEL_CONFIRM} · {PANEL_SKIP}",
+        keys.join(" · ")
+    )
 }

@@ -37,14 +37,13 @@ use crate::ui::{Approve, Ask, Cancel, Verdict};
 use super::cell::{self, Cell};
 
 mod input;
-mod layout;
+pub(crate) mod layout;
 mod notice;
 mod panel;
 mod screen;
 
 use ratatui::backend::CrosstermBackend;
 use screen::Screen;
-mod paint;
 mod picker;
 mod render;
 mod state;

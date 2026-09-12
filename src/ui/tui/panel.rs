@@ -11,35 +11,22 @@
 //! answerable in the user's own words, or the model could only ask about things
 //! it can list -- so the panel takes the keys that choose and leaves everything
 //! else to the editor.
+//!
+//! Drawing is the painter's: [`crate::ui::paint::panel_lines`] turns the
+//! questions, the cursor and the chosen labels into the lines the screen hands
+//! to ratatui. What is here is the state machine -- which question is on
+//! screen, where the cursor is, what has been chosen.
 
-use ratatui::style::Modifier;
 use ratatui::text::Line;
 use tokio::sync::oneshot;
 
 use crate::tools::ask::{Answer, Question};
-use crate::ui::cell::{Span, Style};
 
-use super::paint::{measure, wrapped_lines};
 use super::state::State;
 
 /// What the box says while a question is open: the panel is what offers the
 /// choices, so the box says what it is for -- the answer in the user's own words.
 pub(super) const PANEL_PLACEHOLDER: &str = "or type an answer · Enter confirms";
-
-/// The columns that open a row: where the cursor is, and which options are
-/// chosen. One marker per question kind, so that a row is never saying two things
-/// in one column -- a cursor sitting on a chosen option still shows both.
-const CURSOR: &str = "❯ ";
-const CHOSEN: &str = "✓ ";
-const BLANK: &str = "  ";
-
-/// Lines the panel shows under the options. The keys are the whole of what a
-/// reader has to learn here, and the panel is where they are learnt.
-const MOVE: &str = "↑/↓ move";
-const TOGGLE: &str = "space toggles";
-const TYPE: &str = "type to answer in your own words";
-const CONFIRM: &str = "Enter confirms";
-const SKIP: &str = "Esc skips";
 
 /// The question tool's panel: the questions, which one is on screen, and what has
 /// been chosen so far.
@@ -237,92 +224,20 @@ impl State {
         self.refresh_placeholder();
     }
 
-    /// The panel as it is drawn: which question of how many, the question itself,
-    /// its options with the cursor on one of them, and the keys.
-    ///
-    /// Wrapped, never clipped: it is drawn over the transcript, so an over-long
-    /// line would be cut at the edge of the region instead of folded, which is the
-    /// one thing the terminal cannot be left to fix.
+    /// The panel as the screen draws it: which question of how many, the
+    /// question itself, its options with the cursor on one of them, and the
+    /// keys. The drawing itself lives in [`crate::ui::paint::panel_lines`];
+    /// this layer only hands the panel state over.
     pub(super) fn panel_lines(&self, width: usize) -> Vec<Line<'static>> {
         let Some(panel) = &self.panel else {
             return Vec::new();
         };
-        let width = measure(width);
-        let question = panel.question();
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        if !question.header.is_empty() || panel.questions.len() > 1 {
-            let mut heading = String::new();
-            if !question.header.is_empty() {
-                heading.push_str(&question.header);
-                heading.push_str(" · ");
-            }
-            heading.push_str(&format!(
-                "question {} of {}",
-                panel.at + 1,
-                panel.questions.len()
-            ));
-            lines.extend(wrapped_lines(&[Span::new(Style::Dim, heading)], width));
-        }
-        let mut ask = vec![Span::new(Style::Yellow, question.question.clone())];
-        if question.multi_select {
-            ask.push(Span::new(Style::Dim, " · choose any"));
-        }
-        lines.extend(wrapped_lines(&ask, width));
-        // Every option is drawn: the call allows four of them, so there is
-        // nothing here to window -- and an option nobody can see is an option
-        // nobody can choose.
-        for at in 0..question.options.len() {
-            lines.extend(option_lines(panel, at, width));
-        }
-        lines.extend(wrapped_lines(
-            &[Span::new(Style::Dim, footer(question))],
+        crate::ui::paint::panel_lines(
+            &panel.questions,
+            panel.at,
+            panel.cursor,
+            &panel.chosen,
             width,
-        ));
-        lines
+        )
     }
-}
-
-/// One option as the panel draws it, the cursor's row set in reverse.
-fn option_lines(panel: &Panel, at: usize, width: usize) -> Vec<Line<'static>> {
-    let question = panel.question();
-    let option = &question.options[at];
-    let cursor = if at == panel.cursor { CURSOR } else { BLANK };
-    let mut spans = Vec::new();
-    if question.multi_select {
-        let chosen = panel.chosen[panel.at].contains(&option.label);
-        spans.push(Span::new(
-            Style::Dim,
-            format!("{cursor}{}", if chosen { CHOSEN } else { BLANK }),
-        ));
-    } else {
-        spans.push(Span::new(Style::Dim, cursor));
-    }
-    spans.push(Span::new(Style::Dim, format!("{}. ", at + 1)));
-    spans.push(Span::new(Style::Plain, option.label.clone()));
-    if !option.description.is_empty() {
-        spans.push(Span::new(Style::Dim, format!(" — {}", option.description)));
-    }
-    let mut lines = wrapped_lines(&spans, width);
-    if at == panel.cursor {
-        // The row the next key acts on is the one reversed, the way the picker
-        // marks the row `Enter` would take.
-        for line in &mut lines {
-            for span in &mut line.spans {
-                span.style = span.style.add_modifier(Modifier::REVERSED);
-            }
-        }
-    }
-    lines
-}
-
-/// What the panel says the keys do, under the options it is offering.
-fn footer(question: &Question) -> String {
-    if question.options.is_empty() {
-        return format!("{TYPE} · {CONFIRM} · {SKIP}");
-    }
-    let mut keys = vec![MOVE];
-    if question.multi_select {
-        keys.push(TOGGLE);
-    }
-    format!("{} · {TYPE} · {CONFIRM} · {SKIP}", keys.join(" · "))
 }
