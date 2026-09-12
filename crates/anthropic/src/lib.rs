@@ -37,10 +37,14 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod client;
 pub mod error;
+pub mod stream;
 pub mod types;
 
+pub use client::{API_VERSION, Auth, Client, Profile};
 pub use error::{Api, Error, StreamError};
+pub use stream::EventStream;
 pub use types::{
     Block, BlockDelta, BlockKind, CacheControl, CacheCreation, CacheType, Effort, Event,
     ImageSource, Message, MessageContent, MessageDeltaBody, MessageParam, MessagesRequest,
