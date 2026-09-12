@@ -1,7 +1,7 @@
 //! The tests for the front end as a whole.
 use super::input::{
-    ANSWER_PLACEHOLDER, IDLE_PLACEHOLDER, QUEUE_PLACEHOLDER, QUEUE_ROWS, SECRET_MASK,
-    SECRET_PLACEHOLDER, Submitted,
+    ANSWER_PLACEHOLDER, IDLE_PLACEHOLDER, QUEUE_PLACEHOLDER, SECRET_MASK, SECRET_PLACEHOLDER,
+    Submitted,
 };
 use super::layout::box_rows;
 use super::layout::{BOX_GUTTER, BOX_ROWS, PINNED_ROWS, Window, picker_window};
@@ -14,9 +14,10 @@ use super::paint::{cell_lines, wrapped_lines};
 use super::picker::PICKER_ROWS;
 use super::picker::{Choice, named_rows};
 use super::picker::{Choosing, choice_rows};
+use super::render;
+use super::render::{QUEUE_ROWS, SPINNER};
 use super::screen::Screen;
 use super::screen::fullscreen;
-use super::state::SPINNER;
 use super::state::State;
 use super::state::{Scroll, WHEEL_LINES};
 use super::{CtrlC, Menu, menu_for};
@@ -154,7 +155,7 @@ fn an_open_question_is_drawn_after_the_transcript() {
         name: "Bash".into(),
         args: r#"{"command":"rm -rf /"}"#.into(),
     });
-    let lines = screen.lines(80);
+    let lines = render::lines(&mut screen, 80);
     assert_eq!(lines.len(), 2, "answer, then the question");
     assert!(format!("{:?}", lines[1]).contains("run it?"));
 }
@@ -487,10 +488,13 @@ fn the_queue_is_capped_and_keeps_its_end() {
     for i in 0..(QUEUE_ROWS + 2) {
         state.enqueue(format!("line {i}"));
     }
-    assert_eq!(state.queue_lines(40).len(), QUEUE_ROWS, "capped, in rows");
     assert_eq!(
-        state
-            .queue_lines(40)
+        render::queue_lines(&state, 40).len(),
+        QUEUE_ROWS,
+        "capped, in rows"
+    );
+    assert_eq!(
+        render::queue_lines(&state, 40)
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>(),
@@ -506,8 +510,7 @@ fn a_queued_line_wider_than_the_screen_is_wrapped_not_clipped() {
     let mut state = State::default();
     let typed = "x".repeat(50);
     state.enqueue(typed.clone());
-    let lines: Vec<String> = state
-        .queue_lines(20)
+    let lines: Vec<String> = render::queue_lines(&state, 20)
         .iter()
         .map(|l| l.to_string())
         .collect();
@@ -521,7 +524,7 @@ fn the_standing_list_is_the_last_one_written_and_nothing_when_none_is() {
     // Nothing has been written: the block takes no rows at all, so a session that
     // never uses the tool sees exactly the screen it saw before there was one.
     let mut state = State::default();
-    assert!(state.todo_lines(40).is_empty());
+    assert!(render::todo_lines(&state, 40).is_empty());
     assert_eq!(todo_rows(0), 0);
 
     state.show(written(serde_json::json!({"todos": [
@@ -529,8 +532,7 @@ fn the_standing_list_is_the_last_one_written_and_nothing_when_none_is() {
         {"content": "Draw the cell", "status": "in_progress"}
     ]})));
     assert_eq!(
-        state
-            .todo_lines(40)
+        render::todo_lines(&state, 40)
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>(),
@@ -548,7 +550,7 @@ fn the_standing_list_is_the_last_one_written_and_nothing_when_none_is() {
     // one: what stands is the last list written and not the run of them.
     state.show(written(serde_json::json!({"todos": []})));
     assert!(
-        state.todo_lines(40).is_empty(),
+        render::todo_lines(&state, 40).is_empty(),
         "a cleared list is not one to keep in view"
     );
 }
@@ -563,7 +565,10 @@ fn a_task_longer_than_the_screen_is_wrapped_not_clipped() {
     state.show(written(
         serde_json::json!({"todos": [{"content": long, "status": "in_progress"}]}),
     ));
-    let lines: Vec<String> = state.todo_lines(20).iter().map(|l| l.to_string()).collect();
+    let lines: Vec<String> = render::todo_lines(&state, 20)
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
     assert_eq!(
         lines.len(),
         2 + 3,
@@ -599,9 +604,7 @@ fn the_block_gives_up_its_rows_before_the_box_does() {
     screen.draw().unwrap();
     // The block is drawn whole, in its own rows directly above the box, and the
     // transcript is the region that gave those rows up.
-    let block: Vec<String> = screen
-        .state
-        .todo_lines(40)
+    let block: Vec<String> = render::todo_lines(&screen.state, 40)
         .iter()
         .map(|l| l.to_string())
         .collect();
@@ -1002,7 +1005,7 @@ fn a_running_commands_output_is_watched_and_then_kept() {
     screen.state.apply(Notice::ToolOutput("one\n".into()));
     screen.state.apply(Notice::ToolOutput("two\n".into()));
     screen.draw().unwrap();
-    let live = rendered(&screen.state.lines(40));
+    let live = rendered(&render::lines(&mut screen.state, 40));
     assert!(
         live.iter().any(|(text, _)| text.contains("one")),
         "on screen while the command runs: {live:?}"
@@ -1020,7 +1023,7 @@ fn a_running_commands_output_is_watched_and_then_kept() {
         Cell::ToolOutput("one\ntwo\n".into()),
         "the run of output is one cell, whole"
     );
-    let drawn = rendered(&screen.state.lines(40));
+    let drawn = rendered(&render::lines(&mut screen.state, 40));
     let drawn: String = drawn.into_iter().map(|(text, _)| text).collect();
     assert!(drawn.contains("one") && drawn.contains("two"), "{drawn}");
 }
@@ -1037,10 +1040,14 @@ fn a_folded_think_does_not_jump_open_when_it_closes() {
         .join("\n");
     screen.state.apply(Notice::Reasoning(think));
     screen.draw().unwrap();
-    let live = screen.state.lines(40);
+    let live = render::lines(&mut screen.state, 40);
     screen.state.apply(Notice::FinishTurn);
     screen.draw().unwrap();
-    assert_eq!(screen.state.lines(40), live, "the same lines either way");
+    assert_eq!(
+        render::lines(&mut screen.state, 40),
+        live,
+        "the same lines either way"
+    );
 }
 
 #[test]
@@ -1335,7 +1342,10 @@ fn the_working_border_spins_counts_and_estimates() {
     // 12 345 ms in: frame 154 % 10 = 4, the fifth glyph; 4 000 characters at
     // a measured four to the token over 12.3 s rounds to 81 a second.
     let s = working(Duration::from_millis(12_345), 4000, 4.0);
-    assert_eq!(s.activity_title(60), Some("⠼ 12s · ~81 token/s".to_owned()));
+    assert_eq!(
+        render::activity_title(&s, 60),
+        Some("⠼ 12s · ~81 token/s".to_owned())
+    );
 }
 
 #[test]
@@ -1343,28 +1353,31 @@ fn the_estimate_waits_for_the_average_to_settle() {
     // 2 040 ms: frame 25, off a frame boundary so the clock's second read
     // cannot tip it
     let s = working(Duration::from_millis(2_040), 4000, 4.0);
-    assert_eq!(s.activity_title(60), Some("⠴ 2s".to_owned()));
+    assert_eq!(render::activity_title(&s, 60), Some("⠴ 2s".to_owned()));
 }
 
 #[test]
 fn a_silent_turn_estimates_nothing() {
     let s = working(Duration::from_millis(30_040), 0, 4.0);
-    assert_eq!(s.activity_title(60), Some("⠴ 30s".to_owned()));
+    assert_eq!(render::activity_title(&s, 60), Some("⠴ 30s".to_owned()));
 }
 
 #[test]
 fn a_narrow_border_drops_the_estimate_then_hides_the_indicator() {
     let s = working(Duration::from_millis(12_345), 4000, 4.0);
-    let full = s.activity_title(usize::MAX).unwrap();
+    let full = render::activity_title(&s, usize::MAX).unwrap();
     let count = "⠼ 12s".to_owned();
     // one column short of the whole thing, the estimate goes whole
     assert_eq!(
-        s.activity_title(crate::ui::text::width(&full) - 1),
+        render::activity_title(&s, crate::ui::text::width(&full) - 1),
         Some(count.clone())
     );
     // one column short of the count, nothing at all: a clipped spinner is
     // not an indicator
-    assert_eq!(s.activity_title(crate::ui::text::width(&count) - 1), None);
+    assert_eq!(
+        render::activity_title(&s, crate::ui::text::width(&count) - 1),
+        None
+    );
 }
 
 #[test]
@@ -1444,7 +1457,7 @@ fn a_question_takes_the_border_title_back() {
     let mut s = working(Duration::from_secs(12), 4000, 4.0);
     let (tx, _rx) = oneshot::channel();
     s.open_question(tx);
-    assert_eq!(s.activity_title(60), None);
+    assert_eq!(render::activity_title(&s, 60), None);
 }
 
 #[test]
@@ -1931,7 +1944,7 @@ fn the_queue_counts_the_rows_it_is_not_showing() {
     }
     // A queue with room to spare: every line, and nothing said about rows that
     // are not there.
-    let drawn = rendered(&screen.state.queue_lines(60));
+    let drawn = rendered(&render::queue_lines(&screen.state, 60));
     assert_eq!(drawn.len(), 3, "{drawn:?}");
     assert!(
         drawn.iter().all(|(text, _)| !text.contains("more")),
@@ -1941,7 +1954,7 @@ fn the_queue_counts_the_rows_it_is_not_showing() {
     // One more line than the cap, and the row that does not fit is counted on
     // one of the rows the cap allows: the queue never costs more than three.
     screen.state.queued.push_back("/help".into());
-    let drawn = rendered(&screen.state.queue_lines(60));
+    let drawn = rendered(&render::queue_lines(&screen.state, 60));
     assert_eq!(drawn.len(), QUEUE_ROWS, "{drawn:?}");
     assert!(drawn[0].0.contains("… 2 more"), "{drawn:?}");
     assert!(drawn[1].0.contains("/model"), "{drawn:?}");
@@ -2155,7 +2168,7 @@ fn a_cramped_screen_windows_the_rows_the_layout_gave_it() {
         screen.draw().unwrap();
         let area = origin(&mut screen);
         let input = screen.state.input_rows(height, 0);
-        let queued = screen.state.queue_lines(40).len() as u16;
+        let queued = render::queue_lines(&screen.state, 40).len() as u16;
         assert_eq!(
             screen.state.drawn_rows,
             screen_rows(area, 0, input, queued)[0].height as usize,
@@ -2229,9 +2242,13 @@ fn a_window_is_the_same_lines_as_the_transcript_it_is_a_window_on() {
         .iter()
         .flat_map(|cell| cell_lines(cell, width))
         .collect();
-    assert_eq!(screen.state.lines(width), whole, "the whole transcript");
     assert_eq!(
-        screen.state.window_lines(3, 9, &[], &[]),
+        render::lines(&mut screen.state, width),
+        whole,
+        "the whole transcript"
+    );
+    assert_eq!(
+        render::window_lines(&screen.state, 3, 9, &[], &[]),
         whole[3..9].to_vec(),
         "and a window in the middle of one cell"
     );

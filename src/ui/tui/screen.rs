@@ -18,6 +18,7 @@ use crate::ui::cell::{self, Style};
 use crate::ui::tui::layout::{box_field, box_marker, screen_rows, todo_rows};
 use crate::ui::tui::paint::style_of;
 use crate::ui::tui::picker::PICKER_ROWS;
+use crate::ui::tui::render;
 use crate::ui::tui::state::State;
 
 /// The screen: a terminal, and the state it shows.
@@ -222,24 +223,24 @@ impl<B: Backend> Screen<B> {
             // is as many rows as its words take. Asked for before the box, which
             // gives way to it, and before the layout, which is what the rows it
             // asks for come out of.
-            let todos = Text::from(state.todo_lines(width));
+            let todos = Text::from(render::todo_lines(state, width));
             let todo = todo_rows(todos.height());
             let input = state.input_rows(area.height, todo);
             // What is waiting to run, drawn at the bottom of the transcript: the
             // session, then what comes next, then the box, and under the box the
             // session summary. Asked for before the layout, because how many rows
             // it takes is what the transcript gives up.
-            let queue = Text::from(state.queue_lines(width));
+            let queue = Text::from(render::queue_lines(state, width));
             let queued = queue.height() as u16;
             let rows = screen_rows(area, todo, input, queued);
             state.reset_box_scroll(input);
             // What the transcript has to show, in the three pieces it is made of:
             // the cells that are laid out and kept, then the block still being
             // written, then a question if one is open.
-            state.ensure_laid(width);
-            let live = state.live_lines(width);
-            let question = state.question_lines(width);
-            let total = state.laid_rows() + live.len() + question.len();
+            render::ensure_laid(state, width);
+            let live = render::live_lines(state, width);
+            let question = render::question_lines(state, width);
+            let total = render::laid_rows(state) + live.len() + question.len();
             // The rows the transcript really has: the layout's answer, not a copy
             // of its arithmetic.
             let room = rows[0].height as usize;
@@ -255,7 +256,7 @@ impl<B: Backend> Screen<B> {
                 total.saturating_sub(room)
             };
             let last = (first + room).min(total);
-            let transcript = Text::from(state.window_lines(first, last, &live, &question));
+            let transcript = Text::from(render::window_lines(state, first, last, &live, &question));
 
             frame.render_widget(Paragraph::new(transcript), rows[0]);
             draw_over(frame, &picker, rows[0], PICKER_ROWS);
@@ -325,7 +326,7 @@ fn draw_over(frame: &mut Frame, lines: &[Line<'static>], transcript: Rect, cap: 
 /// nothing at all -- and typing cannot take it away, which is what the marker
 /// inside the placeholder did.
 fn draw_box(frame: &mut Frame, state: &State, area: Rect) {
-    frame.render_widget(state.box_rule(area.width as usize), area);
+    frame.render_widget(render::box_rule(state, area.width as usize), area);
     frame.render_widget(
         Paragraph::new(Line::styled(cell::USER_MARKER, style_of(Style::Dim))),
         box_marker(area),
@@ -338,6 +339,6 @@ fn draw_box(frame: &mut Frame, state: &State, area: Rect) {
 
 /// The session summary, pinned under the box.
 fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
-    let status = state.status_line(area.width as usize);
+    let status = render::status_line(state, area.width as usize);
     frame.render_widget(Paragraph::new(status), area);
 }

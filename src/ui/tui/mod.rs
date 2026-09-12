@@ -46,6 +46,7 @@ use ratatui::backend::CrosstermBackend;
 use screen::Screen;
 mod paint;
 mod picker;
+mod render;
 mod state;
 
 use input::Submitted;

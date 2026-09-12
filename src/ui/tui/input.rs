@@ -8,7 +8,6 @@
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::Style as RStyle;
-use ratatui::text::Line;
 use ratatui_textarea::{CursorMove, TextArea};
 use tokio::sync::{oneshot, watch};
 
@@ -16,16 +15,9 @@ use super::panel::PANEL_PLACEHOLDER;
 use super::picker::Choosing;
 use crate::history;
 use crate::ui::Verdict;
-use crate::ui::cell::{Cell, Span, Style};
+use crate::ui::cell::Cell;
 use crate::ui::tui::layout::box_rows;
-use crate::ui::tui::paint::measure;
-use crate::ui::tui::paint::{more_line, wrapped_lines};
 use crate::ui::tui::state::State;
-
-/// How many rows of the queue are drawn above the input box. The queue is what
-/// was asked for while a turn ran, and a long one costs the transcript rows it is
-/// capped at: what is worth seeing is that the line arrived.
-pub(super) const QUEUE_ROWS: usize = 3;
 
 /// What the box says while a turn runs: the line being typed is not this turn's
 /// message, it is the one to run when this turn ends -- and the turn itself can
@@ -533,33 +525,6 @@ impl State {
             self.revision += 1;
         }
         next
-    }
-
-    /// The queue as it is drawn: one dim line per queued line, the end of it last,
-    /// like the transcript's own window. Capped at [`QUEUE_ROWS`] rows, so that a
-    /// queue longer than that -- more lines, or longer ones -- costs the transcript
-    /// those rows and no more. What the end of the window keeps is the newest line,
-    /// which is the one just typed and the one being waited for; what it is not
-    /// showing is counted rather than dropped, the rule the picker keeps to as
-    /// well, so that a queue running past the cap does not read as a queue of
-    /// three. The count is drawn on one of the rows the cap allows rather than on
-    /// a row of its own: the cap is what the transcript is paying.
-    pub(super) fn queue_lines(&self, width: usize) -> Vec<Line<'static>> {
-        let width = measure(width);
-        let mut lines = Vec::new();
-        for line in &self.queued {
-            lines.extend(wrapped_lines(
-                &[Span::new(Style::Dim, format!("› {line}"))],
-                width,
-            ));
-        }
-        if lines.len() <= QUEUE_ROWS {
-            return lines;
-        }
-        let hidden = lines.len() - (QUEUE_ROWS - 1);
-        let mut window = vec![more_line("  ", hidden)];
-        window.extend(lines.split_off(hidden));
-        window
     }
 
     /// The placeholder for what the box is for right now: the answer while a
