@@ -279,7 +279,7 @@ fn committing_closes_the_block_that_was_still_streaming() {
         .state
         .stream(crate::ui::cell::Style::Plain, "half a line");
     screen.commit();
-    assert!(screen.state.live.is_none(), "nothing left open");
+    assert!(screen.state.stream.current().is_none(), "nothing left open");
     screen
         .state
         .stream(crate::ui::cell::Style::Plain, " and the rest");

@@ -26,7 +26,7 @@ use crate::tools::todo::{self, Todo};
 use crate::ui::cell::{self, Span, Style};
 use crate::ui::tui::layout::{self, BOX_BORDERS};
 use crate::ui::tui::paint::{
-    cell_lines, live_cell, measure, more_line, style_of, wrapped_lines, wrapped_under,
+    cell_lines, measure, more_line, style_of, wrapped_lines, wrapped_under,
 };
 use crate::ui::tui::state::State;
 
@@ -129,8 +129,8 @@ pub(super) fn window_lines(
 /// jump two columns left the moment the block closed, which is the one reading
 /// position a reader is sitting on when the model stops typing.
 pub(super) fn live_lines(state: &State, width: usize) -> Vec<Line<'static>> {
-    match &state.live {
-        Some((style, text)) => cell_lines(&live_cell(*style, text), width),
+    match state.stream.current() {
+        Some((style, text)) => cell_lines(&style.stream_cell(text.to_owned()), width),
         None => Vec::new(),
     }
 }

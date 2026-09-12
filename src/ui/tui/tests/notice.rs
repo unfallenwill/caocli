@@ -51,7 +51,7 @@ fn a_fragment_in_the_other_style_opens_a_new_block() {
     let mut screen = State::default();
     screen.apply(Notice::Reasoning("a".into()));
     screen.apply(Notice::Reasoning("b".into()));
-    assert!(screen.live.is_some(), "still one open block");
+    assert!(screen.stream.current().is_some(), "still one open block");
     screen.apply(Notice::Content("x".into()));
     assert_eq!(
         screen.transcript,
@@ -60,7 +60,7 @@ fn a_fragment_in_the_other_style_opens_a_new_block() {
     );
     screen.apply(Notice::FinishTurn);
     assert_eq!(screen.transcript[1], Cell::Content("x".into()));
-    assert!(screen.live.is_none());
+    assert!(screen.stream.current().is_none());
 }
 
 #[test]

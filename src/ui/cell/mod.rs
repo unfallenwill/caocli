@@ -24,6 +24,7 @@ use super::text;
 mod call;
 pub(super) mod question;
 mod replay;
+pub(super) mod stream;
 mod todos;
 
 // Internally: the helpers a [`Cell`] builds itself from.
@@ -36,6 +37,7 @@ use todos::todo_spans;
 // helper that needs them; the re-export is what keeps `cell::` working as
 // the entry point for the data layer.
 pub use replay::from_messages;
+pub use stream::Stream;
 pub use todos::{standing_todos, todo_gutter, todo_head_spans, todo_line_spans};
 
 /// A text style, held as data. Whether it becomes an escape sequence is decided

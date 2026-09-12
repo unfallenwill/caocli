@@ -157,24 +157,6 @@ pub(super) fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/// The cell a streaming block is: what a run of deltas becomes once it stops
-/// arriving.
-///
-/// One function because a block laid out while it streams and the cell the same
-/// block is filed away as have to be the same value. [`State::live_lines`] lays
-/// one out and [`State::end_block`] stores the other, and a second copy of this
-/// match would be a second answer to what a fragment in a style means -- which is
-/// the answer a resumed session is replayed through.
-pub(super) fn live_cell(style: Style, text: &str) -> Cell {
-    match style {
-        Style::Reasoning => Cell::Reasoning(text.to_owned()),
-        // Dim is the one other style a block is streamed in, and the one thing it
-        // streams: a command's output, while the command runs.
-        Style::Dim => Cell::ToolOutput(text.to_owned()),
-        _ => Cell::Content(text.to_owned()),
-    }
-}
-
 /// Wrap styled spans into the terminal lines they need at `width` columns.
 ///
 /// Both halves of the front end need this, for the same reason: nothing here may

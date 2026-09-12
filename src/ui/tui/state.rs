@@ -19,7 +19,7 @@ use crossterm::event::MouseEventKind;
 use ratatui::text::Line;
 use ratatui_textarea::TextArea;
 
-use crate::ui::cell::{self, Cell, Style};
+use crate::ui::cell::{self, Cell, Stream, Style};
 use crate::ui::status::Status;
 use crate::ui::tui::notice::Notice;
 
@@ -83,9 +83,11 @@ pub(super) struct State {
     /// How many lines the box held at the last draw, so that a box that has just
     /// lost lines can be told from one that has not.
     pub(super) drawn_draft: usize,
-    /// The text block being streamed, with the style it is drawn in. The style is
-    /// the block's identity, so a fragment in the other style opens a new block.
-    pub(super) live: Option<(Style, String)>,
+    /// The text block being streamed. The shared [`Stream`] is the same one
+    /// the plain front end uses: it tracks the open block and turns it into a
+    /// [`Cell`] on close, so the two front ends cannot disagree on what
+    /// "a block in style X becomes".
+    pub(super) stream: Stream,
     /// The question standing over the box, while one is open.
     pub(super) question: Option<Cell>,
     /// The question tool's panel, while the tool is waiting on an answer.
@@ -154,7 +156,7 @@ impl Default for State {
             drawn_lines: 0,
             drawn_rows: 0,
             drawn_draft: 0,
-            live: None,
+            stream: Stream::new(),
             question: None,
             panel: None,
             reply: None,
@@ -371,7 +373,10 @@ impl State {
         let chars = text.chars().count();
         self.streamed_chars += chars;
         self.chars_since_usage += chars;
-        self.block(style).push_str(text);
+        if let Some(cell) = self.stream.append(style, text) {
+            self.revision += 1;
+            self.transcript.push(cell);
+        }
     }
 
     /// Append a running command's own output.
@@ -380,18 +385,10 @@ impl State {
     /// measure the model's output against the tokens it was billed for, and a
     /// compiler's chatter is neither.
     pub(super) fn stream_output(&mut self, text: &str) {
-        self.block(Style::Dim).push_str(text);
-    }
-
-    /// The block a fragment in `style` belongs to, opening one if the block being
-    /// streamed is another style's: the style is the block's identity, which is what
-    /// an arriving fragment in a different one means.
-    fn block(&mut self, style: Style) -> &mut String {
-        if self.live.as_ref().is_none_or(|(open, _)| *open != style) {
-            self.end_block();
-            self.live = Some((style, String::new()));
+        if let Some(cell) = self.stream.append(Style::Dim, text) {
+            self.revision += 1;
+            self.transcript.push(cell);
         }
-        &mut self.live.as_mut().expect("the block was just opened").1
     }
 
     /// Close the block being streamed, if any, so it becomes a finished cell.
@@ -399,8 +396,7 @@ impl State {
     /// Bumps the revision: this is called from the turn's end as well as from a
     /// notice, and in the first case it is the only thing that has changed.
     pub(super) fn end_block(&mut self) {
-        if let Some((style, text)) = self.live.take() {
-            let cell = crate::ui::tui::paint::live_cell(style, &text);
+        if let Some(cell) = self.stream.close() {
             self.revision += 1;
             self.transcript.push(cell);
         }

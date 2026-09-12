@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use crate::types::{Message, Usage};
 
-use super::cell::{Cell, Span, Style};
+use super::cell::{Cell, Span, Stream, Style};
 use super::contract::{Front, Ui};
 use super::status::Status;
 use super::status_bar::StatusBar;
@@ -53,43 +53,6 @@ fn style_code(style: Style) -> &'static str {
     }
 }
 
-/// A text block being streamed.
-///
-/// Deltas are written as they arrive rather than buffered, so the block is never
-/// held whole: only its kind has to be remembered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Block {
-    Reasoning,
-    Content,
-    /// A running command's output: the one block whose text is not the model's, and
-    /// the only one that is not a part of the answer's own two.
-    Output,
-}
-
-impl Block {
-    /// The style the whole block is written in.
-    ///
-    /// The same styles the cells use, which is what keeps a streamed block and the
-    /// cell replay builds out of the same text painted identically.
-    fn style(self) -> Style {
-        match self {
-            Block::Reasoning => Style::Reasoning,
-            Block::Content => Style::Plain,
-            Block::Output => Style::Dim,
-        }
-    }
-
-    /// An empty cell of this kind, used to ask the spacing rule where the block
-    /// belongs without having to duplicate the rule here.
-    fn spacing_cell(self) -> Cell {
-        match self {
-            Block::Reasoning => Cell::Reasoning(String::new()),
-            Block::Content => Cell::Content(String::new()),
-            Block::Output => Cell::ToolOutput(String::new()),
-        }
-    }
-}
-
 /// Streaming renderer. Thinking and body text are two independent render blocks:
 /// - thinking is dim, body text is the normal color
 /// - blocks are separated by a newline; switching from thinking to body adds an
@@ -109,8 +72,11 @@ pub struct Renderer {
     /// sequences, how to silence its echo -- comes from here.
     term: Box<dyn Terminal>,
     color: bool,
-    /// The text block currently being streamed, if any.
-    live: Option<Block>,
+    /// The text block currently being streamed, if any. The shared
+    /// [`Stream`] does the block tracking: the plain front end writes the
+    /// bytes itself, the TUI files the closed cell into its transcript, and
+    /// both ask the same answer to "what cell is a block in style X".
+    stream: Stream,
     /// Whether the cursor is at the start of a line of the block being streamed,
     /// which is a fact only a command's output has a use for: a chunk can end in the
     /// middle of a line, and the line it continues is set in like the rest of the
@@ -141,7 +107,7 @@ impl Renderer {
             out,
             term,
             color,
-            live: None,
+            stream: Stream::new(),
             at_line_start: false,
             prev_was_block: false,
             status: Status::default(),
@@ -310,24 +276,32 @@ impl Renderer {
     /// arrives and leaves the wrapping to the terminal, so the columns of a line it
     /// never sees are not its to choose; the front end that owns the screen lays the
     /// whole block out and sets in every line of it.
-    fn open_block(&mut self, block: Block) {
-        if self.live == Some(block) {
+    fn open_block(&mut self, style: Style) {
+        // Same style already open: the stream's no-op means we write nothing.
+        if self.stream.current().map(|(open, _)| open) == Some(style) {
             return;
         }
         self.close_block();
-        if block.spacing_cell().gap_after(self.prev_was_block) {
+        // The spacing rule is per-cell-type, and a block in `style` becomes a
+        // cell whose gutter and gap come from the same style: an empty cell of
+        // that kind is what the painter used to build, and is what the stream's
+        // `stream_cell("")` answers.
+        let spacing = style.stream_cell(String::new());
+        if spacing.gap_after(self.prev_was_block) {
             self.emit("\n");
         }
-        self.emit(self.open_style(block.style()));
-        if let Some(gutter) = block.spacing_cell().gutter() {
+        self.emit(self.open_style(style));
+        if let Some(gutter) = spacing.gutter() {
             self.emit(gutter.head);
         }
-        self.live = Some(block);
+        // Open the stream in this style. The empty text is the no-op path: the
+        // stream is the one closing the previous block, not us.
+        let _ = self.stream.append(style, "");
     }
 
     /// End the streaming block: close its style and its line.
     fn close_block(&mut self) {
-        if self.live.take().is_none() {
+        if self.stream.close().is_none() {
             return;
         }
         self.emit(self.close_style());
@@ -413,12 +387,12 @@ impl Ui for Renderer {
     }
 
     fn reasoning_delta(&mut self, s: &str) {
-        self.open_block(Block::Reasoning);
+        self.open_block(Style::Reasoning);
         self.emit(s);
     }
 
     fn content_delta(&mut self, s: &str) {
-        self.open_block(Block::Content);
+        self.open_block(Style::Plain);
         self.emit(s);
     }
 
@@ -434,14 +408,14 @@ impl Ui for Renderer {
         if chunk.is_empty() {
             return;
         }
-        self.open_block(Block::Output);
+        self.open_block(Style::Dim);
         // The command's own lines are set in like every other line of a cell, and
         // this is the only layer that sees where they break: what arrives is a run
         // of bytes, so a `\n` in it is a line of the cell that has to carry the
         // continuation columns itself. A line the terminal wraps is still the
         // terminal's, since only it knows where the screen ends.
-        let rest = Block::Output
-            .spacing_cell()
+        let rest = Style::Dim
+            .stream_cell(String::new())
             .gutter()
             .map_or("", |gutter| gutter.rest);
         let mut lines = chunk.split('\n').peekable();
