@@ -6,7 +6,8 @@
 //! credential, the beta names. A backend that speaks the spec is a `Profile`,
 //! not a branch.
 
-use std::time::Duration;
+use std::future::Future;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{Api, Error};
 use crate::stream::EventStream;
@@ -35,6 +36,21 @@ const READ_TIMEOUT: Duration = Duration::from_secs(600);
 /// a request nobody can account for.
 const USER_AGENT: &str = concat!("caocli-anthropic/", env!("CARGO_PKG_VERSION"));
 
+/// How many attempts a request gets before it is a failure: the first one and
+/// this many more. The reference client's own default.
+pub const DEFAULT_MAX_RETRIES: u32 = 2;
+
+/// The first wait of a backoff, and what it doubles from.
+const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// The longest wait a backoff reaches, however many attempts have been made.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(8);
+
+/// The longest wait an endpoint's own `retry-after` can ask for and be obeyed.
+/// Past this the backoff is used instead: an endpoint that wants a minute or an
+/// hour is an endpoint to come back to later, not to hold a turn open for.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
 /// How the client proves who it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Auth {
@@ -60,6 +76,7 @@ pub struct Profile {
     api_version: String,
     auth: Auth,
     betas: Vec<String>,
+    max_retries: u32,
 }
 
 impl Profile {
@@ -77,6 +94,7 @@ impl Profile {
             api_version: API_VERSION.to_string(),
             auth: Auth::None,
             betas: Vec::new(),
+            max_retries: DEFAULT_MAX_RETRIES,
         }
     }
 
@@ -110,6 +128,18 @@ impl Profile {
     /// one header, comma-separated.
     pub fn with_beta(mut self, beta: impl Into<String>) -> Self {
         self.betas.push(beta.into());
+        self
+    }
+
+    /// How many times a request worth retrying is tried again. The default is
+    /// [`DEFAULT_MAX_RETRIES`], which is the reference client's own.
+    ///
+    /// `0` means an attempt is the whole of it: the first failure is the caller's
+    /// failure. A caller that would rather see a refusal than wait through a
+    /// backoff — an interactive one, where the wait shows up as a turn that has
+    /// stopped responding — says so here.
+    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
         self
     }
 
@@ -187,19 +217,26 @@ impl Client {
     /// of the call.
     pub async fn messages(&self, request: &MessagesRequest) -> Result<Message, Error> {
         let body = self.body(request)?;
-        let response = self.post(body).send().await.map_err(Error::Transport)?;
-        let status = response.status();
-        let bytes = response.bytes().await.map_err(Error::Transport)?;
-        if !status.is_success() {
-            return Err(Error::Api(Api {
-                status: status.as_u16(),
-                body: String::from_utf8_lossy(&bytes).into_owned(),
-            }));
-        }
-        serde_json::from_slice(&bytes).map_err(|source| Error::Decode {
-            what: "message",
-            source,
+        self.retrying(|| async {
+            let response = self
+                .post(body.clone())
+                .send()
+                .await
+                .map_err(Error::Transport)?;
+            let status = response.status();
+            // What the headers said is read before the body takes the response.
+            let headers = response.headers().clone();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(Error::Api(refusal(status.as_u16(), &headers, body)));
+            }
+            let bytes = response.bytes().await.map_err(Error::Transport)?;
+            serde_json::from_slice(&bytes).map_err(|source| Error::Decode {
+                what: "message",
+                source,
+            })
         })
+        .await
     }
 
     /// An answer as it is written, one event at a time.
@@ -217,16 +254,54 @@ impl Client {
     /// reference client's transport sends.
     pub async fn stream(&self, request: &MessagesRequest) -> Result<EventStream, Error> {
         let body = self.body(request)?;
-        let response = self.post(body).send().await.map_err(Error::Transport)?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Error::Api(Api {
-                status: status.as_u16(),
-                body,
-            }));
+        self.retrying(|| async {
+            let response = self
+                .post(body.clone())
+                .send()
+                .await
+                .map_err(Error::Transport)?;
+            let status = response.status();
+            if !status.is_success() {
+                // What the headers said is read before the body takes the
+                // response: whether to try again is in them.
+                let headers = response.headers().clone();
+                let body = response.text().await.unwrap_or_default();
+                return Err(Error::Api(refusal(status.as_u16(), &headers, body)));
+            }
+            Ok(EventStream::new(Box::pin(response.bytes_stream())))
+        })
+        .await
+    }
+
+    /// Run one attempt, and another one while the failure is worth another one.
+    ///
+    /// The schedule is the reference client's: the endpoint's own `retry-after`
+    /// when it asked for a wait a client should obey, and otherwise a backoff
+    /// that doubles from half a second to eight, spread by a jitter so that a
+    /// fleet of clients does not come back in lockstep.
+    ///
+    /// Only the establishing of a response is retried. A stream that fails after
+    /// its first event is not: the answer is half-delivered and the caller is the
+    /// one that can decide what to do about it.
+    async fn retrying<T, F, Fut>(&self, attempt: F) -> Result<T, Error>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<T, Error>>,
+    {
+        let mut made = 0;
+        loop {
+            match attempt().await {
+                Ok(value) => return Ok(value),
+                Err(failure) => {
+                    if made >= self.profile.max_retries || !failure.is_transient() {
+                        return Err(failure);
+                    }
+                    let delay = retry_delay(made, failure.retry_after());
+                    made += 1;
+                    tokio::time::sleep(delay).await;
+                }
+            }
         }
-        Ok(EventStream::new(Box::pin(response.bytes_stream())))
     }
 
     /// The request itself: the profile's headers, and the body verbatim.
@@ -255,6 +330,62 @@ impl Client {
             source,
         })
     }
+}
+
+/// A refusal, with what its headers said about it.
+fn refusal(status: u16, headers: &reqwest::header::HeaderMap, body: String) -> Api {
+    let text = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    Api {
+        status,
+        body,
+        request_id: text("request-id"),
+        should_retry: match text("x-should-retry").as_deref() {
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            _ => None,
+        },
+        // Milliseconds first, as the reference client reads them: an endpoint
+        // that sends both means the more precise one.
+        retry_after: text("retry-after-ms")
+            .and_then(|ms| ms.parse::<f64>().ok())
+            .map(|ms| Duration::from_secs_f64((ms / 1000.0).max(0.0)))
+            .or_else(|| {
+                text("retry-after")
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .map(|s| Duration::from_secs_f64(s.max(0.0)))
+            })
+            .filter(|wait| *wait > Duration::ZERO && *wait <= MAX_RETRY_AFTER),
+    }
+}
+
+/// How long to wait before attempt number `made + 1`.
+fn retry_delay(made: u32, retry_after: Option<Duration>) -> Duration {
+    if let Some(asked) = retry_after {
+        return asked;
+    }
+    let backoff = INITIAL_RETRY_DELAY
+        .saturating_mul(2u32.saturating_pow(made))
+        .min(MAX_RETRY_DELAY);
+    backoff.mul_f64(jitter())
+}
+
+/// The fraction of a backoff to actually wait: between three quarters and all of
+/// it, which is the reference client's own spread (`1 - 0.25 * random()`).
+///
+/// The clock's low bits are randomness enough for a jitter whose whole job is to
+/// keep two clients from retrying in the same millisecond, and it costs the crate
+/// no dependency.
+fn jitter() -> f64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.subsec_nanos())
+        .unwrap_or_default();
+    1.0 - 0.25 * (f64::from(nanos % 1_000_000) / 1_000_000.0)
 }
 
 #[cfg(test)]
@@ -456,9 +587,175 @@ mod tests {
             .respond_with(ResponseTemplate::new(529).set_body_string("overloaded"))
             .mount(&server)
             .await;
-        let client = client_for(&server, Profile::endpoint("x"));
+        // No retries here: the point is what the failure *is*, and the retries of
+        // a 529 are the next test's subject.
+        let client = client_for(&server, Profile::endpoint("x").with_max_retries(0));
         let err = client.stream(&request()).await.unwrap_err();
         assert!(err.is_transient());
+        assert_eq!(err.kind(), crate::error::Kind::Overloaded);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// The retry schedule, which is the reference client's: it is a *behavior*,
+    /// so the tests are about how many attempts the endpoint saw and how long the
+    /// client waited between them.
+
+    #[tokio::test]
+    async fn a_refusal_worth_retrying_is_tried_again_and_the_answer_arrives() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "m"})))
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Profile::endpoint("x"));
+        assert!(client.messages(&request()).await.is_ok());
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "one refusal, one answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wait_the_endpoint_asked_for_is_the_wait_that_happens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after-ms", "5")
+                    .set_body_string("slow down"),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "m"})))
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Profile::endpoint("x"));
+        let started = std::time::Instant::now();
+        assert!(client.messages(&request()).await.is_ok());
+        // A backoff would have waited at least 375 ms; five milliseconds is what
+        // the endpoint asked for, and what it gets.
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_that_will_not_change_is_not_tried_again() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Profile::endpoint("x"));
+        let err = client.messages(&request()).await.unwrap_err();
+        assert_eq!(err.kind(), crate::error::Kind::BadRequest);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn what_the_endpoint_says_about_retrying_is_believed() {
+        // A status this client retries, and the endpoint saying not to.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("x-should-retry", "false")
+                    .set_body_string("no"),
+            )
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Profile::endpoint("x"));
+        assert!(client.messages(&request()).await.is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+        // A status it does not retry, and the endpoint saying to.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .insert_header("x-should-retry", "true")
+                    .set_body_string("try again"),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "m"})))
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Profile::endpoint("x"));
+        assert!(client.messages(&request()).await.is_ok());
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_wants_no_retries_gets_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("later"))
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Profile::endpoint("x").with_max_retries(0));
+        assert!(client.messages(&request()).await.is_err());
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "the first failure is the caller's failure"
+        );
+        // And the budget is the reference client's unless a caller says
+        // otherwise.
+        assert_eq!(Profile::endpoint("x").max_retries, DEFAULT_MAX_RETRIES);
+        assert_eq!(DEFAULT_MAX_RETRIES, 2);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_carries_the_endpoints_own_id_for_the_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .insert_header("request-id", "req_01")
+                    .set_body_string("boom"),
+            )
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Profile::endpoint("x").with_max_retries(0));
+        let err = client.messages(&request()).await.unwrap_err();
+        assert_eq!(err.request_id(), Some("req_01"));
+        assert_eq!(err.kind(), crate::error::Kind::ServerError);
+    }
+
+    #[tokio::test]
+    async fn a_request_that_never_arrived_is_tried_again() {
+        // Nothing listens on port 1: every attempt is a connection failure, which
+        // is one of the failures the reference client retries.
+        let client = Client::new(Profile::endpoint("http://127.0.0.1:1/never")).unwrap();
+        let started = std::time::Instant::now();
+        let err = client.messages(&request()).await.unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                crate::error::Kind::Connection | crate::error::Kind::Timeout
+            ),
+            "{err:?}"
+        );
+        // Three attempts, two waits: the shortest they can be is 375 ms and
+        // 750 ms, and the bound is loose because the jitter is real.
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "waited {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

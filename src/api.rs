@@ -62,8 +62,17 @@ impl Client {
             }
             // The endpoint is the provider's own URL, path and all: an
             // Anthropic-compatible gateway puts the messages where it likes.
+            //
+            // No retries, deliberately, where the SDK's default is two. A
+            // refusal worth retrying is one this program would rather show: a
+            // backoff is a turn that has stopped responding for reasons the
+            // person watching cannot see, and pressing enter again is one
+            // keystroke. The SDK keeps the reference client's behavior for a
+            // caller that wants it.
             Wire::Anthropic => Backend::Anthropic(anthropic::Client::new(
-                anthropic::Profile::endpoint(url).with_bearer_token(api_key),
+                anthropic::Profile::endpoint(url)
+                    .with_bearer_token(api_key)
+                    .with_max_retries(0),
             )?),
         };
         Ok(Self { backend })
