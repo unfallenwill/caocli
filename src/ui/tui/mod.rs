@@ -39,6 +39,7 @@ mod picker;
 mod render;
 mod screen;
 mod state;
+mod working;
 
 use channels::Channels;
 use input::Submitted;
