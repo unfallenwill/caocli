@@ -38,5 +38,12 @@
 #![deny(missing_docs)]
 
 pub mod error;
+pub mod types;
 
 pub use error::{Api, Error, StreamError};
+pub use types::{
+    Block, BlockDelta, BlockKind, CacheControl, CacheCreation, CacheType, Effort, Event,
+    ImageSource, Message, MessageContent, MessageDeltaBody, MessageParam, MessagesRequest,
+    Metadata, OutputConfig, OutputTokensDetails, Role, StopReason, SystemPrompt, ThinkingConfig,
+    ThinkingDisplay, Tool, ToolChoice, ToolResultContent, Ttl, Usage,
+};

@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use serde::Deserialize;
+
 /// The endpoint refused the request with a non-success status.
 ///
 /// The body is carried verbatim rather than summarized: on this API it names
@@ -35,7 +37,7 @@ impl fmt::Display for Api {
 /// The spec's own body: a type such as `overloaded_error` and a message meant to
 /// be shown. A stream that carries one is over — there is no more of the answer
 /// coming, so a caller must not finish a turn from what arrived before it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct StreamError {
     /// The error type the endpoint named (`overloaded_error`, `api_error`, …).
     pub r#type: String,
