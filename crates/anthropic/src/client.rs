@@ -19,8 +19,8 @@ const MESSAGES_PATH: &str = "/v1/messages";
 /// required, and a request without one is refused rather than defaulted.
 pub const API_VERSION: &str = "2023-06-01";
 
-/// How long a connection may take to open.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a connection may take to open. The reference client's own bound.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a stream may be silent before it is a failure.
 ///

@@ -996,7 +996,12 @@ pub enum Event {
     },
     /// The answer is over. This is the end of the stream.
     MessageStop,
-    /// A keep-alive. Carries nothing.
+    /// A keep-alive, with nothing in it.
+    ///
+    /// Parsed and then skipped: [`EventStream`] never hands one over, exactly
+    /// as the reference client's loop never yields one.
+    ///
+    /// [`EventStream`]: crate::EventStream
     Ping,
     /// The stream failed. There is no more of the answer coming.
     Error {
@@ -1004,6 +1009,10 @@ pub enum Event {
         error: crate::StreamError,
     },
     /// An event type this crate does not model.
+    ///
+    /// Parsed and then skipped, like a keep-alive: what a caller iterates is the
+    /// events an answer is made of, and a stream that is ahead of this crate is
+    /// not a stream that fails.
     #[serde(other)]
     Unknown,
 }

@@ -13,6 +13,9 @@
 //! payload — the two agree, and a stream that spells the type only in the name
 //! is still a stream this reads. The spec's `id` and `retry` fields are dropped:
 //! nothing here reconnects on its own, so there is nothing for them to steer.
+//! A `ping` keep-alive and an event type this crate does not know are read past
+//! rather than handed over — again what the reference client does, and the
+//! reason neither appears in the sequence a caller iterates.
 //!
 //! The stream is a sequence, not a session: [`EventStream::next_event`] hands
 //! over one event at a time, and the caller decides what a completed answer is.
@@ -68,9 +71,13 @@ impl EventStream {
     ///
     /// `message_stop` is delivered and then the stream is done: the caller sees
     /// the end of the answer as an event, and the call after it returns `None`.
-    /// A stream that reports its own failure does not come through here as an
-    /// event — it fails the call, because an answer that stopped mid-thought
-    /// must not be read as one that finished.
+    ///
+    /// Two of the type's variants never come out of here. A keep-alive
+    /// ([`Event::Ping`]) and a type the spec added later ([`Event::Unknown`]) are
+    /// skipped, and a stream that reported its own failure ([`Event::Error`])
+    /// fails the call instead — an answer that stopped mid-thought must not be
+    /// read as one that finished. All three are parsed and none is delivered,
+    /// which is the reference client's own behavior.
     pub async fn next_event(&mut self) -> Result<Option<Event>, Error> {
         loop {
             if let Some(lines) = take_frame(&mut self.buf) {
@@ -80,6 +87,15 @@ impl EventStream {
                     continue;
                 };
                 let event = decode(&payload)?;
+                // The events a caller sees are the ones an answer is made of.
+                // A keep-alive and a type the spec added later are read past,
+                // which is what the reference client's own loop does: `ping`
+                // continues, and a name it does not know falls through. The
+                // variants stay in the type because a parser that failed on them
+                // would fail on a stream that is merely ahead of this crate.
+                if matches!(event, Event::Ping | Event::Unknown) {
+                    continue;
+                }
                 // A stream that reported its own failure is over, and what
                 // arrived before the report is not an answer: the caller learns
                 // it from the error rather than from an event it must remember
@@ -268,6 +284,8 @@ mod tests {
                 "message_start",
                 serde_json::json!({"type":"message_start","message":{"id":"m1","usage":{"input_tokens":7}}}),
             ),
+            // A keep-alive rides in the middle of the answer and is not
+            // delivered: what a caller iterates is what the answer is made of.
             event("ping", serde_json::json!({"type":"ping"})),
             event(
                 "content_block_start",
@@ -290,14 +308,13 @@ mod tests {
         while let Some(event) = stream.next_event().await.unwrap() {
             seen.push(event);
         }
-        assert_eq!(seen.len(), 7, "every event is delivered once: {seen:?}");
+        assert_eq!(seen.len(), 6, "six events, and no keep-alive: {seen:?}");
         assert!(matches!(seen[0], Event::MessageStart { .. }));
-        assert_eq!(seen[1], Event::Ping);
-        assert!(matches!(seen[2], Event::ContentBlockStart { index: 0, .. }));
-        assert!(matches!(seen[3], Event::ContentBlockDelta { index: 0, .. }));
-        assert_eq!(seen[4], Event::ContentBlockStop { index: 0 });
-        assert!(matches!(seen[5], Event::MessageDelta { .. }));
-        assert_eq!(seen[6], Event::MessageStop);
+        assert!(matches!(seen[1], Event::ContentBlockStart { index: 0, .. }));
+        assert!(matches!(seen[2], Event::ContentBlockDelta { index: 0, .. }));
+        assert_eq!(seen[3], Event::ContentBlockStop { index: 0 });
+        assert!(matches!(seen[4], Event::MessageDelta { .. }));
+        assert_eq!(seen[5], Event::MessageStop);
         assert_eq!(
             stream.next_event().await.unwrap(),
             None,
@@ -309,17 +326,17 @@ mod tests {
     async fn the_name_line_and_the_blank_separator_are_not_part_of_the_payload() {
         // The payload names its own type, so the event name is duplicated data;
         // a stream that wrote it differently still reads.
-        let body = "event: misplaced\ndata:{\"type\":\"ping\"}\n\n";
+        let body = "event: misplaced\ndata:{\"type\":\"message_stop\"}\n\n";
         let mut stream = stream_of(body);
-        assert_eq!(stream.next_event().await.unwrap(), Some(Event::Ping));
+        assert_eq!(stream.next_event().await.unwrap(), Some(Event::MessageStop));
         assert_eq!(stream.next_event().await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn a_carriage_return_does_not_end_up_in_the_payload() {
-        let body = "data: {\"type\":\"ping\"}\r\n\r\n";
+        let body = "data: {\"type\":\"message_stop\"}\r\n\r\n";
         let mut stream = stream_of(body);
-        assert_eq!(stream.next_event().await.unwrap(), Some(Event::Ping));
+        assert_eq!(stream.next_event().await.unwrap(), Some(Event::MessageStop));
     }
 
     #[tokio::test]
@@ -348,8 +365,8 @@ mod tests {
     async fn a_connection_that_closes_ends_the_stream() {
         // No message_stop: the caller is the one that can tell a truncated
         // answer from a finished one, and it does that from the events it saw.
-        let mut stream = stream_of("data: {\"type\":\"ping\"}\n\n");
-        assert_eq!(stream.next_event().await.unwrap(), Some(Event::Ping));
+        let mut stream = stream_of("data: {\"type\":\"message_stop\"}\n\n");
+        assert_eq!(stream.next_event().await.unwrap(), Some(Event::MessageStop));
         assert_eq!(stream.next_event().await.unwrap(), None);
     }
 
@@ -374,15 +391,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unknown_event_is_carried_and_the_stream_reads_on() {
+    async fn an_unknown_event_is_read_past_and_the_stream_reads_on() {
+        // The spec adds event types over time and tells clients to handle the
+        // unknown ones gracefully; what a caller iterates is the events an answer
+        // is made of, so an unknown one is skipped rather than delivered.
         let body = [
             event("future", serde_json::json!({"type":"future_event","x":1})),
-            event("ping", serde_json::json!({"type":"ping"})),
+            event("message_stop", serde_json::json!({"type":"message_stop"})),
         ]
         .concat();
         let mut stream = stream_of(&body);
-        assert_eq!(stream.next_event().await.unwrap(), Some(Event::Unknown));
-        assert_eq!(stream.next_event().await.unwrap(), Some(Event::Ping));
+        assert_eq!(stream.next_event().await.unwrap(), Some(Event::MessageStop));
+        assert_eq!(stream.next_event().await.unwrap(), None);
     }
 
     #[test]
@@ -513,39 +533,41 @@ mod tests {
     #[tokio::test]
     async fn the_events_name_stands_in_for_a_type_the_payload_left_out() {
         // The name and the payload's type are the same word written twice. A
-        // stream that writes it once still reads.
+        // stream that writes it once still reads — and reads as the event the
+        // name says, rather than as an unknown one.
         assert_eq!(
-            events_of("event: ping\ndata: {}\n\n").await,
-            vec![Event::Ping]
+            events_of("event: message_stop\ndata: {}\n\n").await,
+            vec![Event::MessageStop]
         );
-        // An event the name does not make known is carried as unknown, the
-        // same as one whose payload says so.
+        // A name this crate does not know is an unknown event, and unknown
+        // events are read past.
         assert_eq!(
             events_of("event: invented_later\ndata: {}\n\n").await,
-            vec![Event::Unknown]
+            vec![]
         );
         // And a payload that names its own type is believed over the name: the
-        // field is the authority the spec points at.
+        // field is the authority the spec points at. Here the name is one that
+        // would be skipped and the payload is one that is not.
         assert_eq!(
-            events_of("event: content_block_stop\ndata: {\"type\":\"ping\"}\n\n").await,
-            vec![Event::Ping]
+            events_of("event: ping\ndata: {\"type\":\"message_stop\"}\n\n").await,
+            vec![Event::MessageStop]
         );
     }
 
     #[tokio::test]
     async fn a_comment_and_a_lone_blank_line_are_not_events() {
         // Keep-alives: the server says nothing, so neither does this.
-        let body = ": keep-alive\n\n: another\n\ndata: {\"type\":\"ping\"}\n\n";
-        assert_eq!(events_of(body).await, vec![Event::Ping]);
+        let body = ": keep-alive\n\n: another\n\ndata: {\"type\":\"message_stop\"}\n\n";
+        assert_eq!(events_of(body).await, vec![Event::MessageStop]);
     }
 
     #[tokio::test]
     async fn a_stream_terminated_by_carriage_returns_reads_the_same() {
-        let body = "event: ping\r\ndata: {\"type\":\"ping\"}\r\n\r\n";
-        assert_eq!(events_of(body).await, vec![Event::Ping]);
+        let body = "event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n";
+        assert_eq!(events_of(body).await, vec![Event::MessageStop]);
         // A lone `\r` as the terminator is the spec's third spelling.
-        let body = "event: ping\rdata: {\"type\":\"ping\"}\r\r";
-        assert_eq!(events_of(body).await, vec![Event::Ping]);
+        let body = "event: message_stop\rdata: {\"type\":\"message_stop\"}\r\r";
+        assert_eq!(events_of(body).await, vec![Event::MessageStop]);
     }
 
     #[tokio::test]
@@ -554,8 +576,14 @@ mod tests {
         // terminators that would be a blank line, and the event's own name
         // would be an event with no payload in it.
         for (first, second) in [
-            ("event: ping\r", "\ndata: {\"type\":\"ping\"}\r\n\r\n"),
-            ("event: ping\r", "\ndata: {\"type\":\"ping\"}\r\r"),
+            (
+                "event: message_stop\r",
+                "\ndata: {\"type\":\"message_stop\"}\r\n\r\n",
+            ),
+            (
+                "event: message_stop\r",
+                "\ndata: {\"type\":\"message_stop\"}\r\r",
+            ),
         ] {
             let chunks = vec![
                 Ok(Bytes::from(first.to_owned())),
@@ -564,7 +592,7 @@ mod tests {
             let mut stream = EventStream::new(Box::pin(futures_util::stream::iter(chunks)));
             assert_eq!(
                 stream.next_event().await.unwrap(),
-                Some(Event::Ping),
+                Some(Event::MessageStop),
                 "{first:?} + {second:?}"
             );
             assert_eq!(stream.next_event().await.unwrap(), None);
