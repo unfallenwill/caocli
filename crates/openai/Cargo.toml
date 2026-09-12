@@ -1,0 +1,21 @@
+[package]
+name = "caocli-openai"
+version = "0.1.0"
+edition = "2024"
+description = "A client for the OpenAI Chat Completions API: types, the named wire, and the stream it answers with"
+license = "MIT"
+repository = "https://github.com/unfallenwill/caocli"
+
+[dependencies]
+bytes = "1.12.1"
+futures-util = "0.3.34"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "default-tls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+# For the retry schedule's sleep. The transport already needs a tokio runtime
+# (reqwest's is behind it), so this adds no new obligation on a caller.
+tokio = { version = "1.53.1", features = ["time"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6.5"

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/anthropic"]
+members = ["crates/anthropic", "crates/openai"]
 resolver = "3"
 
 [package]
