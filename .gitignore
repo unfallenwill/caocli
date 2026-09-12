@@ -5,3 +5,7 @@ scripts/__pycache__/
 # root (next to Cargo.toml) is the author's local MCP setup, not part
 # of the project. Smoke runs and tests write these beside themselves.
 /.mcp.json
+# A vim swap file is a buffer in progress, not source. One of these
+# was committed here once; nothing else should follow it in.
+*.swp
+*.swo
