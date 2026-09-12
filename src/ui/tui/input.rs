@@ -307,6 +307,29 @@ impl State {
         self.refresh_placeholder();
     }
 
+    /// Take the box over for an answer: hold aside what was being typed, and
+    /// hand back an empty box. The answer to "run it?" is a `y`, and a
+    /// sentence that happened to be in the box is not one -- it comes back when
+    /// [`State::return_from_answer`] is called.
+    ///
+    /// `secret` puts the box into masking mode (the secret is typed on a screen
+    /// other people can see), which is the drawing, not the text.
+    pub(super) fn take_for_answer(&mut self, secret: bool) {
+        self.revision += 1;
+        self.held_draft = Some(self.text());
+        self.textarea = input_box();
+        if secret {
+            self.textarea.set_mask_char(SECRET_MASK);
+        }
+        self.refresh_placeholder();
+    }
+
+    /// Hand the box back to what it was holding before the answer took it.
+    pub(super) fn return_from_answer(&mut self) {
+        let held = self.held_draft.take().unwrap_or_default();
+        self.set_text(&held);
+    }
+
     /// Up: the previous command, or the previous line typed.
     pub(super) fn up(&mut self) {
         if let Some(picker) = &mut self.picker {
@@ -564,21 +587,8 @@ impl State {
 
     /// A question is open: take the box for its answer.
     pub(super) fn open_answer(&mut self, reply: Answer) {
-        self.revision += 1;
-        // A secret is typed on a screen other people can see, so the box shows
-        // dots instead of what is in it. The answer is still what was typed:
-        // this is the drawing, not the text.
-        let secret = matches!(reply, Answer::Secret(_));
         self.reply = Some(reply);
-        // A line being composed when the question arrives is held aside: the
-        // answer to "run it?" is a `y`, and a sentence that happened to be in the
-        // box is not one. It comes back when the question closes.
-        self.held_draft = Some(self.text());
-        self.textarea = input_box();
-        if secret {
-            self.textarea.set_mask_char(SECRET_MASK);
-        }
-        self.refresh_placeholder();
+        self.take_for_answer(matches!(self.reply, Some(Answer::Secret(_))));
     }
 
     /// Answer the open question from what is in the box, if anything. What the
@@ -601,8 +611,7 @@ impl State {
                     let _ = reply.send((!answer.is_empty()).then_some(answer));
                 }
             }
-            let held = self.held_draft.take().unwrap_or_default();
-            self.set_text(&held);
+            self.return_from_answer();
         }
         self.question = None;
         self.refresh_placeholder();

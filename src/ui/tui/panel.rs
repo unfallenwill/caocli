@@ -79,8 +79,7 @@ impl State {
         // A line being composed when the question arrives is held aside, the way
         // it is for the gate: a sentence that happened to be in the box is not an
         // answer, and it comes back when the questions are over.
-        self.held_draft = Some(self.text());
-        self.textarea = super::input::input_box();
+        self.take_for_answer(false);
         self.panel = Some(Panel {
             questions,
             at: 0,
@@ -219,8 +218,7 @@ impl State {
 
     /// Give the box back to what it was holding before the questions arrived.
     fn close_answer_box(&mut self) {
-        let held = self.held_draft.take().unwrap_or_default();
-        self.set_text(&held);
+        self.return_from_answer();
         self.refresh_placeholder();
     }
 
