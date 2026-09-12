@@ -367,7 +367,10 @@ fn an_empty_chunk_opens_no_block() {
     r.tool_output("");
     r.tool_result("exit_code: 0");
     let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-    assert_eq!(s, "\x1b[2m· exit_code: 0 · 12 bytes\x1b[0m\n");
+    // A Bash result without stdout is just the exit code -- no "· N bytes"
+    // suffix, because the suffix was a measure of the result, not of
+    // anything a reader needs to know.
+    assert_eq!(s, "\x1b[2m· exit_code: 0\x1b[0m\n");
 }
 
 #[test]
@@ -402,8 +405,10 @@ fn replay_renders_history_compactly_with_colors() {
     );
     assert!(s.contains("running it"), "{s}");
     assert!(s.contains("▸ Bash ls -la"), "tool calls are yellow: {s}");
-    // tool messages only get a summary, never the full text
-    assert!(s.contains("exit_code: 0 · 39 bytes"), "{s}");
+    // tool messages only get a summary, never the full text. A Bash
+    // summary is just the exit code -- the first line of stdout is
+    // content, and the transcript's rule is that the summary is metadata.
+    assert!(s.contains("exit_code: 0"), "{s}");
     assert!(
         !s.contains("SECRET_BODY"),
         "tool output must not be replayed: {s}"
@@ -563,7 +568,7 @@ fn the_plain_front_ends_stream_is_frozen() {
         "\n",
         // a call, its result, and the usage line
         "\x1b[1;33m▸ Bash ls -la\x1b[0m\n",
-        "\x1b[2m· exit_code: 0 · 32 bytes\x1b[0m\n",
+        "\x1b[2m· exit_code: 0\x1b[0m\n",
         "\x1b[2m  tokens: in 10/10 (hit 6/miss 4) · out 0\x1b[0m\n",
         // the bar picks up the usage the line just recorded, then the gate asks
         "\x1b7\x1b[24;1H\x1b[2K                    ",
@@ -604,13 +609,18 @@ fn approval_requested_asks_without_newline() {
 }
 
 #[test]
-fn tool_result_shows_exit_line_and_bytes() {
+fn tool_result_shows_exit_code_only() {
     let (mut r, buf) = with_buffer(false);
     r.tool_result("exit_code: 3\n--- stdout ---\nhello");
     r.tool_result("");
     let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-    assert!(s.contains("exit_code: 3 · 33 bytes"), "{s}");
-    assert!(s.contains(" · 0 bytes"), "{s}"); // empty result
+    // A Bash result: just the exit code, no first line of stdout, no
+    // byte count. The transcript's rule is that the summary is metadata.
+    assert!(s.contains("exit_code: 3"), "{s}");
+    assert!(!s.contains("hello"), "the stdout body must not leak: {s}");
+    // An empty result: no recognized prefix, the default summary
+    // (first line and byte count) is what falls out.
+    assert!(s.contains(" · 0 bytes"), "{s}");
 }
 
 #[test]

@@ -22,7 +22,7 @@ use std::time::Duration;
 use super::text;
 
 mod call;
-mod question;
+pub(super) mod question;
 mod replay;
 mod todos;
 
@@ -377,7 +377,10 @@ impl Cell {
                 }
                 spans
             }
-            Cell::ToolResult(result) => vec![Span::new(Style::Dim, summary(result))],
+            Cell::ToolResult(result) => {
+                let (style, text) = call::result_summary(result);
+                vec![Span::new(style, text)]
+            }
             Cell::ToolOutput(text) => vec![Span::new(Style::Dim, text.as_str())],
             Cell::Notice(text) => vec![Span::new(Style::Dim, text.as_str())],
             Cell::Failure(text) => vec![Span::new(Style::Red, format!("error: {text}"))],
@@ -427,20 +430,6 @@ impl Cell {
 /// much of it there is, which is as much as the message says.
 fn image_line(image: &Note) -> String {
     format!("[image {} · {} bytes]", image.format, image.bytes)
-}
-
-/// One-line summary of a tool result: its first line and how much text came
-/// back.
-///
-/// The summary shown for a tool result: its first line and how much there is of
-/// it. A result is often a screenful of a file or a command's output, and what the
-/// transcript is for is the shape of the turn, not the contents of every result.
-fn summary(result: &str) -> String {
-    format!(
-        "{} · {} bytes",
-        result.lines().next().unwrap_or(""),
-        result.len()
-    )
 }
 
 /// The per-sub-request usage line.
@@ -649,13 +638,22 @@ mod tests {
     fn tool_result_renders_first_line_and_size_only() {
         let result = "exit_code: 3\n--- stdout ---\nSECRET_BODY";
         let spans = Cell::ToolResult(result.into()).spans();
-        assert_eq!(
-            spans,
-            vec![Span::new(Style::Dim, "exit_code: 3 · 39 bytes")]
-        );
-        // an empty result still reports its (zero) size
+        // A Bash result: the exit code, and only the exit code. The
+        // transcript's rule is that a tool result's summary is metadata,
+        // never content -- and the first line of stdout is content.
+        assert_eq!(spans, vec![Span::new(Style::Dim, "exit_code: 3")]);
+        // An empty result: no recognized prefix, the default summary
+        // (first line and byte count) is what falls out.
         let spans = Cell::ToolResult(String::new()).spans();
         assert_eq!(spans, vec![Span::new(Style::Dim, " · 0 bytes")]);
+    }
+
+    /// An `error:` result is the one case where the style changes: failures
+    /// are red, so a reader can tell success from failure at a glance.
+    #[test]
+    fn a_tool_result_starting_with_error_is_red() {
+        let spans = Cell::ToolResult("error: file not found".into()).spans();
+        assert_eq!(spans, vec![Span::new(Style::Red, "error: file not found")]);
     }
 
     #[test]
