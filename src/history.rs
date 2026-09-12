@@ -60,6 +60,13 @@ pub fn save(path: &Path, entries: &[String]) -> Result<()> {
         out.push_str(&escape(entry));
         out.push('\n');
     }
+    // The directory is made here rather than by the reader of the path: saving a
+    // history is the write that needs it, and the file may be the first thing in
+    // a home that has no `~/.caocli` yet.
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create directory: {}", dir.display()))?;
+    }
     std::fs::write(path, out)
         .with_context(|| format!("failed to write the history to {}", path.display()))
 }

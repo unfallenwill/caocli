@@ -103,13 +103,20 @@ fn home_dir() -> Result<PathBuf> {
         .context("cannot determine HOME directory")
 }
 
+/// `~/.caocli`, where the settings, the history and the sessions live.
+///
+/// The path rather than the directory: reading a setting is not a reason to make
+/// one, and a read that made it would leave a `~/.caocli` behind on a machine
+/// whose user has never stored anything -- and a directory appearing under
+/// whichever `HOME` happened to be current is a write nothing asked for. What
+/// writes there makes it: [`store_key`], the history when it is saved, and
+/// [`sessions_dir`].
 pub fn caocli_dir() -> Result<PathBuf> {
-    let dir = home_dir()?.join(".caocli");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create directory: {}", dir.display()))?;
-    Ok(dir)
+    Ok(home_dir()?.join(".caocli"))
 }
 
+/// `~/.caocli/sessions`, made here rather than by each writer: the sessions are
+/// what this directory is for, and a session is written into it on the way in.
 pub fn sessions_dir() -> Result<PathBuf> {
     let dir = caocli_dir()?.join("sessions");
     std::fs::create_dir_all(&dir)
@@ -192,6 +199,13 @@ pub fn store_key(provider_id: &str, key: &str) -> Result<PathBuf> {
         .or_default()
         .api_key = Some(key.to_string());
     let path = settings_file()?;
+    // The directory is made here, by the write that needs it, and not by the read
+    // above: a key is the first thing many users store, and the file it goes in
+    // may be the first thing in a home that has no `~/.caocli` yet.
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create directory: {}", dir.display()))?;
+    }
     let text = serde_json::to_string_pretty(&settings)? + "\n";
     // Written beside the file and renamed over it, so a crash leaves either the
     // old key or the new one and never half of either.
@@ -255,7 +269,10 @@ pub(crate) fn scratch_home() -> PathBuf {
         std::process::id(),
         COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     ));
-    std::fs::create_dir_all(&home).unwrap();
+    // The config directory with it, because a test that writes a settings file
+    // writes it where the program would look for one, and what reads there no
+    // longer makes the directory on its way past.
+    std::fs::create_dir_all(home.join(".caocli")).unwrap();
     unsafe { std::env::set_var("HOME", &home) };
     home
 }
@@ -512,14 +529,13 @@ mod tests {
         let home = temp_home();
         unsafe { std::env::set_var("HOME", &home) };
 
+        // Asking where the settings are is not a reason to make a directory: a
+        // read that made one would leave a `~/.caocli` behind for a user who has
+        // never stored anything, and would create it under whichever HOME the
+        // process happened to have.
         let d = caocli_dir().unwrap();
         assert_eq!(d, home.join(".caocli"));
-        assert!(d.is_dir());
-
-        let s = sessions_dir().unwrap();
-        assert_eq!(s, home.join(".caocli").join("sessions"));
-        assert!(s.is_dir());
-
+        assert!(!d.is_dir(), "the path is not the directory");
         assert_eq!(
             history_file().unwrap(),
             home.join(".caocli").join("history")
@@ -528,7 +544,18 @@ mod tests {
             settings_file().unwrap(),
             home.join(".caocli").join("settings.json")
         );
-        assert!(caocli_dir().unwrap().is_dir()); // idempotent
+        assert!(!d.is_dir(), "and neither of those made it either");
+
+        // What writes there makes it. The settings file is the case this exists
+        // for: a key is the first thing many users store.
+        let path = store_key("deepseek", "sk-test")
+            .expect("no settings file to read is the empty settings");
+        assert_eq!(path, home.join(".caocli").join("settings.json"));
+        assert!(d.is_dir());
+
+        let s = sessions_dir().unwrap();
+        assert_eq!(s, home.join(".caocli").join("sessions"));
+        assert!(s.is_dir());
         std::fs::remove_dir_all(&home).unwrap();
     }
 
