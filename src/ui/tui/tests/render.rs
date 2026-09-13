@@ -215,7 +215,7 @@ fn a_long_think_folds_to_its_head_and_a_count() {
     }
     assert_eq!(
         row(&screen, top + THINKING_LINES as u16),
-        format!("┆ … {} more lines", 30 - THINKING_LINES),
+        format!("┆ {} more lines", 30 - THINKING_LINES),
         "the count wears the block's own rule and says what is behind it"
     );
     assert_eq!(

@@ -176,7 +176,7 @@ pub(crate) fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
         let hidden = lines.len() - THINKING_LINES;
         lines.truncate(THINKING_LINES);
         lines.push(Line::styled(
-            format!("{}… {hidden} more lines", gutter.head),
+            format!("{}{hidden} more lines", gutter.head),
             style_of(gutter.style),
         ));
     }
