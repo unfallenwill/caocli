@@ -105,8 +105,8 @@ fn a_running_commands_output_is_written_as_it_arrives() {
     r.tool_result("exit_code: 0\n--- stdout ---\none\ntwo");
     let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
     assert!(s.contains("▸ Bash echo one; echo two"), "{s:?}");
-    assert!(s.contains("\x1b[2m· one\n  two\x1b[0m\n"), "{s:?}");
-    assert!(s.contains("· exit_code: 0"), "{s:?}");
+    assert!(s.contains("\x1b[2m‣ one\n  two\x1b[0m\n"), "{s:?}");
+    assert!(s.contains("‣ exit_code: 0"), "{s:?}");
     // Nothing is left on the line the last chunk ended: a chunk that ends with a
     // break ends the block, and the cell after it follows on the next line.
     assert!(!s.contains("  \n"), "no line of nothing but columns: {s:?}");
@@ -123,7 +123,7 @@ fn a_chunk_after_a_break_continues_the_line_it_started() {
     r.tool_output("three");
     r.tool_result("exit_code: 0");
     let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-    assert!(s.contains("\x1b[2m· one\n  two\n  three\x1b[0m\n"), "{s:?}");
+    assert!(s.contains("\x1b[2m‣ one\n  two\n  three\x1b[0m\n"), "{s:?}");
 }
 
 /// Nothing is written for a command that printed nothing: an empty chunk is not a
@@ -137,7 +137,7 @@ fn an_empty_chunk_opens_no_block() {
     // A Bash result without stdout is just the exit code -- no "· N bytes"
     // suffix, because the suffix was a measure of the result, not of
     // anything a reader needs to know.
-    assert_eq!(s, "\x1b[2m· exit_code: 0\x1b[0m\n");
+    assert_eq!(s, "\x1b[2m‣ exit_code: 0\x1b[0m\n");
 }
 
 #[test]
@@ -335,7 +335,7 @@ fn the_plain_front_ends_stream_is_frozen() {
         "\n",
         // a call, its result, and the usage line
         "\x1b[1;33m▸ Bash ls -la\x1b[0m\n",
-        "\x1b[2m· exit_code: 0\x1b[0m\n",
+        "\x1b[2m‣ exit_code: 0\x1b[0m\n",
         "\x1b[2m  tokens: in 10/10 (hit 6/miss 4) · out 0\x1b[0m\n",
         // the bar picks up the usage the line just recorded, then the gate asks
         "\x1b7\x1b[24;1H\x1b[2K                    ",

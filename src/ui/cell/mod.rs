@@ -367,13 +367,14 @@ impl Cell {
             // The result and the output of the command it is the result of: one
             // marker, because one is the other arriving early. A result that
             // is a failure is red, both in the content and in the marker --
-            // a dim `·` followed by a red message would be jarring, and the
+            // a dim `‣` followed by a red message would be jarring, and the
             // marker is what tells the eye which line of the transcript is
-            // the result in the first place.
+            // the result in the first place. The bullet reads as an item, not
+            // as the `·` separator used between fields everywhere else.
             Cell::ToolResult(text) if text.starts_with("error:") => {
-                Some(Gutter::new("· ", "  ", Style::Red))
+                Some(Gutter::new("‣ ", "  ", Style::Red))
             }
-            Cell::ToolResult(_) | Cell::ToolOutput(_) => Some(Gutter::new("· ", "  ", Style::Dim)),
+            Cell::ToolResult(_) | Cell::ToolOutput(_) => Some(Gutter::new("‣ ", "  ", Style::Dim)),
             Cell::Notice(_) => Some(Gutter::new("  ", "  ", Style::Dim)),
             Cell::Failure(_) => Some(Gutter::new("  ", "  ", Style::Red)),
             Cell::Interrupted => Some(Gutter::new("  ", "  ", Style::Yellow)),
@@ -768,7 +769,7 @@ mod tests {
             .gutter()
             .unwrap();
         assert_eq!(gutter.style, Style::Red);
-        assert_eq!(gutter.head, "· ");
+        assert_eq!(gutter.head, "‣ ");
     }
 
     #[test]
