@@ -57,17 +57,18 @@ pub(crate) fn measure(width: usize) -> usize {
 /// Our style, as ratatui sees it. This is what [`Style`] being data buys: the
 /// mapping happens once per front end, instead of at every call site.
 ///
-/// The dim/bold half comes from [`Style::is_dim`] and [`Style::is_bold`] -- the
-/// same methods the plain front end uses, so the two front ends cannot disagree
-/// on what a `Reasoning` line looks like. The colour is this front end's own,
-/// as a `Color` the framework hands to the theme: a palette the theme chose for
-/// a background this code cannot see.
+/// The dim/bold half comes from [`Style::modifiers`] -- the same method the
+/// plain front end uses, so the two front ends cannot disagree on what a
+/// `Reasoning` line looks like. The colour is this front end's own, as a
+/// `Color` the framework hands to the theme: a palette the theme chose for a
+/// background this code cannot see.
 pub(crate) fn style_of(style: Style) -> RStyle {
     let mut s = RStyle::new();
-    if style.is_dim() {
+    let m = style.modifiers();
+    if m.dim {
         s = s.add_modifier(Modifier::DIM);
     }
-    if style.is_bold() {
+    if m.bold {
         s = s.add_modifier(Modifier::BOLD);
     }
     let color = match style {

@@ -34,19 +34,20 @@ const RESET: &str = "\x1b[0m";
 /// backend decide; this one writes SGR directly because it owns its writer,
 /// not a ratatui frame.
 ///
-/// The dim/bold decisions come from [`Style::is_dim`] and [`Style::is_bold`]
-/// -- the same methods the TUI uses -- so the two front ends cannot disagree
-/// on what a `Reasoning` line looks like. The colour is this front end's own:
-/// a palette the terminal chose for a background this code cannot see.
+/// The dim/bold decisions come from [`Style::modifiers`] -- the same method
+/// the TUI uses -- so the two front ends cannot disagree on what a
+/// `Reasoning` line looks like. The colour is this front end's own: a palette
+/// the terminal chose for a background this code cannot see.
 fn style_code(style: Style) -> &'static str {
-    if style.is_bold() {
+    let m = style.modifiers();
+    if m.bold {
         match style {
             Style::Yellow => "\x1b[1;33m",
             Style::Green => "\x1b[1;32m",
             Style::Red => "\x1b[1;31m",
             _ => "",
         }
-    } else if style.is_dim() {
+    } else if m.dim {
         "\x1b[2m"
     } else {
         ""

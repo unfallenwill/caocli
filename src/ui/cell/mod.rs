@@ -95,6 +95,29 @@ impl Style {
     pub fn is_bold(self) -> bool {
         matches!(self, Style::Yellow | Style::Green | Style::Red)
     }
+
+    /// The dim/bold modifiers this style carries, in the shape a backend applies.
+    ///
+    /// The two front ends share these two modifiers as the rules of the cell
+    /// layer; what each backend does with them is its own -- a palette the
+    /// theme chose for a background this code cannot see, so the half that
+    /// does not depend on the theme is what lives here.
+    pub fn modifiers(self) -> Modifiers {
+        Modifiers {
+            dim: self.is_dim(),
+            bold: self.is_bold(),
+        }
+    }
+}
+
+/// The dim/bold flags a backend applies to a span: what `Style::modifiers`
+/// returns, decoupled from the enum so each front end can pattern-match on a
+/// struct of booleans rather than re-derive the same answer from `is_dim` and
+/// `is_bold` separately.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Modifiers {
+    pub dim: bool,
+    pub bold: bool,
 }
 
 /// A styled run of text.
@@ -880,5 +903,26 @@ mod tests {
             assert!(!style.is_dim(), "{style:?} is not dim");
             assert!(style.is_bold(), "{style:?} is bold");
         }
+    }
+
+    /// The modifiers struct is the same shape the two `is_*` methods answer,
+    /// so a backend that asks for `modifiers()` cannot drift from one that
+    /// asks for `is_dim()`/`is_bold()` separately.
+    #[test]
+    fn modifiers_agrees_with_is_dim_and_is_bold() {
+        for style in [
+            Style::Plain,
+            Style::Dim,
+            Style::Reasoning,
+            Style::Yellow,
+            Style::Green,
+            Style::Red,
+        ] {
+            let m = style.modifiers();
+            assert_eq!(m.dim, style.is_dim(), "{style:?} dim");
+            assert_eq!(m.bold, style.is_bold(), "{style:?} bold");
+        }
+        // The empty default is what a plain line carries.
+        assert_eq!(Style::Plain.modifiers(), Modifiers::default());
     }
 }
