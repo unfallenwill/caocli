@@ -127,28 +127,35 @@ pub(crate) struct Window {
     pub(crate) below: usize,
 }
 
-/// The window a list of `total` rows is seen through, for a selection at
-/// `selected` and `room` rows to draw it in.
+/// A window that follows a selection: the run is placed so `selected` is at its
+/// end, and shortened until the counts at the cut ends fit in `room`.
 ///
 /// The window follows the selection, so the row being chosen is always one of the
 /// rows drawn: a menu scrolled past its own highlight is a menu that cannot be
-/// answered, because the one row `Enter` is about is the one row the reader cannot
-/// see. The selection sits at the end of the window it last moved into, so the
-/// window moves when the selection leaves it and not before.
+/// answered, because the one row `Enter` is about is the one row the reader
+/// cannot see. The selection sits at the end of the window it last moved into,
+/// so the window moves when the selection leaves it and not before.
 ///
-/// A window that is cut says so, which costs a row at each end it is cut at: what
-/// is drawn is the longest run that fits in `room` along with the counts it needs.
-/// A list with room to spare is never counted, and is never cut.
-pub(super) fn picker_window(total: usize, selected: usize, room: usize) -> Window {
+/// A window that is cut says so, which costs a row at each end it is cut at:
+/// what is drawn is the longest run that fits in `room` along with the counts
+/// it needs. A list with room to spare is never counted, and is never cut.
+/// A room too small for a count at each end of a single row falls back to a
+/// bare window around `selected` -- the counts are what give way, the row the
+/// selection is on is the one row that cannot.
+///
+/// The inner loop is what tries every `first` between "selection at the end"
+/// and "selection at the start" -- a larger first can lower the cut at the
+/// bottom end (when the run reaches the last row), and that is sometimes the
+/// only way a window fits.
+///
+/// The picker uses this with `selected` as the highlighted row; the standing
+/// task list uses it with the task in hand. Both want the chosen row to be on
+/// the screen, so the rule is the same.
+fn selection_window(total: usize, selected: usize, room: usize) -> Window {
     let room = room.max(1);
     let total = total.max(1);
     let selected = selected.min(total - 1);
     for shown in (1..=room.min(total)).rev() {
-        // Where the run would sit with the selection at its end, and the furthest
-        // down it can start while still holding the selection. Between them: the
-        // first position whose counts fit is the one drawn, so that a count the
-        // room does not have is given up for a row of the list, which is what the
-        // row would have been spent on anyway.
         let last = total - shown;
         for first in selected.saturating_sub(shown - 1)..=last.min(selected) {
             let end = first + shown;
@@ -163,15 +170,22 @@ pub(super) fn picker_window(total: usize, selected: usize, room: usize) -> Windo
             }
         }
     }
-    // A room too small for a count at each end of a single row -- two rows, with
-    // the selection in the middle of the list. The counts are what give way: the
-    // row `Enter` is about is the one row that cannot.
     Window {
         first: selected,
         last: selected + 1,
         above: 0,
         below: 0,
     }
+}
+
+/// The window a list of `total` rows is seen through, for the picker with
+/// `selected` highlighted and `room` rows to draw in.
+///
+/// The window holds the highlighted row whenever that can be managed: a menu
+/// scrolled past its own end is a menu the highlighted row has been carried
+/// away from, and the row `Enter` is about has to be on the screen.
+pub(super) fn picker_window(total: usize, selected: usize, room: usize) -> Window {
+    selection_window(total, selected, room)
 }
 
 /// The window a list of `total` tasks is seen through, for the task at `active`
@@ -182,45 +196,12 @@ pub(super) fn picker_window(total: usize, selected: usize, room: usize) -> Windo
 /// worked on now, and a block pinned to the head of it would hide exactly that
 /// row. With nothing in hand -- a plan not started yet, or one with everything
 /// finished -- it shows the head, which is the plan itself.
-///
-/// The counts are the picker's, for the picker's reason: an end is counted only
-/// when there is room for the count and a row of the list besides, and when there
-/// is not, the count is what gives way. Here the row that cannot give way is the
-/// task in hand.
 pub(crate) fn todo_window(total: usize, active: Option<usize>, room: usize) -> Window {
-    let room = room.max(1);
-    let total = total.max(1);
+    // No active task is the head of the list: row zero, where the plan itself
+    // sits. An active task that is past the end (a stale cursor) is treated as
+    // no active task for the same reason.
     let active = active.filter(|at| *at < total);
-    for shown in (1..=room.min(total)).rev() {
-        // Where the run starts: with the task in hand at its end, so the window
-        // moves when that task leaves it and not before -- the same rule the
-        // picker's window follows for its selection.
-        let last = total - shown;
-        let first = match active {
-            Some(at) => at.saturating_sub(shown - 1).min(last),
-            None => 0,
-        };
-        let end = first + shown;
-        let cut = usize::from(first > 0) + usize::from(end < total);
-        if shown + cut <= room {
-            return Window {
-                first,
-                last: end,
-                above: first,
-                below: total - end,
-            };
-        }
-    }
-    // A room too small for a count at either end of a single row. The count is
-    // what gives way; the task in hand is the one row that cannot, and with none
-    // in hand the first row is what is left to show.
-    let first = active.unwrap_or(0);
-    Window {
-        first,
-        last: first + 1,
-        above: 0,
-        below: 0,
-    }
+    selection_window(total, active.unwrap_or(0), room)
 }
 
 /// The columns inside the box's rules that the draft is written in: the whole

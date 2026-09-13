@@ -380,10 +380,11 @@ impl Front for Renderer {
 
 impl Ui for Renderer {
     fn truncated(&mut self, notice: &str) {
-        // The stream an error goes to: it survives a redirected stdout, and an
-        // answer that stops mid-thought is a failure the reader has to know
-        // about.
-        Front::error(self, notice);
+        // The wire writes the sentence itself ("...; what is in the log is
+        // incomplete"), so what the front end shows is the wire's words. Not
+        // an error: the model stopped on a normal cause, and the transcript's
+        // error styling is the wrong place for it.
+        self.paint_cell(&Cell::Notice(notice.to_owned()));
     }
 
     fn reasoning_delta(&mut self, s: &str) {

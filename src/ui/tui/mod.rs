@@ -41,11 +41,12 @@ mod screen;
 mod state;
 mod working;
 
-use channels::Channels;
+use channels::{LoopHalf, TurnHalf};
 use input::Submitted;
 use notice::{Notifier, drain};
 use picker::{menu_for, offer_menu};
 use screen::Screen;
+use state::State;
 
 // ----------------------------------------------------------------- polling ---
 
@@ -100,17 +101,19 @@ pub async fn run(
     let (gate_tx, gates) = mpsc::unbounded_channel();
     let (question_tx, questions) = mpsc::unbounded_channel();
     let mut handle = Notifier { tx };
-    let mut channels = Channels {
+    let mut loop_half = LoopHalf {
         notices,
         gates,
-        gate_tx,
         questions,
+    };
+    let turn_half = TurnHalf {
+        gate_tx,
         question_tx,
     };
 
     let result: anyhow::Result<()> = 'session: loop {
         // Idle: draw, then wait for something to submit.
-        let line = match idle_line(&mut screen, &mut channels)? {
+        let line = match idle_line(&mut screen, &mut loop_half)? {
             Some(line) => line,
             None => break 'session Ok(()),
         };
@@ -134,8 +137,16 @@ pub async fn run(
             {
                 break;
             }
-            let outcome =
-                run_turn(agent, &mut handle, &mut screen, &mut channels, sdir, &line).await?;
+            let outcome = run_turn(
+                agent,
+                &mut handle,
+                &mut screen,
+                &mut loop_half,
+                &turn_half,
+                sdir,
+                &line,
+            )
+            .await?;
             match outcome {
                 Ok(repl::Outcome::Exit) => break 'session Ok(()),
                 Ok(repl::Outcome::Continue) => {}
@@ -167,15 +178,13 @@ pub async fn run(
 /// asked to leave.
 fn idle_line(
     screen: &mut Screen<CrosstermBackend<Stdout>>,
-    channels: &mut Channels,
+    channels: &mut LoopHalf,
 ) -> anyhow::Result<Option<String>> {
     if let Err(e) = screen.draw_if_changed() {
         return Err(e.into());
     }
     loop {
-        for notice in drain(&mut channels.notices) {
-            screen.state.apply(notice);
-        }
+        drain_channels(&mut screen.state, channels);
         screen.draw_if_changed()?;
         match poll_key(TICK)? {
             Some(event) => match screen.state.key(event) {
@@ -185,6 +194,22 @@ fn idle_line(
             },
             None => continue,
         }
+    }
+}
+
+/// Apply every notice, gate question and panel question that has arrived on
+/// the loop's channels. Called from both the per-tick loop inside `run_turn`
+/// and after the turn ends, because notifications sent after the turn's last
+/// drain are still queued when it resolves.
+fn drain_channels(state: &mut State, channels: &mut LoopHalf) {
+    for notice in drain(&mut channels.notices) {
+        state.apply(notice);
+    }
+    for reply in drain(&mut channels.gates) {
+        state.open_question(reply);
+    }
+    for asked in drain(&mut channels.questions) {
+        state.open_panel(asked.questions, asked.reply);
     }
 }
 
@@ -202,17 +227,18 @@ async fn run_turn(
     agent: &mut Agent,
     handle: &mut Notifier,
     screen: &mut Screen<CrosstermBackend<Stdout>>,
-    channels: &mut Channels,
+    channels: &mut LoopHalf,
+    turn: &TurnHalf,
     sdir: &Path,
     line: &str,
 ) -> anyhow::Result<anyhow::Result<repl::Outcome>> {
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let mut interrupt = channels::CtrlC(cancel_rx);
     let mut approve = channels::Gate {
-        tx: channels.gate_tx.clone(),
+        tx: turn.gate_tx.clone(),
     };
     let mut ask = channels::Questions {
-        tx: channels.question_tx.clone(),
+        tx: turn.question_tx.clone(),
     };
     let turn = repl::handle(
         agent,
@@ -230,15 +256,7 @@ async fn run_turn(
         if let Some(event) = poll_key(TICK)? {
             screen.state.key_while_working(event, &cancel_tx);
         }
-        for notice in drain(&mut channels.notices) {
-            screen.state.apply(notice);
-        }
-        for reply in drain(&mut channels.gates) {
-            screen.state.open_question(reply);
-        }
-        for asked in drain(&mut channels.questions) {
-            screen.state.open_panel(asked.questions, asked.reply);
-        }
+        drain_channels(&mut screen.state, channels);
         screen.state.tick_activity(Instant::now());
         screen.draw_if_changed()?;
         tokio::select! {
@@ -249,15 +267,7 @@ async fn run_turn(
             _ = tokio::time::sleep(TICK) => {}
         }
     };
-    for notice in drain(&mut channels.notices) {
-        screen.state.apply(notice);
-    }
-    for reply in drain(&mut channels.gates) {
-        screen.state.open_question(reply);
-    }
-    for asked in drain(&mut channels.questions) {
-        screen.state.open_panel(asked.questions, asked.reply);
-    }
+    drain_channels(&mut screen.state, channels);
     screen.state.end_turn();
     screen.state.close_question();
     screen.state.close_panel();

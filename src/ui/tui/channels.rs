@@ -106,15 +106,26 @@ impl Ask for Questions {
     }
 }
 
-/// The channels the event loop reads and answers while it runs.
+/// Receivers the event loop reads from.
 ///
-/// The machine's notifications arrive on one, the gate's questions on another and
-/// the question tool's on a third; the sender of each of the last two is what the
-/// machine holds while it waits.
-pub(super) struct Channels {
+/// Each channel's sender travels with the turn that owns it (or with the
+/// notifier held by every turn); the receivers stay with the loop, and the
+/// loop drains them on every tick and after the turn ends. Splitting the
+/// receivers from the senders is what makes it impossible to mistake one
+/// for the other.
+pub(super) struct LoopHalf {
     pub(super) notices: mpsc::UnboundedReceiver<crate::ui::tui::notice::Notice>,
     pub(super) gates: mpsc::UnboundedReceiver<oneshot::Sender<Verdict>>,
-    pub(super) gate_tx: mpsc::UnboundedSender<oneshot::Sender<Verdict>>,
     pub(super) questions: mpsc::UnboundedReceiver<Asked>,
+}
+
+/// Senders that travel with a turn.
+///
+/// The gate's sender is cloned for each turn, the question tool's likewise:
+/// each turn gets a fresh pair and the loop keeps the originals, so a turn
+/// that holds them across an `await` does not stop the next turn from being
+/// asked a question of its own.
+pub(super) struct TurnHalf {
+    pub(super) gate_tx: mpsc::UnboundedSender<oneshot::Sender<Verdict>>,
     pub(super) question_tx: mpsc::UnboundedSender<Asked>,
 }

@@ -11,7 +11,7 @@
 //! queue that holds lines submitted during a turn is a working-time
 //! concern: a head runs when the turn ends, a tail is appended by Enter.
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use tokio::sync::watch;
 
 use super::input::Submitted;
@@ -102,39 +102,34 @@ impl State {
         if key.kind != KeyEventKind::Press {
             return;
         }
-        match key {
-            KeyEvent {
-                code: KeyCode::Up, ..
-            } => self.panel_move(-1),
-            KeyEvent {
-                code: KeyCode::Down,
-                ..
-            } => self.panel_move(1),
-            KeyEvent {
-                code: KeyCode::Char(digit @ '1'..='9'),
-                ..
-            } if self.text().is_empty() => {
-                self.panel_jump(digit.to_digit(10).unwrap_or(1) as usize);
-            }
-            KeyEvent {
-                code: KeyCode::Char(' '),
-                ..
-            } if self.text().is_empty() && self.panel_takes_many() => self.panel_toggle(),
-            KeyEvent {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::NONE,
-                ..
-            } => {
-                let typed = self.text();
-                self.panel_confirm(&typed);
-            }
-            KeyEvent {
-                code: KeyCode::Esc, ..
-            } => self.panel_dismiss(),
-            other => {
-                self.key(Event::Key(other));
-            }
+        if key.code == KeyCode::Up {
+            self.panel_move(-1);
+            return;
         }
+        if key.code == KeyCode::Down {
+            self.panel_move(1);
+            return;
+        }
+        if let KeyCode::Char(digit @ '1'..='9') = key.code
+            && self.text().is_empty()
+        {
+            self.panel_jump(digit.to_digit(10).unwrap_or(1) as usize);
+            return;
+        }
+        if key.code == KeyCode::Char(' ') && self.text().is_empty() && self.panel_takes_many() {
+            self.panel_toggle();
+            return;
+        }
+        if crate::ui::tui::input::matches(key, KeyCode::Enter, KeyModifiers::NONE) {
+            let typed = self.text();
+            self.panel_confirm(&typed);
+            return;
+        }
+        if key.code == KeyCode::Esc {
+            self.panel_dismiss();
+            return;
+        }
+        self.key(Event::Key(key));
     }
 
     /// Put a line after the running turn. It is the whole of what Enter does

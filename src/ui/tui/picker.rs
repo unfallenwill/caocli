@@ -92,6 +92,21 @@ impl Choosing {
         }
     }
 
+    /// The picker this command opens, or `None` when the line names no menu.
+    /// `Command` is excluded on purpose: it is the picker the box grows while
+    /// a name is being typed, and it is never asked for by a submitted line.
+    fn for_command(line: &str) -> Option<Self> {
+        let trimmed = line.trim();
+        [
+            Choosing::Session,
+            Choosing::Provider,
+            Choosing::Model,
+            Choosing::Effort,
+        ]
+        .into_iter()
+        .find(|c| c.command() == trimmed)
+    }
+
     /// Whether the list is the whole message -- a list of things to do rather
     /// than a name being typed -- and so whether Enter takes the highlighted row
     /// instead of submitting what is in the box.
@@ -272,33 +287,13 @@ impl State {
     }
 }
 
-/// The menus the front end can offer where the plain front end can only print.
-///
-/// `/resume` with nothing to resume is a request for the list rather than a
-/// command to run; `/login`, `/model` and `/effort` are commands whose argument
-/// is a row of a menu. The chosen row is submitted as the very line the plain
-/// prompt would have been given, so the switching itself is unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Menu {
-    /// The sessions there are to switch to.
-    Sessions,
-    /// The providers a key can be stored for.
-    Login,
-    /// The models the session can switch to.
-    Model,
-    /// The reasoning effort tiers the provider in use accepts.
-    Effort,
-}
-
 /// The command a line names whose answer is a menu rather than a turn.
-pub(super) fn menu_for(line: &str) -> Option<Menu> {
-    match line.trim() {
-        "/resume" => Some(Menu::Sessions),
-        "/login" => Some(Menu::Login),
-        "/model" => Some(Menu::Model),
-        "/effort" => Some(Menu::Effort),
-        _ => None,
-    }
+///
+/// The list of what this can return is the same list [`Choosing::for_command`]
+/// walks, with the same strings; the two have to agree, so the table lives in
+/// one place.
+pub(super) fn menu_for(line: &str) -> Option<Choosing> {
+    Choosing::for_command(line)
 }
 
 /// Open the menu a command asked for. `Ok(true)` says the menu is up and the
@@ -306,22 +301,25 @@ pub(super) fn menu_for(line: &str) -> Option<Menu> {
 /// -- an empty session directory -- and the line runs as it would have.
 pub(super) fn offer_menu(
     screen: &mut Screen<CrosstermBackend<Stdout>>,
-    menu: Menu,
+    menu: Choosing,
     agent: &Agent,
     sdir: &Path,
 ) -> anyhow::Result<bool> {
     match menu {
-        Menu::Sessions => Ok(screen.state.open_sessions(&session::list(sdir)?)),
-        Menu::Login => Ok(screen
+        Choosing::Session => Ok(screen.state.open_sessions(&session::list(sdir)?)),
+        Choosing::Provider => Ok(screen
             .state
             .open_choices(Choosing::Provider, choice_rows(config::provider_choices()))),
-        Menu::Model => Ok(screen.state.open_choices(
+        Choosing::Model => Ok(screen.state.open_choices(
             Choosing::Model,
             choice_rows(config::model_menu(&agent.model_label())),
         )),
-        Menu::Effort => Ok(screen.state.open_choices(
+        Choosing::Effort => Ok(screen.state.open_choices(
             Choosing::Effort,
             choice_rows(config::effort_menu(&agent.provider(), agent.effort_label())),
         )),
+        // `menu_for` only returns the menu-shaped variants, so Command never
+        // reaches here -- treat it as "no menu".
+        Choosing::Command => Ok(false),
     }
 }

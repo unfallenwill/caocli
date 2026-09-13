@@ -16,11 +16,11 @@ use tokio::sync::oneshot;
 
 use super::panel::PANEL_PLACEHOLDER;
 use super::picker::Choosing;
+use super::state::{Answer, State};
 use crate::history;
 use crate::ui::Verdict;
 use crate::ui::cell::Cell;
 use crate::ui::tui::layout::box_rows;
-use crate::ui::tui::state::State;
 
 /// What the box says while a turn runs: the line being typed is not this turn's
 /// message, it is the one to run when this turn ends -- and the turn itself can
@@ -47,20 +47,6 @@ pub(super) const SECRET_PLACEHOLDER: &str = "type or paste it · Enter saves · 
 /// length of a key is not the key, but a box that shows nothing at all looks
 /// like a box that is not taking anything.
 pub(super) const SECRET_MASK: char = '•';
-
-/// A question the box is waiting on, and who to give the answer to.
-///
-/// The box is the one place an answer is typed, so the two kinds share it and
-/// are told apart by what they do with what was typed.
-pub(super) enum Answer {
-    /// The approval gate: a line starting with `y` allows and anything else
-    /// denies, which is the rule the plain front end applies to a line of stdin.
-    YesNo(oneshot::Sender<Verdict>),
-    /// A secret (an API key): whatever was typed, with the text hidden while it
-    /// is typed, and an empty line for a cancellation. Nothing of it is echoed
-    /// into the transcript, and nothing of it is remembered.
-    Secret(oneshot::Sender<Option<String>>),
-}
 
 /// The input box's editor. Enter submits and Ctrl-J inserts a newline, matching
 /// the plain prompt's keys.
@@ -99,6 +85,18 @@ pub(super) enum Submitted {
     Nothing,
 }
 
+/// Whether `key` is the named code with exactly the named modifiers held.
+///
+/// The dispatch in [`State::key`] and [`State::key_while_working`] reads as a
+/// long list of "is this Ctrl-C? is this Ctrl-D on an empty line?" -- each
+/// guard the same shape, and the shape (`KeyEvent { code: ..., modifiers:
+/// ..., .. }`) loud enough to bury what the rule actually is. This helper is
+/// what lets each arm say "this key, no modifier" instead of spelling out the
+/// pattern every time.
+pub(super) fn matches(key: KeyEvent, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    key.code == code && key.modifiers == modifiers
+}
+
 impl State {
     /// Handle a key at the prompt.
     pub(super) fn key(&mut self, event: Event) -> Submitted {
@@ -121,131 +119,95 @@ impl State {
         if key.kind != KeyEventKind::Press {
             return Submitted::Nothing;
         }
-        match key {
-            // Enter submits. Ctrl-J is deliberately left to the box, which
-            // inserts a newline, so multi-line input works as it does at the
-            // plain prompt.
-            KeyEvent {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::NONE,
-                ..
-            } => {
-                // A list of sessions, providers or models is a list of things to
-                // do rather than a name being typed, so Enter takes the
-                // highlighted row and submits the line it stands for.
-                if self.choose() {
-                    return Submitted::Line;
-                }
-                if self.textarea.is_empty() {
-                    Submitted::Nothing
-                } else {
-                    Submitted::Line
-                }
+        // Enter submits. Ctrl-J is deliberately left to the box, which
+        // inserts a newline, so multi-line input works as it does at the
+        // plain prompt.
+        if matches(key, KeyCode::Enter, KeyModifiers::NONE) {
+            // A list of sessions, providers or models is a list of things to
+            // do rather than a name being typed, so Enter takes the
+            // highlighted row and submits the line it stands for.
+            if self.choose() {
+                return Submitted::Line;
             }
-            // At the prompt Ctrl-C clears the line, as it does in the plain front
-            // end: there is no turn to cancel here.
-            KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.textarea = input_box();
+            return if self.textarea.is_empty() {
                 Submitted::Nothing
-            }
-            // Ctrl-J is the plain prompt's newline key, and Shift-Enter is what
-            // everyone tries first. Both are taken here because the box binds
-            // Ctrl-J to delete-to-line-start, which is not what this front end
-            // promises.
-            KeyEvent {
-                code: KeyCode::Char('j'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::SHIFT,
-                ..
-            } => {
-                self.textarea.insert_newline();
-                Submitted::Nothing
-            }
-            KeyEvent {
-                code: KeyCode::Char('d'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } if self.textarea.is_empty() => Submitted::Exit,
-            // Paging through the transcript. The box scrolls itself with the same
-            // two keys, so a draft with more lines than it has rows keeps them --
-            // which is the only case where the box has anything to page.
-            KeyEvent {
-                code: KeyCode::PageUp,
-                modifiers: KeyModifiers::NONE,
-                ..
-            } if !self.text().contains('\n') => {
+            } else {
+                Submitted::Line
+            };
+        }
+        // At the prompt Ctrl-C clears the line, as it does in the plain front
+        // end: there is no turn to cancel here.
+        if matches(key, KeyCode::Char('c'), KeyModifiers::CONTROL) {
+            self.textarea = input_box();
+            return Submitted::Nothing;
+        }
+        // Ctrl-J is the plain prompt's newline key, and Shift-Enter is what
+        // everyone tries first. Both are taken here because the box binds
+        // Ctrl-J to delete-to-line-start, which is not what this front end
+        // promises.
+        if matches(key, KeyCode::Char('j'), KeyModifiers::CONTROL)
+            || matches(key, KeyCode::Enter, KeyModifiers::SHIFT)
+        {
+            self.textarea.insert_newline();
+            return Submitted::Nothing;
+        }
+        if matches(key, KeyCode::Char('d'), KeyModifiers::CONTROL) && self.textarea.is_empty() {
+            return Submitted::Exit;
+        }
+        // Paging through the transcript. The box scrolls itself with the same
+        // two keys, so a draft with more lines than it has rows keeps them --
+        // which is the only case where the box has anything to page.
+        if !self.text().contains('\n') {
+            if matches(key, KeyCode::PageUp, KeyModifiers::NONE) {
                 self.page(-1);
-                Submitted::Nothing
+                return Submitted::Nothing;
             }
-            KeyEvent {
-                code: KeyCode::PageDown,
-                modifiers: KeyModifiers::NONE,
-                ..
-            } if !self.text().contains('\n') => {
+            if matches(key, KeyCode::PageDown, KeyModifiers::NONE) {
                 self.page(1);
-                Submitted::Nothing
-            }
-            // Up and Down mean the picker while it is open and the history
-            // otherwise: the picker is only open while a command is being named,
-            // so the two never compete for the same keystroke.
-            KeyEvent {
-                code: KeyCode::Up, ..
-            } => {
-                self.up();
-                Submitted::Nothing
-            }
-            KeyEvent {
-                code: KeyCode::Down,
-                ..
-            } => {
-                self.down();
-                Submitted::Nothing
-            }
-            KeyEvent {
-                code: KeyCode::Tab, ..
-            } => {
-                // Completing a command leaves it in the box; choosing a row is
-                // the whole action, so it submits.
-                if self.choose() {
-                    return Submitted::Line;
-                }
-                self.complete();
-                Submitted::Nothing
-            }
-            KeyEvent {
-                code: KeyCode::Esc, ..
-            } => {
-                // Dismissing the command picker takes its line with it: the line
-                // is the query the list was filtered by, and a lone `/` left
-                // behind glues itself to the next word, which then goes out as
-                // an unknown command instead of as a message. A row list was
-                // asked for in full by a submitted command, so what the box
-                // holds is whatever has been typed since it opened -- a draft,
-                // which dismissing has no claim on.
-                if self
-                    .picker
-                    .take()
-                    .is_some_and(|p| p.kind == Choosing::Command)
-                {
-                    self.textarea = input_box();
-                    self.refresh_placeholder();
-                }
-                Submitted::Nothing
-            }
-            _ => {
-                self.textarea.input(Event::Key(key));
-                self.refresh_picker();
-                Submitted::Nothing
+                return Submitted::Nothing;
             }
         }
+        // Up and Down mean the picker while it is open and the history
+        // otherwise: the picker is only open while a command is being named,
+        // so the two never compete for the same keystroke.
+        if key.code == KeyCode::Up {
+            self.up();
+            return Submitted::Nothing;
+        }
+        if key.code == KeyCode::Down {
+            self.down();
+            return Submitted::Nothing;
+        }
+        if key.code == KeyCode::Tab {
+            // Completing a command leaves it in the box; choosing a row is
+            // the whole action, so it submits.
+            if self.choose() {
+                return Submitted::Line;
+            }
+            self.complete();
+            return Submitted::Nothing;
+        }
+        if key.code == KeyCode::Esc {
+            // Dismissing the command picker takes its line with it: the line
+            // is the query the list was filtered by, and a lone `/` left
+            // behind glues itself to the next word, which then goes out as
+            // an unknown command instead of as a message. A row list was
+            // asked for in full by a submitted command, so what the box
+            // holds is whatever has been typed since it opened -- a draft,
+            // which dismissing has no claim on.
+            if self
+                .picker
+                .take()
+                .is_some_and(|p| p.kind == Choosing::Command)
+            {
+                self.textarea = input_box();
+                self.refresh_placeholder();
+            }
+            return Submitted::Nothing;
+        }
+        self.textarea.input(Event::Key(key));
+        self.refresh_picker();
+        Submitted::Nothing
     }
 
     /// What is in the box.

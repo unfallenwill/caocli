@@ -6,6 +6,7 @@
 //! [`State`] and writes pixels.
 
 use std::io::{self, Stdout};
+use std::rc::Rc;
 
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::Rect;
@@ -217,84 +218,9 @@ impl<B: Backend> Screen<B> {
         let drawn = self.terminal.draw(|frame| {
             let state = &mut self.state;
             let area = frame.area();
-            let width = area.width as usize;
-            // The standing task list is laid out before anything is measured,
-            // because it is the one region whose height depends on its text: a task
-            // is as many rows as its words take. Asked for before the box, which
-            // gives way to it, and before the layout, which is what the rows it
-            // asks for come out of.
-            let todos = Text::from(render::todo_lines(state, width));
-            let todo = todo_rows(todos.height());
-            let input = state.input_rows(area.height, todo);
-            // What is waiting to run, drawn at the bottom of the transcript: the
-            // session, then what comes next, then the box, and under the box the
-            // session summary. Asked for before the layout, because how many rows
-            // it takes is what the transcript gives up.
-            let queue = Text::from(render::queue_lines(state, width));
-            let queued = queue.height() as u16;
-            let rows = screen_rows(area, todo, input, queued);
-            state.reset_box_scroll(input);
-            // What the transcript has to show, in the three pieces it is made of:
-            // the cells that are laid out and kept, then the block still being
-            // written, then a question if one is open.
-            render::ensure_laid(state, width);
-            let live = render::live_lines(state, width);
-            let question = render::question_lines(state, width);
-            let total = render::laid_rows(state) + live.len() + question.len();
-            // The rows the transcript really has: the layout's answer, not a copy
-            // of its arithmetic.
-            let room = rows[0].height as usize;
-            // The window over the transcript: its end unless the reader scrolled
-            // back. The picker belongs to the line being typed, so it takes the
-            // box's end of the transcript with it.
-            let picker = state.picker_lines();
-            let panel = state.panel_lines(width);
-            let first = if picker.is_empty() {
-                state.window(total, room)
-            } else {
-                state.follow();
-                total.saturating_sub(room)
-            };
-            let last = (first + room).min(total);
-            // A window that is cut says so on the row it was cut at -- but only
-            // while the reader is somewhere other than the end: at the end the
-            // newest line is the one being watched, and the top being off the
-            // screen is the ordinary state of a long session rather than something
-            // to report.
-            let cut = state.scroll.back > 0;
-            let above = cut && first > 0;
-            let below = cut && last < total;
-            // The two counts take their rows from the window they stand for, so
-            // that neither report is a line out: a row that hides a line it does
-            // not count is a window lying about how much there is.
-            let first = first + usize::from(above);
-            let last = last - usize::from(below);
-            // A session shorter than the window starts at the bottom of it: the
-            // newest line belongs next to the box, where the eye already is,
-            // rather than at the top of a screen with a gap under it. A cut window
-            // fills the region and has nothing to pad with.
-            let taken = usize::from(above) + usize::from(below);
-            let mut lines: Vec<Line> =
-                vec![Line::default(); room.saturating_sub(last - first + taken)];
-            if above {
-                lines.push(paint::edge_line(true, first));
-            }
-            lines.extend(render::window_lines(state, first, last, &live, &question));
-            if below {
-                lines.push(paint::edge_line(false, total - last));
-            }
-            let transcript = Text::from(lines);
-
-            frame.render_widget(Paragraph::new(transcript), rows[0]);
-            draw_over(frame, &picker, rows[0], PICKER_ROWS);
-            // The panel stands over the transcript too, and is given whatever the
-            // transcript has: a question cannot be answered by a reader who
-            // cannot see all of it.
-            draw_over(frame, &panel, rows[0], rows[0].height as usize);
-            frame.render_widget(Paragraph::new(todos), rows[1]);
-            frame.render_widget(Paragraph::new(queue), rows[2]);
-            draw_box(frame, state, rows[3]);
-            draw_status(frame, state, rows[4]);
+            let layout = compute_layout(state, area);
+            let transcript = compose_transcript(state, &layout);
+            paint(&*state, frame, &layout, transcript);
         })?;
         Ok(drawn.area)
     }
@@ -307,6 +233,125 @@ impl<B: Backend> Screen<B> {
     pub(super) fn commit(&mut self) {
         self.state.end_block();
     }
+}
+
+/// What the frame draws into: the row each region gets and the text the
+/// pinned ones were already laid out as. The transcript's text is recomputed
+/// from this by [`compose_transcript`]; the rest is handed to the frame as-is.
+struct Layout {
+    rows: Rc<[Rect]>,
+    width: usize,
+    todos: Text<'static>,
+    queue: Text<'static>,
+}
+
+/// Work out the regions: the standing task list and the queue, the box's
+/// height for the draft it holds, and the row each region gets once the others
+/// have taken what they need.
+///
+/// Todos first, because they are the one region whose height depends on its
+/// text -- a task is as many rows as its words take. The queue is laid out
+/// next, because how many rows it costs the transcript is also its text. Both
+/// are measured before the layout splits the area, so the rows they ask for
+/// are the rows they get.
+fn compute_layout(state: &mut State, area: Rect) -> Layout {
+    let width = area.width as usize;
+    let todos = Text::from(render::todo_lines(state, width));
+    let todo = todo_rows(todos.height());
+    let input = state.input_rows(area.height, todo);
+    let queue = Text::from(render::queue_lines(state, width));
+    let queued = queue.height() as u16;
+    let rows = screen_rows(area, todo, input, queued);
+    state.reset_box_scroll(input);
+    Layout {
+        rows,
+        width,
+        todos,
+        queue,
+    }
+}
+
+/// The transcript's lines: the window on the cells, the block still being
+/// streamed, a question if one is open, and the two edge counts that say what
+/// was scrolled past.
+///
+/// Picker and panel are computed here because they stand over the transcript
+/// and their height is what decides whether to follow the reader to the end
+/// or jump there to make room.
+/// The transcript's lines: the window on the cells, the block still being
+/// streamed, a question if one is open, and the two edge counts that say what
+/// was scrolled past.
+///
+/// Picker and panel are computed here because they stand over the transcript
+/// and their height is what decides whether to follow the reader to the end
+/// or jump there to make room.
+fn compose_transcript(state: &mut State, layout: &Layout) -> Text<'static> {
+    let width = layout.width;
+    let room = layout.rows[0].height as usize;
+    // What the transcript has to show, in the three pieces it is made of:
+    // the cells that are laid out and kept, then the block still being
+    // written, then a question if one is open.
+    render::ensure_laid(state, width);
+    let live = render::live_lines(state, width);
+    let question = render::question_lines(state, width);
+    let total = render::laid_rows(state) + live.len() + question.len();
+    // The picker belongs to the line being typed, so it takes the box's end of
+    // the transcript with it: a window on the end, not where the reader
+    // scrolled back to. The panel is read in `paint` once the transcript's
+    // shape is decided.
+    let picker = state.picker_lines();
+    let first = if picker.is_empty() {
+        state.window(total, room)
+    } else {
+        state.follow();
+        total.saturating_sub(room)
+    };
+    let last = (first + room).min(total);
+    // A window that is cut says so on the row it was cut at -- but only while
+    // the reader is somewhere other than the end: at the end the newest line
+    // is the one being watched, and the top being off the screen is the
+    // ordinary state of a long session rather than something to report.
+    let cut = state.scroll.back > 0;
+    let above = cut && first > 0;
+    let below = cut && last < total;
+    // The two counts take their rows from the window they stand for, so that
+    // neither report is a line out: a row that hides a line it does not count
+    // is a window lying about how much there is.
+    let first = first + usize::from(above);
+    let last = last - usize::from(below);
+    // A session shorter than the window starts at the bottom of it: the
+    // newest line belongs next to the box, where the eye already is, rather
+    // than at the top of a screen with a gap under it. A cut window fills the
+    // region and has nothing to pad with.
+    let taken = usize::from(above) + usize::from(below);
+    let mut lines: Vec<Line> = vec![Line::default(); room.saturating_sub(last - first + taken)];
+    if above {
+        lines.push(paint::edge_line(true, first));
+    }
+    lines.extend(render::window_lines(state, first, last, &live, &question));
+    if below {
+        lines.push(paint::edge_line(false, total - last));
+    }
+    Text::from(lines)
+}
+
+/// Hand the regions to the frame: the transcript, the overlays that stand over
+/// it, and the three pinned regions under it.
+fn paint(state: &State, frame: &mut Frame, layout: &Layout, transcript: Text) {
+    let rows = &layout.rows;
+    frame.render_widget(Paragraph::new(transcript), rows[0]);
+    // The picker and the panel stand over the bottom of the transcript -- the
+    // picker is capped at its own budget, the panel is given the whole
+    // transcript height because a question cannot be answered by a reader who
+    // cannot see all of it.
+    let picker = state.picker_lines();
+    let panel = state.panel_lines(layout.width);
+    draw_over(frame, &picker, rows[0], PICKER_ROWS);
+    draw_over(frame, &panel, rows[0], rows[0].height as usize);
+    frame.render_widget(Paragraph::new(layout.todos.clone()), rows[1]);
+    frame.render_widget(Paragraph::new(layout.queue.clone()), rows[2]);
+    draw_box(frame, state, rows[3]);
+    draw_status(frame, state, rows[4]);
 }
 
 /// Translate the input box's own cursor into a position on the screen, so the

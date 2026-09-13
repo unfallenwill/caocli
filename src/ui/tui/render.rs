@@ -206,7 +206,7 @@ pub(super) fn activity_title(state: &State, width: usize) -> Option<String> {
 }
 
 /// The indicator's words at `now`, without reading the clock.
-fn activity_title_at(state: &State, now: Instant, width: usize) -> Option<String> {
+pub(super) fn activity_title_at(state: &State, now: Instant, width: usize) -> Option<String> {
     if state.reply.is_some() {
         return None;
     }
@@ -259,17 +259,4 @@ pub(super) fn box_rule(state: &State, width: usize) -> Block<'static> {
         block = block.title_top(Line::styled(title, lit).right_aligned());
     }
     block
-}
-
-/// Bump the revision when the spinner frame or the second counter has
-/// advanced, so the border keeps moving while nothing else arrives and no
-/// redraw is spent when it has nothing new to show.
-pub(super) fn tick_activity(state: &mut State, now: Instant) {
-    let Some(title) = activity_title_at(state, now, usize::MAX) else {
-        return;
-    };
-    if Some(&title) != state.ticked_activity.as_ref() {
-        state.ticked_activity = Some(title);
-        state.revision += 1;
-    }
 }

@@ -38,6 +38,14 @@ pub(super) enum Notice {
     Instructions(String),
     Usage(Usage, Duration),
     Interrupted,
+    /// An answer stopped before it was finished -- the model reached
+    /// `max_tokens`, or the conversation outgrew the context window. The
+    /// string is a sentence the wire writes for itself, so every front end
+    /// shows the same one. Carried as its own notice rather than funnelled
+    /// into [`Notice::Error`] because the cause is a normal event, not a
+    /// failure, and the transcript's error styling is the wrong place for
+    /// it.
+    Truncated(String),
     Approval {
         name: String,
         args: String,
@@ -72,14 +80,21 @@ impl Notifier {
         // will be dropped with it.
         let _ = self.tx.send(notice);
     }
+
+    /// Send a tuple-variant notice that wraps a single `&str`. The eight `&str`
+    /// -> `String` wrappers below all look like this; the helper is what lets
+    /// their bodies stay one line.
+    fn send_str(&self, ctor: fn(String) -> Notice, text: &str) {
+        self.send(ctor(text.to_owned()));
+    }
 }
 
 impl Ui for Notifier {
     fn reasoning_delta(&mut self, text: &str) {
-        self.send(Notice::Reasoning(text.to_owned()));
+        self.send_str(Notice::Reasoning, text);
     }
     fn content_delta(&mut self, text: &str) {
-        self.send(Notice::Content(text.to_owned()));
+        self.send_str(Notice::Content, text);
     }
     fn finish_turn(&mut self) {
         self.send(Notice::FinishTurn);
@@ -91,13 +106,13 @@ impl Ui for Notifier {
         });
     }
     fn tool_output(&mut self, chunk: &str) {
-        self.send(Notice::ToolOutput(chunk.to_owned()));
+        self.send_str(Notice::ToolOutput, chunk);
     }
     fn tool_result(&mut self, result: &str) {
-        self.send(Notice::ToolResult(result.to_owned()));
+        self.send_str(Notice::ToolResult, result);
     }
     fn instructions(&mut self, dir: &str) {
-        self.send(Notice::Instructions(dir.to_owned()));
+        self.send_str(Notice::Instructions, dir);
     }
     fn usage(&mut self, usage: &Usage, stream: Duration) {
         self.send(Notice::Usage(usage.clone(), stream));
@@ -106,7 +121,7 @@ impl Ui for Notifier {
         self.send(Notice::Interrupted);
     }
     fn truncated(&mut self, notice: &str) {
-        self.send(Notice::Error(notice.to_owned()));
+        self.send_str(Notice::Truncated, notice);
     }
     fn approval_requested(&mut self, name: &str, args: &str) {
         self.send(Notice::Approval {
@@ -121,16 +136,16 @@ impl Front for Notifier {
         self.send(Notice::Replay(messages.to_vec()));
     }
     fn info(&mut self, text: &str) {
-        self.send(Notice::Info(text.to_owned()));
+        self.send_str(Notice::Info, text);
     }
     fn error(&mut self, text: &str) {
-        self.send(Notice::Error(text.to_owned()));
+        self.send_str(Notice::Error, text);
     }
     fn set_model(&mut self, model: &str) {
-        self.send(Notice::SetModel(model.to_owned()));
+        self.send_str(Notice::SetModel, model);
     }
     fn set_effort(&mut self, effort: &str) {
-        self.send(Notice::SetEffort(effort.to_owned()));
+        self.send_str(Notice::SetEffort, effort);
     }
     fn reset_stats(&mut self) {
         self.send(Notice::ResetStats);
@@ -196,7 +211,7 @@ mod tests {
             Notice::ToolResult("done".into()),
             Notice::Usage(Usage::default(), Duration::from_secs(1)),
             Notice::Interrupted,
-            Notice::Error("cut off".into()),
+            Notice::Truncated("cut off".into()),
             Notice::Info("note".into()),
             Notice::Error("bad".into()),
             Notice::SetModel("glm-4.6".into()),

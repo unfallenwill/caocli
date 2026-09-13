@@ -18,16 +18,32 @@ use std::time::Instant;
 use crossterm::event::MouseEventKind;
 use ratatui::text::Line;
 use ratatui_textarea::TextArea;
+use tokio::sync::oneshot;
 
+use crate::ui::Verdict;
 use crate::ui::cell::{self, Cell, Stream, Style};
 use crate::ui::status::Status;
 use crate::ui::tui::notice::Notice;
 
-use super::input::Answer;
 use super::input::input_box;
 use super::panel::Panel;
 use super::picker::Picker;
 use super::render;
+
+/// A question the box is waiting on, and who to give the answer to.
+///
+/// The box is the one place an answer is typed, so the gate and the secret
+/// prompt share it and are told apart by what they do with what was typed.
+/// Lives on the state because [`State::reply`] is the field that holds it.
+pub(super) enum Answer {
+    /// The approval gate: a line starting with `y` allows and anything else
+    /// denies, which is the rule the plain front end applies to a line of stdin.
+    YesNo(oneshot::Sender<Verdict>),
+    /// A secret (an API key): whatever was typed, with the text hidden while it
+    /// is typed, and an empty line for a cancellation. Nothing of it is echoed
+    /// into the transcript, and nothing of it is remembered.
+    Secret(oneshot::Sender<Option<String>>),
+}
 
 /// The lines one wheel notch moves the window over the transcript: the step a
 /// terminal's own scrollback takes, so a notch here reads like a notch anywhere
@@ -287,7 +303,13 @@ impl State {
     /// runs the cache check that decides whether the screen has anything new
     /// to draw.
     pub(super) fn tick_activity(&mut self, now: Instant) {
-        render::tick_activity(self, now);
+        let Some(title) = render::activity_title_at(self, now, usize::MAX) else {
+            return;
+        };
+        if Some(&title) != self.ticked_activity.as_ref() {
+            self.ticked_activity = Some(title);
+            self.revision += 1;
+        }
     }
 
     /// Fold one notice into the state.
@@ -336,6 +358,13 @@ impl State {
             Notice::Interrupted => {
                 self.end_block();
                 self.transcript.push(Cell::Interrupted);
+            }
+            Notice::Truncated(notice) => {
+                // Not an error: the wire's own sentence already says why the
+                // answer stopped, and the transcript's error styling (red,
+                // "error:" prefix) is the wrong bucket for a normal cause.
+                self.end_block();
+                self.transcript.push(Cell::Notice(notice));
             }
             Notice::Approval { name, args } => {
                 self.end_block();

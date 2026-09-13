@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::super::notice::{Notice, Notifier};
-use super::super::picker::{Menu, menu_for};
+use super::super::picker::{Choosing, menu_for};
 use crate::ui::Renderer;
 use crate::ui::{Cancel, Front, Ui};
 
@@ -37,10 +37,10 @@ fn the_notifier_reaches_the_loop_through_the_channel() {
 
 #[test]
 fn a_menu_command_names_its_menu() {
-    assert_eq!(menu_for("/resume"), Some(Menu::Sessions));
-    assert_eq!(menu_for(" /login "), Some(Menu::Login));
-    assert_eq!(menu_for("/model"), Some(Menu::Model));
-    assert_eq!(menu_for("/effort"), Some(Menu::Effort));
+    assert_eq!(menu_for("/resume"), Some(Choosing::Session));
+    assert_eq!(menu_for(" /login "), Some(Choosing::Provider));
+    assert_eq!(menu_for("/model"), Some(Choosing::Model));
+    assert_eq!(menu_for("/effort"), Some(Choosing::Effort));
 }
 
 #[test]
