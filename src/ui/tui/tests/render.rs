@@ -183,7 +183,7 @@ fn a_long_think_folds_to_its_head_and_a_count() {
     }
     assert_eq!(
         row(&screen, top + THINKING_LINES as u16),
-        format!("┆ … {} more line(s)", 30 - THINKING_LINES),
+        format!("┆ … {} more lines", 30 - THINKING_LINES),
         "the count wears the block's own rule and says what is behind it"
     );
     assert_eq!(
@@ -206,7 +206,7 @@ fn a_think_at_the_cap_is_not_folded() {
     screen.draw().unwrap();
     let drawn = all_rows(&screen).join("\n");
     assert!(
-        !drawn.contains("more line(s)"),
+        !drawn.contains("more lines"),
         "nothing is hidden, so nothing is counted: {drawn}"
     );
 }
@@ -225,7 +225,7 @@ fn only_a_think_folds() {
     screen.draw().unwrap();
     let drawn = all_rows(&screen).join("\n");
     assert!(drawn.contains("line 29"), "kept whole: {drawn}");
-    assert!(!drawn.contains("more line(s)"), "{drawn}");
+    assert!(!drawn.contains("more lines"), "{drawn}");
 }
 
 /// What a command prints while it runs is watched as it arrives, and the block it

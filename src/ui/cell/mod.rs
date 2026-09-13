@@ -414,7 +414,7 @@ impl Cell {
                         DiffKind::Removed => Span::new(Style::Red, format!("\n- {}", line.text)),
                         DiffKind::Added => Span::new(Style::Green, format!("\n+ {}", line.text)),
                         DiffKind::Omitted(n) => {
-                            Span::new(Style::Dim, format!("\n… {n} more line(s)"))
+                            Span::new(Style::Dim, format!("\n… {n} more lines"))
                         }
                         // Context: the same column the gutter's continuation
                         // opens in, one space wide of indent so it does not
