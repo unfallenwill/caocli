@@ -279,7 +279,7 @@ fn the_picker_keeps_its_highlight_on_the_screen() {
     // And the rows the window is not showing are counted, not dropped: four
     // of the nine are above it.
     let drawn = all_rows(&screen);
-    assert!(drawn.iter().any(|r| r.contains("… 4 more")), "{drawn:?}");
+    assert!(drawn.iter().any(|r| r.contains("⋮ 4 more")), "{drawn:?}");
     // The count costs rows, so the block still fits what the transcript can
     // spare: five rows of menu and the count.
     assert_eq!(
@@ -309,7 +309,7 @@ fn the_queue_counts_the_rows_it_is_not_showing() {
     screen.state.queued.push_back("/help".into());
     let drawn = super::rendered(&super::super::render::queue_lines(&screen.state, 60));
     assert_eq!(drawn.len(), super::super::layout::QUEUE_ROWS, "{drawn:?}");
-    assert!(drawn[0].0.contains("… 2 more"), "{drawn:?}");
+    assert!(drawn[0].0.contains("⋮ 2 more"), "{drawn:?}");
     assert!(drawn[1].0.contains("/model"), "{drawn:?}");
     assert!(drawn[2].0.contains("/help"), "{drawn:?}");
 }

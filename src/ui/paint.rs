@@ -112,8 +112,14 @@ pub(crate) fn edge_line(above: bool, n: usize) -> Line<'static> {
 /// queue. Dim, like everything else that is not the thing being chosen; `lead` is
 /// the marker column the row it stands in for would carry, so that the count lines
 /// up with what it counts.
+///
+/// The glyph is the vertical ellipsis `⋮` -- the same one [`edge_line`] uses to
+/// count rows hidden above or below the window over the transcript. The picker
+/// menu, the standing task list and the queued lines are three more vertical
+/// lists with hidden items; sharing the glyph means a reader who has learned
+/// one of them has learned all of them.
 pub(crate) fn more_line(lead: &str, n: usize) -> Line<'static> {
-    Line::styled(format!("{lead}… {n} more"), style_of(Style::Dim))
+    Line::styled(format!("{lead}⋮ {n} more"), style_of(Style::Dim))
 }
 
 /// How many lines of a think the transcript keeps before it says how many are

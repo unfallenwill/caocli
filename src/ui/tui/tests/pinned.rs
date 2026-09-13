@@ -143,7 +143,7 @@ fn the_queue_is_capped_and_keeps_its_end() {
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>(),
-        vec!["  … 3 more", "› line 3", "› line 4"]
+        vec!["  ⋮ 3 more", "› line 3", "› line 4"]
     );
 }
 
