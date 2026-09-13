@@ -331,7 +331,7 @@ fn the_gate_is_drawn_whole_however_long_the_call_is() {
     let drawn = all_rows(&screen).join("");
     assert!(drawn.contains("aaaa"), "the call is there: {drawn}");
     assert!(
-        drawn.contains("run it? [y/N]"),
+        drawn.contains("run it? y/N"),
         "and so is the question: {drawn}"
     );
 }

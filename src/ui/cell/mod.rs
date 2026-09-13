@@ -464,7 +464,7 @@ impl Cell {
             }
             Cell::Approval { name, hint } => vec![Span::new(
                 Style::Yellow,
-                format!("{name} {hint} · run it? [y/N] "),
+                format!("{name} {hint} · run it? y/N "),
             )],
             Cell::Question(questions) => question_spans(questions),
             Cell::Todo(todos) => todo_spans(todos),
@@ -724,7 +724,7 @@ mod tests {
         let cell = Cell::approval("Bash", r#"{"command":"rm -rf /"}"#);
         assert_eq!(
             cell.spans(),
-            vec![Span::new(Style::Yellow, "Bash rm -rf / · run it? [y/N] ")]
+            vec![Span::new(Style::Yellow, "Bash rm -rf / · run it? y/N ")]
         );
         assert_eq!(
             cell.gutter().unwrap().head,
