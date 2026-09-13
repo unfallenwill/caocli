@@ -380,7 +380,11 @@ impl Cell {
             Cell::Notice(_) => Some(Gutter::new("* ", "  ", Style::Dim)),
             Cell::Failure(_) => Some(Gutter::new("  ", "  ", Style::Red)),
             Cell::Interrupted => Some(Gutter::new("  ", "  ", Style::Yellow)),
-            Cell::Usage { .. } => Some(Gutter::new("  ", "  ", Style::Dim)),
+            // A usage line says "tokens:" in its first word, but the gutter
+            // carries its own mark: three short rules for "summary / stats /
+            // numbers", so a reader with colour turned off still sees the
+            // line as the kind of line it is.
+            Cell::Usage { .. } => Some(Gutter::new("≡ ", "  ", Style::Dim)),
         }
     }
 
