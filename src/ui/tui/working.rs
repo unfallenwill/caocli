@@ -48,6 +48,17 @@ impl State {
             let _ = cancel.send(true);
             return;
         }
+        // Ctrl-O flips the verbose toggle during a turn: the running step's
+        // children keep streaming either way, but the *settled* step tail
+        // visible from a scrolled-back view reacts.
+        if let Event::Key(key) = &event
+            && key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Char('o')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.verbose = !self.verbose;
+            return;
+        }
         // The panel is up: it takes the keys that choose, and the box takes what
         // is typed into it. A line is not queued while a question is waiting --
         // the box belongs to the answer, the same rule the gate keeps.
