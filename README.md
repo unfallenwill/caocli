@@ -88,11 +88,10 @@ person reads in `/login` and in an error (`no API key for Z.AI Coding CN: run
 ### Multi-line input
 
 `Enter` submits; `Ctrl-J` inserts a newline, so the whole buffer is sent as
-one prompt. Note that once the buffer spans lines, `Enter` only submits when
-the cursor sits at the end of the input — elsewhere it inserts a newline.
-`Shift-Enter` is not supported: most terminals send the same byte as `Enter`,
-and rustyline 18 does not parse CSI-u key reports. Pasting text that contains
-newlines also works (bracketed paste).
+one prompt. `Up`/`Down` browse the input history. `Ctrl-C` clears the
+draft; `Ctrl-D` on an empty draft leaves the session. `Shift-Enter` is not
+supported: most terminals send the same byte as `Enter`. Pasting text that
+contains newlines also works (bracketed paste).
 
 ### CLI flags
 

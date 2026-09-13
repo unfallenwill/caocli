@@ -187,6 +187,11 @@ pub struct Renderer {
     /// cache statistics.
     status: Status,
     pub(super) bar: Option<StatusBar>,
+    /// Whether the front end currently has the tty in raw mode. The prompt sets
+    /// it before reading keys; `ask_secret` reads it to decide which read path
+    /// to use -- in raw mode the kernel is not collecting a line, so a blocking
+    /// read on stdin never returns.
+    in_raw_mode: bool,
 }
 
 impl Renderer {
@@ -209,7 +214,16 @@ impl Renderer {
             prev_was_block: false,
             status: Status::default(),
             bar: None,
+            in_raw_mode: false,
         }
+    }
+
+    /// Mark the tty as in raw mode. `ask_secret` reads this flag to pick
+    /// between the cooked-mode blocking read (default) and a key-by-key
+    /// read that works in raw mode (where the kernel does not collect a
+    /// line for us).
+    pub fn set_raw_mode(&mut self, raw: bool) {
+        self.in_raw_mode = raw;
     }
 
     /// Sync the status bar against the current terminal size: called when the REPL
@@ -410,20 +424,119 @@ impl Front for Renderer {
     }
 
     fn ask_secret(&mut self, prompt: &str) -> Pin<Box<dyn Future<Output = Option<String>> + '_>> {
-        // The echo goes off before the prompt does, not after: the answer can
-        // arrive the moment the question is on the screen, and the only copy of
-        // it that may exist is the one this returns. The prompt itself is
-        // written now rather than awaited -- an answer nobody knows is being
-        // asked for is not an answer -- and the read waits in the future, where
-        // the caller awaits it.
-        let echo = self.term.echo_off();
-        let _ = writeln!(self.out, "{}", self.paint(Style::Dim, prompt));
-        let _ = self.out.flush();
-        Box::pin(async move {
-            let answer = self.term.read_line().await;
-            drop(echo);
-            answer
-        })
+        // Two read paths, picked by the tty's state:
+        // - cooked mode: the kernel collects a line for us. The echo goes off
+        //   so the answer is hidden, and a blocking read on stdin is what
+        //   gives us back a line.
+        // - raw mode: the kernel is not collecting a line, so a blocking read
+        //   on stdin never returns. Read key by key with crossterm, mask the
+        //   characters as they come in, and treat Enter/Ctrl-D/Ctrl-C the way
+        //   the rest of the prompt does.
+        if self.in_raw_mode {
+            let prompt = prompt.to_owned();
+            Box::pin(async move { read_secret_raw(&prompt).await })
+        } else {
+            // The echo goes off before the prompt does, not after: the answer can
+            // arrive the moment the question is on the screen, and the only copy of
+            // it that may exist is the one this returns. The prompt itself is
+            // written now rather than awaited -- an answer nobody knows is being
+            // asked for is not an answer -- and the read waits in the future, where
+            // the caller awaits it.
+            let echo = self.term.echo_off();
+            let _ = writeln!(self.out, "{}", self.paint(Style::Dim, prompt));
+            let _ = self.out.flush();
+            Box::pin(async move {
+                let answer = self.term.read_line().await;
+                drop(echo);
+                answer
+            })
+        }
+    }
+}
+
+/// Read a secret in raw mode: one event at a time, with the typed character
+/// replaced by a mask. Enter submits, Ctrl-D on an empty buffer cancels (the
+/// same shape as the prompt's Ctrl-D-on-empty), Ctrl-C also cancels. The
+/// prompt is written dim; characters mask as a bullet.
+///
+/// Reads crossterm directly rather than through the renderer, because the
+/// renderer is borrowed by the caller and a future inside a trait method is
+/// not the place to reach into it. The bytes this function writes are the same
+/// shape the rest of the prompt uses (`\r\x1b[2K` to clear, plain dim SGR for
+/// the prompt, a mask char for each character) -- what is different is that
+/// they are the prompt's own bytes, not a `Cell`.
+async fn read_secret_raw(prompt: &str) -> Option<String> {
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    let dim_open = "\x1b[2m";
+    let dim_close = "\x1b[0m";
+    let mask: String = "•".repeat(0);
+    let _ = write!(
+        stdout,
+        "\r\x1b[2K{dim_open}{prompt}{dim_close}\n\r\x1b[2K› {mask}"
+    );
+    let _ = stdout.flush();
+    let mut buf = String::new();
+    loop {
+        let event = match crossterm::event::read() {
+            Ok(ev) => ev,
+            Err(_) => return None,
+        };
+        match event {
+            crossterm::event::Event::Key(key)
+                if key.kind == crossterm::event::KeyEventKind::Press =>
+            {
+                match (key.code, key.modifiers) {
+                    (crossterm::event::KeyCode::Enter, _) => {
+                        let _ = writeln!(stdout);
+                        let _ = stdout.flush();
+                        return Some(buf);
+                    }
+                    (
+                        crossterm::event::KeyCode::Char('c'),
+                        crossterm::event::KeyModifiers::CONTROL,
+                    ) => {
+                        let _ = writeln!(stdout);
+                        let _ = stdout.flush();
+                        return None;
+                    }
+                    (
+                        crossterm::event::KeyCode::Char('d'),
+                        crossterm::event::KeyModifiers::CONTROL,
+                    ) => {
+                        if buf.is_empty() {
+                            let _ = writeln!(stdout);
+                            let _ = stdout.flush();
+                            return None;
+                        }
+                        buf.pop();
+                        let mask: String = "•".repeat(buf.chars().count());
+                        let _ = write!(stdout, "\r\x1b[2K› {mask}");
+                        let _ = stdout.flush();
+                    }
+                    (crossterm::event::KeyCode::Backspace, _) => {
+                        buf.pop();
+                        let mask: String = "•".repeat(buf.chars().count());
+                        let _ = write!(stdout, "\r\x1b[2K› {mask}");
+                        let _ = stdout.flush();
+                    }
+                    (crossterm::event::KeyCode::Char(c), _) => {
+                        buf.push(c);
+                        let mask: String = "•".repeat(buf.chars().count());
+                        let _ = write!(stdout, "\r\x1b[2K› {mask}");
+                        let _ = stdout.flush();
+                    }
+                    _ => {}
+                }
+            }
+            crossterm::event::Event::Paste(text) => {
+                buf.push_str(&text);
+                let mask: String = "•".repeat(buf.chars().count());
+                let _ = write!(stdout, "\r\x1b[2K› {mask}");
+                let _ = stdout.flush();
+            }
+            _ => {}
+        }
     }
 }
 

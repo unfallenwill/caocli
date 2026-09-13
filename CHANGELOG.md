@@ -6,21 +6,20 @@ semantic-version bumps per release.
 
 ## [Unreleased]
 
-### Added
-- The plain REPL now tab-completes slash commands. `repl::completions` is
-  the one source of truth, so what the TUI's picker offers and what
-  rustyline offers are the same list in the same order.
-- Lines typed while a plain-REPL turn is running are queued in
-  `repl::Queue`. The kernel's line discipline has been holding them
-  since the user pressed Enter; a non-blocking drain after the turn
-  returns announces each one ("queued · N waiting: <preview>") and
-  the head runs next ("running queued line: <preview>"). Before, the
-  user had no way to know whether their typing during a long turn
-  had landed. Readline stays in the main thread (it owns the tty,
-  and `ask_secret` reads the same tty for the API-key prompt), so
-  the drain is what bridges the kernel buffer and the queue.
-
 ### Changed
+- The plain REPL's input loop is now built on crossterm raw mode and a
+  `ratatui_textarea::TextArea` used as a pure in-memory buffer: every
+  keystroke is delivered as a `KeyEvent`, the renderer redraws the prompt
+  in place, and there is no longer a kernel line-discipline buffer to drain
+  between turns. The previous design relied on `rustyline` and a
+  non-blocking read of stdin to recover lines submitted while a turn ran;
+  in raw mode the editor owns the tty, so what is not consumed has not been
+  typed. `repl::Queue` is gone, and `rustyline` is no longer a dependency.
+  Tab completion of slash commands is removed in this change: the plain
+  prompt never had the visual context the TUI's picker relies on, and
+  the source-of-truth `repl::completions` is still the one the TUI uses.
+  The `/login` secret prompt now reads key-by-key in raw mode (with a
+  `•` mask) instead of toggling the terminal's echo in cooked mode.
 - Status line's cache segment now reads `N/M` instead of `hit N · miss M`
   (e.g. `cache 98.6% · 32384/461`). The two counts are read as a fraction
   the way other tools report cache hit/miss, and the line is six columns
