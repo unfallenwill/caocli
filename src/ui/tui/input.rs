@@ -417,8 +417,6 @@ impl State {
         self.follow();
     }
 
-
-
     /// The placeholder for what the box is for right now: the answer while a
     /// question is open, the queue while a turn runs, the next message
     /// otherwise.
