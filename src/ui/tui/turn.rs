@@ -48,6 +48,11 @@ pub(crate) struct Turn {
     /// The indicator title the last tick saw, so a tick bumps the revision only
     /// when the border would show something new.
     pub(crate) ticked_activity: Option<String>,
+    /// The verb of the tool call currently running, or `None` while the
+    /// model is reasoning or producing content. Drives the "running X"
+    /// label on the box's top border; the runner resets it to `None`
+    /// when the tool result settles the step.
+    pub(crate) current_tool_verb: Option<String>,
 }
 
 impl Default for Turn {
@@ -60,6 +65,7 @@ impl Default for Turn {
             chars_since_usage: 0,
             chars_per_token: BLIND_CHARS_PER_TOKEN,
             ticked_activity: None,
+            current_tool_verb: None,
         }
     }
 }
