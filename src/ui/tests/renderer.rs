@@ -340,7 +340,7 @@ fn the_plain_front_ends_stream_is_frozen() {
         // the bar picks up the usage the line just recorded, then the gate asks
         "\x1b7\x1b[24;1H\x1b[2K                    ",
         "\x1b[2mdeepseek-v4-pro · effort max · cache 60.0% · hit 6 · miss 4\x1b[0m\x1b8",
-        "\x1b[1;33m▸ Write /tmp/x — run it? [y/N] \x1b[0m",
+        "\x1b[1;33m▸ Write /tmp/x · run it? [y/N] \x1b[0m",
         "\x1b[1;33m  ⏹ interrupted (Ctrl-C)\x1b[0m\n",
         // and the bar goes down as the terminal is handed back
         "\x1b[r\x1b[24;1H\x1b[2K\r\n",
