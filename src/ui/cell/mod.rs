@@ -24,6 +24,7 @@ use super::text;
 mod call;
 pub(super) mod question;
 mod replay;
+pub(super) mod sink;
 pub(super) mod stream;
 mod todos;
 
@@ -37,6 +38,7 @@ use todos::todo_spans;
 // helper that needs them; the re-export is what keeps `cell::` working as
 // the entry point for the data layer.
 pub use replay::from_messages;
+pub use sink::CellSink;
 pub use stream::Stream;
 pub use todos::{standing_todos, todo_gutter, todo_head_spans, todo_line_spans};
 

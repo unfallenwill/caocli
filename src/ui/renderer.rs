@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use crate::types::{Message, Usage};
 
-use super::cell::{Cell, Span, Stream, Style};
+use super::cell::{Cell, CellSink, Stream, Style};
 use super::contract::{Front, Ui};
 use super::status::Status;
 use super::status_bar::StatusBar;
@@ -51,6 +51,102 @@ fn style_code(style: Style) -> &'static str {
         "\x1b[2m"
     } else {
         ""
+    }
+}
+
+/// The plain front end's [`CellSink`]: turns the cell layer's calls into
+/// SGR bytes on a `Write`. Holds the open style for the duration of one cell
+/// so consecutive spans in the same style stay one style run, and the gutter's
+/// continuation columns so an embedded `\n` is set in like the line it
+/// continues.
+struct SgrSink<'a> {
+    out: &'a mut dyn Write,
+    color: bool,
+    open: Option<Style>,
+    gutter_rest: &'static str,
+}
+
+impl<'a> SgrSink<'a> {
+    fn new(out: &'a mut dyn Write, color: bool) -> Self {
+        Self {
+            out,
+            color,
+            open: None,
+            gutter_rest: "",
+        }
+    }
+
+    /// The SGR open on style change, the continuation columns on every `\n`,
+    /// and the bytes in between. One style code per run rather than one per
+    /// span, so consecutive spans in the same style stay one style run.
+    ///
+    /// A `\n` in a cell is a line of that cell, not a line the terminal
+    /// wrapped, so it is set in like every other line of it: the writer writes
+    /// the gutter's continuation columns itself, because a line the terminal
+    /// wraps because it is longer than the screen is the one thing neither
+    /// front end can set in -- only the terminal knows where it breaks.
+    ///
+    /// The opened style runs across the break and over the columns, so the
+    /// continuation is painted in the style of the line it continues rather
+    /// than in the gutter's own. The two differ only for a cell whose marker
+    /// is not blank, and for that one they are the same style by construction.
+    fn write_span(&mut self, style: Style, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.open != Some(style) {
+            if self.open.is_some() {
+                let _ = self.out.write_all(self.reset().as_bytes());
+            }
+            let code = if self.color { style_code(style) } else { "" };
+            let _ = self.out.write_all(code.as_bytes());
+            self.open = Some(style);
+        }
+        for (i, piece) in text.split('\n').enumerate() {
+            if i > 0 {
+                let _ = self.out.write_all(b"\n");
+                if !self.gutter_rest.is_empty() {
+                    let _ = self.out.write_all(self.gutter_rest.as_bytes());
+                }
+            }
+            let _ = self.out.write_all(piece.as_bytes());
+        }
+    }
+
+    /// The SGR reset, or empty when colors are off: an SGR byte the terminal
+    /// has no use for is one the terminal could still echo back, and that is
+    /// a byte the test suite would pin as a one-line oversight.
+    fn reset(&self) -> &'static str {
+        if self.color { RESET } else { "" }
+    }
+}
+
+impl<'a> CellSink for SgrSink<'a> {
+    fn begin_cell(&mut self, gutter: Option<&super::cell::Gutter>) {
+        self.open = None;
+        self.gutter_rest = gutter.map_or("", |g| g.rest);
+    }
+
+    fn gap(&mut self) {
+        let _ = self.out.write_all(b"\n");
+    }
+
+    fn span(&mut self, style: Style, text: &str) {
+        self.write_span(style, text);
+    }
+
+    fn line_end(&mut self) {
+        let _ = self.out.write_all(b"\n");
+    }
+
+    fn end_cell(&mut self) {
+        // Close the open style, so the next cell starts unstyled. The plain
+        // front end is the one place a style could still be open here: the
+        // TUI's sink collects into spans and never opens anything.
+        if self.open.is_some() {
+            let _ = self.out.write_all(self.reset().as_bytes());
+            self.open = None;
+        }
     }
 }
 
@@ -200,68 +296,20 @@ impl Renderer {
         format!("{}{s}{}", self.open_style(style), self.close_style())
     }
 
-    /// Paint a run of spans: one style code per run rather than one per span, and the
-    /// columns the cell continues in after every line break inside it.
+    /// Write a cell: the blank line separating it from the previous one, its
+    /// marker in its gutter, its spans, then its line ending.
     ///
-    /// A `\n` in a cell is a line of that cell, not a line the terminal wrapped, so it
-    /// is set in like every other line of it. For this front end that means writing
-    /// the continuation columns itself -- without them a change's lines would come out
-    /// two columns left of the call they belong to, in the column the answers are in.
-    /// A line the terminal wraps because it is longer than the screen is the one thing
-    /// neither front end can set in: only the terminal knows where it breaks.
-    ///
-    /// The opened style runs across the break and over the columns, so the
-    /// continuation is painted in the style of the line it continues rather than in the
-    /// gutter's own. The two differ only for a cell whose marker is not blank, and for
-    /// that one they are the same style by construction.
-    fn paint_spans(&self, spans: &[Span], rest: &str) -> String {
-        let mut out = String::new();
-        let mut open: Option<Style> = None;
-        for span in spans {
-            if open != Some(span.style) {
-                if open.is_some() {
-                    out.push_str(self.close_style());
-                }
-                out.push_str(self.open_style(span.style));
-                open = Some(span.style);
-            }
-            for (i, piece) in span.text.split('\n').enumerate() {
-                if i > 0 {
-                    out.push('\n');
-                    out.push_str(rest);
-                }
-                out.push_str(piece);
-            }
-        }
-        if open.is_some() {
-            out.push_str(self.close_style());
-        }
-        out
-    }
-
-    /// Write a cell: the blank line separating it from the previous one, its marker
-    /// in its gutter, its spans, then its line ending.
+    /// Rendering goes through [`Cell::render`] so the gap rule, the gutter's
+    /// head and the line end all live on the cell layer; this front end is
+    /// only the sink that turns each call into SGR bytes.
     fn paint_cell(&mut self, cell: &Cell) {
-        // A cell is a line of its own: a block still streaming when one arrives --
-        // which is what a running command's output leaves open -- ends here rather
-        // than running on into it.
+        // A cell is a line of its own: a block still streaming when one arrives
+        // -- which is what a running command's output leaves open -- ends here
+        // rather than running on into it.
         self.close_block();
-        if cell.gap_after(self.prev_was_block) {
-            self.emit("\n");
-        }
-        // The marker first, then the cell's own spans: a cell is set in past its
-        // gutter, and this front end is the one that writes those columns itself --
-        // the front end that owns the screen lays the cell out, and would otherwise
-        // write the marker twice.
-        let gutter = cell.gutter();
-        let led = gutter.map(|g| Span::new(g.style, g.head));
-        let spans: Vec<Span> = led.into_iter().chain(cell.spans()).collect();
-        let painted = self.paint_spans(&spans, gutter.map_or("", |g| g.rest));
-        self.emit(&painted);
-        if cell.ends_line() {
-            self.emit("\n");
-        }
-        self.prev_was_block = cell.is_text_block();
+        let mut sink = SgrSink::new(self.out.as_mut(), self.color);
+        let finish = cell.render(self.prev_was_block, &mut sink);
+        self.prev_was_block = finish.is_text_block;
     }
 
     /// Start streaming a text block: write the separating blank line and open the
