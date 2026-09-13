@@ -381,7 +381,7 @@ fn break_line(piece: &str, room: usize, width: usize) -> (&str, &str, bool) {
 /// result carry, so the three cannot say different things about one list.
 pub(crate) fn todo_title(todos: &[Todo]) -> Line<'static> {
     Line::styled(
-        format!("· todos · {}", todo::summary(todos)),
+        format!("· todo · {}", todo::summary(todos)),
         style_of(Style::Dim),
     )
 }

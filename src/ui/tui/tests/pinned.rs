@@ -185,7 +185,7 @@ fn the_standing_list_is_the_last_one_written_and_nothing_when_none_is() {
             // A blank row first: without it the block reads as the tail of the
             // transcript, which is the one thing it must not be taken for.
             "",
-            "· todos · 1/2 done",
+            "· todo · 1/2 done",
             "✔ Add the parse function",
             "▸ Draw the cell",
         ]
@@ -226,7 +226,7 @@ fn the_standing_list_is_drawn_by_the_block_and_not_by_the_cell_too() {
     let boxed = box_top(&screen);
     assert_eq!(row(&screen, boxed - 1), "▸ Fix the parser");
     assert_eq!(row(&screen, boxed - 2), "✔ Read the failing test");
-    assert_eq!(row(&screen, boxed - 3), "· todos · 1/2 done");
+    assert_eq!(row(&screen, boxed - 3), "· todo · 1/2 done");
 
     let copies = super::all_rows(&screen)
         .iter()
@@ -294,7 +294,7 @@ fn the_block_gives_up_its_rows_before_the_box_does() {
         assert_eq!(&row(&screen, at + i as u16), line, "row {i} of the block");
     }
     assert_eq!(row(&screen, at), "", "the blank row that sets it off");
-    assert_eq!(row(&screen, at + 1), "\u{b7} todos \u{b7} 0/2 done");
+    assert_eq!(row(&screen, at + 1), "\u{b7} todo \u{b7} 0/2 done");
     assert_eq!(row(&screen, at + 2), "\u{2610} one");
     assert_eq!(row(&screen, at + 3), "\u{2610} two");
 
