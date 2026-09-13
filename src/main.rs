@@ -359,6 +359,7 @@ async fn run(cli: Cli) -> Result<()> {
                     &mut interrupt,
                     &mut approve,
                     &mut ask,
+                    repl::FrontKind::Plain,
                 )
                 .await?;
                 if outcome == repl::Outcome::Exit {

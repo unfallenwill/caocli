@@ -15,6 +15,11 @@ semantic-version bumps per release.
   (`ui::answers::allows`): "Y", "Yes", "yeah" all allow on both the plain
   prompt and the TUI. Before, the plain prompt only allowed "y" or
   lowercase-prefixed lines.
+- `/help` shows the input keys the current front end actually accepts:
+  the plain prompt lists `Ctrl-C` clears the line, `Up/Down` browse
+  history; the TUI lists `PageUp/PageDown` and the mouse wheel for
+  scrolling the transcript, `Esc` for dismissing the menu, and so on.
+  The command list and the startup flags are still shared.
 
 ## [0.1.5] — 2026-09-13
 

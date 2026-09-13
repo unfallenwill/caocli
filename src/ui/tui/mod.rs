@@ -248,6 +248,7 @@ async fn run_turn(
         &mut interrupt,
         &mut approve,
         &mut ask,
+        repl::FrontKind::Tui,
     );
     tokio::pin!(turn);
     screen.state.begin_turn(Instant::now());

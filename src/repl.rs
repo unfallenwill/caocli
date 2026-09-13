@@ -27,11 +27,31 @@ pub enum Outcome {
     Exit,
 }
 
+/// Which front end is hosting the session, so commands that look different on
+/// each side (today: `/help`) can show what is true of the one in use rather
+/// than the union of both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontKind {
+    /// The plain prompt (rustyline, scrolling output, status bar).
+    Plain,
+    /// The full-screen TUI (alternate screen, picker, queue, mouse wheel).
+    Tui,
+}
+
 /// Handle one submitted line: a command, or a conversational turn.
 ///
 /// The three answer sources only reach the model when the line is a turn; they
 /// are passed through so that a front end choosing when to run the turn also
 /// chooses where its cancel, approval and question answers come from.
+///
+/// `front` is which front end is hosting the session: `/help` and a few
+/// command menus show different things on each side, and the call site
+/// already knows which side it is on.
+// Eight positional parameters is more than the linter is happy with, but the
+// three answer sources are independent channels, and `front` is the one fact
+// about the host that needs to be in scope: lumping any of them into a
+// context struct would only push the same problem one layer down.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle(
     agent: &mut Agent,
     ui: &mut dyn Front,
@@ -40,10 +60,11 @@ pub async fn handle(
     cancel: &mut dyn Cancel,
     approve: &mut dyn Approve,
     ask: &mut dyn Ask,
+    front: FrontKind,
 ) -> Result<Outcome> {
     match line {
         "/exit" | "/quit" | "/q" => return Ok(Outcome::Exit),
-        "/help" => ui.info(&help()),
+        "/help" => ui.info(&help(front)),
         "/sessions" => {
             for s in session::list(sdir)? {
                 ui.info(&format!(
@@ -456,18 +477,30 @@ pub fn completions(input: &str) -> Vec<&'static Command> {
         .collect()
 }
 
-/// The keys the prompt accepts, and the startup flags. Separate from the table
-/// above because these are not commands.
-const INPUT_AND_FLAGS: &str = "Input:\n  Enter            submit\n  Ctrl-J           newline (multi-line input)\n  Tab              complete a command\n  Up / Down        pick a command, or browse history\nStartup flags:\n  -c / --continue  continue the most recent session\n  --resume <id>    resume a specific session\n  --provider deepseek|zai-coding-cn|minimax\n  --effort low|high|max --model <id>\n  -p \"prompt\"      run once and exit\n  --image <path>   attach an image to -p's prompt";
+/// The keys the prompt accepts. The startup flags are shared by both front
+/// ends; the input section is split because the keys mean different things
+/// (and there are more of them) on the TUI.
+const STARTUP_FLAGS: &str = "Startup flags:\n  -c / --continue  continue the most recent session\n  --resume <id>    resume a specific session\n  --provider deepseek|zai-coding-cn|minimax\n  --effort low|high|max --model <id>\n  -p \"prompt\"      run once and exit\n  --image <path>   attach an image to -p's prompt";
+
+const PLAIN_KEYS: &str = "Input:\n  Enter            submit\n  Ctrl-J           newline (multi-line input)\n  Tab              complete a command\n  Up / Down        browse history\n  Ctrl-C           clear the line\n  Ctrl-D           exit on an empty line";
+
+const TUI_KEYS: &str = "Input:\n  Enter            submit · pick a row in the menu\n  Ctrl-J / Shift-Enter  newline (multi-line input)\n  Tab              complete a command name in the menu\n  Up / Down        move the menu, or browse history\n  PageUp / PageDown  scroll the transcript\n  Mouse wheel      scroll the transcript\n  Ctrl-C           clear the line, or cancel a running turn\n  Ctrl-D           exit on an empty line\n  Esc              dismiss the command menu or question panel";
 
 /// The `/help` text, built from the command table so the two cannot drift.
-pub fn help() -> String {
+/// The keys section is what the front end in use actually accepts -- the
+/// plain prompt and the TUI share the commands, not the keys.
+pub fn help(front: FrontKind) -> String {
     let mut out = String::from("Commands:");
     for c in COMMANDS {
         out.push_str(&format!("\n  {:<15} {}", c.name, c.description));
     }
     out.push('\n');
-    out.push_str(INPUT_AND_FLAGS);
+    out.push_str(match front {
+        FrontKind::Plain => PLAIN_KEYS,
+        FrontKind::Tui => TUI_KEYS,
+    });
+    out.push('\n');
+    out.push_str(STARTUP_FLAGS);
     out
 }
 
@@ -594,6 +627,7 @@ mod tests {
             &mut NoCancel,
             &mut Answer::denies(),
             &mut NoQuestions,
+            FrontKind::Plain,
         )
         .await
         .unwrap()
@@ -623,7 +657,7 @@ mod tests {
             submit(&mut agent, &mut ui, &dir, "/help").await,
             Outcome::Continue
         );
-        assert_eq!(ui.info, vec![help()]);
+        assert_eq!(ui.info, vec![help(FrontKind::Plain)]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1004,43 +1038,75 @@ mod tests {
     fn help_lists_every_command() {
         // Structural now: the help text is built from the table, so this is the
         // one place that could still drift -- a command in the table that the
-        // help text dropped.
-        let text = help();
-        for command in COMMANDS {
-            assert!(
-                text.contains(command.name),
-                "{} is undocumented",
-                command.name
-            );
-            assert!(
-                text.contains(command.description),
-                "{} has no description",
-                command.name
-            );
+        // help text dropped. Checked on both front ends, since the table is
+        // shared.
+        for front in [FrontKind::Plain, FrontKind::Tui] {
+            let text = help(front);
+            for command in COMMANDS {
+                assert!(
+                    text.contains(command.name),
+                    "{} is undocumented in {front:?}",
+                    command.name
+                );
+                assert!(
+                    text.contains(command.description),
+                    "{} has no description in {front:?}",
+                    command.name
+                );
+            }
         }
     }
 
     #[test]
-    fn help_lists_the_startup_flags_and_input_keys() {
-        for expected in [
-            "-c / --continue",
-            "--provider deepseek|zai-coding-cn|minimax",
-            "--effort low|high|max",
-            "-p \"prompt\"",
-            "--image <path>",
-            "Ctrl-J",
-            "Tab",
-        ] {
-            assert!(help().contains(expected), "missing {expected:?}");
+    fn help_lists_the_startup_flags() {
+        for front in [FrontKind::Plain, FrontKind::Tui] {
+            for expected in [
+                "-c / --continue",
+                "--provider deepseek|zai-coding-cn|minimax",
+                "--effort low|high|max",
+                "-p \"prompt\"",
+                "--image <path>",
+            ] {
+                assert!(
+                    help(front).contains(expected),
+                    "missing {expected:?} in {front:?}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn help_keys_reflect_the_front_end_in_use() {
+        // The plain prompt does not have a picker, a transcript to scroll, or
+        // a mouse to wheel over; the TUI has all three. So a help text in one
+        // must not show what only the other can do.
+        let plain = help(FrontKind::Plain);
+        assert!(
+            !plain.contains("PageUp"),
+            "plain help has no PageUp: {plain}"
+        );
+        assert!(
+            !plain.contains("Mouse wheel"),
+            "plain help has no wheel: {plain}"
+        );
+        let tui = help(FrontKind::Tui);
+        assert!(tui.contains("PageUp"), "{tui}");
+        assert!(tui.contains("Mouse wheel"), "{tui}");
     }
 
     #[test]
     fn help_is_a_single_notice() {
         // It reaches the screen through info(), which writes one cell: a trailing
-        // newline would show up as a blank row.
-        assert!(!help().ends_with('\n'));
-        assert!(help().contains('\n'), "the commands are one per line");
+        // newline would show up as a blank row. Checked on both front ends
+        // since the keys section differs.
+        for front in [FrontKind::Plain, FrontKind::Tui] {
+            let text = help(front);
+            assert!(!text.ends_with('\n'), "trailing newline in {front:?}");
+            assert!(
+                text.contains('\n'),
+                "the commands are one per line in {front:?}"
+            );
+        }
     }
 
     #[test]
