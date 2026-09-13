@@ -84,8 +84,8 @@ SEED = "20260910-120000"
 # as well as in it, so a needle that matched both would not say which one was found.
 TODO_DONE = "Draw the change"
 TODO_NOW = "Run the gates"
-CELL_HEAD = "TodoWrite 1/2 done"
-BLOCK_HEAD = "· todos · 1/2 done"
+CELL_HEAD = "todo · 1/2 done"
+BLOCK_HEAD = "· todo · 1/2 done"
 
 # What `/login` is given below. Nonsense on purpose: it is never sent anywhere,
 # and looking for exactly it is how the checks below know that what they found
