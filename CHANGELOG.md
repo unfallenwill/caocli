@@ -6,6 +6,12 @@ semantic-version bumps per release.
 
 ## [Unreleased]
 
+### Changed
+- Status line's cache segment now reads `N/M` instead of `hit N · miss M`
+  (e.g. `cache 98.6% · 32384/461`). The two counts are read as a fraction
+  the way other tools report cache hit/miss, and the line is six columns
+  shorter.
+
 ## [0.1.5] — 2026-09-13
 
 ### Added — MCP (Model Context Protocol)

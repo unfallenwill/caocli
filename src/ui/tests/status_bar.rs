@@ -69,14 +69,15 @@ fn status_bar_setup_teardown_sequences() {
 fn status_bar_render_right_aligns_and_paints() {
     let bar = StatusBar { rows: 10, cols: 40 }; // width = 39
     let (mut r, buf) = with_buffer(true);
-    let label = "cache 98.6% · hit 32384 · miss 461"; // 34 characters
+    let label = "cache 98.6% · 32384/461"; // 23 characters
     let painted = r.paint(Style::Dim, label);
     bar.render(r.out.as_mut(), label, &painted);
     let s = buf_of(&buf);
-    // 39 - 34 = 5 spaces of left padding, right aligned
+    // 39 - 23 = 16 spaces of left padding, right aligned
     assert!(
         s.contains(&format!(
-            "\x1b7\x1b[10;1H\x1b[2K     \x1b[2m{label}\x1b[0m\x1b8"
+            "\x1b7\x1b[10;1H\x1b[2K{}\x1b[2m{label}\x1b[0m\x1b8",
+            " ".repeat(16)
         )),
         "{s:?}"
     );
@@ -96,7 +97,7 @@ fn apply_status_bar_transitions() {
     r.apply_status_bar(Some(a));
     let s = buf_of(&buf);
     assert!(s.contains("\x1b[1;9r"), "{s:?}");
-    assert!(s.contains("cache 0.0% · hit 0 · miss 0"), "{s:?}");
+    assert!(s.contains("cache 0.0% · 0/0"), "{s:?}");
     assert_eq!(r.bar, Some(a));
 
     // (Some, Some(same)): redraw only
@@ -132,11 +133,11 @@ fn usage_paints_session_cache_bar_and_reset_clears_it() {
         "{s:?}"
     );
     // session accumulation: 18 hit / 12 miss = 60.0%
-    assert!(s.contains("cache 60.0% · hit 18 · miss 12"), "{s:?}");
+    assert!(s.contains("cache 60.0% · 18/12"), "{s:?}");
 
     r.reset_stats();
     let tail = &buf_of(&buf)[s.len()..];
-    assert!(tail.contains("cache 0.0% · hit 0 · miss 0"), "{tail:?}");
+    assert!(tail.contains("cache 0.0% · 0/0"), "{tail:?}");
     assert_eq!(r.stats(), CacheStats::default());
 }
 
@@ -168,11 +169,7 @@ fn assert_bar_exactly(cols: u16, model: &str, label: &str) {
 fn status_bar_drops_whole_segments_on_narrow_terminals() {
     let model = "deepseek-v4-flash";
     // 79 columns: everything fits
-    assert_bar_exactly(
-        80,
-        model,
-        "deepseek-v4-flash · cache 60.0% · hit 6 · miss 4",
-    );
+    assert_bar_exactly(80, model, "deepseek-v4-flash · cache 60.0% · 6/4");
     // 34 columns: the counts go, the model and rate stay
     assert_bar_exactly(35, model, "deepseek-v4-flash · cache 60.0%");
     // 19 columns: only the model is left
@@ -207,10 +204,7 @@ fn status_bar_shows_model_and_updates_on_switch() {
     r.set_model("deepseek-v4-flash");
     r.usage(&usage_fixture(6, 4), Duration::ZERO);
     let s = buf_of(&buf);
-    assert!(
-        s.contains("deepseek-v4-flash · cache 60.0% · hit 6 · miss 4"),
-        "{s:?}"
-    );
+    assert!(s.contains("deepseek-v4-flash · cache 60.0% · 6/4"), "{s:?}");
 
     // switching models: after the redraw only the new model is left
     r.set_model("deepseek-v4-pro");
@@ -223,7 +217,7 @@ fn status_bar_shows_model_and_updates_on_switch() {
     r.reset_stats();
     let tail = &buf_of(&buf)[before..];
     assert!(
-        tail.contains("deepseek-v4-pro · cache 0.0% · hit 0 · miss 0"),
+        tail.contains("deepseek-v4-pro · cache 0.0% · 0/0"),
         "{tail:?}"
     );
 }
@@ -248,7 +242,7 @@ fn a_bar_comes_up_on_a_terminal_that_can_host_it_and_goes_down_on_teardown() {
     // the scroll region stops one line short of the bottom, and the bar's first
     // frame is drawn on the line it leaves
     assert!(s.contains("\x1b[1;23r"), "the scroll region: {s:?}");
-    assert!(s.contains("cache 0.0% · hit 0 · miss 0"), "{s:?}");
+    assert!(s.contains("cache 0.0% · 0/0"), "{s:?}");
     // a second refresh with the same size only redraws
     let before = s.len();
     r.refresh_status_bar();

@@ -149,7 +149,7 @@ zai-coding-cn/glm-5.3 · effort max · cache 95.3% · hit 846912 · miss 41538
 
 - **The status line** is the row under the box, always the session summary:
   the model, the reasoning effort tier, the cache hit rate, and the raw hit/miss
-  counts. A new session opens with the defaults (`cache 0.0% · hit 0 · miss 0`)
+  counts. A new session opens with the defaults (`cache 0.0% · 0/0`)
   and the counts move as the provider reports usage; what a turn is doing is the
   transcript's to say, not the status line's.
 - **While a turn runs, the box's top border says so**: a spinner and the seconds

@@ -81,12 +81,12 @@ fn status_notices_reach_the_status_line() {
     ));
     assert_eq!(
         screen.status.full_line(),
-        "m-1 · effort high · cache 60.0% · hit 6 · miss 4"
+        "m-1 · effort high · cache 60.0% · 6/4"
     );
     screen.apply(Notice::ResetStats);
     assert_eq!(
         screen.status.full_line(),
-        "m-1 · effort high · cache 0.0% · hit 0 · miss 0"
+        "m-1 · effort high · cache 0.0% · 0/0"
     );
 }
 

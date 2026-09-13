@@ -41,7 +41,7 @@ impl CacheStats {
     fn segments(&self) -> Vec<String> {
         vec![
             format!("cache {:.1}%", self.hit_rate()),
-            format!("hit {} · miss {}", self.hit, self.miss),
+            format!("{}/{}", self.hit, self.miss),
         ]
     }
 }
@@ -147,7 +147,7 @@ mod tests {
     #[test]
     fn an_empty_status_shows_the_zero_defaults() {
         let s = Status::default();
-        assert_eq!(s.full_line(), "cache 0.0% · hit 0 · miss 0");
+        assert_eq!(s.full_line(), "cache 0.0% · 0/0");
         assert_eq!(s.stats().hit_rate(), 0.0);
     }
 
@@ -156,22 +156,16 @@ mod tests {
         let mut s = Status::default();
         s.set_model("deepseek-v4-flash");
         s.record(&usage(6, 4));
-        assert_eq!(
-            s.full_line(),
-            "deepseek-v4-flash · cache 60.0% · hit 6 · miss 4"
-        );
+        assert_eq!(s.full_line(), "deepseek-v4-flash · cache 60.0% · 6/4");
         s.reset_stats();
-        assert_eq!(
-            s.full_line(),
-            "deepseek-v4-flash · cache 0.0% · hit 0 · miss 0"
-        );
+        assert_eq!(s.full_line(), "deepseek-v4-flash · cache 0.0% · 0/0");
     }
 
     #[test]
     fn an_empty_model_is_not_a_segment() {
         let mut s = Status::default();
         s.set_model("");
-        assert_eq!(s.full_line(), "cache 0.0% · hit 0 · miss 0");
+        assert_eq!(s.full_line(), "cache 0.0% · 0/0");
     }
 
     #[test]
@@ -182,13 +176,13 @@ mod tests {
         s.record(&usage(6, 4));
         assert_eq!(
             s.full_line(),
-            "deepseek/deepseek-flash · effort high · cache 60.0% · hit 6 · miss 4"
+            "deepseek/deepseek-flash · effort high · cache 60.0% · 6/4"
         );
         // It follows the session, not the statistics.
         s.reset_stats();
         assert_eq!(
             s.full_line(),
-            "deepseek/deepseek-flash · effort high · cache 0.0% · hit 0 · miss 0"
+            "deepseek/deepseek-flash · effort high · cache 0.0% · 0/0"
         );
     }
 
@@ -197,7 +191,7 @@ mod tests {
         let mut s = Status::default();
         s.set_model("m-1");
         s.set_effort("");
-        assert_eq!(s.full_line(), "m-1 · cache 0.0% · hit 0 · miss 0");
+        assert_eq!(s.full_line(), "m-1 · cache 0.0% · 0/0");
     }
 
     #[test]
@@ -220,10 +214,7 @@ mod tests {
         s.set_model("deepseek-v4-flash");
         s.record(&usage(6, 4));
         // 79 columns: everything fits
-        assert_eq!(
-            s.line(79),
-            "deepseek-v4-flash · cache 60.0% · hit 6 · miss 4"
-        );
+        assert_eq!(s.line(79), "deepseek-v4-flash · cache 60.0% · 6/4");
         // 34 columns: the counts go, the model and rate stay
         assert_eq!(s.line(34), "deepseek-v4-flash · cache 60.0%");
         // 19 columns: only the model is left
@@ -237,11 +228,11 @@ mod tests {
         let mut s = Status::default();
         // four ideographs: 8 columns, 4 chars
         s.set_model("\u{6df1}\u{5ea6}\u{6c42}\u{7d22}");
-        // the model plus " · cache 0.0%" is 21 columns, and the counts are 14
-        // more: 21 fits, 20 does not, and the whole line is 38.
+        // the model plus " · cache 0.0%" is 21 columns, and " · 0/0" is 6 more
+        // for 27. The "· 0/0" is a separate segment that drops first.
         assert_eq!(
-            s.line(38),
-            "\u{6df1}\u{5ea6}\u{6c42}\u{7d22} · cache 0.0% · hit 0 · miss 0"
+            s.line(27),
+            "\u{6df1}\u{5ea6}\u{6c42}\u{7d22} · cache 0.0% · 0/0"
         );
         assert_eq!(s.line(21), "\u{6df1}\u{5ea6}\u{6c42}\u{7d22} · cache 0.0%");
         assert_eq!(s.line(20), "\u{6df1}\u{5ea6}\u{6c42}\u{7d22}");
@@ -266,7 +257,7 @@ mod tests {
             completion_tokens: 8,
             ..Usage::default()
         });
-        assert_eq!(s.full_line(), "cache 0.0% · hit 0 · miss 0");
+        assert_eq!(s.full_line(), "cache 0.0% · 0/0");
     }
 
     #[test]
@@ -283,7 +274,7 @@ mod tests {
         });
         assert_eq!(
             s.full_line(),
-            "cache 66.7% · hit 800 · miss 400",
+            "cache 66.7% · 800/400",
             "1200 prompt tokens with 800 cached leaves 400 miss"
         );
     }
@@ -294,6 +285,6 @@ mod tests {
         s.record(&usage(6, 4));
         s.record(&usage(32378, 457));
         assert_eq!((s.stats().hit, s.stats().miss), (32384, 461));
-        assert_eq!(s.full_line(), "cache 98.6% · hit 32384 · miss 461");
+        assert_eq!(s.full_line(), "cache 98.6% · 32384/461");
     }
 }

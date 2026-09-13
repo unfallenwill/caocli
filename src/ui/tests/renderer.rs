@@ -316,9 +316,12 @@ fn the_plain_front_ends_stream_is_frozen() {
     // changes any of them is a rewrite, not a move.
     let expected = concat!(
         // the bar comes up on a 24x80 terminal: scroll region 1..23, cursor on 23,
+        // then the bar's right-aligned redraw. The label is 47 columns wide
+        // (deepseek-v4-pro · effort max · cache 0.0% · 0/0), so the bar pads
+        // 79-47=32 spaces to put it flush with the right edge.
         "\x1b[24;1H\x1b[2K\x1b[1;23r\x1b[23;1H",
-        "\x1b7\x1b[24;1H\x1b[2K                     ",
-        "\x1b[2mdeepseek-v4-pro · effort max · cache 0.0% · hit 0 · miss 0\x1b[0m\x1b8",
+        "\x1b7\x1b[24;1H\x1b[2K                                ",
+        "\x1b[2mdeepseek-v4-pro · effort max · cache 0.0% · 0/0\x1b[0m\x1b8",
         // the banner is an info cell
         "\x1b[2m* caocli · session 20260910-213122 (2 messages) · deepseek-v4-pro\x1b[0m\n",
         "\n",
@@ -337,9 +340,10 @@ fn the_plain_front_ends_stream_is_frozen() {
         "\x1b[1;33m▸ Bash ls -la\x1b[0m\n",
         "\x1b[2m‣ exit_code: 0\x1b[0m\n",
         "\x1b[2m≡ tokens: in 10/10 · hit 6/miss 4 · out 0\x1b[0m\n",
-        // the bar picks up the usage the line just recorded, then the gate asks
-        "\x1b7\x1b[24;1H\x1b[2K                    ",
-        "\x1b[2mdeepseek-v4-pro · effort max · cache 60.0% · hit 6 · miss 4\x1b[0m\x1b8",
+        // the bar picks up the usage the line just recorded, then the gate asks.
+        // The label is now 48 columns (cache 60.0% · 6/4), so the pad is 31.
+        "\x1b7\x1b[24;1H\x1b[2K                               ",
+        "\x1b[2mdeepseek-v4-pro · effort max · cache 60.0% · 6/4\x1b[0m\x1b8",
         "\x1b[1;33m▸ Write /tmp/x · run it? y/N \x1b[0m",
         "\x1b[1;33m  ⏹ interrupted (Ctrl-C)\x1b[0m\n",
         // and the bar goes down as the terminal is handed back

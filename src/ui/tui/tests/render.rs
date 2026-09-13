@@ -44,7 +44,7 @@ fn the_status_line_is_the_summary_whether_or_not_a_turn_runs() {
     ));
     screen.draw().unwrap();
     let last = screen.terminal.backend().buffer().area.height - 1;
-    assert_eq!(row(&screen, last), "m-1 · cache 60.0% · hit 6 · miss 4");
+    assert_eq!(row(&screen, last), "m-1 · cache 60.0% · 6/4");
     screen.state.begin_turn(Instant::now());
     screen.state.apply(Notice::ToolStart {
         name: "read_file".into(),
@@ -54,7 +54,7 @@ fn the_status_line_is_the_summary_whether_or_not_a_turn_runs() {
     screen.draw().unwrap();
     assert_eq!(
         row(&screen, last),
-        "m-1 · cache 60.0% · hit 6 · miss 4",
+        "m-1 · cache 60.0% · 6/4",
         "a running turn does not take the row over"
     );
 }
