@@ -38,10 +38,18 @@ pub(super) fn todo_style(status: Status) -> Style {
 /// Its own function because two things are drawn from it -- the cell, and the
 /// cell with the tasks left to the block that stands -- and a second
 /// `format!` of the same sentence is a second answer to what the list is doing.
+///
+/// The prefix reads as a label rather than as a tool name: a "TodoWrite 1/3
+/// done" line in the gutter looked like a tool call that happened to succeed,
+/// and a reader who had not yet seen the standing block would not know the
+/// list it wrote was about to take a row of its own above the box. The summary
+/// the model is answered with (`1/3 done`, `list cleared`) is unchanged -- the
+/// one part the cell and the model's own view have to agree about -- and
+/// shared between the transcript cell and the block, so neither can drift.
 pub fn todo_head_spans(todos: &[Todo]) -> Vec<Span> {
     vec![Span::new(
         Style::Yellow,
-        format!("{} {}", crate::tools::TODO_NAME, todo::summary(todos)),
+        format!("todo · {}", todo::summary(todos)),
     )]
 }
 
@@ -175,7 +183,7 @@ mod tests {
             cell.spans(),
             vec![
                 // The head is the same string the model was answered with.
-                Span::new(Style::Yellow, "TodoWrite 1/3 done"),
+                Span::new(Style::Yellow, "todo · 1/3 done"),
                 // A task is its mark and its words, both in the style of its state.
                 Span::new(Style::Dim, "\n✔ "),
                 Span::new(Style::Dim, "Add the parse function"),
@@ -194,7 +202,7 @@ mod tests {
         let cell = Cell::tool_call("TodoWrite", r#"{"todos":[]}"#);
         assert_eq!(
             cell.spans(),
-            vec![Span::new(Style::Yellow, "TodoWrite list cleared")]
+            vec![Span::new(Style::Yellow, "todo · list cleared")]
         );
     }
 

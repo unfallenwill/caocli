@@ -220,7 +220,7 @@ fn the_standing_list_is_drawn_by_the_block_and_not_by_the_cell_too() {
     screen.draw().unwrap();
 
     let top = transcript_top(&screen, 2);
-    assert_eq!(row(&screen, top), "▸ TodoWrite 1/2 done");
+    assert_eq!(row(&screen, top), "▸ todo · 1/2 done");
     assert_eq!(row(&screen, top + 1), "on it");
 
     let boxed = box_top(&screen);
