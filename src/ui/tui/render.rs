@@ -33,9 +33,10 @@ use crate::ui::tui::layout::BOX_BORDERS;
 use crate::ui::tui::state::State;
 
 /// The frames the working spinner cycles through while a turn runs, one per
-/// [`SPINNER_MS`]. Braille raising-dots: the convention terminal spinners have
-/// settled on, and narrow enough to sit inside a border without crowding it.
-pub(super) const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// [`SPINNER_MS`]. Four half-circles rotating around a centre: the convention
+/// terminal spinners settled on in the late 1990s, and narrow enough to sit
+/// inside a border without crowding it.
+pub(super) const SPINNER: [char; 4] = ['◐', '◓', '◑', '◒'];
 
 /// How long one spinner frame holds, in milliseconds. Twelve-ish frames a
 /// second: fast enough to read as motion, slow enough that a frame is one

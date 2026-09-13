@@ -29,34 +29,34 @@ use super::working;
 /// of `chars_per_token` to the token.
 #[test]
 fn the_working_border_spins_counts_and_estimates() {
-    // 12 345 ms in: frame 154 % 10 = 4, the fifth glyph; 4 000 characters at
+    // 12 345 ms in: frame 154 % 4 = 2, the third glyph; 4 000 characters at
     // a measured four to the token over 12.3 s rounds to 81 a second.
     let s = working(Duration::from_millis(12_345), 4000, 4.0);
     assert_eq!(
         render_mod::activity_title(&s, 60),
-        Some("⠼ 12s · ~81 token/s".to_owned())
+        Some("◑ 12s · ~81 token/s".to_owned())
     );
 }
 
 #[test]
 fn the_estimate_waits_for_the_average_to_settle() {
-    // 2 040 ms: frame 25, off a frame boundary so the clock's second read
-    // cannot tip it
+    // 2 040 ms: frame 25 % 4 = 1, off a frame boundary so the clock's second
+    // read cannot tip it
     let s = working(Duration::from_millis(2_040), 4000, 4.0);
-    assert_eq!(render_mod::activity_title(&s, 60), Some("⠴ 2s".to_owned()));
+    assert_eq!(render_mod::activity_title(&s, 60), Some("◓ 2s".to_owned()));
 }
 
 #[test]
 fn a_silent_turn_estimates_nothing() {
     let s = working(Duration::from_millis(30_040), 0, 4.0);
-    assert_eq!(render_mod::activity_title(&s, 60), Some("⠴ 30s".to_owned()));
+    assert_eq!(render_mod::activity_title(&s, 60), Some("◒ 30s".to_owned()));
 }
 
 #[test]
 fn a_narrow_border_drops_the_estimate_then_hides_the_indicator() {
     let s = working(Duration::from_millis(12_345), 4000, 4.0);
     let full = render_mod::activity_title(&s, usize::MAX).unwrap();
-    let count = "⠼ 12s".to_owned();
+    let count = "◑ 12s".to_owned();
     // one column short of the whole thing, the estimate goes whole
     assert_eq!(
         render_mod::activity_title(&s, crate::ui::text::width(&full) - 1),
