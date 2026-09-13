@@ -46,7 +46,7 @@ pub(super) fn banner_at(id: &str, messages: usize, model: &str, columns: Option<
             },
         ),
         (" · ", model.to_owned()),
-        (" · ", "/help for commands".to_owned()),
+        (" · ", "/help".to_owned()),
     ];
     let line = |keep: usize| {
         parts[..keep]

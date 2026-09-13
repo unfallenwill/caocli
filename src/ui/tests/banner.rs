@@ -7,7 +7,7 @@ use super::*;
 /// most likely to be read on is the one the old line broke in half.
 #[test]
 fn the_banner_fits_the_terminal_it_is_going_into() {
-    let full = "caocli · session 20260910-213122 (12 messages) · deepseek/deepseek-v4-pro · /help for commands";
+    let full = "caocli · session 20260910-213122 (12 messages) · deepseek/deepseek-v4-pro · /help";
     assert_eq!(
         banner_at("20260910-213122", 12, "deepseek/deepseek-v4-pro", None),
         full
@@ -59,7 +59,7 @@ fn the_banner_is_never_cut_mid_word() {
         "caocli · session 20260910-213122",
         "caocli · session 20260910-213122 (12 messages)",
         "caocli · session 20260910-213122 (12 messages) · deepseek/deepseek-v4-pro",
-        "caocli · session 20260910-213122 (12 messages) · deepseek/deepseek-v4-pro · /help for commands",
+        "caocli · session 20260910-213122 (12 messages) · deepseek/deepseek-v4-pro · /help",
     ];
     for columns in 1..=120 {
         let line = banner_at(
@@ -100,6 +100,6 @@ fn the_banner_keeps_everything_when_there_is_no_terminal() {
     // also the case the width is really asked for in.)
     assert_eq!(
         banner("20260910-213122", 12, "deepseek/deepseek-v4-pro"),
-        "caocli · session 20260910-213122 (12 messages) · deepseek/deepseek-v4-pro · /help for commands"
+        "caocli · session 20260910-213122 (12 messages) · deepseek/deepseek-v4-pro · /help"
     );
 }
