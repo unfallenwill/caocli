@@ -38,7 +38,7 @@ pub(super) fn question_spans(questions: &[Question]) -> Vec<Span> {
             spans.push(Span::new(Style::Dim, format!("\n  {}. ", n + 1)));
             spans.push(Span::new(Style::Plain, option.label.clone()));
             if !option.description.is_empty() {
-                spans.push(Span::new(Style::Dim, format!(" — {}", option.description)));
+                spans.push(Span::new(Style::Dim, format!(" · {}", option.description)));
             }
         }
     }
@@ -118,7 +118,7 @@ mod tests {
                 Span::new(Style::Dim, " · choose any"),
                 Span::new(Style::Dim, "\n  1. "),
                 Span::new(Style::Plain, "JWT"),
-                Span::new(Style::Dim, " — one token for the API"),
+                Span::new(Style::Dim, " · one token for the API"),
                 // An option the model gave no description for is its label
                 // alone: no separator with nothing behind it.
                 Span::new(Style::Dim, "\n  2. "),
