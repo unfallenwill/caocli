@@ -11,7 +11,7 @@
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use super::super::notice::{Notice, Notifier};
+use super::super::notice::{MachineNotice, Notifier};
 use super::super::picker::{Choosing, menu_for};
 use crate::ui::Renderer;
 use crate::ui::{Cancel, Front, Ui};
@@ -30,9 +30,13 @@ fn the_notifier_reaches_the_loop_through_the_channel() {
     // The `Ui` side must not touch the terminal: everything it is told has to
     // come out as a notice.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut n = Notifier { tx };
+    let mut n = Notifier {
+        machine: tx,
+        app: mpsc::unbounded_channel().0,
+        secret: mpsc::unbounded_channel().0,
+    };
     n.content_delta("hi");
-    assert!(matches!(rx.try_recv(), Ok(Notice::Content(s)) if s == "hi"));
+    assert!(matches!(rx.try_recv(), Ok(MachineNotice::Content(s)) if s == "hi"));
 }
 
 #[test]

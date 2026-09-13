@@ -6,6 +6,40 @@ semantic-version bumps per release.
 
 ## [Unreleased]
 
+### Changed — UI layer refactor
+- The plain front end's writer half is split into its own module
+  (`ui::plain_writer`). `Renderer` now holds a `PlainWriter` for cells and
+  keeps only the status bar, status line and raw-mode flag -- the
+  responsibilities that belong to a session rather than to a writer. The
+  `Front`/`Ui` surface is unchanged.
+- The `Notice` channel is split into three typed channels: `MachineNotice`
+  carries the model's vocabulary, `AppNotice` carries the application's,
+  and `SecretAsk` carries the secret prompt's oneshot question. The
+  machine cannot accidentally be told about an `Info` line and vice
+  versa, because each receiver's type is the only thing it can read.
+- `State` is split into four pieces -- `View` (cells, scroll, laid
+  cache, status line), `Edit` (textarea, history, held draft), `Overlay`
+  (picker, panel, answer channel), and `Turn` (queue, running flag,
+  speed-estimate counters) -- with the revision counter on `State` itself
+  since every half can change what the screen shows. Methods are split
+  across files by the half they touch.
+- The word-wrap algorithm (`wrapped_lines`/`break_line`) and the
+  row-budget constants (`TODO_ROWS`, `QUEUE_ROWS`, `TODO_HEADS`,
+  `Window`, `selection_window`, `todo_window`) move from
+  `ui::paint`/`tui::layout` into `ui::cell::wrap` and `ui::cell::layout`.
+  A front-end-specific layout (TUI box geometry, screen-row split)
+  stays in `ui::tui::layout`.
+- `Span::text` becomes `Cow<'static, str>`: a literal marker can carry
+  no allocation, while constructed text is owned as before. The painter
+  still copies every span while wrapping (the wrap step's lifetime is
+  independent of the spans); the data-layer shape is what changed.
+- `Cell::tool_call` becomes the simple `Cell::ToolCall` builder; the
+  `AskUserQuestion`/`TodoWrite` dispatch moves to `Cell::from_tool_call`
+  so the cell layer no longer needs to know about specific tool names.
+- `working.rs` is split: `panel_key` lives with `panel.rs`, `enqueue`/
+  `dequeue` live in a new `queue.rs`, and what remains is just the
+  turn-in-flight key routing.
+
 ### Changed
 - The plain REPL's input loop is now built on crossterm raw mode and a
   `ratatui_textarea::TextArea` used as a pure in-memory buffer: every

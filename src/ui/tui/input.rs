@@ -12,11 +12,11 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::Style as RStyle;
 use ratatui_textarea::{CursorMove, TextArea};
-use tokio::sync::oneshot;
 
+use super::overlay::Answer;
 use super::panel::PANEL_PLACEHOLDER;
 use super::picker::Choosing;
-use super::state::{Answer, State};
+use super::state::State;
 use crate::history;
 use crate::ui::Verdict;
 use crate::ui::cell::Cell;
@@ -111,7 +111,7 @@ impl State {
             }
             // A paste goes to the box; the caller redraws either way.
             Event::Paste(text) => {
-                self.textarea.insert_str(text);
+                self.edit.textarea.insert_str(text);
                 return Submitted::Nothing;
             }
             _ => return Submitted::Nothing,
@@ -129,7 +129,7 @@ impl State {
             if self.choose() {
                 return Submitted::Line;
             }
-            return if self.textarea.is_empty() {
+            return if self.edit.textarea.is_empty() {
                 Submitted::Nothing
             } else {
                 Submitted::Line
@@ -138,7 +138,7 @@ impl State {
         // At the prompt Ctrl-C clears the line, as it does in the plain front
         // end: there is no turn to cancel here.
         if matches(key, KeyCode::Char('c'), KeyModifiers::CONTROL) {
-            self.textarea = input_box();
+            self.edit.textarea = input_box();
             return Submitted::Nothing;
         }
         // Ctrl-J is the plain prompt's newline key, and Shift-Enter is what
@@ -148,10 +148,11 @@ impl State {
         if matches(key, KeyCode::Char('j'), KeyModifiers::CONTROL)
             || matches(key, KeyCode::Enter, KeyModifiers::SHIFT)
         {
-            self.textarea.insert_newline();
+            self.edit.textarea.insert_newline();
             return Submitted::Nothing;
         }
-        if matches(key, KeyCode::Char('d'), KeyModifiers::CONTROL) && self.textarea.is_empty() {
+        if matches(key, KeyCode::Char('d'), KeyModifiers::CONTROL) && self.edit.textarea.is_empty()
+        {
             return Submitted::Exit;
         }
         // Paging through the transcript. The box scrolls itself with the same
@@ -196,23 +197,24 @@ impl State {
             // holds is whatever has been typed since it opened -- a draft,
             // which dismissing has no claim on.
             if self
+                .overlay
                 .picker
                 .take()
                 .is_some_and(|p| p.kind == Choosing::Command)
             {
-                self.textarea = input_box();
+                self.edit.textarea = input_box();
                 self.refresh_placeholder();
             }
             return Submitted::Nothing;
         }
-        self.textarea.input(Event::Key(key));
+        self.edit.textarea.input(Event::Key(key));
         self.refresh_picker();
         Submitted::Nothing
     }
 
     /// What is in the box.
     pub(super) fn text(&self) -> String {
-        self.textarea.lines().join("\n")
+        self.edit.textarea.lines().join("\n")
     }
 
     /// How many rows the box needs on a terminal `height` rows tall: one per line
@@ -224,7 +226,7 @@ impl State {
     /// in is a session that cannot continue and a box that is short by a row
     /// still can be.
     pub(super) fn input_rows(&self, height: u16, todos: u16) -> u16 {
-        box_rows(self.textarea.lines().len(), height, todos)
+        box_rows(self.edit.textarea.lines().len(), height, todos)
     }
 
     /// Put the box's window back where the draft it now holds wants it, for a box
@@ -240,9 +242,9 @@ impl State {
     ///
     /// Called before the box is drawn, which is the only time the window matters.
     pub(super) fn reset_box_scroll(&mut self, rows: u16) {
-        let lines = self.textarea.lines().len();
-        let shrank = lines < self.drawn_draft;
-        self.drawn_draft = lines;
+        let lines = self.edit.textarea.lines().len();
+        let shrank = lines < self.view.drawn_draft;
+        self.view.drawn_draft = lines;
         // A draft too tall for the box is the editor's to page -- the window is the
         // point there, and taking it over would undo what the box's own keys did.
         // One that has just lost lines is the exception, whatever its length: it
@@ -250,12 +252,12 @@ impl State {
         if !shrank && lines + 2 > usize::from(rows) {
             return;
         }
-        let cursor = self.textarea.cursor();
+        let cursor = self.edit.textarea.cursor();
         // Scrolling further than there is to scroll is how the window is sent to
         // the top from wherever it was: the editor has no "go to the top".
-        self.textarea.scroll((-i16::MAX, 0));
+        self.edit.textarea.scroll((-i16::MAX, 0));
         if let (Ok(row), Ok(col)) = (u16::try_from(cursor.0), u16::try_from(cursor.1)) {
-            self.textarea.move_cursor(CursorMove::Jump(row, col));
+            self.edit.textarea.move_cursor(CursorMove::Jump(row, col));
         }
     }
 
@@ -265,7 +267,7 @@ impl State {
         if !text.is_empty() {
             box_.insert_str(text);
         }
-        self.textarea = box_;
+        self.edit.textarea = box_;
         // A box built from scratch carries the idle invitation, and the box this
         // replaces may have been saying something else: what it says is the
         // state's, not the constructor's.
@@ -281,23 +283,23 @@ impl State {
     /// other people can see), which is the drawing, not the text.
     pub(super) fn take_for_answer(&mut self, secret: bool) {
         self.revision += 1;
-        self.held_draft = Some(self.text());
-        self.textarea = input_box();
+        self.edit.held_draft = Some(self.text());
+        self.edit.textarea = input_box();
         if secret {
-            self.textarea.set_mask_char(SECRET_MASK);
+            self.edit.textarea.set_mask_char(SECRET_MASK);
         }
         self.refresh_placeholder();
     }
 
     /// Hand the box back to what it was holding before the answer took it.
     pub(super) fn return_from_answer(&mut self) {
-        let held = self.held_draft.take().unwrap_or_default();
+        let held = self.edit.held_draft.take().unwrap_or_default();
         self.set_text(&held);
     }
 
     /// Up: the previous command, or the previous line typed.
     pub(super) fn up(&mut self) {
-        if let Some(picker) = &mut self.picker {
+        if let Some(picker) = &mut self.overlay.picker {
             let len = picker.choices.len().max(1);
             picker.selected = if picker.selected == 0 {
                 len - 1
@@ -311,7 +313,7 @@ impl State {
 
     /// Down: the next command, or the next line typed.
     pub(super) fn down(&mut self) {
-        if let Some(picker) = &mut self.picker {
+        if let Some(picker) = &mut self.overlay.picker {
             let len = picker.choices.len().max(1);
             picker.selected = (picker.selected + 1) % len;
             return;
@@ -325,39 +327,39 @@ impl State {
     /// Browsing closes the picker: a recalled line may well be a command, and
     /// letting the picker open would take the very keys being used to browse.
     pub(super) fn browse(&mut self, step: isize) {
-        if self.history.is_empty() {
+        if self.edit.history.is_empty() {
             return;
         }
-        let next = match self.browsing {
+        let next = match self.edit.browsing {
             None if step < 0 => {
-                self.draft = self.text();
-                Some(self.history.len() - 1)
+                self.edit.draft = self.text();
+                Some(self.edit.history.len() - 1)
             }
             // Already showing the draft, and there is nothing newer to show.
             None => None,
             Some(0) if step < 0 => Some(0),
-            Some(at) if step > 0 && at + 1 >= self.history.len() => None,
+            Some(at) if step > 0 && at + 1 >= self.edit.history.len() => None,
             Some(at) => Some(at.checked_add_signed(step).unwrap_or(at)),
         };
-        self.browsing = next;
+        self.edit.browsing = next;
         let text = match next {
-            Some(at) => self.history[at].clone(),
-            None => std::mem::take(&mut self.draft),
+            Some(at) => self.edit.history[at].clone(),
+            None => std::mem::take(&mut self.edit.draft),
         };
-        self.picker = None;
+        self.overlay.picker = None;
         self.set_text(&text);
     }
 
     /// Record a submitted line. Repeating the previous one is not recorded
     /// again: it is noise when stepping back through the history.
     pub(super) fn remember(&mut self, line: &str) {
-        if line.is_empty() || self.history.last().is_some_and(|last| last == line) {
+        if line.is_empty() || self.edit.history.last().is_some_and(|last| last == line) {
             return;
         }
-        self.history.push(line.to_owned());
-        let excess = self.history.len().saturating_sub(history::MAX_ENTRIES);
+        self.edit.history.push(line.to_owned());
+        let excess = self.edit.history.len().saturating_sub(history::MAX_ENTRIES);
         if excess > 0 {
-            self.history.drain(..excess);
+            self.edit.history.drain(..excess);
         }
     }
 
@@ -372,7 +374,7 @@ impl State {
         self.remember(line);
         if !line.starts_with('/') {
             self.revision += 1;
-            self.transcript.push(Cell::user(line));
+            self.view.transcript.push(Cell::user(line));
         }
         // What was just asked is what the user wants to watch, so the transcript
         // goes back to its end whether or not that line becomes a cell.
@@ -383,11 +385,11 @@ impl State {
     /// question is open, the queue while a turn runs, the next message
     /// otherwise.
     pub(super) fn placeholder(&self) -> &'static str {
-        match self.reply {
+        match self.overlay.reply {
             Some(Answer::YesNo(_)) => ANSWER_PLACEHOLDER,
             Some(Answer::Secret(_)) => SECRET_PLACEHOLDER,
             None if self.panel_open() => PANEL_PLACEHOLDER,
-            None if self.turn_running => QUEUE_PLACEHOLDER,
+            None if self.turn.running => QUEUE_PLACEHOLDER,
             None => IDLE_PLACEHOLDER,
         }
     }
@@ -395,29 +397,18 @@ impl State {
     /// Put that placeholder on the box, which is a thing of the box's own rather
     /// than of the screen's.
     pub(super) fn refresh_placeholder(&mut self) {
-        self.textarea.set_placeholder_text(self.placeholder());
+        self.edit.textarea.set_placeholder_text(self.placeholder());
     }
 
     /// Take the submitted line out of the box, leaving it empty for the next one.
     pub(super) fn take_line(&mut self) -> String {
         let line = self.text();
-        self.textarea = input_box();
+        self.edit.textarea = input_box();
         self.refresh_placeholder();
-        self.picker = None;
-        self.browsing = None;
-        self.draft.clear();
+        self.overlay.picker = None;
+        self.edit.browsing = None;
+        self.edit.draft.clear();
         line
-    }
-
-    /// The approval gate is asking: remember who to answer.
-    pub(super) fn open_question(&mut self, reply: oneshot::Sender<Verdict>) {
-        self.open_answer(Answer::YesNo(reply));
-    }
-
-    /// A question is open: take the box for its answer.
-    pub(super) fn open_answer(&mut self, reply: Answer) {
-        self.reply = Some(reply);
-        self.take_for_answer(matches!(self.reply, Some(Answer::Secret(_))));
     }
 
     /// Answer the open question from what is in the box, if anything. What the
@@ -425,8 +416,8 @@ impl State {
     /// cancels a secret.
     pub(super) fn close_question(&mut self) {
         self.revision += 1;
-        if let Some(reply) = self.reply.take() {
-            let answer = self.textarea.lines().join("\n");
+        if let Some(reply) = self.overlay.reply.take() {
+            let answer = self.edit.textarea.lines().join("\n");
             match reply {
                 Answer::YesNo(reply) => {
                     // The rule is shared with the plain front end's
@@ -447,7 +438,7 @@ impl State {
             }
             self.return_from_answer();
         }
-        self.question = None;
+        self.view.question = None;
         self.refresh_placeholder();
     }
 }

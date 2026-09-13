@@ -11,12 +11,13 @@ use crossterm::event::{KeyCode, MouseButton, MouseEventKind};
 
 use super::super::super::paint::cell_lines;
 use super::super::input::Submitted;
-use super::super::layout::{BOX_ROWS, Window, picker_window};
+use super::super::layout::{BOX_ROWS, picker_window};
 use super::super::picker::PICKER_ROWS;
 use super::super::render as render_mod;
 use crate::ui::cell::Cell;
+use crate::ui::cell::layout::Window;
 
-use super::super::state::WHEEL_LINES;
+use super::super::view::WHEEL_LINES;
 use super::all_rows;
 use super::body;
 use super::mouse;
@@ -35,6 +36,7 @@ fn the_transcript_fills_the_screen_and_shows_its_end() {
     for i in 0..(rows + 5) {
         screen
             .state
+            .view
             .transcript
             .push(Cell::Notice(format!("line {i}")));
     }
@@ -50,6 +52,7 @@ fn paging_back_moves_the_window_and_paging_forward_returns_it() {
     for i in 0..(rows * 3) {
         screen
             .state
+            .view
             .transcript
             .push(Cell::Notice(format!("line {i}")));
     }
@@ -87,6 +90,7 @@ fn a_wheel_notch_moves_the_window_three_lines() {
     for i in 0..(rows * 3) {
         screen
             .state
+            .view
             .transcript
             .push(Cell::Notice(format!("line {i}")));
     }
@@ -111,7 +115,7 @@ fn a_wheel_notch_moves_the_window_three_lines() {
     }
     screen.draw().unwrap();
     assert_eq!(body(&screen, rows as u16 - 1), format!("line {}", last - 1));
-    assert_eq!(screen.state.scroll.back, 0, "following the end again");
+    assert_eq!(screen.state.view.scroll.back, 0, "following the end again");
 }
 
 #[test]
@@ -125,17 +129,18 @@ fn the_wheel_does_not_browse_the_history_the_box_holds() {
     for i in 0..(rows * 3) {
         screen
             .state
+            .view
             .transcript
             .push(Cell::Notice(format!("line {i}")));
     }
     screen.draw().unwrap();
-    screen.state.history = vec!["look at src/main.rs".into()];
+    screen.state.edit.history = vec!["look at src/main.rs".into()];
     screen.state.key(mouse(MouseEventKind::ScrollUp));
     assert!(
-        screen.state.textarea.is_empty(),
+        screen.state.edit.textarea.is_empty(),
         "the box was not the thing a notch moved"
     );
-    assert!(screen.state.scroll.back > 0, "the transcript was");
+    assert!(screen.state.view.scroll.back > 0, "the transcript was");
 }
 
 #[test]
@@ -145,6 +150,7 @@ fn a_click_is_not_a_notch_and_moves_nothing() {
     for i in 0..(rows * 3) {
         screen
             .state
+            .view
             .transcript
             .push(Cell::Notice(format!("line {i}")));
     }
@@ -159,8 +165,8 @@ fn a_click_is_not_a_notch_and_moves_nothing() {
     ] {
         assert!(matches!(screen.state.key(mouse(kind)), Submitted::Nothing));
     }
-    assert_eq!(screen.state.scroll.back, 0, "the window did not move");
-    assert!(screen.state.textarea.is_empty());
+    assert_eq!(screen.state.view.scroll.back, 0, "the window did not move");
+    assert!(screen.state.edit.textarea.is_empty());
 }
 
 #[test]
@@ -172,6 +178,7 @@ fn the_wheel_reads_back_while_a_turn_runs() {
     for i in 0..(rows * 3) {
         screen
             .state
+            .view
             .transcript
             .push(Cell::Notice(format!("line {i}")));
     }
@@ -180,9 +187,9 @@ fn the_wheel_reads_back_while_a_turn_runs() {
     screen
         .state
         .key_while_working(mouse(MouseEventKind::ScrollUp), &cancel);
-    assert!(screen.state.scroll.back > 0, "the window moved");
+    assert!(screen.state.view.scroll.back > 0, "the window moved");
     assert!(
-        screen.state.textarea.is_empty(),
+        screen.state.edit.textarea.is_empty(),
         "and the box stayed out of it"
     );
 }
@@ -197,6 +204,7 @@ fn lines_arriving_do_not_move_a_reader_who_scrolled_back() {
     for i in 0..(rows * 3) {
         screen
             .state
+            .view
             .transcript
             .push(Cell::Notice(format!("line {i}")));
     }
@@ -207,6 +215,7 @@ fn lines_arriving_do_not_move_a_reader_who_scrolled_back() {
     for i in 0..5 {
         screen
             .state
+            .view
             .transcript
             .push(Cell::Notice(format!("more {i}")));
     }
@@ -220,14 +229,18 @@ fn submitting_a_line_returns_to_the_end_of_the_transcript() {
     for i in 0..(transcript_rows(20, BOX_ROWS, 0) as usize * 2) {
         screen
             .state
+            .view
             .transcript
             .push(Cell::Notice(format!("line {i}")));
     }
     screen.draw().unwrap();
     press(&mut screen.state, KeyCode::PageUp);
-    assert!(screen.state.scroll.back > 0, "scrolled back");
+    assert!(screen.state.view.scroll.back > 0, "scrolled back");
     screen.state.submit("look at this");
-    assert_eq!(screen.state.scroll.back, 0, "back to where it is written");
+    assert_eq!(
+        screen.state.view.scroll.back, 0,
+        "back to where it is written"
+    );
 }
 
 #[test]
@@ -236,7 +249,7 @@ fn a_long_line_is_wrapped_into_the_window_not_clipped() {
     // over-long line would otherwise be cut off at the edge.
     let mut screen = screen_for_test(10, 30);
     let long = "abcdefghijklmnopqrstuvwxyz"; // 26 columns at width 10
-    screen.state.transcript.push(Cell::Notice(long.into()));
+    screen.state.view.transcript.push(Cell::Notice(long.into()));
     screen.draw().unwrap();
     let rows = all_rows(&screen);
     let joined: String = rows[..transcript_rows(30, BOX_ROWS, 0) as usize]
@@ -251,8 +264,16 @@ fn a_turn_stays_on_screen_when_it_ends() {
     // Nothing is handed to the terminal's scrollback any more, so what is
     // drawn has to outlive the turn that produced it.
     let mut screen = screen_for_test(40, 20);
-    screen.state.transcript.push(Cell::Notice("first".into()));
-    screen.state.transcript.push(Cell::Notice("second".into()));
+    screen
+        .state
+        .view
+        .transcript
+        .push(Cell::Notice("first".into()));
+    screen
+        .state
+        .view
+        .transcript
+        .push(Cell::Notice("second".into()));
     screen.commit();
     screen.draw().unwrap();
     let rows: Vec<String> = all_rows(&screen).iter().map(|r| unset(r)).collect();
@@ -279,13 +300,16 @@ fn committing_closes_the_block_that_was_still_streaming() {
         .state
         .stream(crate::ui::cell::Style::Plain, "half a line");
     screen.commit();
-    assert!(screen.state.stream.current().is_none(), "nothing left open");
+    assert!(
+        screen.state.view.stream.current().is_none(),
+        "nothing left open"
+    );
     screen
         .state
         .stream(crate::ui::cell::Style::Plain, " and the rest");
     screen.commit();
     assert_eq!(
-        screen.state.transcript,
+        screen.state.view.transcript,
         vec![
             Cell::Content("half a line".into()),
             Cell::Content(" and the rest".into()),
@@ -375,6 +399,7 @@ fn a_window_is_the_same_lines_as_the_transcript_it_is_a_window_on() {
     for i in 0..20 {
         screen
             .state
+            .view
             .transcript
             .push(Cell::Content(format!("line {i}")));
     }
@@ -382,6 +407,7 @@ fn a_window_is_the_same_lines_as_the_transcript_it_is_a_window_on() {
     let width = 24;
     let whole: Vec<ratatui::text::Line> = screen
         .state
+        .view
         .transcript
         .iter()
         .flat_map(|cell| cell_lines(cell, width))
@@ -411,6 +437,7 @@ fn a_window_away_from_the_end_reports_what_it_is_not_showing() {
     for i in 0..(rows * 3) {
         screen
             .state
+            .view
             .transcript
             .push(Cell::Notice(format!("line {i}")));
     }
@@ -420,7 +447,7 @@ fn a_window_away_from_the_end_reports_what_it_is_not_showing() {
 
     // One line back: both ends report, and each count covers the row the report
     // itself stands on as well as the lines beyond it.
-    screen.state.scroll.by(-1, total, rows);
+    screen.state.view.scroll.by(-1, total, rows);
     screen.draw().unwrap();
     assert_eq!(
         row(&screen, 0),
@@ -434,7 +461,7 @@ fn a_window_away_from_the_end_reports_what_it_is_not_showing() {
     assert_eq!(row(&screen, rows as u16 - 1), "\u{22ee} 2 lines below");
 
     // The very top has nothing above it, and reports nothing there.
-    screen.state.scroll.by(-(total as isize), total, rows);
+    screen.state.view.scroll.by(-(total as isize), total, rows);
     screen.draw().unwrap();
     assert_eq!(body(&screen, 0), "line 0");
     assert_eq!(

@@ -16,7 +16,7 @@ use crate::ui::cell::Cell;
 
 use super::super::super::paint::THINKING_LINES;
 use super::super::layout::{BOX_GUTTER, BOX_ROWS, PINNED_ROWS, box_field, box_rows, screen_rows};
-use super::super::notice::Notice;
+use super::super::notice::{AppNotice, MachineNotice};
 use super::super::render as render_mod;
 use super::super::render::SPINNER;
 use super::super::state::State;
@@ -33,8 +33,8 @@ fn the_status_line_is_the_summary_whether_or_not_a_turn_runs() {
     // same session summary it is at rest, and the turn's own doings are the
     // transcript's cells, not the status line's.
     let mut screen = screen_for_test(60, 20);
-    screen.state.status.set_model("m-1");
-    screen.state.apply(Notice::Usage(
+    screen.state.view.status.set_model("m-1");
+    screen.state.apply(MachineNotice::Usage(
         Usage {
             prompt_cache_hit_tokens: 6,
             prompt_cache_miss_tokens: 4,
@@ -46,11 +46,13 @@ fn the_status_line_is_the_summary_whether_or_not_a_turn_runs() {
     let last = screen.terminal.backend().buffer().area.height - 1;
     assert_eq!(row(&screen, last), "m-1 · cache 60.0% · 6/4");
     screen.state.begin_turn(Instant::now());
-    screen.state.apply(Notice::ToolStart {
+    screen.state.apply(MachineNotice::ToolStart {
         name: "read_file".into(),
         args: "{}".into(),
     });
-    screen.state.apply(Notice::Content("here it is".into()));
+    screen
+        .state
+        .apply(MachineNotice::Content("here it is".into()));
     screen.draw().unwrap();
     assert_eq!(
         row(&screen, last),
@@ -62,7 +64,7 @@ fn the_status_line_is_the_summary_whether_or_not_a_turn_runs() {
 #[test]
 fn a_tool_call_that_changes_a_file_is_drawn_across_its_lines() {
     let mut screen = screen_for_test(40, 20);
-    screen.state.transcript.push(Cell::tool_call(
+    screen.state.view.transcript.push(Cell::tool_call(
         "Edit",
         r#"{"file_path":"a.rs","old_string":"one\ntwo","new_string":"three"}"#,
     ));
@@ -83,7 +85,7 @@ fn a_long_line_of_a_change_is_wrapped_like_any_other() {
     // wrap it, or the tail of the line is lost.
     let mut screen = screen_for_test(20, 20);
     let long = "x".repeat(30);
-    screen.state.transcript.push(Cell::tool_call(
+    screen.state.view.transcript.push(Cell::tool_call(
         "Write",
         &format!(r#"{{"file_path":"a.txt","content":"{long}"}}"#),
     ));
@@ -102,8 +104,16 @@ fn thinking_is_set_in_behind_a_rule_of_its_own() {
     // the colors and SGR 2 is not honored everywhere, while the columns are in
     // the layout.
     let mut screen = screen_for_test(40, 20);
-    screen.state.transcript.push(Cell::Reasoning("hmm".into()));
-    screen.state.transcript.push(Cell::Content("answer".into()));
+    screen
+        .state
+        .view
+        .transcript
+        .push(Cell::Reasoning("hmm".into()));
+    screen
+        .state
+        .view
+        .transcript
+        .push(Cell::Content("answer".into()));
     screen.draw().unwrap();
     let top = transcript_top(&screen, 2);
     let buf = screen.terminal.backend().buffer();
@@ -128,7 +138,7 @@ fn an_attached_image_is_drawn_under_the_line_it_came_with() {
     // marker opens the cell for the words, and the image continues in the same
     // columns rather than back at the left edge the answer is read down.
     let mut screen = screen_for_test(40, 20);
-    screen.state.transcript.push(Cell::User {
+    screen.state.view.transcript.push(Cell::User {
         text: "what is this?".into(),
         images: vec![crate::image::Note {
             format: "png".into(),
@@ -137,6 +147,7 @@ fn an_attached_image_is_drawn_under_the_line_it_came_with() {
     });
     screen
         .state
+        .view
         .transcript
         .push(Cell::Content("a picture".into()));
     screen.draw().unwrap();
@@ -153,7 +164,7 @@ fn multiple_attached_images_are_one_line_not_separate_lines() {
     // to the message the backend sees -- it is in the data URL, and a resumed
     // session replays the same bytes it sent the first time.
     let mut screen = screen_for_test(40, 20);
-    screen.state.transcript.push(Cell::User {
+    screen.state.view.transcript.push(Cell::User {
         text: "compare these".into(),
         images: vec![
             crate::image::Note {
@@ -170,7 +181,11 @@ fn multiple_attached_images_are_one_line_not_separate_lines() {
             },
         ],
     });
-    screen.state.transcript.push(Cell::Content("answer".into()));
+    screen
+        .state
+        .view
+        .transcript
+        .push(Cell::Content("answer".into()));
     screen.draw().unwrap();
     let top = transcript_top(&screen, 3);
     assert_eq!(row(&screen, top), "› compare these");
@@ -185,9 +200,14 @@ fn a_wrapped_think_keeps_the_rule_on_every_line() {
     let mut screen = screen_for_test(12, 20);
     screen
         .state
+        .view
         .transcript
         .push(Cell::Reasoning("aaaa bbbb cccc".into()));
-    screen.state.transcript.push(Cell::Content("answer".into()));
+    screen
+        .state
+        .view
+        .transcript
+        .push(Cell::Content("answer".into()));
     screen.draw().unwrap();
     let top = transcript_top(&screen, 3);
     assert_eq!(row(&screen, top), "┆ aaaa bbbb");
@@ -206,8 +226,12 @@ fn a_long_think_folds_to_its_head_and_a_count() {
         .map(|i| format!("line {i}"))
         .collect::<Vec<_>>()
         .join("\n");
-    screen.state.transcript.push(Cell::Reasoning(think));
-    screen.state.transcript.push(Cell::Content("answer".into()));
+    screen.state.view.transcript.push(Cell::Reasoning(think));
+    screen
+        .state
+        .view
+        .transcript
+        .push(Cell::Content("answer".into()));
     screen.draw().unwrap();
     let top = transcript_top(&screen, THINKING_LINES as u16 + 2);
     for i in 0..THINKING_LINES {
@@ -234,7 +258,7 @@ fn a_think_at_the_cap_is_not_folded() {
         .map(|i| format!("line {i}"))
         .collect::<Vec<_>>()
         .join("\n");
-    screen.state.transcript.push(Cell::Reasoning(think));
+    screen.state.view.transcript.push(Cell::Reasoning(think));
     screen.draw().unwrap();
     let drawn = all_rows(&screen).join("\n");
     assert!(
@@ -253,7 +277,7 @@ fn only_a_think_folds() {
         .map(|i| format!("line {i}"))
         .collect::<Vec<_>>()
         .join("\n");
-    screen.state.transcript.push(Cell::Content(long));
+    screen.state.view.transcript.push(Cell::Content(long));
     screen.draw().unwrap();
     let drawn = all_rows(&screen).join("\n");
     assert!(drawn.contains("line 29"), "kept whole: {drawn}");
@@ -266,12 +290,16 @@ fn only_a_think_folds() {
 #[test]
 fn a_running_commands_output_is_watched_and_then_kept() {
     let mut screen = screen_for_test(40, 30);
-    screen.state.apply(Notice::ToolStart {
+    screen.state.apply(MachineNotice::ToolStart {
         name: "Bash".into(),
         args: r#"{"command":"echo one; echo two"}"#.into(),
     });
-    screen.state.apply(Notice::ToolOutput("one\n".into()));
-    screen.state.apply(Notice::ToolOutput("two\n".into()));
+    screen
+        .state
+        .apply(MachineNotice::ToolOutput("one\n".into()));
+    screen
+        .state
+        .apply(MachineNotice::ToolOutput("two\n".into()));
     screen.draw().unwrap();
     let live = rendered(&render_mod::lines(&mut screen.state, 40));
     assert!(
@@ -280,14 +308,14 @@ fn a_running_commands_output_is_watched_and_then_kept() {
     );
     screen
         .state
-        .apply(Notice::ToolResult("exit_code: 0".into()));
+        .apply(MachineNotice::ToolResult("exit_code: 0".into()));
     screen.draw().unwrap();
     assert_eq!(
-        screen.state.transcript.last(),
+        screen.state.view.transcript.last(),
         Some(&Cell::ToolResult("exit_code: 0".into()))
     );
     assert_eq!(
-        screen.state.transcript[screen.state.transcript.len() - 2],
+        screen.state.view.transcript[screen.state.view.transcript.len() - 2],
         Cell::ToolOutput("one\ntwo\n".into()),
         "the run of output is one cell, whole"
     );
@@ -306,10 +334,10 @@ fn a_folded_think_does_not_jump_open_when_it_closes() {
         .map(|i| format!("line {i}"))
         .collect::<Vec<_>>()
         .join("\n");
-    screen.state.apply(Notice::Reasoning(think));
+    screen.state.apply(MachineNotice::Reasoning(think));
     screen.draw().unwrap();
     let live = render_mod::lines(&mut screen.state, 40);
-    screen.state.apply(Notice::FinishTurn);
+    screen.state.apply(MachineNotice::FinishTurn);
     screen.draw().unwrap();
     assert_eq!(
         render_mod::lines(&mut screen.state, 40),
@@ -323,7 +351,7 @@ fn the_gate_is_drawn_whole_however_long_the_call_is() {
     // The question is what the answer is about: a command clipped by the
     // width leaves nothing to decide with.
     let mut screen = screen_for_test(20, 20);
-    screen.state.question = Some(Cell::approval(
+    screen.state.view.question = Some(Cell::approval(
         "Bash",
         r#"{"command":"rm -rf /tmp/aaaaaaaaaaaaaaaaaaaa"}"#,
     ));
@@ -378,8 +406,8 @@ fn a_failure_is_drawn_by_weight_and_not_only_by_color() {
     let mut screen = screen_for_test(40, 20);
     screen
         .state
-        .apply(Notice::Error("the backend said 402".into()));
-    screen.state.apply(Notice::ToolStart {
+        .apply_app(AppNotice::Error("the backend said 402".into()));
+    screen.state.apply(MachineNotice::ToolStart {
         name: "Bash".into(),
         args: r#"{"command":"ls"}"#.into(),
     });
@@ -483,33 +511,33 @@ fn the_box_says_what_enter_will_do() {
     // typed, so it is the only place that can say which one it is.
     let mut state = State::default();
     assert_eq!(
-        state.textarea.placeholder_text(),
+        state.edit.textarea.placeholder_text(),
         super::super::input::IDLE_PLACEHOLDER
     );
 
     state.begin_turn(Instant::now());
     assert_eq!(
-        state.textarea.placeholder_text(),
+        state.edit.textarea.placeholder_text(),
         super::super::input::QUEUE_PLACEHOLDER
     );
 
     let (reply, _answer) = tokio::sync::oneshot::channel();
     state.open_question(reply);
     assert_eq!(
-        state.textarea.placeholder_text(),
+        state.edit.textarea.placeholder_text(),
         super::super::input::ANSWER_PLACEHOLDER
     );
 
     state.close_question();
     assert_eq!(
-        state.textarea.placeholder_text(),
+        state.edit.textarea.placeholder_text(),
         super::super::input::QUEUE_PLACEHOLDER,
         "the turn is still running"
     );
 
     state.end_turn();
     assert_eq!(
-        state.textarea.placeholder_text(),
+        state.edit.textarea.placeholder_text(),
         super::super::input::IDLE_PLACEHOLDER
     );
 }

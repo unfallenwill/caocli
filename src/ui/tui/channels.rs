@@ -22,6 +22,8 @@ use crate::tools::ask::{Answer, Question};
 use crate::types::ToolCall;
 use crate::ui::{Approve, Ask, Cancel, Verdict};
 
+use super::notice::{AppNotice, MachineNotice, SecretAsk};
+
 /// Cancellation as the event loop delivers it: Ctrl-C sets the watch and every
 /// await point in the turn races against [`CtrlC::wait`].
 ///
@@ -113,8 +115,15 @@ impl Ask for Questions {
 /// loop drains them on every tick and after the turn ends. Splitting the
 /// receivers from the senders is what makes it impossible to mistake one
 /// for the other.
+///
+/// Three channels carry what was one: the machine's vocabulary, the
+/// application's vocabulary, and the secret prompt's question. Each receiver
+/// is typed, so a turn's notifications cannot be received as application
+/// calls and vice versa.
 pub(super) struct LoopHalf {
-    pub(super) notices: mpsc::UnboundedReceiver<crate::ui::tui::notice::Notice>,
+    pub(super) machine: mpsc::UnboundedReceiver<MachineNotice>,
+    pub(super) app: mpsc::UnboundedReceiver<AppNotice>,
+    pub(super) secret: mpsc::UnboundedReceiver<SecretAsk>,
     pub(super) gates: mpsc::UnboundedReceiver<oneshot::Sender<Verdict>>,
     pub(super) questions: mpsc::UnboundedReceiver<Asked>,
 }

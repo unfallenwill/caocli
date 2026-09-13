@@ -1,13 +1,18 @@
 //! The plain front end: what the machine's notifications look like when they are
 //! written to a scrolling stream.
 //!
-//! Everything it writes is a [`Cell`], whether it arrived as a live notification
-//! or was folded out of the session log when resuming, so the two paths cannot
-//! drift apart. What it keeps between calls is only what the spacing rule needs:
-//! the block currently streaming, and whether the cell written last was text.
+//! Two halves, kept apart on purpose:
 //!
-//! It reads no global: the writer, the palette and the terminal it draws on are
-//! handed in through [`Renderer::on`], which is also what a test drives.
+//! - [`plain_writer::PlainWriter`] is the bytes-on-the-wire side: cells turned
+//!   into SGR sequences, the open streaming block, and the spacing rule's two
+//!   flags. It is what a cell becomes.
+//! - [`Renderer`] is the session side: the status bar that lives at the bottom
+//!   of the terminal, the model/effort labels the status bar carries, and the
+//!   terminal the plain front end asked for. It is what the session is.
+//!
+//! The split is the shape the `Front`/`Ui` traits see: `paint_cell` lives on
+//! the writer half, `set_model` on the renderer half, and the runtime calls
+//! reach for whichever holds what they need.
 
 use std::future::Future;
 use std::io::Write;
@@ -16,139 +21,12 @@ use std::time::Duration;
 
 use crate::types::{Message, Usage};
 
-use super::cell::{Cell, CellSink, Stream, Style};
+use super::cell::{Cell, Style};
 use super::contract::{Front, Ui};
+use super::plain_writer::PlainWriter;
 use super::status::Status;
 use super::status_bar::StatusBar;
 use super::terminal::{RealTerminal, Terminal};
-
-const RESET: &str = "\x1b[0m";
-
-/// The SGR escape that opens `style`.
-///
-/// This is the plain front end's backend: the place where the semantic
-/// [`Style`] the cell carries becomes bytes on the wire. The cell module
-/// deliberately does not know about SGR -- a [`Style`] is a label, and the
-/// two front ends render it their own way. The TUI renders it through
-/// `paint::style_of` into ratatui's [`ratatui::style::Style`] and lets the
-/// backend decide; this one writes SGR directly because it owns its writer,
-/// not a ratatui frame.
-///
-/// The dim/bold decisions come from [`Style::modifiers`] -- the same method
-/// the TUI uses -- so the two front ends cannot disagree on what a
-/// `Reasoning` line looks like. The colour is this front end's own: a palette
-/// the terminal chose for a background this code cannot see.
-fn style_code(style: Style) -> &'static str {
-    let m = style.modifiers();
-    if m.bold {
-        match style {
-            Style::Yellow => "\x1b[1;33m",
-            Style::Green => "\x1b[1;32m",
-            Style::Red => "\x1b[1;31m",
-            _ => "",
-        }
-    } else if m.dim {
-        "\x1b[2m"
-    } else {
-        ""
-    }
-}
-
-/// The plain front end's [`CellSink`]: turns the cell layer's calls into
-/// SGR bytes on a `Write`. Holds the open style for the duration of one cell
-/// so consecutive spans in the same style stay one style run, and the gutter's
-/// continuation columns so an embedded `\n` is set in like the line it
-/// continues.
-struct SgrSink<'a> {
-    out: &'a mut dyn Write,
-    color: bool,
-    open: Option<Style>,
-    gutter_rest: &'static str,
-}
-
-impl<'a> SgrSink<'a> {
-    fn new(out: &'a mut dyn Write, color: bool) -> Self {
-        Self {
-            out,
-            color,
-            open: None,
-            gutter_rest: "",
-        }
-    }
-
-    /// The SGR open on style change, the continuation columns on every `\n`,
-    /// and the bytes in between. One style code per run rather than one per
-    /// span, so consecutive spans in the same style stay one style run.
-    ///
-    /// A `\n` in a cell is a line of that cell, not a line the terminal
-    /// wrapped, so it is set in like every other line of it: the writer writes
-    /// the gutter's continuation columns itself, because a line the terminal
-    /// wraps because it is longer than the screen is the one thing neither
-    /// front end can set in -- only the terminal knows where it breaks.
-    ///
-    /// The opened style runs across the break and over the columns, so the
-    /// continuation is painted in the style of the line it continues rather
-    /// than in the gutter's own. The two differ only for a cell whose marker
-    /// is not blank, and for that one they are the same style by construction.
-    fn write_span(&mut self, style: Style, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        if self.open != Some(style) {
-            if self.open.is_some() {
-                let _ = self.out.write_all(self.reset().as_bytes());
-            }
-            let code = if self.color { style_code(style) } else { "" };
-            let _ = self.out.write_all(code.as_bytes());
-            self.open = Some(style);
-        }
-        for (i, piece) in text.split('\n').enumerate() {
-            if i > 0 {
-                let _ = self.out.write_all(b"\n");
-                if !self.gutter_rest.is_empty() {
-                    let _ = self.out.write_all(self.gutter_rest.as_bytes());
-                }
-            }
-            let _ = self.out.write_all(piece.as_bytes());
-        }
-    }
-
-    /// The SGR reset, or empty when colors are off: an SGR byte the terminal
-    /// has no use for is one the terminal could still echo back, and that is
-    /// a byte the test suite would pin as a one-line oversight.
-    fn reset(&self) -> &'static str {
-        if self.color { RESET } else { "" }
-    }
-}
-
-impl<'a> CellSink for SgrSink<'a> {
-    fn begin_cell(&mut self, gutter: Option<&super::cell::Gutter>) {
-        self.open = None;
-        self.gutter_rest = gutter.map_or("", |g| g.rest);
-    }
-
-    fn gap(&mut self) {
-        let _ = self.out.write_all(b"\n");
-    }
-
-    fn span(&mut self, style: Style, text: &str) {
-        self.write_span(style, text);
-    }
-
-    fn line_end(&mut self) {
-        let _ = self.out.write_all(b"\n");
-    }
-
-    fn end_cell(&mut self) {
-        // Close the open style, so the next cell starts unstyled. The plain
-        // front end is the one place a style could still be open here: the
-        // TUI's sink collects into spans and never opens anything.
-        if self.open.is_some() {
-            let _ = self.out.write_all(self.reset().as_bytes());
-            self.open = None;
-        }
-    }
-}
 
 /// Streaming renderer. Thinking and body text are two independent render blocks:
 /// - thinking is dim, body text is the normal color
@@ -159,30 +37,16 @@ impl<'a> CellSink for SgrSink<'a> {
 ///
 /// Everything the renderer writes is a [`Cell`]: the live notifications become
 /// cells as they arrive and replayed history becomes cells up front, so both go
-/// through the same painter and cannot drift apart. Only two things are carried
-/// between calls: the block currently streaming, and whether the cell written
-/// last was a text block (all the spacing rule needs).
+/// through the same painter and cannot drift apart. The cell-writing half lives
+/// on [`PlainWriter`]; what [`Renderer`] keeps of its own is the status line,
+/// the status bar that pins to it, and the terminal the front end asked for.
 pub struct Renderer {
-    pub(super) out: Box<dyn Write>,
+    /// The plain front end's writer: SGR bytes, streaming block, spacing rule.
+    pub(super) writer: PlainWriter,
     /// The terminal this front end is attached to: everything it knows about the
     /// process's own terminal -- its width, whether it can take escape
     /// sequences, how to silence its echo -- comes from here.
     term: Box<dyn Terminal>,
-    color: bool,
-    /// The text block currently being streamed, if any. The shared
-    /// [`Stream`] does the block tracking: the plain front end writes the
-    /// bytes itself, the TUI files the closed cell into its transcript, and
-    /// both ask the same answer to "what cell is a block in style X".
-    stream: Stream,
-    /// Whether the cursor is at the start of a line of the block being streamed,
-    /// which is a fact only a command's output has a use for: a chunk can end in the
-    /// middle of a line, and the line it continues is set in like the rest of the
-    /// block. A block of the model's own has no lines this front end breaks.
-    at_line_start: bool,
-    /// Whether the cell written last was a text block. Only this much of the
-    /// previous cell is kept: it is all the spacing rule needs, and the
-    /// transcript itself lives in the session log.
-    prev_was_block: bool,
     /// What the status bar reports: the model, the effort tier and the session's
     /// cache statistics.
     status: Status,
@@ -206,12 +70,8 @@ impl Renderer {
     /// below this line reads a global.
     pub(crate) fn on(out: Box<dyn Write>, color: bool, term: Box<dyn Terminal>) -> Self {
         Self {
-            out,
+            writer: PlainWriter::new(out, color),
             term,
-            color,
-            stream: Stream::new(),
-            at_line_start: false,
-            prev_was_block: false,
             status: Status::default(),
             bar: None,
             in_raw_mode: false,
@@ -238,18 +98,18 @@ impl Renderer {
         match (self.bar, current) {
             (None, None) => {}
             (None, Some(bar)) => {
-                bar.setup(self.out.as_mut());
+                bar.setup(self.writer.out.as_mut());
                 self.bar = Some(bar);
                 self.redraw_status_bar();
             }
             (Some(old), None) => {
-                old.teardown(self.out.as_mut());
+                old.teardown(self.writer.out.as_mut());
                 self.bar = None;
             }
             (Some(old), Some(bar)) if old == bar => self.redraw_status_bar(),
             (Some(old), Some(bar)) => {
-                old.teardown(self.out.as_mut());
-                bar.setup(self.out.as_mut());
+                old.teardown(self.writer.out.as_mut());
+                bar.setup(self.writer.out.as_mut());
                 self.bar = Some(bar);
                 self.redraw_status_bar();
             }
@@ -268,8 +128,8 @@ impl Renderer {
         // an over-long shortest segment is clipped below.
         let label = self.status.line(width);
         let visible = super::text::truncate(&label, width);
-        let painted = self.paint(Style::Dim, visible);
-        bar.render(self.out.as_mut(), visible, &painted);
+        let painted = self.writer.paint(Style::Dim, visible);
+        bar.render(self.writer.out.as_mut(), visible, &painted);
     }
 
     /// Cache statistics accumulated for the current session, the status bar's
@@ -285,127 +145,24 @@ impl Renderer {
     /// status bar line). Idempotent.
     pub fn teardown(&mut self) {
         if let Some(bar) = self.bar.take() {
-            bar.teardown(self.out.as_mut());
+            bar.teardown(self.writer.out.as_mut());
         }
-    }
-
-    fn emit(&mut self, s: &str) {
-        let _ = self.out.write_all(s.as_bytes());
-        let _ = self.out.flush();
-    }
-
-    /// The escape that opens `style`, empty when colors are off.
-    fn open_style(&self, style: Style) -> &'static str {
-        if self.color { style_code(style) } else { "" }
-    }
-
-    /// The escape that closes a style, empty when colors are off.
-    fn close_style(&self) -> &'static str {
-        if self.color { RESET } else { "" }
-    }
-
-    /// Wrap `s` in `style`. Styles are applied per span, so no call site has to
-    /// know whether colors are enabled.
-    pub(super) fn paint(&self, style: Style, s: &str) -> String {
-        format!("{}{s}{}", self.open_style(style), self.close_style())
-    }
-
-    /// Write a cell: the blank line separating it from the previous one, its
-    /// marker in its gutter, its spans, then its line ending.
-    ///
-    /// Rendering goes through [`Cell::render`] so the gap rule, the gutter's
-    /// head and the line end all live on the cell layer; this front end is
-    /// only the sink that turns each call into SGR bytes.
-    fn paint_cell(&mut self, cell: &Cell) {
-        // A cell is a line of its own: a block still streaming when one arrives
-        // -- which is what a running command's output leaves open -- ends here
-        // rather than running on into it.
-        self.close_block();
-        let mut sink = SgrSink::new(self.out.as_mut(), self.color);
-        let finish = cell.render(self.prev_was_block, &mut sink);
-        self.prev_was_block = finish.is_text_block;
-    }
-
-    /// Start streaming a text block: write the separating blank line and open the
-    /// block's style, so the deltas that follow inherit it. A no-op when the block
-    /// is already open, which is what keeps a run of deltas to a single style run.
-    ///
-    /// The block's marker goes on after its style is open, and not before: the marker
-    /// belongs to the block -- a gutter's style is the style of the cell it opens --
-    /// so inheriting it here is what keeps a streamed block to one run, and what
-    /// makes what is streamed and what is replayed the same bytes.
-    ///
-    /// Only the first line can be set in here. This front end writes a line as it
-    /// arrives and leaves the wrapping to the terminal, so the columns of a line it
-    /// never sees are not its to choose; the front end that owns the screen lays the
-    /// whole block out and sets in every line of it.
-    fn open_block(&mut self, style: Style) {
-        // Same style already open: the stream's no-op means we write nothing.
-        if self.stream.current().map(|(open, _)| open) == Some(style) {
-            return;
-        }
-        self.close_block();
-        // The spacing rule is per-cell-type, and a block in `style` becomes a
-        // cell whose gutter and gap come from the same style: an empty cell of
-        // that kind is what the painter used to build, and is what the stream's
-        // `stream_cell("")` answers.
-        let spacing = style.stream_cell(String::new());
-        if spacing.gap_after(self.prev_was_block) {
-            self.emit("\n");
-        }
-        self.emit(self.open_style(style));
-        if let Some(gutter) = spacing.gutter() {
-            self.emit(gutter.head);
-        }
-        // Open the stream in this style. The empty text is the no-op path: the
-        // stream is the one closing the previous block, not us.
-        let _ = self.stream.append(style, "");
-    }
-
-    /// End the streaming block: close its style and its line.
-    fn close_block(&mut self) {
-        if self.stream.close().is_none() {
-            return;
-        }
-        self.emit(self.close_style());
-        // A block whose last chunk ended with a line break has nothing left on the
-        // line it is standing on, and an empty line before the next cell is not a
-        // line of anything.
-        if !self.at_line_start {
-            self.emit("\n");
-        }
-        self.at_line_start = false;
-        self.prev_was_block = true;
-    }
-
-    /// Replay history messages (used when resuming a session).
-    ///
-    /// The messages become the same cells a live turn produces and go through
-    /// the same painter, so a resumed session is laid out exactly like the one
-    /// that was watched live -- including the tool summaries, which are a
-    /// property of the cell and so cannot be forgotten here.
-    fn replay_messages(&mut self, messages: &[Message]) {
-        for cell in super::cell::from_messages(messages) {
-            self.paint_cell(&cell);
-        }
-        // Separate the replayed history from the prompt that follows it.
-        self.emit("\n");
     }
 }
 
 impl Front for Renderer {
     fn replay(&mut self, messages: &[Message]) {
-        self.replay_messages(messages);
+        self.writer.replay_messages(messages);
     }
 
     fn info(&mut self, s: &str) {
-        self.paint_cell(&Cell::Notice(s.to_owned()));
+        self.writer.paint_cell(&Cell::Notice(s.to_owned()));
     }
 
     fn error(&mut self, s: &str) {
         // Straight to the error stream: the plain front end does not own the
         // screen, so an error survives a redirected stdout.
-        eprintln!("{}", self.paint(Style::Red, s));
+        eprintln!("{}", self.writer.paint(Style::Red, s));
     }
 
     fn set_model(&mut self, model: &str) {
@@ -443,8 +200,8 @@ impl Front for Renderer {
             // asked for is not an answer -- and the read waits in the future, where
             // the caller awaits it.
             let echo = self.term.echo_off();
-            let _ = writeln!(self.out, "{}", self.paint(Style::Dim, prompt));
-            let _ = self.out.flush();
+            let _ = writeln!(self.writer.out, "{}", self.writer.paint(Style::Dim, prompt));
+            let _ = self.writer.out.flush();
             Box::pin(async move {
                 let answer = self.term.read_line().await;
                 drop(echo);
@@ -546,32 +303,32 @@ impl Ui for Renderer {
         // incomplete"), so what the front end shows is the wire's words. Not
         // an error: the model stopped on a normal cause, and the transcript's
         // error styling is the wrong place for it.
-        self.paint_cell(&Cell::Notice(notice.to_owned()));
+        self.writer.paint_cell(&Cell::Notice(notice.to_owned()));
     }
 
     fn reasoning_delta(&mut self, s: &str) {
-        self.open_block(Style::Reasoning);
-        self.emit(s);
+        self.writer.open_block(Style::Reasoning);
+        self.writer.emit(s);
     }
 
     fn content_delta(&mut self, s: &str) {
-        self.open_block(Style::Plain);
-        self.emit(s);
+        self.writer.open_block(Style::Plain);
+        self.writer.emit(s);
     }
 
     fn finish_turn(&mut self) {
-        self.close_block();
+        self.writer.close_block();
     }
 
     fn tool_start(&mut self, name: &str, args: &str) {
-        self.paint_cell(&Cell::tool_call(name, args));
+        self.writer.paint_cell(&Cell::from_tool_call(name, args));
     }
 
     fn tool_output(&mut self, chunk: &str) {
         if chunk.is_empty() {
             return;
         }
-        self.open_block(Style::Dim);
+        self.writer.open_block(Style::Dim);
         // The command's own lines are set in like every other line of a cell, and
         // this is the only layer that sees where they break: what arrives is a run
         // of bytes, so a `\n` in it is a line of the cell that has to carry the
@@ -587,40 +344,41 @@ impl Ui for Renderer {
             // columns, and the line the cursor is standing at the start of is still
             // the one the next chunk continues.
             if !line.is_empty() {
-                if self.at_line_start {
-                    self.emit(rest);
+                if self.writer.at_line_start {
+                    self.writer.emit(rest);
                 }
-                self.at_line_start = false;
-                self.emit(line);
+                self.writer.at_line_start = false;
+                self.writer.emit(line);
             }
             if lines.peek().is_some() {
-                self.emit("\n");
-                self.at_line_start = true;
+                self.writer.emit("\n");
+                self.writer.at_line_start = true;
             }
         }
     }
 
     fn tool_result(&mut self, result: &str) {
-        self.paint_cell(&Cell::ToolResult(result.to_owned()));
+        self.writer.paint_cell(&Cell::ToolResult(result.to_owned()));
     }
 
     fn instructions(&mut self, dir: &str) {
-        self.paint_cell(&Cell::Notice(crate::agents_md::notice_text(dir)));
+        self.writer
+            .paint_cell(&Cell::Notice(crate::agents_md::notice_text(dir)));
     }
 
     fn interrupted(&mut self) {
         // A block that was still streaming when the turn was cancelled is closed
         // first, so the notice starts on a line of its own.
-        self.close_block();
-        self.paint_cell(&Cell::Interrupted);
+        self.writer.close_block();
+        self.writer.paint_cell(&Cell::Interrupted);
     }
 
     fn approval_requested(&mut self, name: &str, args: &str) {
-        self.paint_cell(&Cell::approval(name, args));
+        self.writer.paint_cell(&Cell::approval(name, args));
     }
 
     fn usage(&mut self, usage: &Usage, stream: Duration) {
-        self.paint_cell(&Cell::Usage {
+        self.writer.paint_cell(&Cell::Usage {
             usage: usage.clone(),
             stream,
         });
@@ -631,7 +389,7 @@ impl Ui for Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::style_code;
+    use super::super::plain_writer::style_code;
     use crate::ui::cell::Style;
 
     /// The plain front end's mapping: a semantic [`Style`] to the SGR escape

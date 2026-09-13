@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use super::super::notice::Notice;
+use super::super::notice::{AppNotice, MachineNotice};
 use super::super::render;
 use super::super::state::State;
 use crate::types::Message;
@@ -19,20 +19,20 @@ fn every_notice_becomes_a_cell_or_a_status_change() {
     // The mapping is the front end's whole job; a notice with no effect would
     // silently swallow the machine's output.
     let mut screen = State::default();
-    screen.apply(Notice::Reasoning("think".into()));
-    screen.apply(Notice::Content("answer".into()));
-    screen.apply(Notice::FinishTurn);
-    screen.apply(Notice::ToolStart {
+    screen.apply(MachineNotice::Reasoning("think".into()));
+    screen.apply(MachineNotice::Content("answer".into()));
+    screen.apply(MachineNotice::FinishTurn);
+    screen.apply(MachineNotice::ToolStart {
         name: "Bash".into(),
         args: r#"{"command":"ls"}"#.into(),
     });
-    screen.apply(Notice::ToolOutput("out\n".into()));
-    screen.apply(Notice::ToolResult("exit_code: 0\nbody".into()));
-    screen.apply(Notice::Info("note".into()));
-    screen.apply(Notice::Error("boom".into()));
-    screen.apply(Notice::Interrupted);
+    screen.apply(MachineNotice::ToolOutput("out\n".into()));
+    screen.apply(MachineNotice::ToolResult("exit_code: 0\nbody".into()));
+    screen.apply_app(AppNotice::Info("note".into()));
+    screen.apply_app(AppNotice::Error("boom".into()));
+    screen.apply(MachineNotice::Interrupted);
     assert_eq!(
-        screen.transcript,
+        screen.view.transcript,
         vec![
             Cell::Reasoning("think".into()),
             Cell::Content("answer".into()),
@@ -49,26 +49,29 @@ fn every_notice_becomes_a_cell_or_a_status_change() {
 #[test]
 fn a_fragment_in_the_other_style_opens_a_new_block() {
     let mut screen = State::default();
-    screen.apply(Notice::Reasoning("a".into()));
-    screen.apply(Notice::Reasoning("b".into()));
-    assert!(screen.stream.current().is_some(), "still one open block");
-    screen.apply(Notice::Content("x".into()));
+    screen.apply(MachineNotice::Reasoning("a".into()));
+    screen.apply(MachineNotice::Reasoning("b".into()));
+    assert!(
+        screen.view.stream.current().is_some(),
+        "still one open block"
+    );
+    screen.apply(MachineNotice::Content("x".into()));
     assert_eq!(
-        screen.transcript,
+        screen.view.transcript,
         vec![Cell::Reasoning("ab".into())],
         "the reasoning block closed when the style changed"
     );
-    screen.apply(Notice::FinishTurn);
-    assert_eq!(screen.transcript[1], Cell::Content("x".into()));
-    assert!(screen.stream.current().is_none());
+    screen.apply(MachineNotice::FinishTurn);
+    assert_eq!(screen.view.transcript[1], Cell::Content("x".into()));
+    assert!(screen.view.stream.current().is_none());
 }
 
 #[test]
 fn status_notices_reach_the_status_line() {
     let mut screen = State::default();
-    screen.apply(Notice::SetModel("m-1".into()));
-    screen.apply(Notice::SetEffort("high".into()));
-    screen.apply(Notice::Usage(
+    screen.apply_app(AppNotice::SetModel("m-1".into()));
+    screen.apply_app(AppNotice::SetEffort("high".into()));
+    screen.apply(MachineNotice::Usage(
         Usage {
             prompt_tokens: 6,
             total_tokens: 10,
@@ -80,12 +83,12 @@ fn status_notices_reach_the_status_line() {
         Duration::ZERO,
     ));
     assert_eq!(
-        screen.status.full_line(),
+        screen.view.status.full_line(),
         "m-1 · effort high · cache 60.0% · 6/4"
     );
-    screen.apply(Notice::ResetStats);
+    screen.apply_app(AppNotice::ResetStats);
     assert_eq!(
-        screen.status.full_line(),
+        screen.view.status.full_line(),
         "m-1 · effort high · cache 0.0% · 0/0"
     );
 }
@@ -95,7 +98,7 @@ fn replay_and_the_live_stream_produce_the_same_cells() {
     // The invariant the plain front end is held to, held here too: a resumed
     // session must look like the one that was watched live.
     let mut screen = State::default();
-    screen.apply(Notice::Replay(vec![
+    screen.apply_app(AppNotice::Replay(vec![
         Message {
             role: Role::Assistant,
             content: Some("running it".into()),
@@ -107,7 +110,7 @@ fn replay_and_the_live_stream_produce_the_same_cells() {
         Message::tool("call_1", "exit_code: 0\n--- stdout ---\nbody"),
     ]));
     assert_eq!(
-        screen.transcript,
+        screen.view.transcript,
         vec![
             Cell::Reasoning("let me think".into()),
             Cell::Content("running it".into()),
@@ -119,8 +122,8 @@ fn replay_and_the_live_stream_produce_the_same_cells() {
 #[test]
 fn an_open_question_is_drawn_after_the_transcript() {
     let mut screen = State::default();
-    screen.apply(Notice::Content("before".into()));
-    screen.apply(Notice::Approval {
+    screen.apply(MachineNotice::Content("before".into()));
+    screen.apply(MachineNotice::Approval {
         name: "Bash".into(),
         args: r#"{"command":"rm -rf /"}"#.into(),
     });

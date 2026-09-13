@@ -54,7 +54,7 @@ pub fn from_messages(messages: &[Message]) -> Vec<Cell> {
                     cells.push(Cell::Content(text));
                 }
                 for call in m.tool_calls.iter().flatten() {
-                    cells.push(Cell::tool_call(
+                    cells.push(Cell::from_tool_call(
                         &call.function.name,
                         &call.function.arguments,
                     ));

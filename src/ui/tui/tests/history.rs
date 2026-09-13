@@ -46,7 +46,7 @@ fn browsing_an_empty_history_does_nothing() {
     let mut screen = State::default();
     press(&mut screen, KeyCode::Up);
     assert_eq!(screen.text(), "");
-    assert!(screen.browsing.is_none());
+    assert!(screen.edit.browsing.is_none());
 }
 
 #[test]
@@ -56,7 +56,7 @@ fn a_recalled_command_does_not_open_the_picker() {
     screen.remember("/help");
     press(&mut screen, KeyCode::Up);
     assert_eq!(screen.text(), "/help");
-    assert!(screen.picker.is_none());
+    assert!(screen.overlay.picker.is_none());
     press(&mut screen, KeyCode::Up);
     assert_eq!(screen.text(), "/help", "still browsing, not completing");
 }
@@ -68,9 +68,9 @@ fn repeating_a_line_is_not_recorded_twice() {
     screen.remember("same");
     screen.remember("other");
     screen.remember("same");
-    assert_eq!(screen.history, vec!["same", "other", "same"]);
+    assert_eq!(screen.edit.history, vec!["same", "other", "same"]);
     screen.remember("");
-    assert_eq!(screen.history.len(), 3, "an empty line is not a line");
+    assert_eq!(screen.edit.history.len(), 3, "an empty line is not a line");
 }
 
 #[test]
@@ -79,8 +79,8 @@ fn the_history_keeps_only_the_most_recent_entries() {
     for i in 0..(crate::history::MAX_ENTRIES + 5) {
         screen.remember(&format!("line {i}"));
     }
-    assert_eq!(screen.history.len(), crate::history::MAX_ENTRIES);
-    assert_eq!(screen.history[0], "line 5", "the oldest went first");
+    assert_eq!(screen.edit.history.len(), crate::history::MAX_ENTRIES);
+    assert_eq!(screen.edit.history[0], "line 5", "the oldest went first");
 }
 
 #[test]
@@ -91,6 +91,6 @@ fn submitting_empties_the_box_and_the_browsing_state() {
     assert_eq!(screen.text(), "earlier");
     assert_eq!(screen.take_line(), "earlier");
     assert!(screen.text().is_empty());
-    assert!(screen.browsing.is_none());
-    assert!(screen.draft.is_empty());
+    assert!(screen.edit.browsing.is_none());
+    assert!(screen.edit.draft.is_empty());
 }

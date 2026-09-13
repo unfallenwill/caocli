@@ -13,11 +13,10 @@ use ratatui::style::Modifier;
 use crate::ui::cell::Cell;
 
 use super::super::input::IDLE_PLACEHOLDER;
-use super::super::layout::{
-    BOX_ROWS, PINNED_ROWS, QUEUE_ROWS, TODO_HEADS, TODO_ROWS, screen_rows, todo_rows, todo_window,
-};
+use super::super::layout::{BOX_ROWS, PINNED_ROWS, screen_rows, todo_rows};
 use super::super::render;
-use super::super::state::{Scroll, State};
+use super::super::scroll::Scroll;
+use super::super::state::State;
 use super::box_top;
 use super::ctrl_j;
 use super::row;
@@ -25,6 +24,7 @@ use super::screen_for_test;
 use super::transcript_top;
 use super::type_in;
 use super::written;
+use crate::ui::cell::layout::{QUEUE_ROWS, TODO_HEADS, TODO_ROWS, todo_window};
 
 #[test]
 fn paging_to_either_end_stops_there() {
@@ -41,7 +41,7 @@ fn the_pinned_rows_take_the_bottom_of_the_screen() {
     // The shape the pinned region has to keep, whatever the transcript does:
     // the box, then the status line, on the last rows of the terminal.
     let mut screen = screen_for_test(60, 20);
-    screen.state.status.set_model("m-1");
+    screen.state.view.status.set_model("m-1");
     screen.draw().unwrap();
     let last = screen.terminal.backend().buffer().area.height - 1;
     assert!(row(&screen, last - 3).starts_with('─'), "the box's top");
@@ -64,7 +64,7 @@ fn the_queue_is_drawn_above_the_box_until_it_is_run() {
     // foot of the transcript -- and it takes rows from the transcript rather
     // than covering it.
     let mut screen = screen_for_test(40, 20);
-    screen.state.status.set_model("m-1");
+    screen.state.view.status.set_model("m-1");
     let last = screen.terminal.backend().buffer().area.height - 1;
     screen.state.enqueue("first".into());
     screen.state.enqueue("second".into());
@@ -211,12 +211,17 @@ fn the_standing_list_is_drawn_by_the_block_and_not_by_the_cell_too() {
     let mut screen = screen_for_test(60, 20);
     screen
         .state
+        .view
         .transcript
         .push(written(serde_json::json!({"todos": [
             {"content": "Read the failing test", "status": "completed"},
             {"content": "Fix the parser", "status": "in_progress"}
         ]})));
-    screen.state.transcript.push(Cell::Content("on it".into()));
+    screen
+        .state
+        .view
+        .transcript
+        .push(Cell::Content("on it".into()));
     screen.draw().unwrap();
 
     let top = transcript_top(&screen, 2);
@@ -269,7 +274,11 @@ fn the_block_gives_up_its_rows_before_the_box_does() {
     // box is where the session continues, so the block asks for its budget and the
     // box comes out of what is left.
     let mut screen = screen_for_test(40, 24);
-    screen.state.transcript.push(Cell::Content("hello".into()));
+    screen
+        .state
+        .view
+        .transcript
+        .push(Cell::Content("hello".into()));
     screen.draw().unwrap();
     // Nothing pinned: the box sits on the status line, its own three rows.
     assert_eq!(
@@ -412,14 +421,22 @@ fn a_cramped_screen_windows_the_rows_the_layout_gave_it() {
     // and `drawn_rows` is what paging and staying put both read.
     for height in 1..8u16 {
         let mut screen = screen_for_test(40, height);
-        screen.state.transcript.push(Cell::Content("one".into()));
-        screen.state.transcript.push(Cell::Content("two".into()));
+        screen
+            .state
+            .view
+            .transcript
+            .push(Cell::Content("one".into()));
+        screen
+            .state
+            .view
+            .transcript
+            .push(Cell::Content("two".into()));
         screen.draw().unwrap();
         let area = super::origin(&mut screen);
         let input = screen.state.input_rows(height, 0);
         let queued = render::queue_lines(&screen.state, 40).len() as u16;
         assert_eq!(
-            screen.state.drawn_rows,
+            screen.state.view.drawn_rows,
             screen_rows(area, 0, input, queued)[0].height as usize,
             "a {height}-row terminal"
         );
@@ -428,8 +445,16 @@ fn a_cramped_screen_windows_the_rows_the_layout_gave_it() {
     // layout gave it, taken from the end of the transcript. Five rows is the
     // shortest terminal with room for the box as well as a transcript row.
     let mut screen = screen_for_test(40, 5);
-    screen.state.transcript.push(Cell::Content("one".into()));
-    screen.state.transcript.push(Cell::Content("two".into()));
+    screen
+        .state
+        .view
+        .transcript
+        .push(Cell::Content("one".into()));
+    screen
+        .state
+        .view
+        .transcript
+        .push(Cell::Content("two".into()));
     screen.draw().unwrap();
     assert_eq!(row(&screen, 0), "two", "the last line of the transcript");
     assert!(row(&screen, 1).starts_with('─'), "then the box");

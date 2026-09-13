@@ -15,7 +15,7 @@ use tokio::sync::oneshot;
 
 use crate::ui::cell::Style;
 
-use super::super::notice::Notice;
+use super::super::notice::MachineNotice;
 use super::super::screen::Screen;
 use super::super::screen::fullscreen;
 use super::super::state::State;
@@ -30,34 +30,36 @@ fn a_draw_lays_out_only_what_arrived_since_the_last_one() {
     let mut screen = screen_for_test(40, 20);
     screen
         .state
+        .view
         .transcript
         .push(crate::ui::cell::Cell::Content("one".into()));
     screen
         .state
+        .view
         .transcript
         .push(crate::ui::cell::Cell::Content("two".into()));
-    screen.state.laid_cells = 0;
+    screen.state.view.laid_cells = 0;
     screen.draw().unwrap();
-    assert_eq!(screen.state.laid_cells, 2, "both of them, once");
+    assert_eq!(screen.state.view.laid_cells, 2, "both of them, once");
     screen.draw().unwrap();
-    assert_eq!(screen.state.laid_cells, 2, "and not again");
+    assert_eq!(screen.state.view.laid_cells, 2, "and not again");
 
     // A fragment of a running turn is not a cell yet: the block it is writing
     // is wrapped as it is drawn, and it becomes a cell -- one to lay out --
     // when it closes.
-    screen.state.apply(Notice::Content("three".into()));
+    screen.state.apply(MachineNotice::Content("three".into()));
     screen.draw().unwrap();
-    assert_eq!(screen.state.laid_cells, 2, "still the two cells");
-    screen.state.apply(Notice::FinishTurn);
+    assert_eq!(screen.state.view.laid_cells, 2, "still the two cells");
+    screen.state.apply(MachineNotice::FinishTurn);
     screen.draw().unwrap();
-    assert_eq!(screen.state.laid_cells, 3, "the block it left behind");
+    assert_eq!(screen.state.view.laid_cells, 3, "the block it left behind");
 
     // A resize re-lays the whole transcript: every line was wrapped to a
     // width, so a new width is a new layout of every cell there is.
     screen.terminal.backend_mut().resize(30, 20);
     screen.draw().unwrap();
     assert_eq!(
-        screen.state.laid_cells, 6,
+        screen.state.view.laid_cells, 6,
         "all three again, at the new width"
     );
 }
@@ -68,7 +70,7 @@ fn everything_that_changes_the_screen_moves_the_revision() {
     let mut moved = Vec::new();
     let mut step = |state: &State| moved.push(state.revision);
     step(&state);
-    state.apply(Notice::Content("hello".into()));
+    state.apply(MachineNotice::Content("hello".into()));
     step(&state);
     state.key(Event::Key(KeyEvent::from(KeyCode::Char('h'))));
     step(&state);
@@ -191,7 +193,7 @@ fn closing_a_turn_is_worth_a_draw() {
 /// This is the `else` branch in `draw_at`: the window otherwise answers
 /// `state.window(...)`, but a non-empty picker takes the floor with
 /// `state.follow()`. The arithmetic is `total.saturating_sub(room)`, which
-/// becomes "the last `room` lines", regardless of where `state.scroll.back`
+/// becomes "the last `room` lines", regardless of where `state.view.scroll.back`
 /// was pointing before the menu opened.
 #[test]
 fn a_picker_forces_the_window_to_the_end_regardless_of_scroll() {
@@ -200,6 +202,7 @@ fn a_picker_forces_the_window_to_the_end_regardless_of_scroll() {
     for i in 0..(rows * 3) {
         screen
             .state
+            .view
             .transcript
             .push(crate::ui::cell::Cell::Notice(format!("line {i}")));
     }
@@ -211,7 +214,10 @@ fn a_picker_forces_the_window_to_the_end_regardless_of_scroll() {
         super::press(&mut screen.state, KeyCode::PageUp);
     }
     screen.draw().unwrap();
-    assert!(screen.state.scroll.back > 0, "the reader scrolled back");
+    assert!(
+        screen.state.view.scroll.back > 0,
+        "the reader scrolled back"
+    );
     assert!(
         super::body(&screen, 0).contains("line"),
         "and was reading a real line, not an edge report: {:?}",
@@ -228,7 +234,7 @@ fn a_picker_forces_the_window_to_the_end_regardless_of_scroll() {
     );
     screen.draw().unwrap();
     assert_eq!(
-        screen.state.scroll.back, 0,
+        screen.state.view.scroll.back, 0,
         "the picker pinned the window to the end"
     );
     // The newest line is the last one we put in, and the picker is the last

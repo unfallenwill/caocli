@@ -44,7 +44,7 @@ fn status_bar_render_charges_wide_chars_two_columns() {
     assert_eq!(label.chars().count(), 4);
     assert_eq!(text::width(label), 7);
     let visible = text::truncate(label, bar.width());
-    bar.render(r.out.as_mut(), visible, visible);
+    bar.render(r.writer.out.as_mut(), visible, visible);
     let s = buf_of(&buf);
     // 19 - 7 = 12 columns of padding. Counting chars would have written 15
     // and pushed the label 3 columns past the right edge.
@@ -58,8 +58,8 @@ fn status_bar_render_charges_wide_chars_two_columns() {
 fn status_bar_setup_teardown_sequences() {
     let bar = StatusBar { rows: 10, cols: 40 };
     let (mut r, buf) = with_buffer(false);
-    bar.setup(r.out.as_mut());
-    bar.teardown(r.out.as_mut());
+    bar.setup(r.writer.out.as_mut());
+    bar.teardown(r.writer.out.as_mut());
     let s = buf_of(&buf);
     assert!(s.contains("\x1b[10;1H\x1b[2K\x1b[1;9r\x1b[9;1H"), "{s:?}");
     assert!(s.contains("\x1b[r\x1b[10;1H\x1b[2K\r\n"), "{s:?}");
@@ -70,8 +70,8 @@ fn status_bar_render_right_aligns_and_paints() {
     let bar = StatusBar { rows: 10, cols: 40 }; // width = 39
     let (mut r, buf) = with_buffer(true);
     let label = "cache 98.6% · 32384/461"; // 23 characters
-    let painted = r.paint(Style::Dim, label);
-    bar.render(r.out.as_mut(), label, &painted);
+    let painted = r.writer.paint(Style::Dim, label);
+    bar.render(r.writer.out.as_mut(), label, &painted);
     let s = buf_of(&buf);
     // 39 - 23 = 16 spaces of left padding, right aligned
     assert!(

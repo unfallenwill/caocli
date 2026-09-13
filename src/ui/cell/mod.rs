@@ -12,21 +12,24 @@
 //! of them -- an SGR code, a ratatui `Color` -- lives on that front end's
 //! side of the seam, not on the cell's.
 
+use std::borrow::Cow;
+use std::time::Duration;
+
 use crate::image::Note;
 use crate::tools::ask::Question;
 use crate::tools::todo::{self, Todo};
 use crate::types::Usage;
 
-use std::time::Duration;
-
 use super::text;
 
 mod call;
+pub(super) mod layout;
 pub(super) mod question;
 mod replay;
 pub(super) mod sink;
 pub(super) mod stream;
 mod todos;
+pub(super) mod wrap;
 
 // Internally: the helpers a [`Cell`] builds itself from.
 use call::{diff_lines, hint};
@@ -123,19 +126,62 @@ pub struct Modifiers {
 }
 
 /// A styled run of text.
+///
+/// The text is a `Cow<'static, str>` so a literal marker can be borrowed and
+/// a constructed string owned, the way the cell layer wants to express
+/// them. The borrow form is what a future borrow-preserving wrap step would
+/// carry through; today the painter copies every span it wraps, so the
+/// distinction is dormant. The shape is what matters: the cell layer can
+/// now say which text is a literal and which it had to build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Span {
     pub style: Style,
-    pub text: String,
+    pub text: Cow<'static, str>,
 }
 
 impl Span {
     pub fn new(style: Style, text: impl Into<String>) -> Self {
         Self {
             style,
-            text: text.into(),
+            text: Cow::Owned(text.into()),
         }
     }
+}
+
+/// Our style, as ratatui sees it. This is what [`Style`] being data buys: the
+/// mapping happens once and is reused by both the painter and the wrap module,
+/// instead of at every call site.
+///
+/// The dim/bold half comes from [`Style::modifiers`] -- the same method the
+/// plain front end uses, so the two front ends cannot disagree on what a
+/// `Reasoning` line looks like. The colour is this front end's own, as a
+/// `Color` the framework hands to the theme: a palette the theme chose for a
+/// background this code cannot see.
+///
+/// Lives on the cell layer rather than on a single front end because the
+/// conversion is a property of the cell type (`Style`) and the framework, not of
+/// whichever front end is rendering: the wrap module that turns spans into
+/// `Line`s needs the same mapping as the painter that lays out a cell.
+pub(crate) fn style_of(style: Style) -> ratatui::style::Style {
+    use ratatui::style::{Color, Modifier, Style as RStyle};
+    let mut s = RStyle::new();
+    let m = style.modifiers();
+    if m.dim {
+        s = s.add_modifier(Modifier::DIM);
+    }
+    if m.bold {
+        s = s.add_modifier(Modifier::BOLD);
+    }
+    let color = match style {
+        Style::Yellow => Some(Color::Yellow),
+        Style::Green => Some(Color::Green),
+        Style::Red => Some(Color::Red),
+        _ => None,
+    };
+    if let Some(c) = color {
+        s = s.fg(c);
+    }
+    s
 }
 
 /// One line of a change, as a tool call shows it.
@@ -308,17 +354,37 @@ impl Cell {
         }
     }
 
-    /// A tool call, with the argument summary derived from the raw arguments.
+    /// A tool call, with the argument summary and the change it makes.
     ///
-    /// The question tool is the one call whose arguments are what is shown: its
-    /// cell is the questions themselves, because a clipped copy of the wire
-    /// format is not something a person can answer. The todo tool is the other:
-    /// its arguments are a list a person is meant to read, and a reader who has
-    /// to parse the wire format to find the plan has not been shown a plan. An
-    /// unreadable call falls back to the raw line -- the interpreter answers it
-    /// with the parse failure, and the transcript shows what it was that could
-    /// not be read.
+    /// The plain constructor builds a [`Cell::ToolCall`]; callers that want the
+    /// question or todo tool to be folded into their dedicated cell go through
+    /// [`from_tool_call`] instead. Tests that only want the generic shape --
+    /// the Bash call in the test fixtures, the change it makes if it makes
+    /// one -- reach for this directly.
     pub fn tool_call(name: &str, args: &str) -> Self {
+        Cell::ToolCall {
+            name: name.to_owned(),
+            hint: hint(args),
+            diff: diff_lines(name, args),
+        }
+    }
+
+    /// Fold a tool call's arguments into the cell that is meant to show them.
+    ///
+    /// The question tool's arguments are what is shown, and the todo tool's
+    /// arguments are the plan that is meant to be read -- a `ToolCall` cell
+    /// carrying the raw JSON would be a copy of the wire format that a person
+    /// has to parse. Anything else falls back to [`Cell::tool_call`], which is
+    /// what an unreadable call ends up as: the interpreter answers it with the
+    /// parse failure, and the transcript shows what it was that could not be
+    /// read.
+    ///
+    /// Lives on the cell layer rather than at the call sites because the
+    /// dispatch is a property of the cells the call becomes, not of whichever
+    /// front end is rendering: the plain front end and the TUI both end up
+    /// with the same Question or Todo cell when given the same arguments, and
+    /// the fallback is the same generic ToolCall.
+    pub fn from_tool_call(name: &str, args: &str) -> Self {
         if name == crate::tools::ask::ASK_NAME
             && let Ok(questions) = crate::tools::ask::parse(args)
         {
@@ -329,11 +395,7 @@ impl Cell {
         {
             return Cell::Todo(todos);
         }
-        Cell::ToolCall {
-            name: name.to_owned(),
-            hint: hint(args),
-            diff: diff_lines(name, args),
-        }
+        Cell::tool_call(name, args)
     }
 
     /// The approval gate's question for a tool call.

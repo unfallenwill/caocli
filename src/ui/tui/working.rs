@@ -7,9 +7,9 @@
 //! passing them to the editor.
 //!
 //! Split from the idle-time [`super::input`] because the meaning of every
-//! key changes when the loop is no longer waiting at the prompt, and the
-//! queue that holds lines submitted during a turn is a working-time
-//! concern: a head runs when the turn ends, a tail is appended by Enter.
+//! key changes when the loop is no longer waiting at the prompt. The queue
+//! itself lives one module over (see [`super::queue`]): this is the routing
+//! for the keys, that is the data the routing produces.
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use tokio::sync::watch;
@@ -59,7 +59,7 @@ impl State {
         // it, which is the whole point of typing here. One key is still dropped --
         // Ctrl-D, which leaves the session -- because a turn in flight is not the
         // place to leave from either.
-        if self.reply.is_none() {
+        if self.overlay.reply.is_none() {
             if let Submitted::Line = self.key(event) {
                 let line = self.take_line();
                 self.enqueue(line);
@@ -83,69 +83,5 @@ impl State {
             // Backspace, a paste, a letter: all of it is the answer being typed.
             self.key(event);
         }
-    }
-
-    /// Handle a key while the question panel is up.
-    ///
-    /// The panel takes the keys that choose: the arrows and the digits move the
-    /// cursor, space toggles an option for a question that takes several, Enter
-    /// confirms and Esc dismisses the whole call. Everything else is typed into
-    /// the box, which is where an answer in the user's own words goes -- so a
-    /// digit or a space is only the panel's while the box is still empty. Once the
-    /// user is typing, the keyboard is theirs, and a space is a space.
-    pub(super) fn panel_key(&mut self, event: Event) {
-        let Event::Key(key) = event else {
-            // A paste is an answer typed the fast way.
-            self.key(event);
-            return;
-        };
-        if key.kind != KeyEventKind::Press {
-            return;
-        }
-        if key.code == KeyCode::Up {
-            self.panel_move(-1);
-            return;
-        }
-        if key.code == KeyCode::Down {
-            self.panel_move(1);
-            return;
-        }
-        if let KeyCode::Char(digit @ '1'..='9') = key.code
-            && self.text().is_empty()
-        {
-            self.panel_jump(digit.to_digit(10).unwrap_or(1) as usize);
-            return;
-        }
-        if key.code == KeyCode::Char(' ') && self.text().is_empty() && self.panel_takes_many() {
-            self.panel_toggle();
-            return;
-        }
-        if crate::ui::tui::input::matches(key, KeyCode::Enter, KeyModifiers::NONE) {
-            let typed = self.text();
-            self.panel_confirm(&typed);
-            return;
-        }
-        if key.code == KeyCode::Esc {
-            self.panel_dismiss();
-            return;
-        }
-        self.key(Event::Key(key));
-    }
-
-    /// Put a line after the running turn. It is the whole of what Enter does
-    /// during a turn: a session written as if this turn had ended would record two
-    /// answers at once.
-    pub(super) fn enqueue(&mut self, line: String) {
-        self.revision += 1;
-        self.queued.push_back(line);
-    }
-
-    /// Take the head of the queue: the line to run next, if there is one.
-    pub(super) fn dequeue(&mut self) -> Option<String> {
-        let next = self.queued.pop_front();
-        if next.is_some() {
-            self.revision += 1;
-        }
-        next
     }
 }

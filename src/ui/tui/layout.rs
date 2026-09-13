@@ -4,47 +4,31 @@
 //! Pure geometry: nothing here draws, keeps state, or reads the terminal. The
 //! regions answer with what they need and the frame decides what they get, so
 //! the arithmetic and the answer can be tested without a screen.
-
-use std::rc::Rc;
+//!
+//! Cell-layer concerns live one module down in [`crate::ui::cell::layout`]:
+//! the row budgets for the standing task list and the queue, and the
+//! window-follows-selection rule. What is here is the TUI's frame shape: the
+//! input box, the pinned regions, the rows each of them gets once the others
+//! have taken what they need.
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::{Block, Borders};
 
 use crate::ui::cell;
+use crate::ui::cell::layout as cell_layout;
 
 /// Rows the pinned region needs besides the input box: the status line below it.
 pub(super) const PINNED_ROWS: u16 = 1;
 
-/// The rows the standing task list may take, its own two ends included.
-///
-/// The block is pinned, so every row it takes is a row the transcript does not
-/// have: it is worth enough of them to show a plan, and not enough to become the
-/// screen. A list that does not fit in this is a list the model was asked not to
-/// write.
-pub(crate) const TODO_ROWS: usize = 8;
-
-/// The rows of that budget the block spends on its own two ends before it reaches
-/// its first task: the blank row that sets it off from the transcript, so that it
-/// cannot be mistaken for the tail of one, and the title that says what it is and
-/// how far it has got. What is left over is the room the tasks get.
-pub(crate) const TODO_HEADS: usize = 2;
-
-/// The rows the queue is allowed to take from the transcript.
-///
-/// Three lines: enough to read the head and the count without reading so much
-/// that the answer is pushed off the screen. A queue longer than that -- more
-/// lines, or longer ones -- costs the transcript those rows and no more.
-pub(crate) const QUEUE_ROWS: usize = 3;
-
 /// The rows the standing task list takes: what it laid out, capped at
-/// [`TODO_ROWS`].
+/// [`cell_layout::TODO_ROWS`].
 ///
 /// Read off the lines the block actually produced rather than from its task
 /// count, because a task is as many rows as its words take.
 pub(super) fn todo_rows(lines: usize) -> u16 {
     u16::try_from(lines)
         .unwrap_or(u16::MAX)
-        .min(TODO_ROWS as u16)
+        .min(cell_layout::TODO_ROWS as u16)
 }
 
 /// The rows the input box takes when it holds nothing: a border, the empty line,
@@ -102,7 +86,7 @@ pub(super) fn box_rows(lines: usize, height: u16, todos: u16) -> u16 {
 /// is what the running is for: what will still be standing when the turn ends
 /// sits nearer the transcript, and the box keeps the company of the line that is
 /// next.
-pub(super) fn screen_rows(area: Rect, todos: u16, input: u16, queued: u16) -> Rc<[Rect]> {
+pub(super) fn screen_rows(area: Rect, todos: u16, input: u16, queued: u16) -> std::rc::Rc<[Rect]> {
     Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(todos),
@@ -113,95 +97,14 @@ pub(super) fn screen_rows(area: Rect, todos: u16, input: u16, queued: u16) -> Rc
     .split(area)
 }
 
-/// A window over a list of rows: the run of them it draws, and how many it leaves
-/// behind at each end -- which is also what says whether that end carries a count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Window {
-    /// The run drawn, as the first row and the one after the last.
-    pub(crate) first: usize,
-    pub(crate) last: usize,
-    /// Rows left out above the run, and below it, as the count drawn at that end
-    /// says. Both are zero when there was no room for the counts at all -- the one
-    /// case a cut window is drawn without them.
-    pub(crate) above: usize,
-    pub(crate) below: usize,
-}
-
-/// A window that follows a selection: the run is placed so `selected` is at its
-/// end, and shortened until the counts at the cut ends fit in `room`.
-///
-/// The window follows the selection, so the row being chosen is always one of the
-/// rows drawn: a menu scrolled past its own highlight is a menu that cannot be
-/// answered, because the one row `Enter` is about is the one row the reader
-/// cannot see. The selection sits at the end of the window it last moved into,
-/// so the window moves when the selection leaves it and not before.
-///
-/// A window that is cut says so, which costs a row at each end it is cut at:
-/// what is drawn is the longest run that fits in `room` along with the counts
-/// it needs. A list with room to spare is never counted, and is never cut.
-/// A room too small for a count at each end of a single row falls back to a
-/// bare window around `selected` -- the counts are what give way, the row the
-/// selection is on is the one row that cannot.
-///
-/// The inner loop is what tries every `first` between "selection at the end"
-/// and "selection at the start" -- a larger first can lower the cut at the
-/// bottom end (when the run reaches the last row), and that is sometimes the
-/// only way a window fits.
-///
-/// The picker uses this with `selected` as the highlighted row; the standing
-/// task list uses it with the task in hand. Both want the chosen row to be on
-/// the screen, so the rule is the same.
-fn selection_window(total: usize, selected: usize, room: usize) -> Window {
-    let room = room.max(1);
-    let total = total.max(1);
-    let selected = selected.min(total - 1);
-    for shown in (1..=room.min(total)).rev() {
-        let last = total - shown;
-        for first in selected.saturating_sub(shown - 1)..=last.min(selected) {
-            let end = first + shown;
-            let cut = usize::from(first > 0) + usize::from(end < total);
-            if shown + cut <= room {
-                return Window {
-                    first,
-                    last: end,
-                    above: first,
-                    below: total - end,
-                };
-            }
-        }
-    }
-    Window {
-        first: selected,
-        last: selected + 1,
-        above: 0,
-        below: 0,
-    }
-}
-
 /// The window a list of `total` rows is seen through, for the picker with
 /// `selected` highlighted and `room` rows to draw in.
 ///
 /// The window holds the highlighted row whenever that can be managed: a menu
 /// scrolled past its own end is a menu the highlighted row has been carried
 /// away from, and the row `Enter` is about has to be on the screen.
-pub(super) fn picker_window(total: usize, selected: usize, room: usize) -> Window {
-    selection_window(total, selected, room)
-}
-
-/// The window a list of `total` tasks is seen through, for the task at `active`
-/// and for the `room` rows there are to draw it in.
-///
-/// The window holds the task in hand whenever that can be managed: a list too
-/// long for the block is a list whose one interesting row is the task being
-/// worked on now, and a block pinned to the head of it would hide exactly that
-/// row. With nothing in hand -- a plan not started yet, or one with everything
-/// finished -- it shows the head, which is the plan itself.
-pub(crate) fn todo_window(total: usize, active: Option<usize>, room: usize) -> Window {
-    // No active task is the head of the list: row zero, where the plan itself
-    // sits. An active task that is past the end (a stale cursor) is treated as
-    // no active task for the same reason.
-    let active = active.filter(|at| *at < total);
-    selection_window(total, active.unwrap_or(0), room)
+pub(super) fn picker_window(total: usize, selected: usize, room: usize) -> cell_layout::Window {
+    cell_layout::selection_window(total, selected, room)
 }
 
 /// The columns inside the box's rules that the draft is written in: the whole

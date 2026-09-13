@@ -29,14 +29,14 @@
 //! no backend-agnostic detour through a `RenderedSpan` the plain front end
 //! would only translate back.
 
-use ratatui::style::{Color, Modifier, Style as RStyle};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span as RSpan};
 
 use crate::tools::ask::Question;
 use crate::tools::todo::{self, Todo};
-use crate::ui::cell::{self, Cell, Gutter, Span, Style};
-use crate::ui::text;
-use crate::ui::tui::layout;
+use crate::ui::cell::{
+    self, Cell, Gutter, Span, Style, layout as cell_layout, style_of, wrap::wrapped_lines,
+};
 
 /// The widest a line of the transcript is laid out, however wide the terminal is.
 ///
@@ -52,35 +52,6 @@ pub(crate) const MEASURE: usize = 100;
 /// region, and no wider than [`MEASURE`].
 pub(crate) fn measure(width: usize) -> usize {
     width.min(MEASURE)
-}
-
-/// Our style, as ratatui sees it. This is what [`Style`] being data buys: the
-/// mapping happens once per front end, instead of at every call site.
-///
-/// The dim/bold half comes from [`Style::modifiers`] -- the same method the
-/// plain front end uses, so the two front ends cannot disagree on what a
-/// `Reasoning` line looks like. The colour is this front end's own, as a
-/// `Color` the framework hands to the theme: a palette the theme chose for a
-/// background this code cannot see.
-pub(crate) fn style_of(style: Style) -> RStyle {
-    let mut s = RStyle::new();
-    let m = style.modifiers();
-    if m.dim {
-        s = s.add_modifier(Modifier::DIM);
-    }
-    if m.bold {
-        s = s.add_modifier(Modifier::BOLD);
-    }
-    let color = match style {
-        Style::Yellow => Some(Color::Yellow),
-        Style::Green => Some(Color::Green),
-        Style::Red => Some(Color::Red),
-        _ => None,
-    };
-    if let Some(c) = color {
-        s = s.fg(c);
-    }
-    s
 }
 
 /// The row that says how much of the transcript the window is not showing, drawn
@@ -209,101 +180,16 @@ pub(crate) fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
 /// the row count the window is computed from.
 ///
 /// Progress is guaranteed even when a single character is wider than the whole
-/// field: the first character is taken regardless, so a narrow terminal degrades
-/// to a clipped wide glyph rather than looping forever.
-pub(crate) fn wrapped_lines(spans: &[Span], width: usize) -> Vec<Line<'static>> {
-    let width = width.max(1);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut current: Vec<RSpan<'static>> = Vec::new();
-    let mut used = 0usize;
-    // Whether the line being built is still empty, and, if so, whether the width
-    // is what emptied it. Without the second flag an explicit newline landing on a
-    // line the width already ended would look like a blank line in the text.
-    let mut fresh = true;
-    let mut ended_by_width = false;
-
-    for span in spans {
-        let style = style_of(span.style);
-        let mut rest = span.text.as_str();
-        loop {
-            let (piece, after) = match rest.find('\n') {
-                Some(at) => (&rest[..at], Some(&rest[at + 1..])),
-                None => (rest, None),
-            };
-            let mut piece = piece;
-            while !piece.is_empty() {
-                // Whitespace at the head of a line the width broke is the break, not
-                // text: it is dropped and the line starts with the word after it. A
-                // line that follows an explicit newline keeps its leading whitespace
-                // -- that is the text's own indentation, and it is read.
-                if fresh && ended_by_width {
-                    piece = piece.trim_start_matches(char::is_whitespace);
-                    if piece.is_empty() {
-                        break;
-                    }
-                }
-                let (head, rest, done) = break_line(piece, width - used, width);
-                let (head, rest) = if head.is_empty() {
-                    if used > 0 {
-                        // The line has run out of columns and this text cannot
-                        // start one yet.
-                        lines.push(Line::from(std::mem::take(&mut current)));
-                        used = 0;
-                        fresh = true;
-                        ended_by_width = true;
-                        continue;
-                    }
-                    // Even alone it does not fit: take the character anyway, and
-                    // cut it where it falls -- there is no space to break at.
-                    let ch = piece.chars().next().expect("piece is not empty");
-                    (&piece[..ch.len_utf8()], &piece[ch.len_utf8()..])
-                } else {
-                    (head, rest)
-                };
-                current.push(RSpan::styled(head.to_owned(), style));
-                used += text::width(head);
-                fresh = false;
-                ended_by_width = false;
-                piece = rest;
-                // A break at a space ends the line there, however many columns it
-                // left unused: the next word belongs on the next line.
-                if done || used >= width {
-                    lines.push(Line::from(std::mem::take(&mut current)));
-                    used = 0;
-                    fresh = true;
-                    ended_by_width = true;
-                }
-            }
-            match after {
-                Some(after) => {
-                    // An explicit break ends the line -- and means a blank one
-                    // when nothing was written since the last break.
-                    if !fresh {
-                        lines.push(Line::from(std::mem::take(&mut current)));
-                        used = 0;
-                        fresh = true;
-                    } else if !ended_by_width {
-                        lines.push(Line::from(""));
-                    }
-                    ended_by_width = false;
-                    rest = after;
-                }
-                None => break,
-            }
-        }
-    }
-    if !fresh {
-        lines.push(Line::from(current));
-    }
-    lines
-}
-
-/// The rule that keeps a wrapped block on one left edge, and the reason it lives
-/// here rather than in the cell: only the layer that does the wrapping knows where
-/// the lines fall. A cell reaches it through [`cell_lines`], and the standing task
-/// list through it directly -- a block that is pinned is not a cell, but a task
-/// whose wrapped rows came back to column zero would still read as a task of its
-/// own.
+/// Wrap styled spans to the columns the region has, prefixing every wrapped
+/// line with the gutter's continuation columns. The rule that keeps a wrapped
+/// block on one left edge lives here rather than in the cell: only the layer
+/// that does the wrapping knows where the lines fall. A cell reaches it
+/// through [`cell_lines`], and the standing task list through it directly -- a
+/// block that is pinned is not a cell, but a task whose wrapped rows came back
+/// to column zero would still read as a task of its own.
+///
+/// The wrapping itself (`wrapped_lines`) and the word-break rule (`break_line`)
+/// live in [`crate::ui::cell::wrap`]; what is here is the gutter prefix.
 fn wrapped_under(spans: &[Span], width: usize, gutter: Gutter) -> Vec<Line<'static>> {
     wrapped_lines(spans, width.saturating_sub(gutter.width()))
         .into_iter()
@@ -315,57 +201,6 @@ fn wrapped_under(spans: &[Span], width: usize, gutter: Gutter) -> Vec<Line<'stat
             Line::from(spans)
         })
         .collect()
-}
-
-/// Where a line ends inside `piece`: what stays, what the next line starts with,
-/// and whether the line is finished.
-///
-/// `room` is the columns left in the line being built, `width` the columns a line
-/// has. A break is taken at a space when there is one to take -- after the last
-/// word that fits, or before the word that does not -- so that a wrapped line reads
-/// as a line instead of as two halves of a word. The space a break is taken at is
-/// the break and not text: it is dropped, and the next line starts with the word
-/// after it.
-///
-/// Two cases have no space to break at, and both are cut at the column, which is
-/// the only place a word is ever cut:
-///
-/// - the word is wider than a whole line, so moving it down would waste what is
-///   left of this one without saving the cut -- filling the line first costs a row
-///   fewer, and not one column is lost;
-/// - there is no space in what fits, because it is all one word already.
-///
-/// The flag says whether the line is finished: a break at a space finishes it at
-/// once, while text that fits leaves it open for whatever comes next.
-fn break_line(piece: &str, room: usize, width: usize) -> (&str, &str, bool) {
-    let fits = text::truncate(piece, room);
-    if fits.len() == piece.len() {
-        return (fits, "", false);
-    }
-    let after = &piece[fits.len()..];
-    // A space being the first thing that did not fit means the cut is already at a
-    // word boundary: the line ends after the word that fit. The whitespace the break
-    // is taken at is the break and not text, so none of it is carried to the line.
-    let next = after.trim_start_matches(char::is_whitespace);
-    if next.len() < after.len() {
-        return (fits.trim_end_matches(char::is_whitespace), next, true);
-    }
-    // Otherwise the cut landed inside a word, and how wide that word is decides
-    // whether moving it down is worth a row. The word begins on this line and ends
-    // on the next one: it is what is left of it here, plus what did not fit, up to
-    // the space after it.
-    let start = fits.rfind(char::is_whitespace).map_or(0, |at| at + 1);
-    let tail = &after[..after.find(char::is_whitespace).unwrap_or(after.len())];
-    let whole = text::width(&fits[start..]) + text::width(tail);
-    let cut = fits[..start].trim_end_matches(char::is_whitespace);
-    if whole > width || cut.is_empty() {
-        // Cut where it falls -- and whitespace it fell on is a break like any other,
-        // so none of it is left dangling at the end of the line either.
-        return (fits.trim_end_matches(char::is_whitespace), after, false);
-    }
-    // The word moves down whole: the next line starts at the word itself, which is
-    // this piece from just past the space the break is taken at.
-    (cut, &piece[start..], true)
 }
 
 // ============================================================ standing tasks =
@@ -391,16 +226,14 @@ pub(crate) fn todo_title(todos: &[Todo]) -> Line<'static> {
 /// the tasks. A list that does not fit in the block folds to a count, the way
 /// the window over the transcript folds when it is scrolled.
 ///
-/// The tasks drawn are the window [`layout::todo_window`] picks, so the task in
+/// The tasks drawn are the window [`cell_layout::todo_window`] picks, so the task in
 /// hand is one of them: a block pinned to the head would hide exactly the row
 /// being worked on.
 pub(crate) fn standing_todo_lines(todos: &[Todo], width: usize) -> Vec<Line<'static>> {
     let width = measure(width);
-    let room = layout::TODO_ROWS.saturating_sub(layout::TODO_HEADS);
-    let active = todos
-        .iter()
-        .position(|todo| todo.status == todo::Status::InProgress);
-    let window = layout::todo_window(todos.len(), active, room);
+    let room = cell_layout::TODO_ROWS.saturating_sub(cell_layout::TODO_HEADS);
+    let active = cell_layout::active_task(todos);
+    let window = cell_layout::todo_window(todos.len(), active, room);
     // The blank row first, so that the block cannot be read as the tail of the
     // transcript above it, then the title.
     let mut lines = vec![Line::default(), todo_title(todos)];
@@ -425,7 +258,7 @@ pub(crate) fn standing_todo_lines(todos: &[Todo], width: usize) -> Vec<Line<'sta
 
 // ================================================================ queue ======
 
-/// The queued lines, laid out, capped at [`layout::QUEUE_ROWS`].
+/// The queued lines, laid out, capped at [`cell_layout::QUEUE_ROWS`].
 ///
 /// The cap is a budget of the screen, not the queue: a queue longer than that
 /// -- more lines, or longer ones -- costs the transcript those rows and no
@@ -444,10 +277,10 @@ pub(crate) fn queued_lines(queued: &[String], width: usize) -> Vec<Line<'static>
             width,
         ));
     }
-    if lines.len() <= layout::QUEUE_ROWS {
+    if lines.len() <= cell_layout::QUEUE_ROWS {
         return lines;
     }
-    let hidden = lines.len() - (layout::QUEUE_ROWS - 1);
+    let hidden = lines.len() - (cell_layout::QUEUE_ROWS - 1);
     let mut window = vec![more_line("  ", hidden)];
     window.extend(lines.split_off(hidden));
     window

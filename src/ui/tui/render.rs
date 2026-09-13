@@ -61,20 +61,20 @@ pub(super) const SPEED_AFTER_SECS: u64 = 3;
 /// `width` invalidates every entry, since wrapping depends on width.
 pub(super) fn ensure_laid(state: &mut State, width: usize) {
     // A different width is a different wrapping of every line there is.
-    if state.laid_width != Some(width) {
-        state.laid.clear();
-        state.laid_width = Some(width);
+    if state.view.laid_width != Some(width) {
+        state.view.laid.clear();
+        state.view.laid_width = Some(width);
     }
     // Never more cells than the transcript has. Only a test can take one away,
     // and lines of a cell that is gone are worse than laying one out twice.
-    state.laid.truncate(state.transcript.len());
-    let from = state.laid.len();
-    for cell in &state.transcript[from..] {
+    state.view.laid.truncate(state.view.transcript.len());
+    let from = state.view.laid.len();
+    for cell in &state.view.transcript[from..] {
         #[cfg(test)]
         {
-            state.laid_cells += 1;
+            state.view.laid_cells += 1;
         }
-        state.laid.push(cell_lines(cell, width));
+        state.view.laid.push(cell_lines(cell, width));
     }
 }
 
@@ -82,7 +82,7 @@ pub(super) fn ensure_laid(state: &mut State, width: usize) {
 /// in. A count rather than a copy of the lines, so the part of a long session
 /// that is off the top costs a draw nothing.
 pub(super) fn laid_rows(state: &State) -> usize {
-    state.laid.iter().map(Vec::len).sum()
+    state.view.laid.iter().map(Vec::len).sum()
 }
 
 /// The rows `[first, last)`, at the width the cells were laid at.
@@ -100,7 +100,13 @@ pub(super) fn window_lines(
 ) -> Vec<Line<'static>> {
     let mut out = Vec::with_capacity(last.saturating_sub(first));
     let mut at = 0;
-    for segment in state.laid.iter().map(Vec::as_slice).chain([live, question]) {
+    for segment in state
+        .view
+        .laid
+        .iter()
+        .map(Vec::as_slice)
+        .chain([live, question])
+    {
         if at >= last {
             break;
         }
@@ -125,7 +131,7 @@ pub(super) fn window_lines(
 /// jump two columns left the moment the block closed, which is the one reading
 /// position a reader is sitting on when the model stops typing.
 pub(super) fn live_lines(state: &State, width: usize) -> Vec<Line<'static>> {
-    match state.stream.current() {
+    match state.view.stream.current() {
         Some((style, text)) => cell_lines(&style.stream_cell(text.to_owned()), width),
         None => Vec::new(),
     }
@@ -138,7 +144,7 @@ pub(super) fn live_lines(state: &State, width: usize) -> Vec<Line<'static>> {
 /// cell like any other, so it carries the marker its kind carries, and the
 /// answer typed into the box below it starts in the column its own text does.
 pub(super) fn question_lines(state: &State, width: usize) -> Vec<Line<'static>> {
-    match &state.question {
+    match &state.view.question {
         Some(question) => cell_lines(question, width),
         None => Vec::new(),
     }
@@ -153,7 +159,7 @@ pub(super) fn question_lines(state: &State, width: usize) -> Vec<Line<'static>> 
 /// The drawing itself lives in [`crate::ui::paint::standing_todo_lines`]; this
 /// layer only finds the list.
 pub(super) fn todo_lines(state: &State, width: usize) -> Vec<Line<'static>> {
-    let Some(todos) = cell::standing_todos(&state.transcript) else {
+    let Some(todos) = cell::standing_todos(&state.view.transcript) else {
         return Vec::new();
     };
     standing_todo_lines(todos, width)
@@ -162,7 +168,7 @@ pub(super) fn todo_lines(state: &State, width: usize) -> Vec<Line<'static>> {
 /// The queued lines as the screen draws them. The drawing itself lives in
 /// [`crate::ui::paint::queued_lines`]; this layer only hands the queue over.
 pub(super) fn queue_lines(state: &State, width: usize) -> Vec<Line<'static>> {
-    let queued: Vec<String> = state.queued.iter().cloned().collect();
+    let queued: Vec<String> = state.turn.queued.iter().cloned().collect();
     crate::ui::paint::queued_lines(&queued, width)
 }
 
@@ -190,7 +196,7 @@ pub(super) fn lines(state: &mut State, width: usize) -> Vec<Line<'static>> {
 ///
 /// One column is left free so the write cannot trigger autowrap.
 pub(super) fn status_line(state: &State, width: usize) -> Line<'static> {
-    Line::from(state.status.line(width.saturating_sub(1)))
+    Line::from(state.view.status.line(width.saturating_sub(1)))
 }
 
 /// The working indicator the input box's top border carries while a turn
@@ -208,19 +214,19 @@ pub(super) fn activity_title(state: &State, width: usize) -> Option<String> {
 
 /// The indicator's words at `now`, without reading the clock.
 pub(super) fn activity_title_at(state: &State, now: Instant, width: usize) -> Option<String> {
-    if state.reply.is_some() {
+    if state.overlay.reply.is_some() {
         return None;
     }
-    let started = state.turn_started?;
+    let started = state.turn.started?;
     let elapsed = now - started;
     let frame = SPINNER[(elapsed.as_millis() / SPINNER_MS) as usize % SPINNER.len()];
     let count = format!("{frame} {}s", elapsed.as_secs());
     let mut title = count.clone();
-    if elapsed.as_secs() >= SPEED_AFTER_SECS && state.streamed_chars > 0 {
+    if elapsed.as_secs() >= SPEED_AFTER_SECS && state.turn.streamed_chars > 0 {
         // The measured ratio turns characters into tokens; the tilde keeps
         // the estimate honest about being one.
         let per_second =
-            state.streamed_chars as f64 / state.chars_per_token / elapsed.as_secs_f64();
+            state.turn.streamed_chars as f64 / state.turn.chars_per_token / elapsed.as_secs_f64();
         let per_second = per_second.round().max(1.0) as u64;
         title = format!("{count} · ~{per_second} token/s");
     }

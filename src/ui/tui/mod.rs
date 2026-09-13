@@ -31,14 +31,20 @@ use crate::types::Message;
 use crate::ui::cell::{self, Cell};
 
 mod channels;
+mod edit;
 mod input;
 pub(crate) mod layout;
 mod notice;
+mod overlay;
 mod panel;
 mod picker;
+mod queue;
 mod render;
 mod screen;
+mod scroll;
 mod state;
+mod turn;
+mod view;
 mod working;
 
 use channels::{LoopHalf, TurnHalf};
@@ -91,18 +97,30 @@ pub async fn run(
         Err(_) => return Ok(false),
     };
     let history_path = crate::config::history_file()?;
-    screen.state.history = history::load(&history_path);
-    screen.state.status.set_model(&agent.model_label());
-    screen.state.status.set_effort(agent.effort_label());
+    screen.state.edit.history = history::load(&history_path);
+    screen.state.view.status.set_model(&agent.model_label());
+    screen.state.view.status.set_effort(agent.effort_label());
     screen.state.show(Cell::Notice(banner.to_owned()));
-    screen.state.transcript.extend(cell::from_messages(history));
+    screen
+        .state
+        .view
+        .transcript
+        .extend(cell::from_messages(history));
 
-    let (tx, notices) = mpsc::unbounded_channel();
+    let (machine_tx, machine_rx) = mpsc::unbounded_channel();
+    let (app_tx, app_rx) = mpsc::unbounded_channel();
+    let (secret_tx, secret_rx) = mpsc::unbounded_channel();
     let (gate_tx, gates) = mpsc::unbounded_channel();
     let (question_tx, questions) = mpsc::unbounded_channel();
-    let mut handle = Notifier { tx };
+    let mut handle = Notifier {
+        machine: machine_tx,
+        app: app_tx,
+        secret: secret_tx,
+    };
     let mut loop_half = LoopHalf {
-        notices,
+        machine: machine_rx,
+        app: app_rx,
+        secret: secret_rx,
         gates,
         questions,
     };
@@ -167,7 +185,7 @@ pub async fn run(
     screen.leave();
     // Written on the way out rather than per line: the file is small, and a
     // rewrite per keystroke would be work for nothing.
-    if let Err(e) = history::save(&history_path, &screen.state.history) {
+    if let Err(e) = history::save(&history_path, &screen.state.edit.history) {
         screen.state.show(Cell::Failure(format!("{e:#}")));
     }
     result?;
@@ -202,8 +220,14 @@ fn idle_line(
 /// and after the turn ends, because notifications sent after the turn's last
 /// drain are still queued when it resolves.
 fn drain_channels(state: &mut State, channels: &mut LoopHalf) {
-    for notice in drain(&mut channels.notices) {
+    for notice in drain(&mut channels.machine) {
         state.apply(notice);
+    }
+    for notice in drain(&mut channels.app) {
+        state.apply_app(notice);
+    }
+    for asked in drain(&mut channels.secret) {
+        state.open_secret(asked.prompt, asked.reply);
     }
     for reply in drain(&mut channels.gates) {
         state.open_question(reply);

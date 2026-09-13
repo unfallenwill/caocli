@@ -16,7 +16,7 @@ use crate::types::Usage;
 use crate::ui::cell::Style;
 
 use super::super::layout::BOX_ROWS;
-use super::super::notice::Notice;
+use super::super::notice::MachineNotice;
 use super::super::render as render_mod;
 use super::super::render::SPINNER;
 use super::super::state::State;
@@ -97,21 +97,24 @@ fn the_working_indicator_is_not_dim_on_a_dim_rule() {
 #[test]
 fn calibration_learns_from_a_usage_notice() {
     let mut s = State {
-        turn_running: true,
-        turn_started: Some(Instant::now()),
+        turn: crate::ui::tui::turn::Turn {
+            running: true,
+            started: Some(Instant::now()),
+            ..crate::ui::tui::turn::Turn::default()
+        },
         ..State::default()
     };
     s.stream(Style::Reasoning, &"x".repeat(800));
-    s.apply(Notice::Usage(
+    s.apply(MachineNotice::Usage(
         Usage {
             completion_tokens: 200,
             ..Usage::default()
         },
         Duration::ZERO,
     ));
-    assert_eq!(s.chars_per_token, 4.0);
+    assert_eq!(s.turn.chars_per_token, 4.0);
     // the counter is spent on the measurement: the next ratio starts clean
-    assert_eq!(s.chars_since_usage, 0);
+    assert_eq!(s.turn.chars_since_usage, 0);
 }
 
 #[test]
@@ -121,25 +124,28 @@ fn a_tool_calls_arguments_join_the_calibration_window() {
     // next usage notice calibrates on — otherwise a call-heavy turn runs the
     // ratio towards zero tokens per character.
     let mut s = State {
-        turn_running: true,
-        turn_started: Some(Instant::now()),
+        turn: crate::ui::tui::turn::Turn {
+            running: true,
+            started: Some(Instant::now()),
+            ..crate::ui::tui::turn::Turn::default()
+        },
         ..State::default()
     };
-    s.apply(Notice::ToolStart {
+    s.apply(MachineNotice::ToolStart {
         name: "Bash".into(),
         args: r#"{"command":"echo hi"}"#.into(),
     });
     let args_chars = r#"{"command":"echo hi"}"#.chars().count();
-    assert_eq!(s.streamed_chars, args_chars);
-    assert_eq!(s.chars_since_usage, args_chars);
-    s.apply(Notice::Usage(
+    assert_eq!(s.turn.streamed_chars, args_chars);
+    assert_eq!(s.turn.chars_since_usage, args_chars);
+    s.apply(MachineNotice::Usage(
         Usage {
             completion_tokens: 10,
             ..Usage::default()
         },
         Duration::ZERO,
     ));
-    assert_eq!(s.chars_per_token, args_chars as f64 / 10.0);
+    assert_eq!(s.turn.chars_per_token, args_chars as f64 / 10.0);
 }
 
 #[test]
@@ -154,9 +160,9 @@ fn a_question_takes_the_border_title_back() {
 fn the_border_shows_the_working_turn_and_then_does_not() {
     let mut screen = screen_for_test(60, 20);
     screen.state.begin_turn(Instant::now());
-    screen.state.turn_started = Some(Instant::now() - Duration::from_secs(12));
-    screen.state.streamed_chars = 4000;
-    screen.state.chars_per_token = 4.0;
+    screen.state.turn.started = Some(Instant::now() - Duration::from_secs(12));
+    screen.state.turn.streamed_chars = 4000;
+    screen.state.turn.chars_per_token = 4.0;
     screen.draw().unwrap();
     // the box's top border: the status line's row, the box's three, and no
     // queue above it

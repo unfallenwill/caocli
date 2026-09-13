@@ -25,6 +25,7 @@ use super::press;
 use super::row;
 use super::screen_for_test;
 use super::type_in;
+use crate::ui::cell::layout::QUEUE_ROWS;
 
 /// A session as the picker sees it. Its path is never read: the front end is
 /// handed the list, it does not go looking for it.
@@ -41,9 +42,16 @@ fn session_info(id: &str, messages: usize, preview: &str) -> session::SessionInf
 #[test]
 fn a_slash_opens_the_picker_and_a_space_closes_it() {
     let mut screen = State::default();
-    assert!(screen.picker.is_none(), "nothing typed, nothing to offer");
+    assert!(
+        screen.overlay.picker.is_none(),
+        "nothing typed, nothing to offer"
+    );
     type_in(&mut screen, "/res");
-    let picker = screen.picker.as_ref().expect("a command is being named");
+    let picker = screen
+        .overlay
+        .picker
+        .as_ref()
+        .expect("a command is being named");
     assert_eq!(
         picker
             .choices
@@ -54,24 +62,24 @@ fn a_slash_opens_the_picker_and_a_space_closes_it() {
     );
     // A space means the rest is an argument, not part of the name.
     type_in(&mut screen, " 2026");
-    assert!(screen.picker.is_none());
+    assert!(screen.overlay.picker.is_none());
 }
 
 #[test]
 fn the_highlight_wraps_in_both_directions() {
     let mut screen = State::default();
     type_in(&mut screen, "/");
-    let count = screen.picker.as_ref().unwrap().choices.len();
+    let count = screen.overlay.picker.as_ref().unwrap().choices.len();
     assert!(count > 1, "the bare slash offers every command");
-    assert_eq!(screen.picker.as_ref().unwrap().selected, 0);
+    assert_eq!(screen.overlay.picker.as_ref().unwrap().selected, 0);
     press(&mut screen, KeyCode::Up);
     assert_eq!(
-        screen.picker.as_ref().unwrap().selected,
+        screen.overlay.picker.as_ref().unwrap().selected,
         count - 1,
         "up from the first reaches the last"
     );
     press(&mut screen, KeyCode::Down);
-    assert_eq!(screen.picker.as_ref().unwrap().selected, 0);
+    assert_eq!(screen.overlay.picker.as_ref().unwrap().selected, 0);
 }
 
 #[test]
@@ -83,9 +91,9 @@ fn tab_puts_the_highlighted_command_in_the_box_without_running_it() {
         Submitted::Nothing
     ));
     assert_eq!(screen.text(), "/resume");
-    assert!(screen.picker.is_none(), "it has been chosen");
+    assert!(screen.overlay.picker.is_none(), "it has been chosen");
     // And it is not submitted: an argument may still be wanted.
-    assert!(!screen.history.iter().any(|h| h == "/resume"));
+    assert!(!screen.edit.history.iter().any(|h| h == "/resume"));
 }
 
 #[test]
@@ -93,7 +101,7 @@ fn escape_dismisses_the_command_picker_and_the_line_it_was_filtering() {
     let mut screen = State::default();
     type_in(&mut screen, "/s");
     press(&mut screen, KeyCode::Esc);
-    assert!(screen.picker.is_none());
+    assert!(screen.overlay.picker.is_none());
     assert_eq!(
         screen.text(),
         "",
@@ -101,7 +109,7 @@ fn escape_dismisses_the_command_picker_and_the_line_it_was_filtering() {
          would glue itself to the next word"
     );
     assert_eq!(
-        screen.textarea.placeholder_text(),
+        screen.edit.textarea.placeholder_text(),
         IDLE_PLACEHOLDER,
         "the box is back to inviting the next message"
     );
@@ -114,7 +122,7 @@ fn sessions_are_offered_newest_first_with_what_is_in_them() {
         session_info("20260910-120000", 12, "what does this do?"),
         session_info("20260909-090000", 3, "hello"),
     ]));
-    let picker = screen.picker.as_ref().unwrap();
+    let picker = screen.overlay.picker.as_ref().unwrap();
     assert_eq!(picker.kind, Choosing::Session);
     let shown: Vec<_> = picker
         .choices
@@ -146,7 +154,7 @@ fn choosing_a_session_submits_the_line_that_switches_to_it() {
         Submitted::Line
     ));
     assert_eq!(screen.text(), "/resume older");
-    assert!(screen.picker.is_none(), "it has been chosen");
+    assert!(screen.overlay.picker.is_none(), "it has been chosen");
 }
 
 #[test]
@@ -165,11 +173,18 @@ fn typing_does_not_turn_a_session_list_into_a_command_search() {
     let mut screen = State::default();
     screen.open_sessions(&[session_info("one", 1, "hi")]);
     type_in(&mut screen, "/he");
-    let picker = screen.picker.as_ref().expect("still the session list");
+    let picker = screen
+        .overlay
+        .picker
+        .as_ref()
+        .expect("still the session list");
     assert_eq!(picker.kind, Choosing::Session);
     assert_eq!(picker.choices.len(), 1);
     press(&mut screen, KeyCode::Esc);
-    assert!(screen.picker.is_none(), "escape is how it is dismissed");
+    assert!(
+        screen.overlay.picker.is_none(),
+        "escape is how it is dismissed"
+    );
     assert_eq!(
         screen.text(),
         "/he",
@@ -184,7 +199,7 @@ fn nothing_to_offer_leaves_the_line_alone() {
     // where both front ends say what an id is for.
     let mut screen = State::default();
     assert!(!screen.open_sessions(&[]));
-    assert!(screen.picker.is_none());
+    assert!(screen.overlay.picker.is_none());
 }
 
 #[test]
@@ -293,7 +308,7 @@ fn the_picker_keeps_its_highlight_on_the_screen() {
 fn the_queue_counts_the_rows_it_is_not_showing() {
     let mut screen = screen_for_test(60, 20);
     for line in ["/new", "/sessions", "/model"] {
-        screen.state.queued.push_back(line.into());
+        screen.state.turn.queued.push_back(line.into());
     }
     // A queue with room to spare: every line, and nothing said about rows that
     // are not there.
@@ -306,9 +321,9 @@ fn the_queue_counts_the_rows_it_is_not_showing() {
 
     // One more line than the cap, and the row that does not fit is counted on
     // one of the rows the cap allows: the queue never costs more than three.
-    screen.state.queued.push_back("/help".into());
+    screen.state.turn.queued.push_back("/help".into());
     let drawn = super::rendered(&super::super::render::queue_lines(&screen.state, 60));
-    assert_eq!(drawn.len(), super::super::layout::QUEUE_ROWS, "{drawn:?}");
+    assert_eq!(drawn.len(), QUEUE_ROWS, "{drawn:?}");
     assert!(drawn[0].0.contains("⋮ 2 more"), "{drawn:?}");
     assert!(drawn[1].0.contains("/model"), "{drawn:?}");
     assert!(drawn[2].0.contains("/help"), "{drawn:?}");
@@ -363,7 +378,7 @@ fn a_provider_or_model_row_is_submitted_as_the_line_it_stands_for() {
     state.down();
     assert!(state.choose());
     assert_eq!(
-        state.textarea.lines(),
+        state.edit.textarea.lines(),
         ["/login zai-coding-cn"],
         "the row is read by name and submitted by id"
     );
@@ -373,7 +388,10 @@ fn a_provider_or_model_row_is_submitted_as_the_line_it_stands_for() {
         named_rows(vec![("zai-coding-cn/glm-5.3".into(), "current".into())])
     ));
     assert!(state.choose());
-    assert_eq!(state.textarea.lines(), ["/model zai-coding-cn/glm-5.3"]);
+    assert_eq!(
+        state.edit.textarea.lines(),
+        ["/model zai-coding-cn/glm-5.3"]
+    );
 
     assert!(state.open_choices(
         Choosing::Effort,
@@ -381,7 +399,7 @@ fn a_provider_or_model_row_is_submitted_as_the_line_it_stands_for() {
     ));
     assert!(state.choose());
     assert_eq!(
-        state.textarea.lines(),
+        state.edit.textarea.lines(),
         ["/effort max"],
         "a tier is named by itself"
     );
@@ -397,5 +415,8 @@ fn an_offered_list_of_providers_survives_typing_like_a_session_list_does() {
         named_rows(vec![("Z.AI Coding CN".into(), "no key".into())]),
     );
     state.refresh_picker();
-    assert_eq!(state.picker.as_ref().unwrap().kind, Choosing::Provider);
+    assert_eq!(
+        state.overlay.picker.as_ref().unwrap().kind,
+        Choosing::Provider
+    );
 }

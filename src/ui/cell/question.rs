@@ -84,7 +84,7 @@ mod tests {
         assert_eq!(
             cells,
             vec![
-                Cell::tool_call("AskUserQuestion", args),
+                Cell::from_tool_call("AskUserQuestion", args),
                 Cell::ToolResult("auth: JWT".into()),
             ]
         );
@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn the_question_tool_shows_its_questions_and_not_its_arguments() {
-        let cell = Cell::tool_call(
+        let cell = Cell::from_tool_call(
             "AskUserQuestion",
             &serde_json::json!({"questions": [{
                 "id": "auth",
@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn a_question_with_nothing_to_pick_from_says_so() {
-        let cell = Cell::tool_call(
+        let cell = Cell::from_tool_call(
             "AskUserQuestion",
             r#"{"questions":[{"id":"a","question":"Which?"}]}"#,
         );
@@ -146,7 +146,7 @@ mod tests {
     fn arguments_the_question_tool_cannot_read_are_still_a_call() {
         // The interpreter answers this one with the parse failure; the transcript
         // shows the line that could not be read.
-        let cell = Cell::tool_call("AskUserQuestion", r#"{"questions":"nonsense"}"#);
+        let cell = Cell::from_tool_call("AskUserQuestion", r#"{"questions":"nonsense"}"#);
         assert!(matches!(cell, Cell::ToolCall { .. }), "was {cell:?}");
     }
 }

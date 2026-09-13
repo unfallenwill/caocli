@@ -10,10 +10,11 @@
 //! `wrapped_lines` helper carries spans (with their styles) through to a
 //! list of `Line`s, which is what the TUI renders.
 
+use crate::ui::cell::wrap::wrapped_lines;
 use crate::ui::cell::{Cell, Span, Style};
+use crate::ui::paint::MEASURE;
 use crate::ui::text;
 
-use super::super::super::paint::{MEASURE, wrapped_lines};
 use super::super::layout::BOX_ROWS;
 use super::all_rows;
 use super::rendered;
@@ -92,6 +93,7 @@ fn a_wide_terminal_keeps_a_line_of_text_to_the_measure() {
     let mut screen = screen_for_test(200, 30);
     screen
         .state
+        .view
         .transcript
         .push(Cell::Content("word ".repeat(60).trim_end().to_owned()));
     screen.draw().unwrap();

@@ -134,15 +134,21 @@ impl State {
     pub(super) fn refresh_picker(&mut self) {
         // An offered list is not a completion: it was asked for in full, and it
         // stays until it is answered or dismissed, whatever is typed next.
-        if self.picker.as_ref().is_some_and(|p| p.kind.takes_a_row()) {
+        if self
+            .overlay
+            .picker
+            .as_ref()
+            .is_some_and(|p| p.kind.takes_a_row())
+        {
             return;
         }
         let matches = repl::completions(&self.text());
         if matches.is_empty() {
-            self.picker = None;
+            self.overlay.picker = None;
             return;
         }
         let previous = self
+            .overlay
             .picker
             .as_ref()
             .and_then(|p| p.choices.get(p.selected))
@@ -150,7 +156,7 @@ impl State {
         let selected = previous
             .and_then(|name| matches.iter().position(|c| c.name == name))
             .unwrap_or(0);
-        self.picker = Some(Picker {
+        self.overlay.picker = Some(Picker {
             kind: Choosing::Command,
             choices: matches
                 .into_iter()
@@ -188,10 +194,10 @@ impl State {
     pub(super) fn open_choices(&mut self, kind: Choosing, rows: Vec<Choice>) -> bool {
         self.revision += 1;
         if rows.is_empty() {
-            self.picker = None;
+            self.overlay.picker = None;
             return false;
         }
-        self.picker = Some(Picker {
+        self.overlay.picker = Some(Picker {
             kind,
             choices: rows,
             selected: 0,
@@ -203,7 +209,7 @@ impl State {
     /// been given, so choosing has one implementation rather than one per front
     /// end.
     pub(super) fn choose(&mut self) -> bool {
-        let Some(picker) = &self.picker else {
+        let Some(picker) = &self.overlay.picker else {
             return false;
         };
         if !picker.kind.takes_a_row() {
@@ -217,7 +223,7 @@ impl State {
             return false;
         };
         let line = format!("{} {argument}", picker.kind.command());
-        self.picker = None;
+        self.overlay.picker = None;
         self.set_text(&line);
         true
     }
@@ -226,7 +232,7 @@ impl State {
     /// argument may still be wanted. Only a command reaches here: the other lists
     /// are menus, and `Tab` submits a menu's row the way `Enter` does.
     pub(super) fn complete(&mut self) {
-        let Some(picker) = self.picker.take() else {
+        let Some(picker) = self.overlay.picker.take() else {
             return;
         };
         if let Some(choice) = picker.choices.get(picker.selected) {
@@ -244,7 +250,7 @@ impl State {
     /// less -- past its own end, and what `Enter` would choose was then not on the
     /// screen at all.
     pub(super) fn picker_lines(&self) -> Vec<Line<'static>> {
-        let Some(picker) = &self.picker else {
+        let Some(picker) = &self.overlay.picker else {
             return Vec::new();
         };
         // As wide as the widest name in this list, so its rows line up without

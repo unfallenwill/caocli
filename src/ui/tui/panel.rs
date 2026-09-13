@@ -17,6 +17,7 @@
 //! to ratatui. What is here is the state machine -- which question is on
 //! screen, where the cursor is, what has been chosen.
 
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::text::Line;
 use tokio::sync::oneshot;
 
@@ -80,7 +81,7 @@ impl State {
         // it is for the gate: a sentence that happened to be in the box is not an
         // answer, and it comes back when the questions are over.
         self.take_for_answer(false);
-        self.panel = Some(Panel {
+        self.overlay.panel = Some(Panel {
             questions,
             at: 0,
             cursor: 0,
@@ -92,12 +93,13 @@ impl State {
 
     /// A panel is up: the box is not the queue's while it is.
     pub(super) fn panel_open(&self) -> bool {
-        self.panel.is_some()
+        self.overlay.panel.is_some()
     }
 
     /// Whether the question on screen allows more than one option to be chosen.
     pub(super) fn panel_takes_many(&self) -> bool {
-        self.panel
+        self.overlay
+            .panel
             .as_ref()
             .is_some_and(|panel| panel.question().multi_select)
     }
@@ -105,7 +107,9 @@ impl State {
     /// Move the cursor by `step` options, wrapping around the ends the way the
     /// picker's list does: an option is always one key away.
     pub(super) fn panel_move(&mut self, step: isize) {
-        let Some(panel) = &mut self.panel else { return };
+        let Some(panel) = &mut self.overlay.panel else {
+            return;
+        };
         let len = panel.question().options.len();
         if len == 0 {
             return;
@@ -116,7 +120,9 @@ impl State {
 
     /// Jump the cursor to the `n`th option (1-based), when there is one.
     pub(super) fn panel_jump(&mut self, n: usize) {
-        let Some(panel) = &mut self.panel else { return };
+        let Some(panel) = &mut self.overlay.panel else {
+            return;
+        };
         if n >= 1 && n <= panel.question().options.len() && panel.cursor != n - 1 {
             self.revision += 1;
             panel.cursor = n - 1;
@@ -129,7 +135,9 @@ impl State {
     /// they were toggled in: it is the question's answer, and it should read the
     /// same as the options it was chosen from.
     pub(super) fn panel_toggle(&mut self) {
-        let Some(panel) = &mut self.panel else { return };
+        let Some(panel) = &mut self.overlay.panel else {
+            return;
+        };
         let question = panel.question();
         if !question.multi_select || question.options.is_empty() {
             return;
@@ -158,7 +166,9 @@ impl State {
     /// no options and nothing typed is left blank, which the model is told.
     pub(super) fn panel_confirm(&mut self, typed: &str) {
         let typed = typed.trim().to_owned();
-        let Some(panel) = &mut self.panel else { return };
+        let Some(panel) = &mut self.overlay.panel else {
+            return;
+        };
         let question = panel.question();
         let labels = if !typed.is_empty() {
             vec![typed]
@@ -188,7 +198,7 @@ impl State {
     /// Esc: every question is dismissed, and the model is told the user did not
     /// answer rather than which option they did not pick.
     pub(super) fn panel_dismiss(&mut self) {
-        let Some(panel) = self.panel.take() else {
+        let Some(panel) = self.overlay.panel.take() else {
             return;
         };
         self.revision += 1;
@@ -198,7 +208,7 @@ impl State {
 
     /// The last question has been answered: hand the answers back.
     fn finish_panel(&mut self) {
-        let Some(panel) = self.panel.take() else {
+        let Some(panel) = self.overlay.panel.take() else {
             return;
         };
         self.close_answer_box();
@@ -210,7 +220,7 @@ impl State {
     /// on it hears nothing -- which is the dismissal the machine already knows how
     /// to write down.
     pub(super) fn close_panel(&mut self) {
-        if self.panel.take().is_some() {
+        if self.overlay.panel.take().is_some() {
             self.revision += 1;
             self.close_answer_box();
         }
@@ -227,7 +237,7 @@ impl State {
     /// keys. The drawing itself lives in [`crate::ui::paint::panel_lines`];
     /// this layer only hands the panel state over.
     pub(super) fn panel_lines(&self, width: usize) -> Vec<Line<'static>> {
-        let Some(panel) = &self.panel else {
+        let Some(panel) = &self.overlay.panel else {
             return Vec::new();
         };
         crate::ui::paint::panel_lines(
@@ -237,5 +247,52 @@ impl State {
             &panel.chosen,
             width,
         )
+    }
+
+    /// Handle a key while the question panel is up.
+    ///
+    /// The panel takes the keys that choose: the arrows and the digits move the
+    /// cursor, space toggles an option for a question that takes several, Enter
+    /// confirms and Esc dismisses the whole call. Everything else is typed into
+    /// the box, which is where an answer in the user's own words goes -- so a
+    /// digit or a space is only the panel's while the box is still empty. Once the
+    /// user is typing, the keyboard is theirs, and a space is a space.
+    pub(super) fn panel_key(&mut self, event: Event) {
+        let Event::Key(key) = event else {
+            // A paste is an answer typed the fast way.
+            self.key(event);
+            return;
+        };
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+        if key.code == KeyCode::Up {
+            self.panel_move(-1);
+            return;
+        }
+        if key.code == KeyCode::Down {
+            self.panel_move(1);
+            return;
+        }
+        if let KeyCode::Char(digit @ '1'..='9') = key.code
+            && self.text().is_empty()
+        {
+            self.panel_jump(digit.to_digit(10).unwrap_or(1) as usize);
+            return;
+        }
+        if key.code == KeyCode::Char(' ') && self.text().is_empty() && self.panel_takes_many() {
+            self.panel_toggle();
+            return;
+        }
+        if crate::ui::tui::input::matches(key, KeyCode::Enter, KeyModifiers::NONE) {
+            let typed = self.text();
+            self.panel_confirm(&typed);
+            return;
+        }
+        if key.code == KeyCode::Esc {
+            self.panel_dismiss();
+            return;
+        }
+        self.key(Event::Key(key));
     }
 }

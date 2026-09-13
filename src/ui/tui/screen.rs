@@ -15,8 +15,8 @@ use ratatui::widgets::{Clear, Paragraph};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use ratatui_textarea::ScreenCursor;
 
-use crate::ui::cell::{self, Style};
-use crate::ui::paint::{self, style_of};
+use crate::ui::cell::{self, Style, style_of};
+use crate::ui::paint;
 use crate::ui::tui::layout::{box_field, box_marker, screen_rows, todo_rows};
 use crate::ui::tui::picker::PICKER_ROWS;
 use crate::ui::tui::render;
@@ -311,7 +311,7 @@ fn compose_transcript(state: &mut State, layout: &Layout) -> Text<'static> {
     // the reader is somewhere other than the end: at the end the newest line
     // is the one being watched, and the top being off the screen is the
     // ordinary state of a long session rather than something to report.
-    let cut = state.scroll.back > 0;
+    let cut = state.view.scroll.back > 0;
     let above = cut && first > 0;
     let below = cut && last < total;
     // The two counts take their rows from the window they stand for, so that
@@ -404,8 +404,8 @@ fn draw_box(frame: &mut Frame, state: &State, area: Rect) {
         box_marker(area),
     );
     let field = box_field(area);
-    frame.render_widget(&state.textarea, field);
-    let cursor = state.textarea.screen_cursor();
+    frame.render_widget(&state.edit.textarea, field);
+    let cursor = state.edit.textarea.screen_cursor();
     place_cursor(frame, field, cursor);
 }
 

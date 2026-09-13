@@ -15,7 +15,6 @@ use tokio::sync::{oneshot, watch};
 use crate::ui::Verdict;
 
 use super::super::input::{SECRET_MASK, SECRET_PLACEHOLDER};
-use super::super::notice::Notice;
 use super::super::state::State;
 use super::all_rows;
 use super::row;
@@ -32,10 +31,10 @@ fn the_gate_is_answered_by_typing_at_it_while_the_turn_runs() {
     let (reply, answer) = oneshot::channel();
     state.open_question(reply);
     state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Char('y'))), &cancel);
-    assert_eq!(state.textarea.lines(), ["y"], "it went into the box");
+    assert_eq!(state.edit.textarea.lines(), ["y"], "it went into the box");
     state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Enter)), &cancel);
     assert_eq!(answer.blocking_recv(), Ok(Verdict::Allowed));
-    assert!(state.reply.is_none(), "the gate is closed again");
+    assert!(state.overlay.reply.is_none(), "the gate is closed again");
 }
 
 #[test]
@@ -54,7 +53,7 @@ fn anything_that_is_not_yes_denies() {
         let mut screen = State::default();
         let (reply, answer) = oneshot::channel();
         screen.open_question(reply);
-        screen.textarea.insert_str(typed);
+        screen.edit.textarea.insert_str(typed);
         screen.close_question();
         assert_eq!(
             answer.blocking_recv(),
@@ -69,12 +68,15 @@ fn a_question_is_answered_by_what_the_user_submits() {
     let mut screen = State::default();
     let (reply, answer) = oneshot::channel();
     screen.open_question(reply);
-    assert!(screen.reply.is_some(), "the answer has somewhere to go");
-    screen.textarea.insert_str("yes");
+    assert!(
+        screen.overlay.reply.is_some(),
+        "the answer has somewhere to go"
+    );
+    screen.edit.textarea.insert_str("yes");
     screen.close_question();
     assert_eq!(answer.blocking_recv(), Ok(Verdict::Allowed));
-    assert!(screen.question.is_none());
-    assert!(screen.textarea.is_empty());
+    assert!(screen.view.question.is_none());
+    assert!(screen.edit.textarea.is_empty());
 }
 
 #[test]
@@ -88,7 +90,7 @@ fn a_line_being_typed_is_held_aside_while_the_gate_is_open() {
     let (reply, answer) = oneshot::channel();
     state.open_question(reply);
     assert!(
-        state.textarea.is_empty(),
+        state.edit.textarea.is_empty(),
         "the answer starts from an empty box"
     );
 
@@ -100,11 +102,11 @@ fn a_line_being_typed_is_held_aside_while_the_gate_is_open() {
         "the gate got its answer"
     );
     assert_eq!(
-        state.textarea.lines(),
+        state.edit.textarea.lines(),
         ["and then refactor"],
         "and the line came back"
     );
-    assert!(state.queued.is_empty(), "it was never submitted");
+    assert!(state.turn.queued.is_empty(), "it was never submitted");
 }
 
 #[test]
@@ -115,25 +117,26 @@ fn a_secret_is_typed_into_the_box_and_answered_with_what_was_typed() {
     let mut state = State::default();
     let (cancel, _cancelled) = watch::channel(false);
     let (reply, answer) = oneshot::channel();
-    state.apply(Notice::Secret {
-        prompt: "glm API key".into(),
-        reply,
-    });
+    state.open_secret("glm API key".into(), reply);
     assert_eq!(
-        state.textarea.mask_char(),
+        state.edit.textarea.mask_char(),
         Some(SECRET_MASK),
         "the text is not on the screen while it is typed"
     );
     type_while_working(&mut state, "sk-test", &cancel);
-    assert_eq!(state.textarea.lines(), ["sk-test"], "the box holds it");
+    assert_eq!(state.edit.textarea.lines(), ["sk-test"], "the box holds it");
     state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Enter)), &cancel);
     assert_eq!(answer.blocking_recv(), Ok(Some("sk-test".to_owned())));
     assert!(
-        state.queued.is_empty(),
+        state.turn.queued.is_empty(),
         "an answer is not a line to run next"
     );
-    assert!(state.reply.is_none(), "the question is closed");
-    assert_eq!(state.textarea.mask_char(), None, "the box is a box again");
+    assert!(state.overlay.reply.is_none(), "the question is closed");
+    assert_eq!(
+        state.edit.textarea.mask_char(),
+        None,
+        "the box is a box again"
+    );
 }
 
 #[test]
@@ -141,10 +144,7 @@ fn an_empty_answer_cancels_a_secret() {
     let mut state = State::default();
     let (cancel, _cancelled) = watch::channel(false);
     let (reply, answer) = oneshot::channel();
-    state.apply(Notice::Secret {
-        prompt: "glm API key".into(),
-        reply,
-    });
+    state.open_secret("glm API key".into(), reply);
     state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Enter)), &cancel);
     assert_eq!(answer.blocking_recv(), Ok(None));
 }
@@ -157,10 +157,7 @@ fn the_answer_to_a_secret_never_reaches_the_transcript_or_the_queue() {
     let (cancel, _cancelled) = watch::channel(false);
     let (reply, answer) = oneshot::channel();
     screen.state.begin_turn(std::time::Instant::now());
-    screen.state.apply(Notice::Secret {
-        prompt: "glm API key".into(),
-        reply,
-    });
+    screen.state.open_secret("glm API key".into(), reply);
     type_while_working(&mut screen.state, "sk-do-not-keep-me", &cancel);
     screen.draw().unwrap();
     let drawn = all_rows(&screen).join("\n");
@@ -178,20 +175,17 @@ fn the_answer_to_a_secret_never_reaches_the_transcript_or_the_queue() {
         Ok(Some("sk-do-not-keep-me".to_owned()))
     );
     assert!(
-        screen.state.transcript.is_empty(),
+        screen.state.view.transcript.is_empty(),
         "nothing was written down"
     );
-    assert!(screen.state.queued.is_empty());
+    assert!(screen.state.turn.queued.is_empty());
 }
 
 #[test]
 fn what_is_drawn_while_a_secret_is_asked_for_says_what_the_box_wants() {
     let mut screen = super::screen_for_test(60, 20);
     let (reply, _answer) = oneshot::channel();
-    screen.state.apply(Notice::Secret {
-        prompt: "glm API key".into(),
-        reply,
-    });
+    screen.state.open_secret("glm API key".into(), reply);
     screen.draw().unwrap();
     let last = screen.terminal.backend().buffer().area.height - 1;
     assert!(
@@ -208,19 +202,16 @@ fn a_line_being_typed_is_held_aside_while_a_secret_is_open() {
     state.begin_turn(std::time::Instant::now());
     type_while_working(&mut state, "and then refactor", &cancel);
     let (reply, _answer) = oneshot::channel();
-    state.apply(Notice::Secret {
-        prompt: "deepseek API key".into(),
-        reply,
-    });
+    state.open_secret("deepseek API key".into(), reply);
     assert!(
-        state.textarea.is_empty(),
+        state.edit.textarea.is_empty(),
         "the key starts from an empty box"
     );
     state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Enter)), &cancel);
     assert_eq!(
-        state.textarea.lines(),
+        state.edit.textarea.lines(),
         ["and then refactor"],
         "the draft came back"
     );
-    assert!(state.queued.is_empty());
+    assert!(state.turn.queued.is_empty());
 }

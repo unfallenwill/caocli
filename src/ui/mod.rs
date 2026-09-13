@@ -33,6 +33,7 @@ mod contract;
 #[cfg(test)]
 pub(crate) mod doubles;
 pub(crate) mod paint;
+mod plain_writer;
 mod renderer;
 mod status;
 mod status_bar;

@@ -71,7 +71,7 @@ pub(super) fn unset(drawn: &str) -> String {
 /// above it. `drawn_rows` is the region's height as the last draw saw it, which
 /// is the layout's answer rather than a copy of its arithmetic.
 pub(super) fn transcript_top(screen: &Screen<ratatui::backend::TestBackend>, lines: u16) -> u16 {
-    (screen.state.drawn_rows as u16).saturating_sub(lines)
+    (screen.state.view.drawn_rows as u16).saturating_sub(lines)
 }
 
 /// Where the drawn area is. A full screen starts at the origin, and a test
@@ -119,7 +119,7 @@ pub(super) fn box_top(screen: &Screen<ratatui::backend::TestBackend>) -> u16 {
 /// The cell a todo call leaves in the transcript, built the way the transcript
 /// itself builds it: out of the call's own arguments.
 pub(super) fn written(todos: serde_json::Value) -> Cell {
-    Cell::tool_call("TodoWrite", &todos.to_string())
+    Cell::from_tool_call("TodoWrite", &todos.to_string())
 }
 
 /// Type a key into a state, as if it were a key event from the terminal.
@@ -160,11 +160,14 @@ pub(super) fn type_while_working(state: &mut State, text: &str, cancel: &watch::
 /// A state with a turn running, its clock and its stream pre-loaded.
 pub(super) fn working(elapsed: Duration, chars: usize, chars_per_token: f64) -> State {
     State {
-        turn_running: true,
-        turn_started: Some(Instant::now() - elapsed),
-        streamed_chars: chars,
-        chars_since_usage: chars,
-        chars_per_token,
+        turn: crate::ui::tui::turn::Turn {
+            running: true,
+            started: Some(Instant::now() - elapsed),
+            streamed_chars: chars,
+            chars_since_usage: chars,
+            chars_per_token,
+            ..crate::ui::tui::turn::Turn::default()
+        },
         ..State::default()
     }
 }

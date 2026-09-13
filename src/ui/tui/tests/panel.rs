@@ -114,7 +114,7 @@ fn a_question_that_takes_one_answer_ignores_the_space_key() {
     let (cancel, _cancelled) = watch::channel(false);
     let _answers = open(&mut state, vec![two_options(false)]);
     state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Char(' '))), &cancel);
-    assert_eq!(state.textarea.lines(), [" "], "it went into the box");
+    assert_eq!(state.edit.textarea.lines(), [" "], "it went into the box");
 }
 
 #[test]
@@ -173,7 +173,7 @@ fn the_questions_are_asked_one_at_a_time() {
     state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Enter)), &cancel);
     assert!(state.panel_open(), "there is another question to answer");
     assert!(
-        state.textarea.is_empty(),
+        state.edit.textarea.is_empty(),
         "the box starts the next one empty"
     );
     state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Down)), &cancel);
@@ -222,12 +222,12 @@ fn the_line_being_written_is_held_while_the_questions_are_open() {
     super::type_while_working(&mut state, "a sentence I was writing", &cancel);
     let _answers = open(&mut state, vec![two_options(false)]);
     assert!(
-        state.textarea.is_empty(),
+        state.edit.textarea.is_empty(),
         "the box is the answer's while the questions are open"
     );
     state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Esc)), &cancel);
     assert_eq!(
-        state.textarea.lines(),
+        state.edit.textarea.lines(),
         ["a sentence I was writing"],
         "and the draft comes back untouched"
     );
@@ -244,7 +244,7 @@ fn the_line_being_written_comes_back_when_the_last_question_is_answered() {
     let _answers = open(&mut state, vec![two_options(false)]);
     state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Enter)), &cancel);
     assert!(!state.panel_open());
-    assert_eq!(state.textarea.lines(), ["a sentence I was writing"]);
+    assert_eq!(state.edit.textarea.lines(), ["a sentence I was writing"]);
 }
 
 #[test]

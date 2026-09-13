@@ -114,9 +114,9 @@ fn escape_while_a_turn_runs_gives_the_queue_line_back() {
     screen.begin_turn(std::time::Instant::now());
     type_in(&mut screen, "/s");
     press(&mut screen, KeyCode::Esc);
-    assert!(screen.picker.is_none());
+    assert!(screen.overlay.picker.is_none());
     assert_eq!(
-        screen.textarea.placeholder_text(),
+        screen.edit.textarea.placeholder_text(),
         super::super::input::QUEUE_PLACEHOLDER,
         "the box still belongs to the turn that is running"
     );
@@ -130,10 +130,10 @@ fn what_the_user_says_becomes_part_of_the_transcript() {
     let mut state = State::default();
     state.submit("look at src/main.rs");
     assert_eq!(
-        state.transcript,
+        state.view.transcript,
         vec![crate::ui::cell::Cell::user("look at src/main.rs")]
     );
-    assert_eq!(state.history, vec!["look at src/main.rs"]);
+    assert_eq!(state.edit.history, vec!["look at src/main.rs"]);
 }
 
 #[test]
@@ -142,8 +142,12 @@ fn a_command_is_not_part_of_the_transcript() {
     // session does not have them either.
     let mut state = State::default();
     state.submit("/help");
-    assert!(state.transcript.is_empty(), "nothing to replay");
-    assert_eq!(state.history, vec!["/help"], "but it is worth recalling");
+    assert!(state.view.transcript.is_empty(), "nothing to replay");
+    assert_eq!(
+        state.edit.history,
+        vec!["/help"],
+        "but it is worth recalling"
+    );
 }
 
 #[test]
@@ -152,6 +156,7 @@ fn a_submitted_line_is_drawn_above_what_the_turn_says() {
     screen.state.submit("look at src/main.rs");
     screen
         .state
+        .view
         .transcript
         .push(crate::ui::cell::Cell::Content("on it".into()));
     screen.draw().unwrap();
@@ -167,15 +172,15 @@ fn a_line_typed_while_a_turn_runs_is_queued_and_not_dropped() {
     let mut state = State::default();
     let (cancel, cancelled) = watch::channel(false);
     type_while_working(&mut state, "the next thing", &cancel);
-    assert_eq!(state.textarea.lines(), ["the next thing"]);
+    assert_eq!(state.edit.textarea.lines(), ["the next thing"]);
     state.key_while_working(Event::Key(KeyEvent::from(KeyCode::Enter)), &cancel);
-    assert_eq!(state.queued, ["the next thing"]);
+    assert_eq!(state.turn.queued, ["the next thing"]);
     assert!(
-        state.textarea.is_empty(),
+        state.edit.textarea.is_empty(),
         "the box is freed for the one after"
     );
     assert!(
-        state.transcript.is_empty(),
+        state.view.transcript.is_empty(),
         "nothing has run, so nothing is part of the session yet"
     );
     assert!(!*cancelled.borrow(), "queuing is not cancelling");
@@ -191,8 +196,8 @@ fn a_key_meant_for_the_prompt_is_dropped_only_where_it_would_leave() {
         Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
         &cancel,
     );
-    assert!(state.queued.is_empty(), "not queued as a line");
-    assert!(state.textarea.is_empty(), "and not typed into the box");
+    assert!(state.turn.queued.is_empty(), "not queued as a line");
+    assert!(state.edit.textarea.is_empty(), "and not typed into the box");
 }
 
 #[test]
@@ -205,9 +210,9 @@ fn the_cancel_key_is_still_the_cancel_key_while_a_line_is_being_queued() {
         &cancel,
     );
     assert!(*cancelled.borrow(), "Ctrl-C cancels the turn");
-    assert!(state.queued.is_empty(), "and is not a line of its own");
+    assert!(state.turn.queued.is_empty(), "and is not a line of its own");
     assert_eq!(
-        state.textarea.lines(),
+        state.edit.textarea.lines(),
         ["half a thought"],
         "what was being typed is still there: the cancellation is the turn's, \
          not the box's"
@@ -229,7 +234,7 @@ fn enter_submits_only_when_there_is_something_to_submit() {
     let mut screen = State::default();
     let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(matches!(screen.key(enter), Submitted::Nothing));
-    screen.textarea.insert_str("hello");
+    screen.edit.textarea.insert_str("hello");
     assert!(matches!(
         screen.key(Event::Key(KeyEvent::new(
             KeyCode::Enter,
@@ -240,7 +245,7 @@ fn enter_submits_only_when_there_is_something_to_submit() {
     let taken = screen.take_line();
     assert_eq!(taken, "hello");
     assert!(
-        screen.textarea.is_empty(),
+        screen.edit.textarea.is_empty(),
         "the box is ready for the next line"
     );
 }
@@ -248,29 +253,29 @@ fn enter_submits_only_when_there_is_something_to_submit() {
 #[test]
 fn ctrl_j_is_left_to_the_box_so_input_can_be_multiline() {
     let mut screen = State::default();
-    screen.textarea.insert_str("first");
+    screen.edit.textarea.insert_str("first");
     screen.key(Event::Key(KeyEvent::new(
         KeyCode::Char('j'),
         KeyModifiers::CONTROL,
     )));
-    screen.textarea.insert_str("second");
+    screen.edit.textarea.insert_str("second");
     assert_eq!(screen.take_line(), "first\nsecond");
 }
 
 #[test]
 fn ctrl_c_clears_the_line_and_ctrl_d_on_an_empty_box_leaves() {
     let mut screen = State::default();
-    screen.textarea.insert_str("half typed");
+    screen.edit.textarea.insert_str("half typed");
     screen.key(Event::Key(KeyEvent::new(
         KeyCode::Char('c'),
         KeyModifiers::CONTROL,
     )));
-    assert!(screen.textarea.is_empty(), "Ctrl-C clears");
+    assert!(screen.edit.textarea.is_empty(), "Ctrl-C clears");
 
     let ctrl_d = || Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
     assert!(matches!(screen.key(ctrl_d()), Submitted::Exit));
     // ... but only on an empty box: otherwise it is just a keystroke.
-    screen.textarea.insert_str("text");
+    screen.edit.textarea.insert_str("text");
     assert!(matches!(screen.key(ctrl_d()), Submitted::Nothing));
 }
 

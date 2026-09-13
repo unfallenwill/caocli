@@ -157,7 +157,7 @@ mod tests {
         assert_eq!(
             cells,
             vec![
-                Cell::tool_call("TodoWrite", args),
+                Cell::from_tool_call("TodoWrite", args),
                 Cell::ToolResult("todo list updated (0/1 done)".into()),
             ]
         );
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn the_todo_tool_shows_the_list_and_not_its_arguments() {
-        let cell = Cell::tool_call(
+        let cell = Cell::from_tool_call(
             "TodoWrite",
             &serde_json::json!({"todos": [
                 {"content": "Add the parse function", "status": "completed"},
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn a_cleared_list_is_a_cell_with_nothing_under_it() {
-        let cell = Cell::tool_call("TodoWrite", r#"{"todos":[]}"#);
+        let cell = Cell::from_tool_call("TodoWrite", r#"{"todos":[]}"#);
         assert_eq!(
             cell.spans(),
             vec![Span::new(Style::Yellow, "todo · list cleared")]
@@ -249,12 +249,12 @@ mod tests {
     fn arguments_the_todo_tool_cannot_read_are_still_a_call() {
         // The model is answered with the parse failure; the transcript shows the
         // call that could not be read rather than a list nobody wrote.
-        let cell = Cell::tool_call("TodoWrite", r#"{"todos":"a plan"}"#);
+        let cell = Cell::from_tool_call("TodoWrite", r#"{"todos":"a plan"}"#);
         assert!(matches!(cell, Cell::ToolCall { .. }), "was {cell:?}");
     }
 
     fn written(todos: serde_json::Value) -> Cell {
-        Cell::tool_call("TodoWrite", &todos.to_string())
+        Cell::from_tool_call("TodoWrite", &todos.to_string())
     }
 
     /// The list that stands is a fold of the transcript -- the last list a call
@@ -302,7 +302,7 @@ mod tests {
     fn a_call_that_could_not_be_read_leaves_the_standing_list_alone() {
         let cells = vec![
             written(serde_json::json!({"todos": [{"content": "a"}]})),
-            Cell::tool_call("TodoWrite", r#"{"todos":"a plan"}"#),
+            Cell::from_tool_call("TodoWrite", r#"{"todos":"a plan"}"#),
         ];
         let standing = standing_todos(&cells).expect("the first write still stands");
         assert_eq!(standing.len(), 1);
