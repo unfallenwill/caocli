@@ -1,7 +1,15 @@
 //! The status line: the session summary, in one row.
 //!
-//! Shared by both front ends so the line reads the same either way, and so the
-//! progressive-disclosure rule lives in one place.
+//! Slimmed to cache statistics only. The model id and reasoning effort
+//! tier used to live here too, but they describe a *turn*, not a session:
+//! the user can `/model` and `/effort` mid-session, so a model name on
+//! the pinned row is a snapshot the user did not ask for. They moved to
+//! the per-prompt metadata row above each User cell. Cache stats, by
+//! contrast, are session-level and cumulative, so the bottom row is
+//! still the right place for them.
+//!
+//! Shared by both front ends so the line reads the same either way, and so
+//! the progressive-disclosure rule lives in one place.
 
 use crate::types::Usage;
 
@@ -14,7 +22,7 @@ pub struct CacheStats {
 }
 
 impl CacheStats {
-    fn record(&mut self, usage: &Usage) {
+    pub fn record(&mut self, usage: &Usage) {
         // Normalization: DeepSeek's flat fields and GLM's nested details both
         // converge in Usage::cache(). A provider that does not report caching
         // records nothing, so the line keeps the defaults it opened with.
@@ -46,70 +54,34 @@ impl CacheStats {
     }
 }
 
-/// The status line's content: the model id, the reasoning effort tier, and the
-/// session's cache statistics.
+/// The status line's content: the session's cache statistics. The model
+/// id and effort tier moved to the per-prompt metadata row above each
+/// User cell, so this struct now carries only what is truly session-level.
 #[derive(Debug, Default)]
 pub struct Status {
-    /// Model id (updated when a session is created or switched).
-    model: Option<String>,
-    /// Reasoning effort tier in effect (updated when a session is created or
-    /// switched, and when `/effort` changes it).
-    effort: Option<String>,
     stats: CacheStats,
 }
 
 impl Status {
-    /// Set the model id shown in the first segment.
-    pub fn set_model(&mut self, model: &str) {
-        self.model = Some(model.to_owned());
-    }
-
-    /// Set the reasoning effort tier shown right after the model.
-    pub fn set_effort(&mut self, effort: &str) {
-        self.effort = Some(effort.to_owned());
-    }
-
     /// Fold one sub-request's usage into the cache statistics.
     pub fn record(&mut self, usage: &Usage) {
         self.stats.record(usage);
     }
 
-    /// Clear the cache statistics (when switching sessions). The model id stays:
-    /// it follows the session meta and is set separately.
+    /// Clear the cache statistics (when switching sessions).
     pub fn reset_stats(&mut self) {
         self.stats = CacheStats::default();
     }
 
-    /// Statistics accumulated so far. Read by tests only.
-    #[cfg(test)]
+    /// Statistics accumulated so far. Read by tests and by `/debug`.
+    #[allow(dead_code)]
     pub fn stats(&self) -> CacheStats {
         self.stats
     }
 
-    /// Status segments, most significant first: the model, the effort tier,
-    /// then the cache statistics. This is the order a narrow line drops them in.
-    pub fn parts(&self) -> Vec<String> {
-        let mut parts = Vec::new();
-        if let Some(m) = &self.model
-            && !m.is_empty()
-        {
-            parts.push(m.clone());
-        }
-        if let Some(e) = &self.effort
-            && !e.is_empty()
-        {
-            parts.push(format!("effort {e}"));
-        }
-        parts.extend(self.stats.segments());
-        parts
-    }
-
-    /// The longest segment combination that fits `width` display columns.
-    ///
-    /// Detail is dropped by whole segments rather than by clipping, so a narrow
-    /// terminal never shows half a number. If not even the shortest combination
-    /// fits, it is returned anyway and the caller clips it -- an over-long line
-    /// reads better than an empty one.
+    /// The status line: `cache X% · hit/miss` at the width the caller has.
+    /// Cache stats are the only thing the bottom row carries after the
+    /// metadata row took the model and effort.
     pub fn line(&self, width: usize) -> String {
         let parts = self.parts();
         let mut label = String::new();
@@ -122,169 +94,13 @@ impl Status {
         label
     }
 
+    fn parts(&self) -> Vec<String> {
+        self.stats.segments()
+    }
+
     /// Every segment joined: what a line wide enough for everything displays.
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn full_line(&self) -> String {
         self.parts().join(" · ")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn usage(hit: u64, miss: u64) -> Usage {
-        Usage {
-            prompt_tokens: hit + miss,
-            total_tokens: hit + miss,
-            completion_tokens: 0,
-            prompt_cache_hit_tokens: hit,
-            prompt_cache_miss_tokens: miss,
-            prompt_tokens_details: None,
-        }
-    }
-
-    #[test]
-    fn an_empty_status_shows_the_zero_defaults() {
-        let s = Status::default();
-        assert_eq!(s.full_line(), "cache 0.0% · 0/0");
-        assert_eq!(s.stats().hit_rate(), 0.0);
-    }
-
-    #[test]
-    fn model_comes_first_and_survives_a_stats_reset() {
-        let mut s = Status::default();
-        s.set_model("deepseek-v4-flash");
-        s.record(&usage(6, 4));
-        assert_eq!(s.full_line(), "deepseek-v4-flash · cache 60.0% · 6/4");
-        s.reset_stats();
-        assert_eq!(s.full_line(), "deepseek-v4-flash · cache 0.0% · 0/0");
-    }
-
-    #[test]
-    fn an_empty_model_is_not_a_segment() {
-        let mut s = Status::default();
-        s.set_model("");
-        assert_eq!(s.full_line(), "cache 0.0% · 0/0");
-    }
-
-    #[test]
-    fn effort_sits_between_the_model_and_the_cache() {
-        let mut s = Status::default();
-        s.set_model("deepseek/deepseek-flash");
-        s.set_effort("high");
-        s.record(&usage(6, 4));
-        assert_eq!(
-            s.full_line(),
-            "deepseek/deepseek-flash · effort high · cache 60.0% · 6/4"
-        );
-        // It follows the session, not the statistics.
-        s.reset_stats();
-        assert_eq!(
-            s.full_line(),
-            "deepseek/deepseek-flash · effort high · cache 0.0% · 0/0"
-        );
-    }
-
-    #[test]
-    fn an_empty_effort_is_not_a_segment() {
-        let mut s = Status::default();
-        s.set_model("m-1");
-        s.set_effort("");
-        assert_eq!(s.full_line(), "m-1 · cache 0.0% · 0/0");
-    }
-
-    #[test]
-    fn line_drops_the_effort_before_the_model() {
-        let mut s = Status::default();
-        s.set_model("m-1");
-        s.set_effort("max");
-        assert_eq!(
-            s.line(29),
-            "m-1 · effort max · cache 0.0%",
-            "the counts go first"
-        );
-        assert_eq!(s.line(16), "m-1 · effort max");
-        assert_eq!(s.line(15), "m-1", "the model is the last thing dropped");
-    }
-
-    #[test]
-    fn line_drops_whole_segments_to_fit() {
-        let mut s = Status::default();
-        s.set_model("deepseek-v4-flash");
-        s.record(&usage(6, 4));
-        // 79 columns: everything fits
-        assert_eq!(s.line(79), "deepseek-v4-flash · cache 60.0% · 6/4");
-        // 34 columns: the counts go, the model and rate stay
-        assert_eq!(s.line(34), "deepseek-v4-flash · cache 60.0%");
-        // 19 columns: only the model is left
-        assert_eq!(s.line(19), "deepseek-v4-flash");
-        // 9 columns: nothing fits, so the shortest segment comes back to be clipped
-        assert_eq!(s.line(9), "deepseek-v4-flash");
-    }
-
-    #[test]
-    fn line_measures_wide_characters_by_column() {
-        let mut s = Status::default();
-        // four ideographs: 8 columns, 4 chars
-        s.set_model("\u{6df1}\u{5ea6}\u{6c42}\u{7d22}");
-        // the model plus " · cache 0.0%" is 21 columns, and " · 0/0" is 6 more
-        // for 27. The "· 0/0" is a separate segment that drops first.
-        assert_eq!(
-            s.line(27),
-            "\u{6df1}\u{5ea6}\u{6c42}\u{7d22} · cache 0.0% · 0/0"
-        );
-        assert_eq!(s.line(21), "\u{6df1}\u{5ea6}\u{6c42}\u{7d22} · cache 0.0%");
-        assert_eq!(s.line(20), "\u{6df1}\u{5ea6}\u{6c42}\u{7d22}");
-    }
-
-    #[test]
-    fn stats_accumulate_across_requests() {
-        let mut s = Status::default();
-        s.record(&usage(6, 4));
-        s.record(&usage(0, 10));
-        assert_eq!(s.stats().hit, 6);
-        assert_eq!(s.stats().miss, 14);
-        assert_eq!(s.stats().hit_rate(), 30.0);
-    }
-
-    #[test]
-    fn a_provider_without_cache_reporting_keeps_the_defaults() {
-        let mut s = Status::default();
-        s.record(&Usage {
-            prompt_tokens: 20,
-            total_tokens: 28,
-            completion_tokens: 8,
-            ..Usage::default()
-        });
-        assert_eq!(s.full_line(), "cache 0.0% · 0/0");
-    }
-
-    #[test]
-    fn glm_nested_details_derive_the_miss_count() {
-        // GLM shape: only prompt_tokens_details.cached_tokens is given, so the
-        // miss count has to be derived from prompt_tokens.
-        let mut s = Status::default();
-        s.record(&Usage {
-            prompt_tokens: 1200,
-            completion_tokens: 300,
-            total_tokens: 1500,
-            prompt_tokens_details: Some(crate::types::PromptTokensDetails { cached_tokens: 800 }),
-            ..Usage::default()
-        });
-        assert_eq!(
-            s.full_line(),
-            "cache 66.7% · 800/400",
-            "1200 prompt tokens with 800 cached leaves 400 miss"
-        );
-    }
-
-    #[test]
-    fn a_long_run_accumulates_a_rate_to_one_decimal() {
-        let mut s = Status::default();
-        s.record(&usage(6, 4));
-        s.record(&usage(32378, 457));
-        assert_eq!((s.stats().hit, s.stats().miss), (32384, 461));
-        assert_eq!(s.full_line(), "cache 98.6% · 32384/461");
     }
 }

@@ -142,10 +142,11 @@ fn usage_paints_session_cache_bar_and_reset_clears_it() {
 }
 
 /// The status bar line the renderer draws at the given terminal width, with
-/// a model and cache statistics already in place.
-fn bar_line(cols: u16, model: &str) -> String {
+/// cache statistics already in place. The bar's only segment is the
+/// cache line; the model id has moved to the metadata row above each
+/// user prompt and is no longer a segment here.
+fn bar_line(cols: u16) -> String {
     let (mut r, buf) = with_buffer(false);
-    r.set_model(model);
     r.usage(&usage_fixture(6, 4), Duration::ZERO);
     // The bar is attached last, so the redraw it triggers is the first one
     // that has anything to draw.
@@ -155,8 +156,8 @@ fn bar_line(cols: u16, model: &str) -> String {
 
 /// Assert that the bar's content is exactly `label`: clipping it would
 /// break the `\x1b8` cursor restore that immediately follows.
-fn assert_bar_exactly(cols: u16, model: &str, label: &str) {
-    let s = bar_line(cols, model);
+fn assert_bar_exactly(cols: u16, label: &str) {
+    let s = bar_line(cols);
     assert!(
         s.contains(&format!("{label}\x1b8")),
         "cols={cols} expected {label:?} in {s:?}"
@@ -167,59 +168,48 @@ fn assert_bar_exactly(cols: u16, model: &str, label: &str) {
 /// segments from the end instead of cutting a number in half.
 #[test]
 fn status_bar_drops_whole_segments_on_narrow_terminals() {
-    let model = "deepseek-v4-flash";
     // 79 columns: everything fits
-    assert_bar_exactly(80, model, "deepseek-v4-flash · cache 60.0% · 6/4");
-    // 34 columns: the counts go, the model and rate stay
-    assert_bar_exactly(35, model, "deepseek-v4-flash · cache 60.0%");
-    // 19 columns: only the model is left
-    assert_bar_exactly(20, model, "deepseek-v4-flash");
+    assert_bar_exactly(80, "cache 60.0% · 6/4");
+    // 14 columns: just the rate, the counts go
+    assert_bar_exactly(15, "cache 60.0%");
+    // 11 columns: no room for the trailing percent
+    assert_bar_exactly(11, "cache 60.0");
 }
 
 /// When not even the shortest combination fits, it is clipped rather than
 /// leaving the bar blank.
 #[test]
 fn status_bar_clips_the_shortest_segment_as_a_last_resort() {
-    assert_bar_exactly(10, "deepseek-v4-flash", "deepseek-");
+    assert_bar_exactly(10, "cache 60.");
 }
 
-/// Variants are chosen by display width, not by char count: at 21 columns
-/// the rate segment is 22 columns wide (18 chars), so it has to be dropped.
+/// Variants are chosen by display width, not by char count.
 #[test]
 fn status_bar_chooses_variants_by_display_width() {
-    let wide_model = "\u{6df1}\u{5ea6}\u{6c42}\u{7d22}"; // 8 columns, 4 chars
-    assert_bar_exactly(
-        25,
-        wide_model,
-        "\u{6df1}\u{5ea6}\u{6c42}\u{7d22} · cache 60.0%",
-    );
-    assert_bar_exactly(21, wide_model, wide_model);
+    // "cache 60.0%" is 12 columns. At 12 it fits, at 11 it has to be clipped.
+    assert_bar_exactly(12, "cache 60.0%");
+    assert_bar_exactly(11, "cache 60.0");
 }
 
 #[test]
 fn status_bar_shows_model_and_updates_on_switch() {
+    // The bar carries cache stats only now; the model id lives in
+    // `state.model` and shows up above each user prompt as a metadata
+    // row, not on the pinned line. The bar still reflects cache hits
+    // as the session records them.
     let bar = StatusBar { rows: 10, cols: 80 };
     let (mut r, buf) = with_buffer(false);
     r.apply_status_bar(Some(bar));
-    r.set_model("deepseek-v4-flash");
     r.usage(&usage_fixture(6, 4), Duration::ZERO);
     let s = buf_of(&buf);
-    assert!(s.contains("deepseek-v4-flash · cache 60.0% · 6/4"), "{s:?}");
+    assert!(s.contains("cache 60.0% · 6/4"), "{s:?}");
 
-    // switching models: after the redraw only the new model is left
-    r.set_model("deepseek-v4-pro");
-    let tail = &buf_of(&buf)[s.len()..];
-    assert!(tail.contains("deepseek-v4-pro · cache 60.0%"), "{tail:?}");
-    assert!(!tail.contains("deepseek-v4-flash"), "{tail:?}");
-
-    // reset_stats clears only the cache stats and keeps the model
-    let before = buf_of(&buf).len();
+    // switching models is not visible on the bar any more -- the
+    // metadata row carries that -- but resetting stats is.
+    r.usage(&usage_fixture(0, 0), Duration::ZERO);
     r.reset_stats();
-    let tail = &buf_of(&buf)[before..];
-    assert!(
-        tail.contains("deepseek-v4-pro · cache 0.0% · 0/0"),
-        "{tail:?}"
-    );
+    let tail = &buf_of(&buf)[s.len()..];
+    assert!(tail.contains("cache 0.0% · 0/0"), "{tail:?}");
 }
 
 #[test]

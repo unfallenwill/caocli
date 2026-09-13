@@ -65,6 +65,7 @@ pub async fn handle(
     match line {
         "/exit" | "/quit" | "/q" => return Ok(Outcome::Exit),
         "/help" => ui.info(&help(front)),
+        "/debug" => ui.info(&debug_summary(agent)),
         "/sessions" => {
             for s in session::list(sdir)? {
                 ui.info(&format!(
@@ -417,6 +418,10 @@ pub const COMMANDS: &[Command] = &[
         description: "show this",
     },
     Command {
+        name: "/debug",
+        description: "show cache hit rate and other session stats",
+    },
+    Command {
         name: "/new",
         description: "start a new session",
     },
@@ -501,6 +506,20 @@ pub fn help(front: FrontKind) -> String {
     });
     out.push('\n');
     out.push_str(STARTUP_FLAGS);
+    out
+}
+
+/// The `/debug` summary: model, provider, and effort. The cache stats
+/// the bottom row already carries; `/debug` is for what the bottom row
+/// cannot say -- which provider and model a session is on, for the
+/// reader who has scrolled away from the metadata row.
+pub fn debug_summary(agent: &Agent) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("model:  {}\n", agent.model_label()));
+    out.push_str(&format!("effort:  {}\n", agent.effort_label()));
+    if let Some(provider) = agent.provider_meta() {
+        out.push_str(&format!("provider:  {}\n", provider));
+    }
     out
 }
 

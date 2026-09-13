@@ -104,6 +104,13 @@ impl Agent {
             .unwrap_or(self.provider.default_effort)
     }
 
+    /// The provider id that opened this session: the bare id (`deepseek`,
+    /// `zai-coding-cn`), as it appears in `--provider` and `~/.caocli/`.
+    /// `None` only for sessions written before providers were recorded.
+    pub fn provider_meta(&self) -> Option<&str> {
+        self.session.meta.provider.as_deref()
+    }
+
     /// Point the machine at a provider: a client for its endpoint and key. The
     /// ceiling the request is sent with comes from the preset itself (see
     /// `request::build_request`), so there is nothing to carry over here. The

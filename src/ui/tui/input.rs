@@ -155,6 +155,14 @@ impl State {
         {
             return Submitted::Exit;
         }
+        // Ctrl-O flips the verbose toggle. Settled-Done steps reveal their
+        // children when verbose; running and failed steps are unchanged.
+        // Reasoning is folded the same way in both modes -- the toggle is
+        // about settled tool output, not the live block.
+        if matches(key, KeyCode::Char('o'), KeyModifiers::CONTROL) {
+            self.verbose = !self.verbose;
+            return Submitted::Nothing;
+        }
         // Paging through the transcript. The box scrolls itself with the same
         // two keys, so a draft with more lines than it has rows keeps them --
         // which is the only case where the box has anything to page.
@@ -374,6 +382,12 @@ impl State {
         self.remember(line);
         if !line.starts_with('/') {
             self.revision += 1;
+            // The per-prompt metadata row: model and effort at the time
+            // the line is asked, so a session that switched models reads
+            // the way the user asked it.
+            if let Some(meta) = self.metadata_text() {
+                self.view.transcript.push(Cell::Notice(meta));
+            }
             self.view.transcript.push(Cell::user(line));
         }
         // What was just asked is what the user wants to watch, so the transcript

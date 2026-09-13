@@ -341,7 +341,7 @@ fn the_picker_is_drawn_over_the_live_area_with_one_row_highlighted() {
     };
     let help = shows("/help");
     let resume = shows("/resume");
-    assert_eq!(resume, help + 3, "the whole list, in table order");
+    assert_eq!(resume, help + 4, "the whole list, in table order");
     // The first entry is highlighted, and only it.
     let selected = screen
         .terminal
