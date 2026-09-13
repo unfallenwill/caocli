@@ -231,6 +231,56 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The API key for a provider, or the absence of one with the message that says so.
+///
+/// Missing is data, not error: a one-shot run fails on missing, an interactive
+/// session prints it in the banner so the user knows `/login` is the next step.
+/// Keeping the absence in the type (rather than `Result<String, _>`) is what
+/// makes the two cases read differently at the call site — the `require`
+/// method is the one that fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // scaffolded by the startup refactor; consumed in the next step
+pub enum ApiKey {
+    Present(String),
+    Missing { hint: String },
+}
+
+impl ApiKey {
+    /// Read the key the user stored under this provider's id.
+    #[allow(dead_code)] // scaffolded by the startup refactor; consumed in the next step
+    pub fn load(provider: &Provider) -> Result<Self> {
+        match stored_key(provider.id)? {
+            Some(key) => Ok(ApiKey::Present(key)),
+            None => Ok(ApiKey::Missing {
+                hint: format!(
+                    "no API key for {}: run /login {}",
+                    provider.name, provider.id
+                ),
+            }),
+        }
+    }
+
+    /// The key, or an error carrying the missing hint. One-shot runs use this:
+    /// they have nowhere to ask, so they have to fail now rather than at the
+    /// first request.
+    #[allow(dead_code)] // scaffolded by the startup refactor; consumed in the next step
+    pub fn require(self) -> Result<String> {
+        match self {
+            ApiKey::Present(key) => Ok(key),
+            ApiKey::Missing { hint } => bail!("{hint}"),
+        }
+    }
+
+    /// The hint to show in the banner, if the key is missing.
+    #[allow(dead_code)] // scaffolded by the startup refactor; consumed in the next step
+    pub fn missing_note(&self) -> Option<&str> {
+        match self {
+            ApiKey::Present(_) => None,
+            ApiKey::Missing { hint } => Some(hint),
+        }
+    }
+}
+
 /// Resolve the API key for this provider: the one `/login` stored in
 /// `settings.json`. There is no second place for one to come from — a key in an
 /// environment variable was one, and a key that two mechanisms hold is a key
@@ -565,5 +615,63 @@ mod tests {
         unsafe { std::env::remove_var("HOME") };
         let err = home_dir().unwrap_err().to_string();
         assert!(err.contains("HOME"), "err: {err}");
+    }
+
+    #[test]
+    fn api_key_load_returns_present_when_stored() {
+        let _g = env_lock();
+        let home = bare_home();
+        store_key("deepseek", "sk-stored").unwrap();
+        assert_eq!(
+            ApiKey::load(&DEEPSEEK).unwrap(),
+            ApiKey::Present("sk-stored".into())
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn api_key_load_returns_missing_with_hint_when_absent() {
+        let _g = env_lock();
+        let home = bare_home();
+        match ApiKey::load(&ZAI_CODING_CN).unwrap() {
+            ApiKey::Missing { hint } => {
+                assert!(hint.contains("Z.AI"), "hint names the provider: {hint}");
+                assert!(
+                    hint.contains("/login zai-coding-cn"),
+                    "hint names the command: {hint}"
+                );
+            }
+            other => panic!("expected Missing, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn api_key_require_passes_present_through() {
+        let key = ApiKey::Present("sk-test".into());
+        assert_eq!(key.require().unwrap(), "sk-test");
+    }
+
+    #[test]
+    fn api_key_require_fails_with_the_hint() {
+        let key = ApiKey::Missing {
+            hint: "no API key for X".into(),
+        };
+        let err = key.require().unwrap_err().to_string();
+        assert!(err.contains("no API key for X"), "{err}");
+    }
+
+    #[test]
+    fn api_key_missing_note_is_none_when_present() {
+        let key = ApiKey::Present("sk-test".into());
+        assert_eq!(key.missing_note(), None);
+    }
+
+    #[test]
+    fn api_key_missing_note_carries_the_hint() {
+        let key = ApiKey::Missing {
+            hint: "the hint".into(),
+        };
+        assert_eq!(key.missing_note(), Some("the hint"));
     }
 }

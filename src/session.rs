@@ -365,6 +365,56 @@ pub fn latest(dir: PathBuf) -> Result<Option<PathBuf>> {
     Ok(list(&dir)?.into_iter().next().map(|i| i.path))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // scaffolded by the startup refactor; consumed in the next step
+pub enum SessionSource {
+    /// A session the user named explicitly: the file `<id>.jsonl` in the sessions dir.
+    Resume { id: String },
+    /// Whichever session was last written. None is the empty sessions dir.
+    ContinueLatest,
+    /// A fresh session, started on this run's provider/model/effort.
+    Fresh,
+}
+
+impl SessionSource {
+    /// The priority order is `--resume > --continue > fresh`: an explicit id
+    /// always wins, `--continue` falls back to fresh when there is no prior
+    /// session, and a bare run is fresh.
+    #[allow(dead_code)] // scaffolded by the startup refactor; consumed in the next step
+    pub fn from_cli(resume: Option<&str>, cont: bool) -> Self {
+        if let Some(id) = resume {
+            return SessionSource::Resume { id: id.to_string() };
+        }
+        if cont {
+            return SessionSource::ContinueLatest;
+        }
+        SessionSource::Fresh
+    }
+
+    /// Resolve into a session, creating one where none exists.
+    ///
+    /// `fresh_meta` is a closure so a `--resume` run does not pay to build it:
+    /// reading the workspace's AGENTS.md is filesystem IO, and the only call
+    /// sites that need a meta are the ones that create a session.
+    #[allow(dead_code)] // scaffolded by the startup refactor; consumed in the next step
+    pub fn resolve<F>(self, dir: &Path, fresh_meta: F) -> Result<Session>
+    where
+        F: FnOnce() -> Result<SessionMeta>,
+    {
+        match self {
+            SessionSource::Resume { id } => {
+                let path = dir.join(format!("{id}.jsonl"));
+                Session::load(&path).with_context(|| format!("failed to resume session {id}"))
+            }
+            SessionSource::ContinueLatest => match latest(dir.to_path_buf())? {
+                Some(path) => Session::load(&path),
+                None => Session::create(dir, fresh_meta()?),
+            },
+            SessionSource::Fresh => Session::create(dir, fresh_meta()?),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,6 +849,91 @@ mod tests {
         let mut s2 = Session::create(&dir, test_meta()).unwrap();
         s2.append_message(&Message::user("new")).unwrap();
         assert_eq!(latest(dir.clone()).unwrap().unwrap(), s2.path);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn session_source_from_cli_priority() {
+        // --resume wins over --continue over fresh.
+        assert_eq!(
+            SessionSource::from_cli(Some("abc"), true),
+            SessionSource::Resume { id: "abc".into() }
+        );
+        assert_eq!(
+            SessionSource::from_cli(None, true),
+            SessionSource::ContinueLatest
+        );
+        assert_eq!(SessionSource::from_cli(None, false), SessionSource::Fresh);
+    }
+
+    #[test]
+    fn resolve_resume_loads_named_session() {
+        let dir = tmpdir();
+        let mut original = Session::create(&dir, test_meta()).unwrap();
+        original.append_message(&Message::user("hello")).unwrap();
+        let path = original.path.clone();
+        drop(original);
+
+        let loaded = SessionSource::Resume {
+            id: path.file_stem().unwrap().to_string_lossy().into_owned(),
+        }
+        .resolve(&dir, || panic!("resume must not build a fresh meta"))
+        .unwrap();
+        assert_eq!(loaded.messages.len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_continue_latest_creates_when_empty() {
+        let dir = tmpdir();
+        let s = SessionSource::ContinueLatest
+            .resolve(&dir, || Ok(test_meta()))
+            .unwrap();
+        assert_eq!(s.meta.model, "deepseek-v4-flash");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_continue_latest_loads_when_present() {
+        let dir = tmpdir();
+        let prior = Session::create(&dir, test_meta()).unwrap();
+        let path = prior.path.clone();
+        drop(prior);
+
+        let loaded = SessionSource::ContinueLatest
+            .resolve(&dir, || {
+                panic!("continue with a prior session must not build a fresh meta")
+            })
+            .unwrap();
+        assert_eq!(loaded.path, path);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_fresh_always_calls_the_meta_closure() {
+        let dir = tmpdir();
+        let mut called = false;
+        let _ = SessionSource::Fresh
+            .resolve(&dir, || {
+                called = true;
+                Ok(test_meta())
+            })
+            .unwrap();
+        assert!(called, "fresh must build a meta");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_resume_does_not_call_the_meta_closure() {
+        let dir = tmpdir();
+        let mut original = Session::create(&dir, test_meta()).unwrap();
+        original.append_message(&Message::user("x")).unwrap();
+        let id = original.id.clone();
+        drop(original);
+
+        let _ = SessionSource::Resume { id }
+            .resolve(&dir, || panic!("resume must not build a fresh meta"))
+            .unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
