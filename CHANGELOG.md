@@ -6,6 +6,11 @@ semantic-version bumps per release.
 
 ## [Unreleased]
 
+### Added
+- The plain REPL now tab-completes slash commands. `repl::completions` is
+  the one source of truth, so what the TUI's picker offers and what
+  rustyline offers are the same list in the same order.
+
 ### Changed
 - Status line's cache segment now reads `N/M` instead of `hit N · miss M`
   (e.g. `cache 98.6% · 32384/461`). The two counts are read as a fraction

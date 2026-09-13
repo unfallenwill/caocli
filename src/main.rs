@@ -2,6 +2,7 @@ mod agent;
 mod agents_md;
 mod api;
 mod cli;
+mod completer;
 mod config;
 mod history;
 mod image;
@@ -24,6 +25,7 @@ use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers};
 use crate::agent::{Agent, Approval};
 use crate::api::Client;
 use crate::cli::Cli;
+use crate::completer::CommandCompleter;
 use crate::session::{Session, SessionMeta};
 use crate::ui::tui;
 use crate::ui::{Front, Renderer};
@@ -138,7 +140,9 @@ fn apply_overrides(
 /// still submits the whole thing.
 /// rustyline binds both Ctrl-J and Enter to AcceptOrInsertLine by default, so
 /// Ctrl-J is overridden here.
-fn enable_multiline(rl: &mut rustyline::DefaultEditor) {
+fn enable_multiline<H: rustyline::Helper>(
+    rl: &mut rustyline::Editor<H, rustyline::history::DefaultHistory>,
+) {
     let _ = rl.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
 }
 
@@ -317,7 +321,8 @@ async fn run(cli: Cli) -> Result<()> {
     }
 
     // REPL
-    let mut rl = rustyline::DefaultEditor::new()?;
+    let mut rl = rustyline::Editor::<CommandCompleter, _>::new()?;
+    rl.set_helper(Some(CommandCompleter));
     enable_multiline(&mut rl);
     let hist_path = config::history_file()?;
     let _ = rl.load_history(&hist_path);
