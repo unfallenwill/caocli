@@ -170,7 +170,7 @@ mod tests {
                 Event::Begin(Some("  ")),
                 Event::Span {
                     style: Style::Dim,
-                    text: "  ".into()
+                    text: "* ".into()
                 },
                 Event::Span {
                     style: Style::Dim,

@@ -320,7 +320,7 @@ fn the_plain_front_ends_stream_is_frozen() {
         "\x1b7\x1b[24;1H\x1b[2K                     ",
         "\x1b[2mdeepseek-v4-pro · effort max · cache 0.0% · hit 0 · miss 0\x1b[0m\x1b8",
         // the banner is an info cell
-        "\x1b[2m  caocli · session 20260910-213122 (2 messages) · deepseek-v4-pro\x1b[0m\n",
+        "\x1b[2m* caocli · session 20260910-213122 (2 messages) · deepseek-v4-pro\x1b[0m\n",
         "\n",
         "\x1b[2m› \x1b[0mtake a look\x1b[0m\n",
         "\x1b[2m┆ let me think\x1b[0m\n",
@@ -416,7 +416,7 @@ fn color_variants_render_codes_and_plain() {
     let (mut r, buf) = with_buffer(true);
     r.info("ok");
     let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-    assert_eq!(s, "\x1b[2m  ok\x1b[0m\n");
+    assert_eq!(s, "\x1b[2m* ok\x1b[0m\n");
     r.error("boom"); // eprintln, does not write to buf; only checks it does not
     // panic and that the red paint call is covered
 }
@@ -427,7 +427,7 @@ fn no_color_paint_returns_plain_text() {
     r.info("plain");
     assert_eq!(
         String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-        "  plain\n"
+        "* plain\n"
     );
 }
 

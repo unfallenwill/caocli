@@ -375,7 +375,9 @@ impl Cell {
                 Some(Gutter::new("‣ ", "  ", Style::Red))
             }
             Cell::ToolResult(_) | Cell::ToolOutput(_) => Some(Gutter::new("‣ ", "  ", Style::Dim)),
-            Cell::Notice(_) => Some(Gutter::new("  ", "  ", Style::Dim)),
+            // A notice has no tool name to put in the gutter -- the bullet
+            // `*` reads as "this is a note", not as a separator or a call.
+            Cell::Notice(_) => Some(Gutter::new("* ", "  ", Style::Dim)),
             Cell::Failure(_) => Some(Gutter::new("  ", "  ", Style::Red)),
             Cell::Interrupted => Some(Gutter::new("  ", "  ", Style::Yellow)),
             Cell::Usage { .. } => Some(Gutter::new("  ", "  ", Style::Dim)),
