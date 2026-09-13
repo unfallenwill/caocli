@@ -399,6 +399,88 @@ pub fn effort_menu(provider: &provider::Provider, current: &str) -> String {
     out
 }
 
+/// Lines submitted while a turn is running, oldest first. The head runs as
+/// soon as the turn in flight ends, whether it finished on its own or was
+/// interrupted; the tail is appended by the readline task as more lines
+/// arrive.
+///
+/// Shared by both front ends -- the TUI keeps one in its `State`, the plain
+/// prompt keeps one across turns -- so a "lines typed while the model is
+/// thinking" feels the same on either side. The shape is a thin wrapper
+/// around `VecDeque` rather than a re-export, so the contract (what counts
+/// as queued, what the order is, when a line is dequeued) lives in one place
+/// instead of being rebuilt by every caller.
+#[derive(Debug, Default)]
+pub struct Queue {
+    pending: std::collections::VecDeque<String>,
+}
+
+impl Queue {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Put `line` after whatever is already waiting. The head is unchanged:
+    /// a turn in flight gets to finish before the new line runs.
+    pub fn enqueue(&mut self, line: String) {
+        self.pending.push_back(line);
+    }
+
+    /// The next line to run, if any. Called by the main loop between turns;
+    /// a turn that ends with an empty queue yields `None` and the loop falls
+    /// back to waiting for a fresh line from the user.
+    pub fn dequeue(&mut self) -> Option<String> {
+        self.pending.pop_front()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::Queue;
+
+    #[test]
+    fn a_fresh_queue_is_empty() {
+        let mut q = Queue::new();
+        assert!(q.is_empty());
+        assert_eq!(q.len(), 0);
+        assert!(q.dequeue().is_none());
+    }
+
+    #[test]
+    fn lines_run_in_the_order_they_were_enqueued() {
+        let mut q = Queue::new();
+        q.enqueue("first".into());
+        q.enqueue("second".into());
+        q.enqueue("third".into());
+        assert_eq!(q.dequeue().as_deref(), Some("first"));
+        assert_eq!(q.dequeue().as_deref(), Some("second"));
+        assert_eq!(q.dequeue().as_deref(), Some("third"));
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn enqueue_after_partial_drain_goes_to_the_tail() {
+        // A line enqueued after some have been dequeued should sit behind
+        // whatever is still waiting, not jump the queue: the order is the
+        // order the user typed in, not the order turns happened to start.
+        let mut q = Queue::new();
+        q.enqueue("a".into());
+        q.enqueue("b".into());
+        assert_eq!(q.dequeue().as_deref(), Some("a"));
+        q.enqueue("c".into());
+        assert_eq!(q.dequeue().as_deref(), Some("b"));
+        assert_eq!(q.dequeue().as_deref(), Some("c"));
+    }
+}
+
 /// One slash command, as the picker and the help text both need it.
 pub struct Command {
     pub name: &'static str,

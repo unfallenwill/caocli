@@ -339,53 +339,156 @@ async fn run(cli: Cli) -> Result<()> {
         ui.replay(&agent.session.messages);
     }
 
-    loop {
+    // Readline stays in the main thread: it owns the tty, and `ask_secret`
+    // reads the same tty for the API-key prompt -- a second reader on
+    // stdin would race with both. The cost is that a line typed while a
+    // turn is running is held by the kernel's line discipline until the
+    // next `readline` call; `Queue` exists so a session can carry those
+    // lines through the turn and announce them when it ends.
+    let mut queue = repl::Queue::new();
+    let outcome = loop {
         // Sync the status bar before each input (which also handles window resizes)
         if !cli.no_status_bar {
             ui.refresh_status_bar();
         }
-        match rl.readline("› ") {
-            Ok(raw) => {
-                let line = raw.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                let _ = rl.add_history_entry(line);
-                // One interrupt listener per turn, subscribed before the turn's
-                // first await point (see Agent::turn).
-                let mut interrupt = Sigint::new()?;
-                let mut approve = StdinApproval;
-                let mut ask = StdinQuestions;
-                let outcome = repl::handle(
-                    &mut agent,
-                    &mut ui,
-                    &sdir,
-                    line,
-                    &mut interrupt,
-                    &mut approve,
-                    &mut ask,
-                    repl::FrontKind::Plain,
-                )
-                .await?;
-                if outcome == repl::Outcome::Exit {
-                    break;
+        let raw = if let Some(queued) = queue.dequeue() {
+            // A line that was waiting from the previous turn: run it now,
+            // and tell the user one fewer is waiting. The notice names the
+            // first line of the queued text so a reader can recognise their
+            // own input in the transcript.
+            let preview = queued.lines().next().unwrap_or("");
+            if !queue.is_empty() {
+                ui.info(&format!(
+                    "running queued line · {} still waiting: {preview}",
+                    queue.len()
+                ));
+            } else {
+                ui.info(&format!("running queued line: {preview}"));
+            }
+            queued
+        } else {
+            // Wait for a fresh line. Readline owns the tty, so `Eof` on
+            // Ctrl-D is the user's way of leaving; `Interrupted` is
+            // Ctrl-C clearing the box (a no-op, the line buffer is
+            // already empty).
+            match rl.readline("› ") {
+                Ok(line) => line,
+                Err(rustyline::error::ReadlineError::Eof) => break Outcome::Exit,
+                Err(rustyline::error::ReadlineError::Interrupted) => continue,
+                Err(e) => {
+                    ui.error(&format!("readline error: {e}"));
+                    break Outcome::Exit;
                 }
             }
-            Err(rustyline::error::ReadlineError::Interrupted) => continue, // Ctrl-C clears the line
-            Err(rustyline::error::ReadlineError::Eof) => break,            // Ctrl-D exits
-            Err(e) => {
-                ui.error(&format!("readline error: {e}"));
-                break;
-            }
+        };
+        let line = raw.trim().to_owned();
+        if line.is_empty() {
+            continue;
         }
-    }
+        let _ = rl.add_history_entry(&line);
+        // One interrupt listener per turn, subscribed before the turn's
+        // first await point (see Agent::turn).
+        let mut interrupt = Sigint::new()?;
+        let turn_outcome = repl::handle(
+            &mut agent,
+            &mut ui,
+            &sdir,
+            &line,
+            &mut interrupt,
+            &mut StdinApproval,
+            &mut StdinQuestions,
+            repl::FrontKind::Plain,
+        )
+        .await?;
+        if turn_outcome == repl::Outcome::Exit {
+            break Outcome::Exit;
+        }
+        // Pull the lines the kernel buffered during the turn: the user
+        // has no other way to know they landed, and the next iteration
+        // runs the head.
+        drain_buffered_lines(&mut queue, &mut rl, &mut ui);
+    };
+
     let _ = rl.save_history(&hist_path);
     // Every server this session started is ended here rather than left to be
     // killed: closing its input is the shutdown the protocol asks for, and a
     // program this one started should not outlive it.
     agent.mcp.shutdown().await;
     ui.teardown();
+    let _ = outcome;
     Ok(())
+}
+
+/// Outcome of the REPL loop. The plain prompt is single-threaded and never
+/// shares this with anything else, so the value is local to the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Exit,
+}
+
+/// Drain whatever the kernel's line discipline has been holding during the
+/// turn into `queue`, and announce each one.
+///
+/// Rustyline does not expose "the next line the kernel has ready", so this
+/// is a non-blocking read of stdin: bytes the user typed while the turn ran
+/// and submitted (Enter) before the turn ended. An empty read means the
+/// kernel is empty; the loop exits. The tty is left in its original
+/// blocking state.
+fn drain_buffered_lines(
+    queue: &mut repl::Queue,
+    rl: &mut rustyline::Editor<CommandCompleter, rustyline::history::DefaultHistory>,
+    ui: &mut dyn crate::ui::Front,
+) {
+    use std::io::Read;
+    let mut stdin = std::io::stdin();
+    let _ = set_nonblocking(&stdin, true);
+    let mut buf = [0u8; 4096];
+    loop {
+        match stdin.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                for line in text.split('\n') {
+                    let line = line.trim_end_matches('\r').trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let _ = rl.add_history_entry(line);
+                    queue.enqueue(line.to_owned());
+                    let preview = line.lines().next().unwrap_or("");
+                    ui.info(&format!("queued · {} waiting: {preview}", queue.len()));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+    let _ = set_nonblocking(&stdin, false);
+}
+
+/// Toggle non-blocking mode on stdin. Returns whether the mode actually
+/// changed (so the caller can avoid a redundant restore).
+fn set_nonblocking(stdin: &std::io::Stdin, nonblocking: bool) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let fd = stdin.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let new_flags = if nonblocking {
+        flags | libc::O_NONBLOCK
+    } else {
+        flags & !libc::O_NONBLOCK
+    };
+    if new_flags == flags {
+        return Ok(false);
+    }
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, new_flags) };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(true)
+    }
 }
 
 #[cfg(test)]

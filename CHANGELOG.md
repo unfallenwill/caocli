@@ -10,6 +10,15 @@ semantic-version bumps per release.
 - The plain REPL now tab-completes slash commands. `repl::completions` is
   the one source of truth, so what the TUI's picker offers and what
   rustyline offers are the same list in the same order.
+- Lines typed while a plain-REPL turn is running are queued in
+  `repl::Queue`. The kernel's line discipline has been holding them
+  since the user pressed Enter; a non-blocking drain after the turn
+  returns announces each one ("queued · N waiting: <preview>") and
+  the head runs next ("running queued line: <preview>"). Before, the
+  user had no way to know whether their typing during a long turn
+  had landed. Readline stays in the main thread (it owns the tty,
+  and `ask_secret` reads the same tty for the API-key prompt), so
+  the drain is what bridges the kernel buffer and the queue.
 
 ### Changed
 - Status line's cache segment now reads `N/M` instead of `hit N · miss M`
