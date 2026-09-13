@@ -157,10 +157,7 @@ pub async fn run(
     // Written on the way out rather than per line: the file is small, and a
     // rewrite per keystroke would be work for nothing.
     if let Err(e) = history::save(&history_path, &screen.state.history) {
-        screen
-            .state
-            .transcript
-            .push(Cell::Failure(format!("{e:#}")));
+        screen.state.show(Cell::Failure(format!("{e:#}")));
     }
     result?;
     Ok(true)
