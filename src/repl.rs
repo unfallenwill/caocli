@@ -1524,4 +1524,20 @@ mod tests {
         assert_front::<Renderer>();
         assert_front::<Recording>();
     }
+
+    #[test]
+    fn prompt_metadata_pairs_model_and_effort() {
+        // The plain front end echoes this line as a dim row before each
+        // model run; the TUI carries the same text in a transcript cell
+        // above each User prompt. Both surfaces say the same thing.
+        // The first arg is the *provider id*, the second is the bare
+        // model id; `Agent::model_label` joins them, so the prefix here
+        // is the provider and the suffix the model.
+        let dir = tmpdir("prompt-meta");
+        let agent = agent_in(&dir, "deepseek-v4-pro");
+        assert_eq!(
+            prompt_metadata(&agent),
+            "deepseek/deepseek-v4-pro · effort max"
+        );
+    }
 }

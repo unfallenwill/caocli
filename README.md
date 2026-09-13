@@ -14,7 +14,15 @@ seven tools: `Bash`, `Read`, `Glob` (which finds files by name), `Edit`,
 the tools of any [MCP servers](#mcp-servers) the session connects to, which are
 offered to the model beside them. Both
 backends see images, which are attached with `/image` or `--image` and travel
-inside the message itself. Project instructions in the workspace's `AGENTS.md`
+inside the message itself.
+
+Every tool call is one cell on the transcript, with the verb (`Bash` /
+`Read` / ...), the subject (the command or file), the streaming children
+(the tool's own output), and the verdict (the one-line result summary) all
+together. Successful steps settle to a single line — `✔ Bash ls · exit_code: 0` —
+with the children hidden until `Ctrl-O` flips verbose; failed steps auto-expand
+the body that caused the failure so the reader can see why without toggling. Edits
+keep their diff visible in both modes, because the change is what the call is for. Project instructions in the workspace's `AGENTS.md`
 files are read when a session starts and sent with every request (see
 [Project instructions](#project-instructions-agentsmd)).
 Sessions are append-only JSONL
@@ -50,6 +58,7 @@ place for a key to hide in.
 | Command | Description |
 |---|---|
 | `/help` | Show available commands |
+| `/debug` | Show the model id, effort tier, and provider of the current session (cache stats stay on the status bar) |
 | `/new` | Start a new session, inheriting the current model settings; the workspace's `AGENTS.md` instructions are read again for it |
 | `/sessions` | List sessions (id, message count, last user message preview) |
 | `/resume <id>` | Switch to an existing session, replaying its history to the screen |
@@ -140,17 +149,31 @@ ok: package.name = caocli (312 bytes)
 ✔ Read the failing test
 ▸ Fix the parser
 ☐ Bump the version
-─────────────────────────────────────────⠸ 12s · ~38 token/s
+─────────────────────────────────────────⠸ 12s · running Bash · ~38 token/s
 ›  the turn is running · Enter queues · Ctrl-C stops
 ──────────────────────────────────────────────────────────────────────────
-zai-coding-cn/glm-5.3 · effort max · cache 95.3% · hit 846912 · miss 41538
+› deepseek-v4-pro · effort max
+cache 95.3% · hit 846912 · miss 41538
 ```
 
-- **The status line** is the row under the box, always the session summary:
-  the model, the reasoning effort tier, the cache hit rate, and the raw hit/miss
-  counts. A new session opens with the defaults (`cache 0.0% · 0/0`)
-  and the counts move as the provider reports usage; what a turn is doing is the
-  transcript's to say, not the status line's.
+- **The status line** is the row under the box, always the session's cache stats:
+  hit rate and raw hit/miss counts. A new session opens with the defaults
+  (`cache 0.0% · 0/0`) and the counts move as the provider reports usage. Stats reset
+  when the session, the model, or the provider switches — what is true of a row
+  that names only what is cumulative.
+- **The metadata row** rides one line above each user prompt, naming the
+  `provider/model · effort tier` the next request will carry. The renderer
+  flips when `/model` or `/effort` changes a future one, so a session that
+  switched mid-history reads the way the user asked it.
+- **The border above the box says what the agent is doing**: `thinking`
+  while a Reasoning block streams, `running Bash` (or whatever verb) while a tool
+  call is in flight, `working` otherwise. The spinner character and the elapsed
+  seconds stay on every phase; only the word between them changes. A question
+  standing over the box (the approval gate) takes the border back.
+- **`Ctrl-O`** toggles a verbose mode: settled-Done steps show their children
+  (the tool's own output) when verbose is on; running and failed steps are
+  unchanged. Failures auto-expand regardless — a settled failure that has
+  children shows them in both modes.
 - **While a turn runs, the box's top border says so**: a spinner and the seconds
   it has run, and — once the turn has lasted long enough for an average to mean
   anything — an estimated `~N token/s`. Estimated, because the provider reports
@@ -198,23 +221,23 @@ a terminal), which is the front end the status bar below belongs to.
 
 ### Status bar
 
-In the plain REPL (`--no-tui`), a status bar pinned to the bottom line shows the active model,
-the reasoning effort tier and the session's cumulative cache hit rate, right-aligned:
+In the plain REPL (`--no-tui`), a status bar pinned to the bottom line shows the session's
+cumulative cache hit rate, right-aligned:
 
 ```
-deepseek/deepseek-flash · effort max · cache 98.6% · hit 32384 · miss 461
+cache 98.6% · hit 32384 · miss 461
 ```
 
-The model segment names the model by its provider; the effort segment is the
-tier the next request carries. Both follow the session, so they are refreshed on
-`/new`, `/resume`, `/model`, `/effort` and CLI overrides.
+The cache stats are the only session-level signal that belongs on a pinned row —
+they are cumulative, they follow the session, and they reset on `/new`, `/resume`,
+and `/model`. The model id and reasoning effort tier, by contrast, are per-turn
+and were moved to a metadata row above each User cell in the TUI transcript
+(and echoed as a dim line by the plain front end), since the pinned row used to
+be a snapshot the reader did not ask for.
 
-It appears only when stdout is a TTY and the terminal has at least 3 rows;
-`--no-status-bar` turns it off. The bar reserves the last terminal line via
+`--no-status-bar` turns the bar off. The bar reserves the last terminal line via
 a scroll region, so output scrolls above it — the trade-off is that lines
 scrolled out of the region do not enter the terminal's scrollback buffer.
-Stats reset when you switch sessions (`/new`, `/resume`) or models
-(`/model`), and the bar is restored on exit.
 
 ### Images
 
