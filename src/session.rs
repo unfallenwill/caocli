@@ -366,7 +366,6 @@ pub fn latest(dir: PathBuf) -> Result<Option<PathBuf>> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // scaffolded by the startup refactor; consumed in the next step
 pub enum SessionSource {
     /// A session the user named explicitly: the file `<id>.jsonl` in the sessions dir.
     Resume { id: String },
@@ -380,7 +379,6 @@ impl SessionSource {
     /// The priority order is `--resume > --continue > fresh`: an explicit id
     /// always wins, `--continue` falls back to fresh when there is no prior
     /// session, and a bare run is fresh.
-    #[allow(dead_code)] // scaffolded by the startup refactor; consumed in the next step
     pub fn from_cli(resume: Option<&str>, cont: bool) -> Self {
         if let Some(id) = resume {
             return SessionSource::Resume { id: id.to_string() };
@@ -396,7 +394,6 @@ impl SessionSource {
     /// `fresh_meta` is a closure so a `--resume` run does not pay to build it:
     /// reading the workspace's AGENTS.md is filesystem IO, and the only call
     /// sites that need a meta are the ones that create a session.
-    #[allow(dead_code)] // scaffolded by the startup refactor; consumed in the next step
     pub fn resolve<F>(self, dir: &Path, fresh_meta: F) -> Result<Session>
     where
         F: FnOnce() -> Result<SessionMeta>,

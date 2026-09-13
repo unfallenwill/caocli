@@ -10,7 +10,6 @@ use std::path::PathBuf;
 /// the TUI is what the front end attempts first, and the plain prompt is the
 /// fallback when it declines.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // scaffolded by the startup refactor; consumed in the next step
 pub(crate) enum Mode {
     ListSessions,
     OneShot {
@@ -89,7 +88,6 @@ impl Cli {
     /// `--image` without `--prompt` is rejected here: an attached image has
     /// nowhere to go except the one-shot prompt, and the interactive front end
     /// takes images through `/image`, not through the command line.
-    #[allow(dead_code)] // scaffolded by the startup refactor; consumed in the next step
     pub(crate) fn mode(&self) -> Result<Mode> {
         if self.list {
             return Ok(Mode::ListSessions);

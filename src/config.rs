@@ -239,7 +239,6 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 /// makes the two cases read differently at the call site — the `require`
 /// method is the one that fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // scaffolded by the startup refactor; consumed in the next step
 pub enum ApiKey {
     Present(String),
     Missing { hint: String },
@@ -247,7 +246,6 @@ pub enum ApiKey {
 
 impl ApiKey {
     /// Read the key the user stored under this provider's id.
-    #[allow(dead_code)] // scaffolded by the startup refactor; consumed in the next step
     pub fn load(provider: &Provider) -> Result<Self> {
         match stored_key(provider.id)? {
             Some(key) => Ok(ApiKey::Present(key)),
@@ -263,7 +261,6 @@ impl ApiKey {
     /// The key, or an error carrying the missing hint. One-shot runs use this:
     /// they have nowhere to ask, so they have to fail now rather than at the
     /// first request.
-    #[allow(dead_code)] // scaffolded by the startup refactor; consumed in the next step
     pub fn require(self) -> Result<String> {
         match self {
             ApiKey::Present(key) => Ok(key),
@@ -272,7 +269,6 @@ impl ApiKey {
     }
 
     /// The hint to show in the banner, if the key is missing.
-    #[allow(dead_code)] // scaffolded by the startup refactor; consumed in the next step
     pub fn missing_note(&self) -> Option<&str> {
         match self {
             ApiKey::Present(_) => None,
