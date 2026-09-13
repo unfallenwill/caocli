@@ -155,6 +155,11 @@ pub async fn handle(
             ui.info("unknown command; /help lists the available commands")
         }
         _ => {
+            // Echo the per-prompt metadata the TUI's transcript already
+            // carries: a plain-front-end user does not get a transcript
+            // of their own, so the metadata row lands as a dim line just
+            // before the model starts answering.
+            ui.info(&prompt_metadata(agent));
             if let Err(e) = agent.turn(line, ui, cancel, approve, ask).await {
                 ui.error(&format!("{e:#}"));
             }
@@ -521,6 +526,14 @@ pub fn debug_summary(agent: &Agent) -> String {
         out.push_str(&format!("provider:  {}\n", provider));
     }
     out
+}
+
+/// The single-line per-prompt metadata the plain front end echoes before
+/// the model starts answering. The TUI carries the same text in a
+/// transcript cell above each user prompt; the plain front end writes
+/// it as a dim line because it has no transcript of its own to hold it.
+pub fn prompt_metadata(agent: &Agent) -> String {
+    format!("{} · effort {}", agent.model_label(), agent.effort_label())
 }
 
 #[cfg(test)]
