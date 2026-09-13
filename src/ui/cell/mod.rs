@@ -394,12 +394,26 @@ impl Cell {
                 // came with: dim, like the rest of what is about the message
                 // rather than being it. With no words it is the cell's first
                 // line, and there is nothing to break away from.
-                for image in images {
-                    let lead = if spans.is_empty() { "" } else { "\n" };
+                //
+                // Two or more images are one line of their own, with the count
+                // and the total bytes rather than one entry per image: a user
+                // who attaches five pictures gets one line, not five, and the
+                // per-image format is left to the message the backend sees --
+                // it is in the data URL, so it survives a resume.
+                let lead = if spans.is_empty() { "" } else { "\n" };
+                if images.len() > 1 {
+                    let total: usize = images.iter().map(|i| i.bytes).sum();
                     spans.push(Span::new(
                         Style::Dim,
-                        format!("{lead}{}", image_line(image)),
+                        format!("{lead}[{} images · {total} bytes]", images.len()),
                     ));
+                } else {
+                    for image in images {
+                        spans.push(Span::new(
+                            Style::Dim,
+                            format!("{lead}{}", image_line(image)),
+                        ));
+                    }
                 }
                 spans
             }
@@ -584,6 +598,40 @@ mod tests {
     }
 
     #[test]
+    fn multiple_images_collapse_to_one_line_with_count_and_total_bytes() {
+        // The format breakdown is one entry per image -- that turns a five-image
+        // message into five lines of "what it is", which is five rows the
+        // reader has to skip past before the answer. One line, count and total
+        // bytes, is what a user with several pictures actually wants to see:
+        // the format itself is in the data URL the backend sees, and a resumed
+        // session replays the same bytes it sent the first time.
+        let cell = Cell::User {
+            text: "compare these".into(),
+            images: vec![
+                Note {
+                    format: "png".into(),
+                    bytes: 49152,
+                },
+                Note {
+                    format: "jpeg".into(),
+                    bytes: 30720,
+                },
+                Note {
+                    format: "webp".into(),
+                    bytes: 16384,
+                },
+            ],
+        };
+        assert_eq!(
+            cell.spans(),
+            vec![
+                Span::new(Style::Plain, "compare these"),
+                Span::new(Style::Dim, "\n[3 images · 96256 bytes]"),
+            ]
+        );
+    }
+
+    #[test]
     fn a_tool_call_with_context_and_hunk_lines_renders_them() {
         // The new variants of `DiffKind` are how a real unified diff is
         // painted: context lines have a single leading space and the plain
@@ -643,12 +691,12 @@ mod tests {
                 },
             ],
         };
+        // The aggregate line carries the cell's break itself, so a message
+        // whose only content is images opens in the same column the answer
+        // would -- never with a blank line the reader would have to skip.
         assert_eq!(
             cell.spans(),
-            vec![
-                Span::new(Style::Dim, "[image jpeg · 3 bytes]"),
-                Span::new(Style::Dim, "\n[image webp · 4 bytes]"),
-            ]
+            vec![Span::new(Style::Dim, "[2 images · 7 bytes]")]
         );
     }
 

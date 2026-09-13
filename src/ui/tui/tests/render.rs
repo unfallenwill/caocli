@@ -147,6 +147,38 @@ fn an_attached_image_is_drawn_under_the_line_it_came_with() {
 }
 
 #[test]
+fn multiple_attached_images_are_one_line_not_separate_lines() {
+    // Five pictures become one row, not five: the user is reading the answer,
+    // not the count of the files they attached. The per-image format is left
+    // to the message the backend sees -- it is in the data URL, and a resumed
+    // session replays the same bytes it sent the first time.
+    let mut screen = screen_for_test(40, 20);
+    screen.state.transcript.push(Cell::User {
+        text: "compare these".into(),
+        images: vec![
+            crate::image::Note {
+                format: "png".into(),
+                bytes: 6,
+            },
+            crate::image::Note {
+                format: "jpeg".into(),
+                bytes: 4,
+            },
+            crate::image::Note {
+                format: "webp".into(),
+                bytes: 2,
+            },
+        ],
+    });
+    screen.state.transcript.push(Cell::Content("answer".into()));
+    screen.draw().unwrap();
+    let top = transcript_top(&screen, 3);
+    assert_eq!(row(&screen, top), "› compare these");
+    assert_eq!(row(&screen, top + 1), "  [3 images · 12 bytes]");
+    assert_eq!(row(&screen, top + 2), "answer");
+}
+
+#[test]
 fn a_wrapped_think_keeps_the_rule_on_every_line() {
     // A continuation line that came back to the left edge would be a line that
     // reads as an answer, in the middle of a block that is not one.
