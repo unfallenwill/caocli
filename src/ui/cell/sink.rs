@@ -208,17 +208,17 @@ mod tests {
         assert!(finish.ends_line);
     }
 
-    /// A tool call after a text block: the gap rule fires because a tool
-    /// call is announced on a line of its own.
+    /// A step opens tight against a text block: the gap is the cell's
+    /// own gutter, not a blank line the spacing rule inserts.
     #[test]
-    fn a_tool_call_after_a_block_gaps() {
-        let cell = Cell::tool_call("Bash", "{}");
+    fn a_step_after_a_block_is_tight() {
+        let cell = Cell::from_tool_call("Bash", "{}");
         let mut sink = Recording::new();
         cell.render(true, &mut sink);
 
         assert!(
-            sink.events().iter().any(|e| matches!(e, Event::Gap)),
-            "a tool call after a block gets a gap"
+            !sink.events().iter().any(|e| matches!(e, Event::Gap)),
+            "a step's header is its own line, no padding from the spacing rule"
         );
     }
 

@@ -27,12 +27,13 @@ pub(super) mod layout;
 pub(super) mod question;
 mod replay;
 pub(super) mod sink;
+mod step;
 pub(super) mod stream;
 mod todos;
 pub(super) mod wrap;
 
 // Internally: the helpers a [`Cell`] builds itself from.
-use call::{diff_lines, hint};
+use call::hint;
 use question::question_spans;
 use todos::todo_spans;
 
@@ -42,6 +43,10 @@ use todos::todo_spans;
 // the entry point for the data layer.
 pub use replay::from_messages;
 pub use sink::CellSink;
+// `StepStatus` is re-exported for tests and downstream callers; the cell
+// layer's own match arms reach for it through the `step::*` path.
+#[allow(unused_imports)]
+pub use step::{Step, StepStatus};
 pub use stream::Stream;
 pub use todos::{standing_todos, todo_gutter, todo_head_spans, todo_line_spans};
 
@@ -241,40 +246,37 @@ pub enum Cell {
     Reasoning(String),
     /// A body-text block.
     Content(String),
-    /// A tool call about to run, with the change it makes if it makes one.
-    ToolCall {
-        name: String,
-        hint: String,
-        diff: Vec<DiffLine>,
-    },
+    /// A tool call's full lifecycle: born running, settles on the result.
+    ///
+    /// A [`Step`] is one row in the ledger. While running, the tool's own
+    /// output streams in as children. On `ToolResult`, the verdict line is
+    /// filled in and the step is settled: a successful step is quiet (one
+    /// line -- the verdict), a failed step is loud (verdict + children).
+    ///
+    /// Replaces what used to be three separate cells -- `ToolCall`, the
+    /// stream of `ToolOutput` cells, and `ToolResult` -- because a tool
+    /// call is one thing with a lifecycle, not three things the renderer
+    /// happens to lay out next to each other.
+    Step(Step),
     /// The question tool's call: what is being asked, and what there is to
     /// choose from.
     ///
-    /// A cell of its own rather than a [`Cell::ToolCall`] carrying the raw
+    /// A cell of its own rather than a [`Cell::Step`] carrying the raw
     /// arguments, because these are the words the user has to read -- and because
     /// they are read back from the call's own arguments, so a resumed session
     /// shows the questions exactly as the live one did.
     Question(Vec<Question>),
     /// The todo tool's call: the plan for the work in hand.
     ///
-    /// A cell of its own rather than a [`Cell::ToolCall`] carrying the raw
+    /// A cell of its own rather than a [`Cell::Step`] carrying the raw
     /// arguments, for the reason the question tool's is: the list is the thing
     /// the reader is meant to read, and it is read back from the call's own
     /// arguments, so a resumed session shows the list exactly as it was written
     /// and not as a copy of it that has to be kept somewhere.
     Todo(Vec<Todo>),
-    /// A tool result. Only a summary is ever rendered, never the full text.
-    ToolResult(String),
-    /// A running command's own output, as it arrived.
-    ///
-    /// The one cell no session log can rebuild: those bytes are the terminal's, the
-    /// log keeps a result and not a view of one, and a resumed session therefore
-    /// shows the result where a watched one showed this and then the result. It is
-    /// marked as a result because that is what it is -- the result, arriving before
-    /// the call is over -- and a reader tells the two apart by what they say: a
-    /// stream of the command's lines, then the line the call answered with.
-    ToolOutput(String),
-    /// A dim informational line.
+    /// A dim informational line. Used for results that are not part of a
+    /// [`Cell::Step`] (the answer to a [`Cell::Question`], the update
+    /// confirmation for a [`Cell::Todo`]) and for one-off notes.
     Notice(String),
     /// A failure. The plain front end writes these to the error stream; a front
     /// end owning the screen has to place them in its own output instead.
@@ -354,36 +356,20 @@ impl Cell {
         }
     }
 
-    /// A tool call, with the argument summary and the change it makes.
-    ///
-    /// The plain constructor builds a [`Cell::ToolCall`]; callers that want the
-    /// question or todo tool to be folded into their dedicated cell go through
-    /// [`from_tool_call`] instead. Tests that only want the generic shape --
-    /// the Bash call in the test fixtures, the change it makes if it makes
-    /// one -- reach for this directly.
-    pub fn tool_call(name: &str, args: &str) -> Self {
-        Cell::ToolCall {
-            name: name.to_owned(),
-            hint: hint(args),
-            diff: diff_lines(name, args),
-        }
-    }
-
-    /// Fold a tool call's arguments into the cell that is meant to show them.
+    /// A tool call about to run: produces an open [`Cell::Step`] for regular
+    /// tools, or the dedicated rich cell for the question and todo tools.
     ///
     /// The question tool's arguments are what is shown, and the todo tool's
-    /// arguments are the plan that is meant to be read -- a `ToolCall` cell
-    /// carrying the raw JSON would be a copy of the wire format that a person
-    /// has to parse. Anything else falls back to [`Cell::tool_call`], which is
-    /// what an unreadable call ends up as: the interpreter answers it with the
-    /// parse failure, and the transcript shows what it was that could not be
-    /// read.
+    /// arguments are the plan that is meant to be read -- a step carrying
+    /// the raw JSON would be a copy of the wire format that a person has
+    /// to parse. Anything else falls back to an open step, which is what an
+    /// unreadable call ends up as.
     ///
     /// Lives on the cell layer rather than at the call sites because the
-    /// dispatch is a property of the cells the call becomes, not of whichever
-    /// front end is rendering: the plain front end and the TUI both end up
-    /// with the same Question or Todo cell when given the same arguments, and
-    /// the fallback is the same generic ToolCall.
+    /// dispatch is a property of the cells the call becomes, not of
+    /// whichever front end is rendering: the plain front end and the TUI
+    /// both end up with the same Question, Todo, or open Step when given
+    /// the same arguments, and the fallback is the same.
     pub fn from_tool_call(name: &str, args: &str) -> Self {
         if name == crate::tools::ask::ASK_NAME
             && let Ok(questions) = crate::tools::ask::parse(args)
@@ -395,7 +381,7 @@ impl Cell {
         {
             return Cell::Todo(todos);
         }
-        Cell::tool_call(name, args)
+        Cell::Step(Step::open(name, args))
     }
 
     /// The approval gate's question for a tool call.
@@ -423,22 +409,28 @@ impl Cell {
             // rule is painted in the thinking's own style, not a second one: it is
             // part of the block, and one block is one style run.
             Cell::Reasoning(_) => Some(Gutter::new("┆ ", "┆ ", Style::Reasoning)),
-            Cell::ToolCall { .. } | Cell::Approval { .. } | Cell::Question(_) | Cell::Todo(_) => {
+            // A step opens with the marker the status chose: `▸` for something
+            // about to happen, `✔` for something that finished well, `✘` for
+            // something that did not. The marker's style carries the verdict's
+            // weight -- a green check and a red cross read differently even
+            // without colour -- so a terminal that ignores SGR still shows the
+            // step's outcome.
+            Cell::Step(step) => Some(Gutter::new(
+                step.status.marker(),
+                "  ",
+                match step.status {
+                    step::StepStatus::Running => Style::Yellow,
+                    step::StepStatus::Done => Style::Green,
+                    step::StepStatus::Failed | step::StepStatus::Denied => Style::Red,
+                },
+            )),
+            Cell::Approval { .. } | Cell::Question(_) | Cell::Todo(_) => {
                 Some(Gutter::new("▸ ", "  ", Style::Yellow))
             }
-            // The result and the output of the command it is the result of: one
-            // marker, because one is the other arriving early. A result that
-            // is a failure is red, both in the content and in the marker --
-            // a dim `‣` followed by a red message would be jarring, and the
-            // marker is what tells the eye which line of the transcript is
-            // the result in the first place. The bullet reads as an item, not
-            // as the `·` separator used between fields everywhere else.
-            Cell::ToolResult(text) if text.starts_with("error:") => {
-                Some(Gutter::new("‣ ", "  ", Style::Red))
-            }
-            Cell::ToolResult(_) | Cell::ToolOutput(_) => Some(Gutter::new("‣ ", "  ", Style::Dim)),
-            // A notice has no tool name to put in the gutter -- the bullet
-            // `*` reads as "this is a note", not as a separator or a call.
+            // A failed step's auto-expanded children take the same dim
+            // gutter as their settled result would, so the failure reads as
+            // one block from the verdict line down through the output that
+            // caused it.
             Cell::Notice(_) => Some(Gutter::new("* ", "  ", Style::Dim)),
             Cell::Failure(_) => Some(Gutter::new("  ", "  ", Style::Red)),
             Cell::Interrupted => Some(Gutter::new("  ", "  ", Style::Yellow)),
@@ -452,7 +444,20 @@ impl Cell {
 
     /// The cell's styled spans, without the columns its [`Cell::gutter`] sets it
     /// in, the separating blank line, or the line ending the painter adds.
+    ///
+    /// This is the compact form: settled-Done steps hide their children,
+    /// failures auto-expand. The Ctrl-O verbose toggle re-renders with
+    /// [`Cell::spans_with`]`(true)`, which surfaces settled-Done children
+    /// without changing the layout of the running or failed ones.
     pub fn spans(&self) -> Vec<Span> {
+        self.spans_with(false)
+    }
+
+    /// The cell's spans at `verbose`. Only `Step` changes shape between
+    /// compact and verbose: every other cell has the same spans in both
+    /// modes, and the parameter is here so the call site reads
+    /// uniformly.
+    pub fn spans_with(&self, verbose: bool) -> Vec<Span> {
         match self {
             Cell::User { text, images } => {
                 let mut spans = Vec::with_capacity(images.len() + 1);
@@ -488,42 +493,7 @@ impl Cell {
             }
             Cell::Reasoning(text) => vec![Span::new(Style::Reasoning, text.as_str())],
             Cell::Content(text) => vec![Span::new(Style::Plain, text.as_str())],
-            Cell::ToolCall { name, hint, diff } => {
-                let mut spans = vec![Span::new(Style::Yellow, format!("{name} {hint}"))];
-                // A line of the change is a line of the cell, so it lands in the
-                // gutter's continuation columns and lines up under the call.
-                for line in diff {
-                    spans.push(match &line.kind {
-                        DiffKind::Removed => Span::new(Style::Red, format!("\n- {}", line.text)),
-                        DiffKind::Added => Span::new(Style::Green, format!("\n+ {}", line.text)),
-                        DiffKind::Omitted(n) => {
-                            Span::new(Style::Dim, format!("\n… {n} more lines"))
-                        }
-                        // Context: the same column the gutter's continuation
-                        // opens in, one space wide of indent so it does not
-                        // read as a removed line.
-                        DiffKind::Context => Span::new(Style::Plain, format!("\n {}", line.text)),
-                        // Hunk header: the line that says where in the file the
-                        // change is, dim so it does not compete with the lines
-                        // it heads.
-                        DiffKind::Hunk {
-                            old_start,
-                            old_count,
-                            new_start,
-                            new_count,
-                        } => Span::new(
-                            Style::Dim,
-                            format!("\n@@ -{old_start},{old_count} +{new_start},{new_count} @@"),
-                        ),
-                    });
-                }
-                spans
-            }
-            Cell::ToolResult(result) => {
-                let (style, text) = call::result_summary(result);
-                vec![Span::new(style, text)]
-            }
-            Cell::ToolOutput(text) => vec![Span::new(Style::Dim, text.as_str())],
+            Cell::Step(step) => step.spans_with(verbose),
             Cell::Notice(text) => vec![Span::new(Style::Dim, text.as_str())],
             Cell::Failure(text) => vec![Span::new(Style::Red, format!("error: {text}"))],
             Cell::Interrupted => vec![Span::new(Style::Yellow, "⏹ interrupted (Ctrl-C)")],
@@ -549,9 +519,14 @@ impl Cell {
             // that opens a turn -- or follows a tool line -- starts tight
             // against it, so a turn is not padded with blank lines.
             Cell::Reasoning(_) | Cell::Content(_) => prev_is_text_block,
-            // A tool call is announced on a line of its own, and a replayed user
-            // line is set off from whatever preceded it.
-            Cell::ToolCall { .. } | Cell::User { .. } | Cell::Question(_) | Cell::Todo(_) => true,
+            // A step is announced on a line of its own (the header), but the
+            // children that follow it are part of the same cell -- the cell's
+            // own spans join them with `\n` -- so a step gap_after is false:
+            // the gap before the step's header is its gutter's job, not the
+            // spacing rule's.
+            Cell::Step(_) => false,
+            // A replayed user line is set off from whatever preceded it.
+            Cell::User { .. } | Cell::Question(_) | Cell::Todo(_) | Cell::Approval { .. } => true,
             _ => false,
         }
     }
@@ -622,18 +597,24 @@ mod tests {
 
     #[test]
     fn gap_is_declared_by_the_non_block_cells() {
-        let call = Cell::tool_call("Bash", "{}");
-        assert!(call.gap_after(false), "a tool call gets its own line");
+        let call = Cell::from_tool_call("Bash", "{}");
+        // A step's header is its own line; the gap (if any) is the
+        // spacing rule's job, and it is none for a step -- the cells
+        // that come before are the ones whose gap_after says so.
+        assert!(
+            !call.gap_after(false),
+            "a step opens tight against its predecessor"
+        );
         assert!(Cell::user("hi").gap_after(false));
         assert!(!Cell::Interrupted.gap_after(true));
         assert!(!Cell::Notice("n".into()).gap_after(false));
-        assert!(!Cell::ToolResult("r".into()).gap_after(false));
+        assert!(!Cell::Step(Step::settled("Bash", "{}", "r")).gap_after(false));
     }
 
     #[test]
     fn only_the_approval_question_leaves_its_line_open() {
         assert!(!Cell::approval("Bash", "{}").ends_line());
-        assert!(Cell::tool_call("Bash", "{}").ends_line());
+        assert!(Cell::from_tool_call("Bash", "{}").ends_line());
         assert!(Cell::Content("x".into()).ends_line());
     }
 
@@ -713,33 +694,34 @@ mod tests {
         // painted: context lines have a single leading space and the plain
         // style, hunk headers name the line ranges in dim. The test pins the
         // shape of both, since both front ends go through `spans()`.
-        let cell = Cell::ToolCall {
-            name: "Edit".into(),
-            hint: "a.rs".into(),
-            diff: vec![
-                DiffLine {
-                    kind: DiffKind::Hunk {
-                        old_start: 1,
-                        old_count: 3,
-                        new_start: 1,
-                        new_count: 3,
-                    },
-                    text: String::new(),
+        let mut step = Step::open(
+            "Edit",
+            r#"{"file_path":"a.rs","old_string":"fn a() {\n    1\n}","new_string":"fn a() {\n    2\n}"}"#,
+        );
+        step.diff = vec![
+            DiffLine {
+                kind: DiffKind::Hunk {
+                    old_start: 1,
+                    old_count: 3,
+                    new_start: 1,
+                    new_count: 3,
                 },
-                DiffLine {
-                    kind: DiffKind::Context,
-                    text: "fn a() {".into(),
-                },
-                DiffLine {
-                    kind: DiffKind::Removed,
-                    text: "    1".into(),
-                },
-                DiffLine {
-                    kind: DiffKind::Added,
-                    text: "    2".into(),
-                },
-            ],
-        };
+                text: String::new(),
+            },
+            DiffLine {
+                kind: DiffKind::Context,
+                text: "fn a() {".into(),
+            },
+            DiffLine {
+                kind: DiffKind::Removed,
+                text: "    1".into(),
+            },
+            DiffLine {
+                kind: DiffKind::Added,
+                text: "    2".into(),
+            },
+        ];
+        let cell = Cell::Step(step);
         assert_eq!(
             cell.spans(),
             vec![
@@ -778,15 +760,14 @@ mod tests {
 
     #[test]
     fn tool_cells_carry_the_extracted_hint() {
-        match Cell::tool_call("Bash", r#"{"command":"ls"}"#) {
-            Cell::ToolCall { name, hint, diff } => {
-                assert_eq!(name, "Bash");
-                assert_eq!(hint, "ls");
-                assert!(diff.is_empty(), "a command has no lines to show");
-            }
+        let step = match Cell::from_tool_call("Bash", r#"{"command":"ls"}"#) {
+            Cell::Step(s) => s,
             other => panic!("expected a tool call, got {other:?}"),
-        }
-        let cell = Cell::tool_call("Bash", r#"{"command":"ls"}"#);
+        };
+        assert_eq!(step.verb, "Bash");
+        assert_eq!(step.subject, "ls");
+        assert!(step.diff.is_empty(), "a command has no lines to show");
+        let cell = Cell::from_tool_call("Bash", r#"{"command":"ls"}"#);
         assert_eq!(cell.spans(), vec![Span::new(Style::Yellow, "Bash ls")]);
         assert_eq!(cell.gutter().unwrap().head, "▸ ");
         let cell = Cell::approval("Bash", r#"{"command":"rm -rf /"}"#);
@@ -801,17 +782,24 @@ mod tests {
         );
     }
 
-    /// A command's own output is kept whole, unlike the result of the call: it is
-    /// what the command printed, and a reader watching a build is reading it.
+    /// A tool call's streaming output: the children of a running step,
+    /// each line dim, each on its own row under the header.
     #[test]
     fn tool_output_renders_the_lines_it_was_given() {
-        let cell = Cell::ToolOutput("Compiling foo\nwarning: unused\n".into());
+        let mut step = Step::open("Bash", r#"{"command":"ls"}"#);
+        step.push_output("Compiling foo\nwarning: unused\n");
+        let cell = Cell::Step(step);
         assert_eq!(
             cell.spans(),
-            vec![Span::new(Style::Dim, "Compiling foo\nwarning: unused\n")]
+            vec![
+                Span::new(Style::Yellow, "Bash ls"),
+                Span::new(Style::Dim, "\nCompiling foo"),
+                Span::new(Style::Dim, "\nwarning: unused"),
+            ]
         );
-        // Marked as a result, since it is one arriving early, and set in like one.
-        assert_eq!(cell.gutter(), Cell::ToolResult(String::new()).gutter());
+        // Marked as a step, set in like one. The gutter depends on
+        // status, not on whether children are present.
+        assert_eq!(cell.gutter().unwrap().head, "▸ ");
         assert!(cell.ends_line());
         assert!(!cell.is_text_block());
         assert!(!cell.gap_after(true));
@@ -820,31 +808,39 @@ mod tests {
     #[test]
     fn tool_result_renders_first_line_and_size_only() {
         let result = "exit_code: 3\n--- stdout ---\nSECRET_BODY";
-        let spans = Cell::ToolResult(result.into()).spans();
-        // A Bash result: the exit code, and only the exit code. The
-        // transcript's rule is that a tool result's summary is metadata,
-        // never content -- and the first line of stdout is content.
-        assert_eq!(spans, vec![Span::new(Style::Dim, "exit_code: 3")]);
+        let cell = Cell::Step(Step::settled("Bash", r#"{"command":"ls"}"#, result));
+        let spans = cell.spans();
+        // A Bash result with a non-zero exit code is a failure: the
+        // settled step carries the verdict in red, with the verb and
+        // subject attached so the reader can scan the row.
+        assert_eq!(spans, vec![Span::new(Style::Red, "Bash ls · exit_code: 3")]);
         // An empty result: no recognized prefix, the default summary
-        // (first line and byte count) is what falls out.
-        let spans = Cell::ToolResult(String::new()).spans();
-        assert_eq!(spans, vec![Span::new(Style::Dim, " · 0 bytes")]);
+        // (first line and byte count) is what falls out. An empty result
+        // is not a failure, so the settled step is green.
+        let cell = Cell::Step(Step::settled("Bash", r#"{"command":"ls"}"#, ""));
+        let spans = cell.spans();
+        assert_eq!(spans, vec![Span::new(Style::Green, "Bash ls ·  · 0 bytes")]);
     }
 
     /// An `error:` result is the one case where the style changes: failures
     /// are red, so a reader can tell success from failure at a glance.
     #[test]
     fn a_tool_result_starting_with_error_is_red() {
-        let spans = Cell::ToolResult("error: file not found".into()).spans();
-        assert_eq!(spans, vec![Span::new(Style::Red, "error: file not found")]);
-        // The gutter follows the content: a dim marker in front of a red
-        // message would be a line that fights itself, and the marker is
-        // the only thing that says "this is a tool result".
-        let gutter = Cell::ToolResult("error: file not found".into())
-            .gutter()
-            .unwrap();
+        let cell = Cell::Step(Step::settled(
+            "Read",
+            r#"{"file_path":"/nope"}"#,
+            "error: file not found",
+        ));
+        let spans = cell.spans();
+        assert_eq!(
+            spans,
+            vec![Span::new(Style::Red, "Read /nope · error: file not found")]
+        );
+        // The gutter follows the content: a red marker in front of a red
+        // message reads as one failure, not two things.
+        let gutter = cell.gutter().unwrap();
         assert_eq!(gutter.style, Style::Red);
-        assert_eq!(gutter.head, "‣ ");
+        assert_eq!(gutter.head, "✘ ");
     }
 
     #[test]
@@ -940,13 +936,13 @@ mod tests {
             Cell::user("hi"),
             Cell::Reasoning("hmm".into()),
             Cell::Content("answer".into()),
-            Cell::tool_call("Bash", r#"{"command":"ls"}"#),
-            Cell::tool_call(
+            Cell::from_tool_call("Bash", r#"{"command":"ls"}"#),
+            Cell::from_tool_call(
                 "AskUserQuestion",
                 r#"{"questions":[{"id":"a","question":"Which?"}]}"#,
             ),
-            Cell::tool_call("TodoWrite", r#"{"todos":[{"content":"Run the gates"}]}"#),
-            Cell::ToolResult("ok".into()),
+            Cell::from_tool_call("TodoWrite", r#"{"todos":[{"content":"Run the gates"}]}"#),
+            Cell::Step(Step::settled("Bash", r#"{"command":"ls"}"#, "ok")),
             Cell::Notice("noted".into()),
             Cell::Failure("broken".into()),
             Cell::Interrupted,

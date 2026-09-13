@@ -83,14 +83,21 @@ fn same_mode_deltas_do_not_reopen_block() {
 
 #[test]
 fn tool_start_extracts_command_hint() {
+    // tool_start alone stores the open step but does not paint -- the
+    // hint is shown on the matching `tool_result`, which settles the
+    // step. Each settled step's header carries the verb and the hint
+    // the args named; bad JSON falls back to the raw args text.
     let (mut r, buf) = with_buffer(true);
     r.tool_start("Bash", r#"{"command":"ls -la"}"#);
+    r.tool_result("exit_code: 0");
     r.tool_start("Read", r#"{"file_path":"/a/b.txt"}"#);
+    r.tool_result("[package]\nname = \"caocli\"\n");
     r.tool_start("Write", "not json at all");
+    r.tool_result("ok: wrote /tmp/x.txt (5 bytes)");
     let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-    assert!(s.contains("▸ Bash ls -la"), "{s}");
-    assert!(s.contains("▸ Read /a/b.txt"), "{s}");
-    assert!(s.contains("▸ Write not json at all"), "{s}"); // bad JSON falls back to raw text
+    assert!(s.contains("✔ Bash ls -la"), "{s}");
+    assert!(s.contains("✔ Read /a/b.txt"), "{s}");
+    assert!(s.contains("✔ Write not json at all"), "{s}");
 }
 
 /// A running command's output is written as it arrives, in its own block: the
@@ -104,9 +111,17 @@ fn a_running_commands_output_is_written_as_it_arrives() {
     r.tool_output("two");
     r.tool_result("exit_code: 0\n--- stdout ---\none\ntwo");
     let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-    assert!(s.contains("▸ Bash echo one; echo two"), "{s:?}");
-    assert!(s.contains("\x1b[2m‣ one\n  two\x1b[0m\n"), "{s:?}");
-    assert!(s.contains("‣ exit_code: 0"), "{s:?}");
+    // The settled step's header carries the call's verb and subject, with the
+    // gutter's marker in the verdict's colour. Live and replay both paint
+    // just this one line per call -- the streamed output was already written.
+    assert!(
+        s.contains("✔ Bash echo one; echo two · exit_code: 0"),
+        "{s:?}"
+    );
+    // Streamed output is dim; the marker is the header's, not the chunk's.
+    // The second line carries the continuation indent, since the chunk
+    // before it ended with a newline.
+    assert!(s.contains("\x1b[2mone\n  two\x1b[0m\n"), "{s:?}");
     // Nothing is left on the line the last chunk ended: a chunk that ends with a
     // break ends the block, and the cell after it follows on the next line.
     assert!(!s.contains("  \n"), "no line of nothing but columns: {s:?}");
@@ -118,12 +133,13 @@ fn a_running_commands_output_is_written_as_it_arrives() {
 #[test]
 fn a_chunk_after_a_break_continues_the_line_it_started() {
     let (mut r, buf) = with_buffer(true);
+    r.tool_start("Bash", r#"{"command":"echo one; echo two"}"#);
     r.tool_output("one\n");
     r.tool_output("two\n");
     r.tool_output("three");
     r.tool_result("exit_code: 0");
     let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-    assert!(s.contains("\x1b[2m‣ one\n  two\n  three\x1b[0m\n"), "{s:?}");
+    assert!(s.contains("\x1b[2mone\n  two\n  three\x1b[0m\n"), "{s:?}");
 }
 
 /// Nothing is written for a command that printed nothing: an empty chunk is not a
@@ -131,13 +147,17 @@ fn a_chunk_after_a_break_continues_the_line_it_started() {
 #[test]
 fn an_empty_chunk_opens_no_block() {
     let (mut r, buf) = with_buffer(true);
+    r.tool_start("Bash", r#"{"command":": # prints nothing"}"#);
     r.tool_output("");
     r.tool_result("exit_code: 0");
     let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-    // A Bash result without stdout is just the exit code -- no "· N bytes"
-    // suffix, because the suffix was a measure of the result, not of
-    // anything a reader needs to know.
-    assert_eq!(s, "\x1b[2m‣ exit_code: 0\x1b[0m\n");
+    // A Bash result without stdout is just the settled step header:
+    // the open step's marker (now green / done), the verb and subject,
+    // and the verdict.
+    assert_eq!(
+        s,
+        "\x1b[1;32m✔ Bash : # prints nothing · exit_code: 0\x1b[0m\n"
+    );
 }
 
 #[test]
@@ -171,7 +191,13 @@ fn replay_renders_history_compactly_with_colors() {
         "thinking is set in behind its own rule: {s}"
     );
     assert!(s.contains("running it"), "{s}");
-    assert!(s.contains("▸ Bash ls -la"), "tool calls are yellow: {s}");
+    // The settled step's header is the verb and the parsed verdict -- no
+    // separate open step at replay time, since from_messages folds the
+    // assistant's tool call and the tool result into one cell.
+    assert!(
+        s.contains("✔ Bash ls -la · exit_code: 0"),
+        "settled step in green: {s}"
+    );
     // tool messages only get a summary, never the full text. A Bash
     // summary is just the exit code -- the first line of stdout is
     // content, and the transcript's rule is that the summary is metadata.
@@ -315,13 +341,12 @@ fn the_plain_front_ends_stream_is_frozen() {
     // Frozen against the bytes this front end writes today: a move that
     // changes any of them is a rewrite, not a move.
     let expected = concat!(
-        // the bar comes up on a 24x80 terminal: scroll region 1..23, cursor on 23,
-        // then the bar's right-aligned redraw. The label is 47 columns wide
-        // (deepseek-v4-pro · effort max · cache 0.0% · 0/0), so the bar pads
-        // 79-47=32 spaces to put it flush with the right edge.
+        // The pinned row is now cache-only: "cache 0.0% · 0/0" is 18
+        // columns, so the bar pads 80-18=62 spaces to put it flush with
+        // the right edge. The model + effort are gone from this row.
         "\x1b[24;1H\x1b[2K\x1b[1;23r\x1b[23;1H",
-        "\x1b7\x1b[24;1H\x1b[2K                                ",
-        "\x1b[2mdeepseek-v4-pro · effort max · cache 0.0% · 0/0\x1b[0m\x1b8",
+        "\x1b7\x1b[24;1H\x1b[2K                                                               ",
+        "\x1b[2mcache 0.0% · 0/0\x1b[0m\x1b8",
         // the banner is an info cell
         "\x1b[2m* caocli · session 20260910-213122 (2 messages) · deepseek-v4-pro\x1b[0m\n",
         "\n",
@@ -335,15 +360,22 @@ fn the_plain_front_ends_stream_is_frozen() {
         "\x1b[2m┆ weigh it\x1b[0m\n",
         "\n",
         "here goes\x1b[0m\n",
-        "\n",
+        // A step opens tight against its predecessor: the cell's own
+        // line is its own gap. No extra `\n` here.
         // a call, its result, and the usage line
-        "\x1b[1;33m▸ Bash ls -la\x1b[0m\n",
-        "\x1b[2m‣ exit_code: 0\x1b[0m\n",
+        // The settled step's header: green marker for a clean exit, the
+        // verb and subject, and the verdict. Live no longer paints a
+        // separate `▸ Bash ls -la` header at `tool_start` -- the step
+        // settles in one line, so live and replay read the same.
+        "\x1b[1;32m✔ Bash ls -la · exit_code: 0\x1b[0m\n",
         "\x1b[2m≡ tokens: in 10/10 · hit 6/miss 4 · out 0\x1b[0m\n",
         // the bar picks up the usage the line just recorded, then the gate asks.
         // The label is now 48 columns (cache 60.0% · 6/4), so the pad is 31.
-        "\x1b7\x1b[24;1H\x1b[2K                               ",
-        "\x1b[2mdeepseek-v4-pro · effort max · cache 60.0% · 6/4\x1b[0m\x1b8",
+        // Cache hits accumulate to 60.0% on the second redraw; the row
+        // is cache-only now, so the label is "cache 60.0% · 6/4" -- 18
+        // columns, 62 spaces of padding.
+        "\x1b7\x1b[24;1H\x1b[2K                                                              ",
+        "\x1b[2mcache 60.0% · 6/4\x1b[0m\x1b8\n",
         "\x1b[1;33m▸ Write /tmp/x · run it? y/N \x1b[0m",
         "\x1b[1;33m  ⏹ interrupted (Ctrl-C)\x1b[0m\n",
         // and the bar goes down as the terminal is handed back
@@ -473,14 +505,19 @@ fn a_streamed_block_and_the_same_block_replayed_are_the_same_bytes() {
 /// left out without a change's lines landing in the column the answers are in.
 #[test]
 fn a_cells_own_line_breaks_are_set_in_too() {
+    // An Edit step settles in one line: the verdict header followed by
+    // the diff lines. Live and replay both produce this single block, so
+    // the diff is rendered in the columns the call's lines are.
     let (mut r, buf) = with_buffer(false);
     r.tool_start(
         "Edit",
         r#"{"file_path":"a.txt","old_string":"one","new_string":"two"}"#,
     );
+    r.tool_result("ok: replaced 1 occurrence; /tmp/a.txt is now 4 bytes");
     let drawn = buf_of(&buf);
+    eprintln!("DEBUG drawn: {drawn:?}");
     assert!(
-        drawn.contains("▸ Edit a.txt\n  - one\n  + two"),
+        drawn.contains("✔ Edit a.txt · replaced in /tmp/a.txt · now 4 bytes\n  - one\n  + two"),
         "a change is set in under its call, in the columns the call's lines are: {drawn:?}"
     );
 

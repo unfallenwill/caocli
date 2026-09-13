@@ -20,13 +20,42 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use crate::types::{Message, Usage};
+use crate::ui::cell::{Cell, Step, Style};
+use crate::ui::contract::{Front, Ui};
+use crate::ui::plain_writer::PlainWriter;
+use crate::ui::status::Status;
+use crate::ui::status_bar::StatusBar;
+use crate::ui::terminal::{RealTerminal, Terminal};
 
-use super::cell::{Cell, Style};
-use super::contract::{Front, Ui};
-use super::plain_writer::PlainWriter;
-use super::status::Status;
-use super::status_bar::StatusBar;
-use super::terminal::{RealTerminal, Terminal};
+/// The plain front end's tool-result summary: a one-line rendering of what
+/// came back, matching the cell layer's `Step::settle` verdict line in shape
+/// so a `ToolResult` arriving without a matching `ToolStart` (a defensive
+/// fallback, never a real wire shape) reads the same as a settled step's
+/// header would.
+fn call_result_summary(result: &str) -> (Style, String) {
+    if let Some(rest) = result.strip_prefix("error:") {
+        return (Style::Red, format!("error: {}", rest.trim_start()));
+    }
+    if let Some(code) = result
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("exit_code:"))
+        .and_then(|n| n.trim().parse::<i64>().ok())
+    {
+        return (
+            if code == 0 { Style::Green } else { Style::Red },
+            format!("exit_code: {code}"),
+        );
+    }
+    (
+        Style::Dim,
+        format!(
+            "{} · {} bytes",
+            result.lines().next().unwrap_or(""),
+            result.len()
+        ),
+    )
+}
 
 /// Streaming renderer. Thinking and body text are two independent render blocks:
 /// - thinking is dim, body text is the normal color
@@ -47,15 +76,29 @@ pub struct Renderer {
     /// process's own terminal -- its width, whether it can take escape
     /// sequences, how to silence its echo -- comes from here.
     term: Box<dyn Terminal>,
-    /// What the status bar reports: the model, the effort tier and the session's
-    /// cache statistics.
+    /// What the status bar reports: cache statistics only. The model and
+    /// effort tier moved to the per-prompt metadata row written just
+    /// before each user line.
     status: Status,
+    /// The model id in effect. Set once at session start and on `/model`;
+    /// joins the metadata row above the next user line.
+    model: Option<String>,
+    /// The reasoning effort tier in effect. Same lifetime as `model`.
+    effort: Option<String>,
     pub(super) bar: Option<StatusBar>,
     /// Whether the front end currently has the tty in raw mode. The prompt sets
     /// it before reading keys; `ask_secret` reads it to decide which read path
     /// to use -- in raw mode the kernel is not collecting a line, so a blocking
     /// read on stdin never returns.
     in_raw_mode: bool,
+    /// The tool call that is currently running, if any. The plain front end
+    /// writes its header line when the call starts and accumulates its
+    /// children as the output streams; the result settles the step and the
+    /// verdict line closes the cell on screen. Question and todo calls do
+    /// not open a step -- their `from_tool_call` dispatch produces a rich
+    /// cell that paints itself and waits for the result notice, which the
+    /// renderer files as a notice.
+    open_step: Option<Step>,
 }
 
 impl Renderer {
@@ -73,8 +116,11 @@ impl Renderer {
             writer: PlainWriter::new(out, color),
             term,
             status: Status::default(),
+            model: None,
+            effort: None,
             bar: None,
             in_raw_mode: false,
+            open_step: None,
         }
     }
 
@@ -166,12 +212,12 @@ impl Front for Renderer {
     }
 
     fn set_model(&mut self, model: &str) {
-        self.status.set_model(model);
+        self.model = Some(model.to_owned());
         self.redraw_status_bar();
     }
 
     fn set_effort(&mut self, effort: &str) {
-        self.status.set_effort(effort);
+        self.effort = Some(effort.to_owned());
         self.redraw_status_bar();
     }
 
@@ -321,23 +367,48 @@ impl Ui for Renderer {
     }
 
     fn tool_start(&mut self, name: &str, args: &str) {
-        self.writer.paint_cell(&Cell::from_tool_call(name, args));
+        // Open a `Step` in the writer's state. We do not paint a separate
+        // header line: live and replay both settle the step on `ToolResult`
+        // and render that single line. Painting a header here would mean a
+        // live turn prints two lines per call and a replayed turn prints
+        // one -- the divergence the `live_and_replay_lay_out_a_turn_identically`
+        // test guards against.
+        let cell = Cell::from_tool_call(name, args);
+        match &cell {
+            Cell::Step(step) => {
+                self.open_step = Some(step.clone());
+            }
+            // The question and todo tools paint themselves when their
+            // rich cell is filed -- the matching `ToolResult` adds the
+            // answer / confirmation as a notice beside it.
+            _ => self.writer.paint_cell(&cell),
+        }
     }
 
     fn tool_output(&mut self, chunk: &str) {
         if chunk.is_empty() {
             return;
         }
+        // The chunk is added to the open step's children so a settled step
+        // can be re-rendered with its full output if needed (Ctrl-O), but
+        // the plain front end writes the bytes as they arrive -- a TUI is
+        // what the cell model exists for, and the plain front end is just
+        // a byte stream the terminal folds.
+        if let Some(step) = self.open_step.as_mut() {
+            step.push_output(chunk);
+        }
+        // The continuation indent that lines up under the open step's
+        // header: a "▸ Bash ls" header is followed by lines that start
+        // where the verb starts (after the marker), which is two columns
+        // in. Without it a `cargo build`'s lines would run together at
+        // the left edge.
+        const REST: &str = "  ";
         self.writer.open_block(Style::Dim);
         // The command's own lines are set in like every other line of a cell, and
         // this is the only layer that sees where they break: what arrives is a run
         // of bytes, so a `\n` in it is a line of the cell that has to carry the
         // continuation columns itself. A line the terminal wraps is still the
         // terminal's, since only it knows where the screen ends.
-        let rest = Style::Dim
-            .stream_cell(String::new())
-            .gutter()
-            .map_or("", |gutter| gutter.rest);
         let mut lines = chunk.split('\n').peekable();
         while let Some(line) = lines.next() {
             // A line with nothing on it is a line the block leaves empty: it takes no
@@ -345,7 +416,7 @@ impl Ui for Renderer {
             // the one the next chunk continues.
             if !line.is_empty() {
                 if self.writer.at_line_start {
-                    self.writer.emit(rest);
+                    self.writer.emit(REST);
                 }
                 self.writer.at_line_start = false;
                 self.writer.emit(line);
@@ -358,7 +429,26 @@ impl Ui for Renderer {
     }
 
     fn tool_result(&mut self, result: &str) {
-        self.writer.paint_cell(&Cell::ToolResult(result.to_owned()));
+        // Settle an open step in place: its children stay, the verdict is
+        // filled in, and the step is closed with the settled header line.
+        // Children were streamed as they arrived and so are dropped before
+        // the cell renders (otherwise we'd see every line of `cargo test`
+        // twice); the diff is kept, so an Edit's change is visible on the
+        // settled step.
+        if let Some(mut step) = self.open_step.take() {
+            step.settle(result);
+            step.children.clear();
+            self.writer.paint_cell(&Cell::Step(step));
+            return;
+        }
+        // No open step. The wire should not send a `ToolResult` without a
+        // matching `ToolStart`, but if it does, the result text is what
+        // the model saw -- print the verdict line as a dim line with no
+        // marker, so the reader can still see what came back.
+        let (style, text) = call_result_summary(result);
+        self.writer.open_block(style);
+        self.writer.emit(&text);
+        self.writer.emit("\n");
     }
 
     fn instructions(&mut self, dir: &str) {

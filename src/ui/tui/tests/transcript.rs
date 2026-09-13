@@ -410,7 +410,7 @@ fn a_window_is_the_same_lines_as_the_transcript_it_is_a_window_on() {
         .view
         .transcript
         .iter()
-        .flat_map(|cell| cell_lines(cell, width))
+        .flat_map(|cell| cell_lines(cell, width, screen.state.verbose))
         .collect();
     assert_eq!(
         render_mod::lines(&mut screen.state, width),

@@ -85,7 +85,7 @@ mod tests {
             cells,
             vec![
                 Cell::from_tool_call("AskUserQuestion", args),
-                Cell::ToolResult("auth: JWT".into()),
+                Cell::Notice("auth: JWT".into()),
             ]
         );
         assert!(matches!(cells[0], Cell::Question(_)));
@@ -147,6 +147,6 @@ mod tests {
         // The interpreter answers this one with the parse failure; the transcript
         // shows the line that could not be read.
         let cell = Cell::from_tool_call("AskUserQuestion", r#"{"questions":"nonsense"}"#);
-        assert!(matches!(cell, Cell::ToolCall { .. }), "was {cell:?}");
+        assert!(matches!(cell, Cell::Step(_)), "was {cell:?}");
     }
 }

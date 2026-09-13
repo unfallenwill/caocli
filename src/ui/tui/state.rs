@@ -52,6 +52,19 @@ pub(super) struct State {
     pub(super) overlay: Overlay,
     /// The running turn's clock and the line queue.
     pub(super) turn: Turn,
+    /// The Ctrl-O verbose toggle. When `true`, settled-Done steps render
+    /// their children as well as the verdict; the default keeps them
+    /// quiet. Lives on `State` (not `View`) because the laid cache
+    /// invalidates on the change, and the cache is read by callers that
+    /// already reach through `State`.
+    pub(super) verbose: bool,
+    /// The model id in effect. Set once at session start (the front end's
+    /// `model_label`) and on `/model`. Drives the per-prompt metadata row
+    /// above each User cell. `None` until the agent picks one.
+    pub(super) model: Option<String>,
+    /// The reasoning effort tier in effect. Set at session start and on
+    /// `/effort`. Joins the model in the per-prompt metadata row.
+    pub(super) effort: Option<String>,
     /// Bumped by everything that changes what the screen should show, so a
     /// draw can be skipped when nothing has. Lives on [`State`] rather than
     /// any one half because every half can change the picture: a notice
@@ -63,6 +76,20 @@ pub(super) struct State {
 // ----------------------------------------------------------------- methods ---
 
 impl State {
+    /// A `State` configured for tests that exercise the per-prompt
+    /// metadata row: a known model and effort, no other state. Built
+    /// through a constructor rather than `Default::default() + field
+    /// assignment` so the lint that catches "init-then-overwrite"
+    /// patterns does not flag the test fixture.
+    #[cfg(test)]
+    pub(super) fn for_test_with_meta(model: &str, effort: &str) -> Self {
+        Self {
+            model: Some(model.to_owned()),
+            effort: Some(effort.to_owned()),
+            ..Self::default()
+        }
+    }
+
     /// Put a cell in the transcript that the machine did not send -- the banner,
     /// a session-level failure. It still moves the revision, or the draw that
     /// should show it would be skipped.
@@ -77,7 +104,15 @@ impl State {
         match notice {
             MachineNotice::Reasoning(text) => self.stream(Style::Reasoning, &text),
             MachineNotice::Content(text) => self.stream(Style::Plain, &text),
-            MachineNotice::FinishTurn => self.end_block(),
+            MachineNotice::FinishTurn => {
+                // A turn ending while a tool is still open is unusual -- the
+                // machine settles every tool before finishing -- but it can
+                // happen after an interruption. Closing the open step here
+                // keeps the transcript from carrying an open step into the
+                // next turn.
+                self.finalize_open_step("interrupted");
+                self.end_block();
+            }
             MachineNotice::ToolStart { name, args } => {
                 // The call's arguments are output the backend billed for: the
                 // characters join both counters so the usage notice that ends
@@ -89,10 +124,41 @@ impl State {
                 let chars = args.chars().count();
                 self.turn.streamed_chars += chars;
                 self.turn.chars_since_usage += chars;
+                // The verb drives the "running X" label on the box's top
+                // border while the tool runs. The result notice clears it
+                // when the step settles.
+                self.turn.current_tool_verb = Some(name.clone());
+                // Close any open step first: a step in flight across two
+                // tool calls would be malformed (the model emits ToolResult
+                // before ToolStart), but an Interrupted turn can leave one
+                // open. Finalizing it as interrupted is the safe default.
+                self.finalize_open_step("interrupted");
+                // `from_tool_call` is the dispatcher: regular tools become
+                // an open Cell::Step, the question and todo tools keep
+                // their own rich cells. The open step's children will be
+                // filled by the ToolOutput notices that follow.
                 self.close_and_push(Cell::from_tool_call(&name, &args));
             }
-            MachineNotice::ToolOutput(chunk) => self.stream_output(&chunk),
-            MachineNotice::ToolResult(result) => self.close_and_push(Cell::ToolResult(result)),
+            MachineNotice::ToolOutput(chunk) => {
+                // Tool output now belongs to the open step, not to the
+                // streaming text block. A step that is still open takes the
+                // chunk as its newest children; a stray chunk (no open
+                // step, perhaps because the result arrived before the
+                // output) is dropped on the floor -- the result carries
+                // whatever the result carries.
+                if let Some(Cell::Step(step)) = self.view.transcript.last_mut()
+                    && !step.status.is_settled()
+                {
+                    step.push_output(&chunk);
+                    // The last cell changed; the laid cache from this
+                    // index onwards is stale.
+                    let stale_from = self.view.transcript.len() - 1;
+                    self.view.laid.truncate(stale_from);
+                }
+            }
+            MachineNotice::ToolResult(result) => {
+                self.finalize_tool_result(&result);
+            }
             MachineNotice::Instructions(dir) => {
                 self.close_and_push(Cell::Notice(crate::agents_md::notice_text(&dir)));
             }
@@ -108,7 +174,14 @@ impl State {
                 }
                 self.turn.chars_since_usage = 0;
             }
-            MachineNotice::Interrupted => self.close_and_push(Cell::Interrupted),
+            MachineNotice::Interrupted => {
+                // An interrupted turn closes any open tool step as well as
+                // filing the interruption notice: the children the tool had
+                // accumulated up to that point are what the reader saw, and
+                // dropping them on the floor would mean losing the work.
+                self.finalize_open_step("interrupted");
+                self.close_and_push(Cell::Interrupted);
+            }
             MachineNotice::Truncated(notice) => {
                 // Not an error: the wire's own sentence already says why the
                 // answer stopped, and the transcript's error styling (red,
@@ -128,13 +201,32 @@ impl State {
         match notice {
             AppNotice::Replay(messages) => {
                 self.end_block();
-                self.view.transcript.extend(cell::from_messages(&messages));
+                // The metadata row sits above each User cell. Push one
+                // before replaying the user line, so a resumed session
+                // reads the same as one that was watched live.
+                let mut buf = Vec::new();
+                for m in messages {
+                    if matches!(m.role, crate::types::Role::User)
+                        && let Some(meta) = self.metadata_text()
+                    {
+                        buf.push(Cell::Notice(meta));
+                    }
+                    buf.extend(cell::from_messages(std::slice::from_ref(&m)));
+                }
+                self.view.transcript.extend(buf);
             }
             AppNotice::Info(text) => self.close_and_push(Cell::Notice(text)),
             AppNotice::Error(text) => self.close_and_push(Cell::Failure(text)),
-            AppNotice::SetModel(model) => self.view.status.set_model(&model),
-            AppNotice::SetEffort(effort) => self.view.status.set_effort(&effort),
+            AppNotice::SetModel(model) => self.model = Some(model),
+            AppNotice::SetEffort(effort) => self.effort = Some(effort),
             AppNotice::ResetStats => self.view.status.reset_stats(),
+            AppNotice::SetVerbose(v) => {
+                // Flipping verbose invalidates the laid cache on the next
+                // draw -- `ensure_laid` keys on `laid_verbose` and will
+                // rebuild every cell at the new mode. The revision bump
+                // above wakes the loop.
+                self.verbose = v;
+            }
         }
     }
 
@@ -171,18 +263,6 @@ impl State {
         }
     }
 
-    /// Append a running command's own output.
-    ///
-    /// Deliberately not [`State::stream`]: the counters behind the speed estimate
-    /// measure the model's output against the tokens it was billed for, and a
-    /// compiler's chatter is neither.
-    pub(super) fn stream_output(&mut self, text: &str) {
-        if let Some(cell) = self.view.stream.append(Style::Dim, text) {
-            self.revision += 1;
-            self.view.transcript.push(cell);
-        }
-    }
-
     /// Close the block being streamed, if any, so it becomes a finished cell.
     ///
     /// Bumps the revision: this is called from the turn's end as well as from a
@@ -206,6 +286,90 @@ impl State {
         self.end_block();
         self.revision += 1;
         self.view.transcript.push(cell);
+    }
+
+    /// Settle an open [`Cell::Step`] at the end of the transcript with a
+    /// failure verdict, when the turn ends (or is interrupted) without a
+    /// matching `ToolResult`. Idempotent: a transcript whose last cell is
+    /// not an open step is left alone.
+    ///
+    /// The note goes into the verdict, which keeps the failed step on the
+    /// same row as its header line -- the cause of the failure is right
+    /// there in the one line the reader sees.
+    fn finalize_open_step(&mut self, note: &str) {
+        if let Some(Cell::Step(step)) = self.view.transcript.last_mut()
+            && !step.status.is_settled()
+        {
+            step.interrupt();
+            // The note replaces the "interrupted" default only when the
+            // caller wants to say something more specific; the default is
+            // "interrupted" because that is the most common cause.
+            if note != "interrupted" {
+                step.verdict = note.to_owned();
+            }
+            // The laid cache for the last cell is stale.
+            let stale_from = self.view.transcript.len() - 1;
+            self.view.laid.truncate(stale_from);
+            // The tool that was running is no longer running. An
+            // interrupted step leaves the border's "running X" label
+            // pointing at a call that did not actually run, which is
+            // what made `Ctrl-C` the right thing to do -- so it goes.
+            self.turn.current_tool_verb = None;
+        }
+    }
+
+    /// Settle the open step (if any) with the result text, or file the
+    /// result as a notice after a question or todo cell. Mirrors what the
+    /// replay path does for the same wire shape.
+    fn finalize_tool_result(&mut self, result: &str) {
+        // Settle the last cell in place if it is an open step.
+        if let Some(Cell::Step(step)) = self.view.transcript.last_mut()
+            && !step.status.is_settled()
+        {
+            step.settle(result);
+            let stale_from = self.view.transcript.len() - 1;
+            self.view.laid.truncate(stale_from);
+            // The tool that was running is no longer running -- the
+            // border's "running X" label picks up the next phase.
+            self.turn.current_tool_verb = None;
+            return;
+        }
+        // No open step: the preceding cell is a question or todo, or
+        // something we did not expect. The result text is what the model
+        // sees; the transcript gets it as a dim notice.
+        if matches!(
+            self.view.transcript.last(),
+            Some(Cell::Question(_)) | Some(Cell::Todo(_))
+        ) {
+            self.close_and_push(Cell::Notice(result.to_owned()));
+        }
+        // Stray tool result with no preceding tool call: dropped. The
+        // machine should not send one without a ToolStart; if it does,
+        // the result has nowhere to land in the cell layer.
+    }
+
+    /// The per-prompt metadata row's text: `provider/model · effort tier`,
+    /// or `None` when neither field is known yet (the very first turn
+    /// before the agent picks a model). `None` means "do not push a
+    /// metadata cell", which keeps a resumed session that pre-dates
+    /// metadata from picking up an empty notice.
+    pub(super) fn metadata_text(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(m) = &self.model
+            && !m.is_empty()
+        {
+            parts.push(m.clone());
+        }
+        if let Some(e) = &self.effort
+            && !e.is_empty()
+        {
+            parts.push(format!("effort {e}"));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" · "))
+        }
     }
 
     /// A turn is starting at `started`.

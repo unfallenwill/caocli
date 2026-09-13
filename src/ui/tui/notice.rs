@@ -89,6 +89,15 @@ pub(super) enum AppNotice {
     SetEffort(String),
     /// Clear the session's cache statistics.
     ResetStats,
+    /// Flip the Ctrl-O verbose toggle. The cell layer re-renders settled
+    /// steps with their children visible at `true`, and back to quiet at
+    /// `false`. The laid cache invalidates on the change so the next
+    /// draw re-wraps at the new mode.
+    ///
+    /// Wired up by the key-binding layer; the tests construct it directly
+    /// to exercise the toggle end-to-end.
+    #[allow(dead_code)]
+    SetVerbose(bool),
 }
 
 /// A question the secret prompt asked: the prompt to show, and the channel the
