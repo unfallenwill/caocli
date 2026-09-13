@@ -512,13 +512,20 @@ fn image_line(image: &Note) -> String {
 /// second figure, appended when it is worth showing: a stream must have run at
 /// least a second (below that the quotient is noise the test suite would pin at
 /// absurd heights) and must have produced tokens at all.
+///
+/// The line lays out as `in X/Y · cache hit/miss · out Z [· N token/s]`: a
+/// flat sequence joined by the same "·" the rest of the UI uses as a
+/// separator, so the eye learns one rule for "what kind of thing comes next".
+/// The cache segment names its own sub-fields rather than wrapping them in
+/// parentheses, which read as a parenthesis rather than as a separator against
+/// the joins around them.
 fn usage_line(usage: &Usage, stream: Duration) -> String {
     let cache = match usage.cache() {
         Some(c) => format!("hit {}/miss {}", c.hit, c.miss),
         None => "cache —".to_string(),
     };
     let mut line = format!(
-        "tokens: in {}/{} ({cache}) · out {}",
+        "tokens: in {}/{} · {cache} · out {}",
         usage.prompt_tokens, usage.total_tokens, usage.completion_tokens
     );
     if usage.completion_tokens > 0 && stream >= Duration::from_secs(1) {
@@ -788,7 +795,7 @@ mod tests {
         .spans();
         assert_eq!(
             spans,
-            vec![Span::new(Style::Dim, "tokens: in 20/28 (cache —) · out 8")]
+            vec![Span::new(Style::Dim, "tokens: in 20/28 · cache — · out 8")]
         );
         u.prompt_cache_hit_tokens = 12;
         u.prompt_cache_miss_tokens = 8;
@@ -801,7 +808,7 @@ mod tests {
             spans,
             vec![Span::new(
                 Style::Dim,
-                "tokens: in 20/28 (hit 12/miss 8) · out 8"
+                "tokens: in 20/28 · hit 12/miss 8 · out 8"
             )]
         );
     }
@@ -824,7 +831,7 @@ mod tests {
             spans,
             vec![Span::new(
                 Style::Dim,
-                "tokens: in 20/532 (cache —) · out 512 · 410 token/s"
+                "tokens: in 20/532 · cache — · out 512 · 410 token/s"
             )]
         );
     }
@@ -843,7 +850,7 @@ mod tests {
             stream: Duration::from_millis(999),
         }
         .spans();
-        assert_eq!(spans[0].text, "tokens: in 20/532 (cache —) · out 512");
+        assert_eq!(spans[0].text, "tokens: in 20/532 · cache — · out 512");
         // nothing streamed: no tokens to divide by
         let u = Usage {
             prompt_tokens: 20,
@@ -856,7 +863,7 @@ mod tests {
             stream: Duration::from_secs(9),
         }
         .spans();
-        assert_eq!(spans[0].text, "tokens: in 20/20 (cache —) · out 0");
+        assert_eq!(spans[0].text, "tokens: in 20/20 · cache — · out 0");
     }
 
     /// One of every kind of cell, so a rule about cells can be asked of all of them.

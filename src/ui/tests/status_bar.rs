@@ -128,7 +128,7 @@ fn usage_paints_session_cache_bar_and_reset_clears_it() {
     r.usage(&usage_fixture(12, 8), Duration::ZERO);
     let s = buf_of(&buf);
     assert!(
-        s.contains("tokens: in 10/10 (hit 6/miss 4) · out 0"),
+        s.contains("tokens: in 10/10 · hit 6/miss 4 · out 0"),
         "{s:?}"
     );
     // session accumulation: 18 hit / 12 miss = 60.0%
