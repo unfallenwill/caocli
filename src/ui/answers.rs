@@ -61,9 +61,7 @@ impl Approve for StdinApproval {
             let yes = tokio::task::spawn_blocking(|| {
                 let mut line = String::new();
                 let bytes_read = std::io::stdin().read_line(&mut line);
-                let line = line.trim();
-                bytes_read.map(|count| count > 0).unwrap_or(false)
-                    && (line.eq_ignore_ascii_case("y") || line.starts_with('y'))
+                bytes_read.map(|count| count > 0).unwrap_or(false) && allows(&line)
             })
             .await
             .unwrap_or(false);
@@ -74,6 +72,16 @@ impl Approve for StdinApproval {
             }
         })
     }
+}
+
+/// Whether a line of input should allow the call the gate asked about.
+///
+/// The same rule the interactive front end applies in `State::close_question`:
+/// any line that, trimmed and lowered, begins with `y`. "Y", "Yes", "yeah",
+/// "yup" all allow; "n", "N", "no", an empty line, anything else denies. The
+/// rule is one place so the two front ends cannot disagree.
+pub fn allows(line: &str) -> bool {
+    line.trim().to_lowercase().starts_with('y')
 }
 
 /// The question tool, answered from stdin: one line per question, read under the
@@ -278,5 +286,24 @@ mod tests {
         );
         // Even when the words are a number, since there is no option it could be.
         assert_eq!(labels(&question, "2"), ["2"]);
+    }
+
+    /// The approval gate's y/N rule. The plain front end and the TUI share this
+    /// one, so a "Y" typed into the box is the same as a "Y" on stdin -- and a
+    /// replayed session asks the same question both ways.
+    #[test]
+    fn allows_recognises_any_case_of_y() {
+        for s in ["y", "Y", "yes", "YES", "Yes", "yeah", "yup", "  Y  ", "y\n"] {
+            assert!(allows(s), "{s:?} should allow");
+        }
+    }
+
+    #[test]
+    fn allows_denies_anything_that_does_not_start_with_y() {
+        for s in [
+            "", "  ", "n", "N", "no", "NO", "no way", "nope", "ok", "sure",
+        ] {
+            assert!(!allows(s), "{s:?} should deny");
+        }
     }
 }

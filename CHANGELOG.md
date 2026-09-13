@@ -11,6 +11,10 @@ semantic-version bumps per release.
   (e.g. `cache 98.6% · 32384/461`). The two counts are read as a fraction
   the way other tools report cache hit/miss, and the line is six columns
   shorter.
+- The approval gate's y/N rule now lives in one place
+  (`ui::answers::allows`): "Y", "Yes", "yeah" all allow on both the plain
+  prompt and the TUI. Before, the plain prompt only allowed "y" or
+  lowercase-prefixed lines.
 
 ## [0.1.5] — 2026-09-13
 

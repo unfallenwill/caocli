@@ -426,10 +426,14 @@ impl State {
     pub(super) fn close_question(&mut self) {
         self.revision += 1;
         if let Some(reply) = self.reply.take() {
-            let answer = self.textarea.lines().join("\n").trim().to_owned();
+            let answer = self.textarea.lines().join("\n");
             match reply {
                 Answer::YesNo(reply) => {
-                    let verdict = if answer.to_lowercase().starts_with('y') {
+                    // The rule is shared with the plain front end's
+                    // `StdinApproval`, so an approval that was allowed there
+                    // is allowed here too: a transcript replayed through the
+                    // other front end reads the same way.
+                    let verdict = if crate::ui::answers::allows(&answer) {
                         Verdict::Allowed
                     } else {
                         Verdict::Denied
@@ -437,7 +441,8 @@ impl State {
                     let _ = reply.send(verdict);
                 }
                 Answer::Secret(reply) => {
-                    let _ = reply.send((!answer.is_empty()).then_some(answer));
+                    let trimmed = answer.trim().to_owned();
+                    let _ = reply.send((!trimmed.is_empty()).then_some(trimmed));
                 }
             }
             self.return_from_answer();
