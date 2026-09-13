@@ -16,7 +16,6 @@ mod types;
 mod ui;
 
 use std::io::IsTerminal;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -66,13 +65,15 @@ async fn run(cli: Cli) -> Result<()> {
     // The servers this workspace and the user's settings name, connected before
     // anything asks the model for a first answer: their tools are part of every
     // request, and a session that offered some of them would offer a different
-    // prefix than the one it will send next.
-    let mcp = mcp::Hub::connect(&startup.workspace).await;
-    let mcp_notes = mcp.notes();
+    // prefix than the one it will send next. The guard shuts every connection
+    // down on drop, so the three exit paths (one-shot, TUI, plain REPL) all
+    // clean up the same way: by going out of scope.
+    let mcp = mcp::McpGuard::new(mcp::Hub::connect(&startup.workspace).await);
+    let mcp_notes = mcp.notes().to_vec();
 
     let mut agent = Agent::new(startup.client, startup.session, startup.provider);
     agent.approval = startup.approval;
-    agent.mcp = Arc::new(mcp);
+    agent.mcp = mcp.hub();
     ui.set_model(&agent.model_label());
     ui.set_effort(agent.effort_label());
 
@@ -119,7 +120,6 @@ async fn run(cli: Cli) -> Result<()> {
             ui.error(&format!("{e:#}"));
             std::process::exit(1);
         }
-        agent.mcp.shutdown().await;
         return Ok(());
     }
 
@@ -159,7 +159,6 @@ async fn run(cli: Cli) -> Result<()> {
         // session; this is once, at startup.
         let history = agent.session.messages.clone();
         if tui::run(&mut agent, &startup.sessions_dir, &banner, &history).await? {
-            agent.mcp.shutdown().await;
             return Ok(());
         }
     }
@@ -196,15 +195,10 @@ async fn run(cli: Cli) -> Result<()> {
     )
     .await?;
     if prompt_outcome == Outcome::Exit {
-        agent.mcp.shutdown().await;
         ui.teardown();
         return Ok(());
     }
 
-    // Every server this session started is ended here rather than left to be
-    // killed: closing its input is the shutdown the protocol asks for, and a
-    // program this one started should not outlive it.
-    agent.mcp.shutdown().await;
     ui.teardown();
     let _ = prompt_outcome;
     Ok(())
