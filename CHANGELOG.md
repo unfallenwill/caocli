@@ -6,6 +6,26 @@ semantic-version bumps per release.
 
 ## [Unreleased]
 
+### Added — render markdown in the answer and the thinking block
+
+- The screen and plain front ends used to lay the model's output down as
+  raw text: a heading rendered as `# Title`, a list as `- one\n- two`,
+  a fenced code block as a fence line of backticks followed by the body.
+  Both front ends now parse a CommonMark-flavoured fragment (paragraphs,
+  emphasis, strong, strikethrough, inline code, fenced and indented
+  code blocks, headings, ordered and unordered lists, task-list
+  markers, block quotes, thematic rules, links, images, hard and soft
+  line breaks) and emit the styled spans the cell layer already speaks:
+  bold runs paint yellow, code runs paint dim, headings lead with `##`,
+  list items with `- ` or `1. `, blockquote lines with `> `. Tables fall
+  back to the indented raw source, because column-aligned rendering is
+  the one thing our wrap step cannot do and pretending otherwise would
+  draw a worse table than the source already is. The parser lives at the
+  cell layer (`src/ui/cell/markdown.rs`), so both front ends, live
+  streaming and session replay, see the same answer to the same source.
+  HTML, footnotes and math are dropped silently -- emitting the raw
+  bytes would put angle brackets on the screen.
+
 ### Changed — the transcript fills the terminal
 
 - The screen front end used to lay every line out to at most 100 columns,
