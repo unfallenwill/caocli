@@ -463,30 +463,47 @@ impl State {
         }
     }
 
-    /// Toggle the expanded view of the most recently-committed thought region.
+    /// Toggle the expanded view of the thought region the reader is looking at.
     ///
-    /// The active region (the one still in the transcript, whose body is
-    /// still growing) can expand and collapse. A historical region that
-    /// happens to be expanded can be collapsed; any other historical region
-    /// is left alone, because its body is already frozen and the fold line
-    /// already names it.
-    pub(super) fn toggle_latest_thought(&mut self) {
-        // The youngest Thought, not the last transcript cell: a region that
-        // is followed by its own Step is still the active region.
-        if let Some(Cell::Thought(active)) = self
+    /// The subject of the key is the region the view is showing -- the
+    /// youngest expanded one, which is what [`State::expanded_snapshot`]
+    /// hands the screen. It is closed first, whatever its status: the reader
+    /// asked to read a body, and the press after it puts the transcript
+    /// back. Only when no body is on screen does the key open one, and the
+    /// region it opens is the youngest in the transcript.
+    ///
+    /// Targeting the youngest region rather than the shown one is what made
+    /// the key a one-way trip: a body opened while the stream was still
+    /// arriving went historical the moment the next region opened, the
+    /// press after it landed on that newer region instead, and -- with two
+    /// regions expanded -- the view (the youngest expanded) and the key (the
+    /// youngest) no longer named the same region, so the transcript could
+    /// not be reached again. At most one region is expanded here, which is
+    /// what keeps the two answers the same region.
+    pub(super) fn toggle_expanded_thought(&mut self) {
+        // The shown region first: collapse it, and clear the frozen copy so
+        // the next expansion of it takes a fresh one.
+        if let Some(expanded) = self.view.transcript.iter_mut().rev().find_map(|c| match c {
+            Cell::Thought(t) if t.expanded => Some(t),
+            _ => None,
+        }) {
+            expanded.expanded = false;
+            expanded.clear_snapshot();
+            self.revision += 1;
+            return;
+        }
+        // Nothing is expanded: open the youngest region. Not the last
+        // transcript cell -- a region that is followed by its own Step is
+        // still the region the reader is at.
+        if let Some(Cell::Thought(youngest)) = self
             .view
             .transcript
             .iter_mut()
             .rev()
             .find(|c| matches!(c, Cell::Thought(_)))
         {
-            if active.expanded {
-                active.expanded = false;
-                active.clear_snapshot();
-            } else {
-                active.snapshot_body();
-                active.expanded = true;
-            }
+            youngest.snapshot_body();
+            youngest.expanded = true;
             self.revision += 1;
         }
     }
@@ -527,10 +544,13 @@ impl State {
     }
 
     /// The snapshot the expanded view should render, if any.
+    ///
+    /// The one expanded region's snapshot, which is what the user reads:
+    /// a closed region that was expanded at the moment it closed keeps the
+    /// snapshot the user opened, and [`State::toggle_expanded_thought`]
+    /// keeps the transcript to one expanded region at a time, so this and
+    /// the key always name the same region.
     pub(super) fn expanded_snapshot(&self) -> Option<&[Cell]> {
-        // The youngest Thought's snapshot is what the user reads when it
-        // is expanded; a closed region that was expanded at the moment it
-        // closed keeps the snapshot the user opened.
         self.view.transcript.iter().rev().find_map(|c| match c {
             Cell::Thought(t) if t.expanded => Some(t.snapshot.as_slice()),
             _ => None,
@@ -735,13 +755,79 @@ mod thought_state_machine {
     }
 
     #[test]
-    fn toggle_latest_thought_expands_and_collapsed_snapshots_drop() {
+    fn toggling_the_body_expands_then_collapses_and_drops_the_snapshot() {
         let mut s = state();
         s.apply(MachineNotice::Reasoning("thinking".into()));
         s.apply(MachineNotice::Content("done".into()));
-        s.toggle_latest_thought();
+        s.toggle_expanded_thought();
         assert!(s.has_expanded_thought());
-        s.toggle_latest_thought();
+        s.toggle_expanded_thought();
         assert!(!s.has_expanded_thought());
+    }
+
+    #[test]
+    fn ctrl_o_closes_what_is_on_screen_after_a_new_region_opens() {
+        let mut s = state();
+        s.apply(MachineNotice::Reasoning("first".into()));
+        s.apply(MachineNotice::Content("body".into()));
+        // The reader opens the region on screen, then the stream carries on
+        // and a second region opens below it.
+        s.toggle_expanded_thought();
+        assert!(s.expanded_snapshot().is_some(), "the body is on screen");
+        s.apply(MachineNotice::Reasoning("second".into()));
+        // The key still acts on what the reader is reading: the press that
+        // follows closes the body, it does not open the new region.
+        s.toggle_expanded_thought();
+        assert!(
+            s.expanded_snapshot().is_none(),
+            "Ctrl-O returns to the transcript, whatever opened meanwhile"
+        );
+    }
+
+    #[test]
+    fn the_transcript_is_reachable_again_however_long_the_stream_runs() {
+        // The region the reader opened goes historical while output keeps
+        // arriving. Every pair of presses has to leave the reader back on the
+        // transcript: a key that toggled a different region than the one the
+        // view showed would leave the transcript unreachable for good.
+        let mut s = state();
+        s.apply(MachineNotice::Reasoning("first".into()));
+        s.apply(MachineNotice::Content("body".into()));
+        s.toggle_expanded_thought();
+        for round in 0..3 {
+            s.apply(MachineNotice::Reasoning(format!("round {round}")));
+            s.apply(MachineNotice::Content(format!("body {round}")));
+            assert!(
+                s.expanded_snapshot().is_some(),
+                "round {round}: the reader's body stays on screen"
+            );
+            s.toggle_expanded_thought();
+            assert!(
+                s.expanded_snapshot().is_none(),
+                "round {round}: the transcript comes back"
+            );
+            s.toggle_expanded_thought();
+        }
+    }
+
+    #[test]
+    fn at_most_one_region_is_expanded() {
+        let mut s = state();
+        s.apply(MachineNotice::Reasoning("first".into()));
+        s.apply(MachineNotice::Content("body".into()));
+        s.toggle_expanded_thought();
+        s.apply(MachineNotice::Reasoning("second".into()));
+        s.apply(MachineNotice::Content("body".into()));
+        s.toggle_expanded_thought();
+        // The collapse leaves nothing expanded; the press after it -- which
+        // opens the newest region -- must not leave the older one behind it.
+        s.toggle_expanded_thought();
+        let expanded = s
+            .view
+            .transcript
+            .iter()
+            .filter(|c| matches!(c, Cell::Thought(t) if t.expanded))
+            .count();
+        assert_eq!(expanded, 1, "the younger region replaces the older one");
     }
 }

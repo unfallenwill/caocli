@@ -48,19 +48,18 @@ impl State {
             let _ = cancel.send(true);
             return;
         }
-        // Ctrl-O toggles the latest thought block's expanded view. The
-        // active block can be expanded and collapsed; a historical
-        // block that was expanded at the moment it became historical
-        // can be collapsed back to its header; a historical block
-        // that was folded stays folded -- it is not the "latest"
-        // subject of the widget, and there is nothing to expand it
-        // to.
+        // Ctrl-O toggles the expanded view of the thought block the reader
+        // is looking at: the one whose body fills the screen collapses back
+        // to its header, and when no body is up the key opens the youngest
+        // block. A block that went historical while the stream ran is still
+        // what the screen shows, so the key still closes it -- a turn
+        // running outside is not a reason to take the reader's body away.
         if let Event::Key(key) = &event
             && key.kind == KeyEventKind::Press
             && key.code == KeyCode::Char('o')
             && key.modifiers.contains(KeyModifiers::CONTROL)
         {
-            self.toggle_latest_thought();
+            self.toggle_expanded_thought();
             return;
         }
         // The panel is up: it takes the keys that choose, and the box takes what
