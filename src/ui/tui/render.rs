@@ -34,7 +34,6 @@ use crate::ui::cell;
 use crate::ui::paint::{cell_lines, standing_todo_lines};
 use crate::ui::tui::layout::BOX_BORDERS;
 use crate::ui::tui::overlay::Overlay;
-use crate::ui::tui::thought::ThoughtBlock;
 use crate::ui::tui::turn::Turn;
 use crate::ui::tui::view::View;
 
@@ -87,7 +86,7 @@ pub(super) fn ensure_laid(view: &mut View, width: usize) {
 /// in. A count rather than a copy of the lines, so the part of a long session
 /// that is off the top costs a draw nothing.
 pub(super) fn laid_rows(view: &View) -> usize {
-    view.laid.iter().map(Vec::len).sum()
+    view.laid.iter().map(|cell| cell.len()).sum()
 }
 
 /// The rows `[first, last)`, at the width the cells were laid at.
@@ -105,19 +104,37 @@ pub(super) fn window_lines(
 ) -> Vec<Line<'static>> {
     let mut out = Vec::with_capacity(last.saturating_sub(first));
     let mut at = 0;
-    for segment in view.laid.iter().map(Vec::as_slice).chain([live, question]) {
-        if at >= last {
-            break;
-        }
-        let end = at + segment.len();
-        if end > first {
-            let lo = first.saturating_sub(at);
-            let hi = (last - at).min(segment.len());
-            out.extend_from_slice(&segment[lo..hi]);
-        }
-        at = end;
+    for cell_lines in &view.laid {
+        let segment: &[Line<'static>] = cell_lines.as_slice();
+        push_window(&mut out, &mut at, first, last, segment);
     }
+    // Live and question come after the cells.
+    push_window(&mut out, &mut at, first, last, live);
+    push_window(&mut out, &mut at, first, last, question);
     out
+}
+
+/// Push the slice of `segment` that falls inside `[first, last)` onto
+/// `out`, advancing `at` by the full segment length regardless of
+/// clipping. Split out so [`window_lines`] stays focused on the cell /
+/// live / question walk.
+fn push_window(
+    out: &mut Vec<Line<'static>>,
+    at: &mut usize,
+    first: usize,
+    last: usize,
+    segment: &[Line<'static>],
+) {
+    if *at >= last {
+        return;
+    }
+    let end = *at + segment.len();
+    if end > first {
+        let lo = first.saturating_sub(*at);
+        let hi = (last - *at).min(segment.len());
+        out.extend_from_slice(&segment[lo..hi]);
+    }
+    *at = end;
 }
 
 // ------------------------------------------------------------------ blocks -
@@ -136,48 +153,31 @@ pub(super) fn live_lines(view: &View, width: usize) -> Vec<Line<'static>> {
     }
 }
 
-/// The question standing over the box, laid out, or nothing when none is open.
-///
-/// The question is what the answer is about, and the call in it can be a long
-/// command: one that is clipped gives the user nothing to decide with. It is a
-/// cell like any other, so it carries the marker its kind carries, and the
-/// answer typed into the box below it starts in the column its own text does.
+/// The lines a question cell (or approval cell) occupies at `width`. Empty
+/// when no question is open.
 pub(super) fn question_lines(view: &View, width: usize) -> Vec<Line<'static>> {
     match &view.question {
-        Some(question) => cell_lines(question, width),
+        Some(cell) => cell_lines(cell, width),
         None => Vec::new(),
     }
 }
 
-/// The standing task list as the screen draws it: nothing when no call has
-/// written one or the last one cleared it.
-///
-/// A fold over the transcript and not a copy of it: what is standing is the
-/// last list a call wrote, which is a cell like any other, so a resumed
-/// session keeps exactly the list in view that the session watched live had.
-/// The drawing itself lives in [`crate::ui::paint::standing_todo_lines`]; this
-/// layer only finds the list.
+/// The standing task list: empty when there is no list.
 pub(super) fn todo_lines(view: &View, width: usize) -> Vec<Line<'static>> {
-    let Some(todos) = cell::standing_todos(&view.transcript) else {
-        return Vec::new();
-    };
-    standing_todo_lines(todos, width)
+    match cell::standing_todos(&view.transcript) {
+        Some(todos) => standing_todo_lines(todos, width),
+        None => Vec::new(),
+    }
 }
 
-/// Render the expanded body of a thought block: the cells the
-/// thought "owns", laid out flat, full window width.
+/// Render the expanded body of a thought region: the cells the
+/// region "owns", laid out flat, full window width.
 ///
 /// Cells come from `thought.snapshot` — the frozen copy taken when
 /// the user pressed Ctrl-O. Step cells render with their children
 /// visible (a Done step's output is exactly the detail the user
 /// opened the expanded view to read); Reasoning cells render the
 /// same way they do on the transcript.
-///
-/// `gap` is the space between two consecutive cells in the body —
-/// the same blank line the transcript puts between cells, kept
-/// consistent so a body that begins with the same cells the
-/// transcript ended with reads as the same picture.
-#[allow(dead_code)] // wired up by the thinking widget in a follow-up commit
 pub(super) fn expanded_thought_lines(
     snapshot: &[crate::ui::cell::Cell],
     width: usize,
@@ -216,8 +216,6 @@ pub(super) fn lines(view: &mut View, width: usize) -> Vec<Line<'static>> {
     window_lines(view, 0, total, &live, &question)
 }
 
-// ----------------------------------------------------------- status / box -
-
 /// The pinned status line: the session summary, always. What a turn is doing
 /// is the transcript's to say -- the cells it produces -- and the summary is
 /// what you read when you are about to type rather than while you wait.
@@ -236,21 +234,16 @@ pub(super) fn status_line(view: &View, width: usize) -> Line<'static> {
 /// narrow even for the spinner and the count. A narrow border drops the
 /// estimate whole first and hides the indicator entirely second -- never a
 /// clipped number, the same rule the status line keeps to.
-pub(super) fn activity_title(
-    overlay: &Overlay,
-    turn: &Turn,
-    thought: Option<&ThoughtBlock>,
-    width: usize,
-) -> Option<String> {
-    activity_title_at(overlay, turn, thought, Instant::now(), width)
+pub(super) fn activity_title(overlay: &Overlay, turn: &Turn, width: usize) -> Option<String> {
+    activity_title_at(overlay, turn, Instant::now(), width)
 }
 
 /// The indicator's words at `now`, without reading the clock.
 ///
 /// Phase-aware: the label says what the agent is doing, not just that
 /// something is happening. The phases the border can name are
-/// `thinking` (a thought block is open, no tool running), `running X`
-/// (a tool that keeps the thought open is in flight), and `working`
+/// `thinking` (the agent is streaming reasoning), `running X`
+/// (a tool that changes something is in flight), and `working`
 /// (the model is producing content or the turn has nothing yet). The
 /// spinner glyph and the elapsed seconds stay on every phase; the
 /// only thing that changes is the word between them.
@@ -260,36 +253,18 @@ pub(super) fn activity_title(
 pub(super) fn activity_title_at(
     overlay: &Overlay,
     turn: &Turn,
-    thought: Option<&ThoughtBlock>,
     now: Instant,
     width: usize,
 ) -> Option<String> {
     if overlay.reply.is_some() {
         return None;
     }
-    // The clock the spinner and the seconds read from. The thought's
-    // own clock when one is open (this is the per-block "how long
-    // has this section been running"); the turn's clock when no
-    // thought is open — a side-effectful tool has just closed the
-    // previous one, the new one has not started, and the turn's
-    // timer is the only one still running.
-    let started = thought.and_then(|t| t.started_at).or(turn.started)?;
+    let started = turn.started?;
     let elapsed = now - started;
     let frame = SPINNER[(elapsed.as_millis() / SPINNER_MS) as usize % SPINNER.len()];
-    // The phase comes from what the thought (or the running tool) is
-    // doing right now. A tool running inside an open thought is the
-    // "running X" shape; a tool that closed the thought (write,
-    // edit, side-effectful bash) still shows on the border, but as
-    // "running X" without an enclosing thought -- the turn is
-    // still alive, the agent is still working, and saying nothing
-    // would be a regression from the previous border.
     let phase = if let Some(verb) = turn.current_tool_verb.as_deref() {
         format!("running {verb}")
-    } else if thought.is_some() {
-        // The thought is open and no tool is running: the agent is
-        // either streaming reasoning or just sitting between steps.
-        // Either way, "thinking" is the closer word, and the thought
-        // body's expanded view is where the distinction lives.
+    } else if turn.reasoning_in_flight {
         "thinking".to_owned()
     } else {
         "working".to_owned()
@@ -321,16 +296,11 @@ pub(super) fn activity_title_at(
 /// Built per draw, which costs one small struct: the title is a clock and a
 /// spinner, so there is nothing here worth remembering, and nothing that can go
 /// stale when the editor is replaced whole by a submitted or a cleared line.
-pub(super) fn box_rule(
-    overlay: &Overlay,
-    turn: &Turn,
-    thought: Option<&ThoughtBlock>,
-    width: usize,
-) -> Block<'static> {
+pub(super) fn box_rule(overlay: &Overlay, turn: &Turn, width: usize) -> Block<'static> {
     let mut block = Block::default()
         .borders(BOX_BORDERS)
         .border_style(RStyle::new().add_modifier(Modifier::DIM));
-    if let Some(title) = activity_title(overlay, turn, thought, width.saturating_sub(2)) {
+    if let Some(title) = activity_title(overlay, turn, width.saturating_sub(2)) {
         // Not dim, unlike the rule it sits on: it is the one thing on this box
         // that moves, and the only sign that a turn is still running when the
         // model has gone quiet. A dim indicator on a dim border is the signal
@@ -344,4 +314,22 @@ pub(super) fn box_rule(
         block = block.title_top(Line::styled(title, lit).right_aligned());
     }
     block
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::cell::Cell;
+
+    /// The simplest case: laid_rows sums the lines of every laid cell, in order.
+    /// A count rather than a copy so a million-line transcript whose window
+    /// shows a dozen lines costs a window nothing.
+    #[test]
+    fn laid_rows_sums_cell_lines() {
+        let mut view = View::default();
+        view.transcript.push(Cell::Notice("one line".into()));
+        view.transcript.push(Cell::Notice("two\nlines".into()));
+        ensure_laid(&mut view, 80);
+        assert_eq!(laid_rows(&view), 3);
+    }
 }

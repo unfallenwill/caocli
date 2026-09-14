@@ -10,10 +10,13 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::watch;
 
 use super::super::input::Submitted;
+use super::super::notice::MachineNotice;
 use super::super::state::State;
+use super::all_rows;
 use super::ctrl_j;
 use super::press;
 use super::row;
+use super::screen_for_test;
 use super::transcript_top;
 use super::type_in;
 use super::type_while_working;
@@ -300,4 +303,85 @@ fn a_paste_lands_in_the_box_whole() {
     let mut screen = State::default();
     screen.key(Event::Paste("pasted\nlines".into()));
     assert_eq!(screen.take_line(), "pasted\nlines");
+}
+
+/// Ctrl-O: the key the reader opens a thought region's body with.
+fn ctrl_o() -> Event {
+    Event::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+}
+
+/// The subject of Ctrl-O, drawn: the reader opens the body of the region the
+/// transcript shows, the stream moves on and opens a second region under it,
+/// and the key arrives once more.
+///
+/// What is asked of the screen is the whole point of the key: the body the
+/// reader opened stays up while the turn keeps writing, and the press after it
+/// puts the transcript back. A key that toggled a different region than the
+/// one on screen -- the newest region rather than the shown one -- left two
+/// regions expanded, and with the view and the key naming different regions,
+/// the transcript could not be reached again.
+///
+/// `press` is how a Ctrl-O reaches the state, because the idle prompt and a
+/// running turn route keys through different handlers that have to agree about
+/// this one's subject.
+fn the_body_on_screen_is_the_subject_of_ctrl_o(press: impl Fn(&mut State, &watch::Sender<bool>)) {
+    let mut screen = screen_for_test(40, 20);
+    let (tx, _rx) = watch::channel(false);
+    // Region one: "first thought" is its body and only its body -- the
+    // transcript shows the fold line and the answer, not the reasoning.
+    screen
+        .state
+        .apply(MachineNotice::Reasoning("first thought".into()));
+    screen
+        .state
+        .apply(MachineNotice::Content("first answer".into()));
+    press(&mut screen.state, &tx);
+    screen.draw().unwrap();
+    let rows = all_rows(&screen);
+    assert!(
+        rows.iter().any(|r| r.contains("first thought")),
+        "the body the reader asked for is on screen"
+    );
+    // The stream carries on: the region the reader opened goes historical and
+    // a second one opens below it. The reader is reading, so what they asked
+    // for stays up.
+    screen
+        .state
+        .apply(MachineNotice::Reasoning("second thought".into()));
+    screen
+        .state
+        .apply(MachineNotice::Content("second answer".into()));
+    screen.draw().unwrap();
+    let rows = all_rows(&screen);
+    assert!(
+        rows.iter().any(|r| r.contains("first thought")),
+        "the reader's body is still on screen"
+    );
+    // The press after it closes what is on screen rather than opening the new
+    // region.
+    press(&mut screen.state, &tx);
+    screen.draw().unwrap();
+    let rows = all_rows(&screen);
+    assert!(
+        !rows.iter().any(|r| r.contains("first thought")),
+        "the body is closed: the transcript is back"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("Thought for")),
+        "the fold line the body was opened from is drawn again"
+    );
+}
+
+#[test]
+fn ctrl_o_while_a_turn_runs_closes_the_body_on_screen() {
+    the_body_on_screen_is_the_subject_of_ctrl_o(|state, tx| {
+        state.key_while_working(ctrl_o(), tx);
+    });
+}
+
+#[test]
+fn ctrl_o_at_the_prompt_closes_the_body_on_screen() {
+    the_body_on_screen_is_the_subject_of_ctrl_o(|state, _tx| {
+        state.key(ctrl_o());
+    });
 }

@@ -44,11 +44,23 @@ fn every_notice_becomes_a_cell_or_a_status_change() {
     // StepId and `started_at` are process-global state that does not
     // reset between assertions: borrow both from the actual screen so
     // the comparison only walks the fields that describe what happened
-    // here (verb, subject, status, children, verdict).
-    let actual_step = match &screen.view.transcript[2] {
-        Cell::Step(s) => s.clone(),
-        _ => panic!("transcript[2] should be a Step"),
-    };
+    // here (verb, subject, status, children, verdict). The Step lives
+    // in the transcript for a side-effectful tool, and inside a
+    // `Cell::Thought` body for a safe one (`Bash ls` is on the
+    // whitelist).
+    let actual_step = screen
+        .view
+        .transcript
+        .iter()
+        .find_map(|c| match c {
+            Cell::Step(s) => Some(s.clone()),
+            Cell::Thought(t) => t.body.iter().find_map(|b| match b {
+                Cell::Step(s) => Some(s.clone()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .expect("a Step should be in the transcript or in the thought body");
     let expected_step_borrowed = match expected_step {
         Cell::Step(mut s) => {
             s.id = actual_step.id;
@@ -57,10 +69,25 @@ fn every_notice_becomes_a_cell_or_a_status_change() {
         }
         _ => unreachable!("from_tool_call should produce a Step for Bash"),
     };
+    // The transcript now opens with a folded `Cell::Thought` (the
+    // reasoning region) instead of a `Cell::Reasoning`: the state
+    // machine folds the run into one cell, so what the transcript
+    // sees is its fold line. `Bash ls` is on the safe whitelist, so
+    // its Step belongs to the Thought body, not the transcript; the
+    // transcript after the Info/Error/Interrupted trail is the Thought
+    // (folded) and then three session-level cells.
+    let expected_thought = match &screen.view.transcript[0] {
+        Cell::Thought(t) => t.clone(),
+        other => panic!("transcript[0] should be a Thought, got {other:?}"),
+    };
+    // `Bash ls` is on the safe whitelist but no Thought was open when it
+    // arrived -- the `Content`/`FinishTurn` pair closed the prior
+    // reasoning region. The Step therefore lands in the transcript
+    // directly, not in a body.
     assert_eq!(
         screen.view.transcript,
         vec![
-            Cell::Reasoning("think".into()),
+            Cell::Thought(expected_thought),
             Cell::Content("answer".into()),
             expected_step_borrowed,
             Cell::Notice("note".into()),
@@ -80,11 +107,19 @@ fn a_fragment_in_the_other_style_opens_a_new_block() {
         "still one open block"
     );
     screen.apply(MachineNotice::Content("x".into()));
-    assert_eq!(
-        screen.view.transcript,
-        vec![Cell::Reasoning("ab".into())],
-        "the reasoning block closed when the style changed"
-    );
+    // The reasoning is folded into a `Cell::Thought`; the body has the
+    // Reasoning cell that was being streamed. The Content fragment is
+    // itself a new open block in the stream -- it commits to the
+    // transcript when the next boundary (FinishTurn, in this test)
+    // closes it.
+    assert_eq!(screen.view.transcript.len(), 1);
+    match &screen.view.transcript[0] {
+        Cell::Thought(t) => {
+            assert_eq!(t.body.len(), 1);
+            assert!(matches!(&t.body[0], Cell::Reasoning(s) if s == "ab"));
+        }
+        other => panic!("transcript[0] should be a Thought, got {other:?}"),
+    }
     screen.apply(MachineNotice::FinishTurn);
     assert_eq!(screen.view.transcript[1], Cell::Content("x".into()));
     assert!(screen.view.stream.current().is_none());

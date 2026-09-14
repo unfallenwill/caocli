@@ -2032,26 +2032,32 @@ mod tests {
 
     // ----- G7: layout (per-cwd session directories) -----
 
-    /// Tests in this module change HOME and walk the layout. The
-    /// shared env lock in `config::tests` is private to that module;
-    /// use a dedicated one and serialise on it. The tests are also
-    /// marked `--test-threads=1`-safe by virtue of taking this lock.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Counter for the scratch homes below, so two of them cannot land on one
+    /// path.
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     fn next_counter() -> usize {
         COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Tests in this module change HOME and walk the layout.
+    ///
+    /// They serialise on [`crate::config::env_lock`], the one lock the whole
+    /// test binary shares, and not on a private one: HOME is one variable for
+    /// the process, so a lock that only holds between the tests of this module
+    /// lets them move it under another module's test -- which lands that test
+    /// reading a key out of a home nobody stored it in (a flake measured as
+    /// `no API key for MiniMax` in `repl`).
     fn with_env_home<F: FnOnce(&std::path::Path)>(f: F) {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::config::env_lock();
         let scratch = std::env::temp_dir().join(format!(
             "caocli-session-layout-{}-{}",
             std::process::id(),
             next_counter()
         ));
         std::fs::create_dir_all(&scratch).unwrap();
-        // SAFETY: tests in this module serialise on ENV_LOCK.
+        // SAFETY: every test that touches HOME holds this lock, this one
+        // included.
         unsafe {
             std::env::set_var("HOME", &scratch);
         }

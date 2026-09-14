@@ -20,9 +20,10 @@ Every tool call is one cell on the transcript, with the verb (`Bash` /
 `Read` / ...), the subject (the command or file), the streaming children
 (the tool's own output), and the verdict (the one-line result summary) all
 together. Successful steps settle to a single line — `✔ Bash ls · exit_code: 0` —
-with the children hidden until `Ctrl-O` flips verbose; failed steps auto-expand
-the body that caused the failure so the reader can see why without toggling. Edits
-keep their diff visible in both modes, because the change is what the call is for. Project instructions in the workspace's `AGENTS.md`
+and the body that produced them stays in the region that owns it (see the
+`Ctrl-O` note below); failed steps auto-expand
+the body that caused the failure so the reader can see why. Edits
+keep their diff visible either way, because the change is what the call is for. Project instructions in the workspace's `AGENTS.md`
 files are read when a session starts and sent with every request (see
 [Project instructions](#project-instructions-agentsmd)).
 Sessions are append-only JSONL
@@ -175,10 +176,19 @@ cache 95.3% · hit 846912 · miss 41538
   call is in flight, `working` otherwise. The spinner character and the elapsed
   seconds stay on every phase; only the word between them changes. A question
   standing over the box (the approval gate) takes the border back.
-- **`Ctrl-O`** toggles a verbose mode: settled-Done steps show their children
-  (the tool's own output) when verbose is on; running and failed steps are
-  unchanged. Failures auto-expand regardless — a settled failure that has
-  children shows them in both modes.
+- **A stretch of machinery folds to one line, and nothing inside it is
+  counted away.** The model's thinking streams on the transcript as it arrives;
+  when the answer starts — or a call that changes something does — the stretch
+  folds to a single dim line, `Thought · running Read · 3s`. Reading and
+  looking are the way the model works, not the work, and the answer is what the
+  transcript is for. **`Ctrl-O`** expands the newest one over the whole screen:
+  the reasoning and the output of the safe calls inside it, whole; the key acts
+  on the fold the screen is showing, so a second press puts the transcript back
+  even when the turn has opened a newer fold meanwhile. A long think
+  is scrolled to, never replaced by an `N more lines` row; the same full text is
+  in the session log, which is where the durable copy lives. The thinking carries
+  no marker in either front end: it is set in two columns, and the answer is the
+  one line that starts at the left edge.
 - **While a turn runs, the box's top border says so**: a spinner and the seconds
   it has run, and — once the turn has lasted long enough for an average to mean
   anything — an estimated `~N token/s`. Estimated, because the provider reports
@@ -256,7 +266,7 @@ history and the model can look at it again.
 › what does this error say?
   [image png · 48213 bytes]
 
-┆ Let me read the screenshot.
+  Let me read the screenshot.
 The dialog says ...
 ```
 

@@ -155,13 +155,12 @@ impl State {
         {
             return Submitted::Exit;
         }
-        // Ctrl-O toggles the latest thought block's expanded view. Same
-        // rule as the working handler: the active block can expand
-        // and collapse, the latest historical block can only
-        // collapse if it was already expanded, and any other block
-        // is left alone.
+        // Ctrl-O toggles the expanded view of the thought block the reader
+        // is looking at. Same rule as the working handler: the block whose
+        // body is on screen closes, and the youngest block opens when none
+        // is.
         if matches(key, KeyCode::Char('o'), KeyModifiers::CONTROL) {
-            self.toggle_latest_thought();
+            self.toggle_expanded_thought();
             return Submitted::Nothing;
         }
         // Paging through the transcript. The box scrolls itself with the same
