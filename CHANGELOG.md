@@ -6,6 +6,16 @@ semantic-version bumps per release.
 
 ## [Unreleased]
 
+### Changed — the transcript fills the terminal
+
+- The screen front end used to lay every line out to at most 100 columns,
+  whatever the terminal's width. On a wider terminal the transcript
+  stopped short of the right edge while the input box's rules and the
+  status line ran the full width, so the text read as a column wedged
+  into the left of the screen. A line now breaks at the region's edge and
+  nowhere else; the standing task list, the queue waiting to run and the
+  question panel were capped by the same call and are uncapped with it.
+
 ## [0.1.6] — 2026-09-14
 
 ### Changed — the transcript is one cell per tool call
