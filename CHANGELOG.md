@@ -6,6 +6,38 @@ semantic-version bumps per release.
 
 ## [Unreleased]
 
+### Changed — the transcript is one cell per tool call
+
+- A tool call is one `Step` cell now, rather than three cells (the
+  `ToolCall`, its `ToolOutput` children, and the `ToolResult`). Three
+  cells for one thing made the lifecycle a property of the renderer, so
+  the start, the children and the verdict could disagree on shape. The
+  cell carries the verb and its subject, the children as they stream,
+  and the verdict; a settled success folds to one line
+  (`✔ Bash ls · exit_code: 0`), and a failure auto-expands the body that
+  caused it, so the reason is visible without a toggle. Edit and Write
+  keep their diff in both modes, because the change is what the call is
+  for. Live rendering and replay fold the same messages into the same
+  steps, so a resumed session reads back what the session drew.
+- `Ctrl-O` toggles verbose: a settled-Done step shows its children when
+  the flag is on, Running and Failed are unchanged (their children are
+  the verdict), Denied never. The laid cache is keyed on the flag
+  alongside the width, so flipping it re-wraps every cell.
+- The model and the reasoning effort tier move out of the pinned row to
+  a metadata row above each user prompt (`deepseek-v4-pro · effort max`),
+  pushed on submit and on replay, so a session that switched models
+  mid-history reads the way the user asked it. The pinned row, and the
+  plain front end's status bar with it, are cache-only from here on --
+  the cache counts are the one segment that really is session-level --
+  and a new `/debug` command prints the model, the effort and the
+  provider. The plain front end echoes the same metadata line before
+  each turn, having no transcript to carry a row.
+- The border above the box says what the agent is doing: `thinking`
+  while a reasoning block streams, `running Bash` (or whatever verb)
+  while a tool call is in flight, `working` otherwise. The spinner
+  character and the elapsed seconds are unchanged; only the word between
+  them moves.
+
 ### Changed — UI layer refactor
 - The plain front end's writer half is split into its own module
   (`ui::plain_writer`). `Renderer` now holds a `PlainWriter` for cells and
