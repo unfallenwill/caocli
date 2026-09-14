@@ -28,7 +28,10 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, StreamError};
-use crate::responses_types::{ResponseError, ResponseOutputItem, ResponseStatus};
+use crate::responses_types::{
+    IncompleteDetails, InputTokensDetails, OutputTokensDetails, ResponseError, ResponseOutputItem,
+    ResponseStatus,
+};
 
 /// The bytes a stream reads from: whatever transport the caller has, as long as
 /// it is `Send` and says nothing until the answer arrives.
@@ -427,13 +430,23 @@ pub struct ResponseSummary {
     /// Token usage, when the endpoint reports one.
     #[serde(default)]
     pub usage: Option<ResponseUsageSummary>,
+    /// Why the response is incomplete, when it is.
+    #[serde(default)]
+    pub incomplete_details: Option<IncompleteDetails>,
     /// The output items, when the event carries them (e.g. on completion).
     #[serde(default)]
     pub output: Vec<ResponseOutputItem>,
 }
 
-/// A summary of the usage block on a streaming event. Only the totals are
-/// carried on lifecycle events; the breakdowns arrive on the final event.
+/// The usage block on a streaming event.
+///
+/// The same counts the full [`crate::responses_types::ResponseUsage`] carries —
+/// totals and the input/output breakdowns, `input_tokens_details.cached_tokens`
+/// among them — with one difference: every field defaults, so an endpoint that
+/// reports the totals on a lifecycle event and the breakdowns only on the last
+/// one still parses at every stage. A streaming caller reads the breakdowns
+/// where the spec says the final event carries them; what it must not do is
+/// drop them when they are there, which is what a totals-only type does.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct ResponseUsageSummary {
     /// Tokens the model spent on the input.
@@ -445,6 +458,12 @@ pub struct ResponseUsageSummary {
     /// `input_tokens + output_tokens`.
     #[serde(default)]
     pub total_tokens: u64,
+    /// A breakdown of the input tokens, when the endpoint reports one.
+    #[serde(default)]
+    pub input_tokens_details: Option<InputTokensDetails>,
+    /// A breakdown of the output tokens, when the endpoint reports one.
+    #[serde(default)]
+    pub output_tokens_details: Option<OutputTokensDetails>,
 }
 
 /// A JSON value used by the stream events for fields like annotations and
@@ -819,6 +838,68 @@ mod tests {
         let event = stream.next_event().await.unwrap().unwrap();
         assert!(matches!(event, ResponseStreamEvent::Completed { .. }));
         assert_eq!(stream.next_event().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn the_completed_event_keeps_the_usage_breakdowns_and_the_incomplete_reason() {
+        // An endpoint that reports prompt-cache hits reports them here, on the
+        // event that closes the stream: a summary that keeps only the totals
+        // would drop the number the caller came for.
+        let body = [
+            event(json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 1000,
+                        "input_tokens_details": {"cached_tokens": 900},
+                        "output_tokens": 200,
+                        "output_tokens_details": {"reasoning_tokens": 150},
+                        "total_tokens": 1200
+                    }
+                },
+                "sequence_number": 0,
+            })),
+            event(json!({
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp_2",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"}
+                },
+                "sequence_number": 1,
+            })),
+        ]
+        .concat();
+        let mut stream = stream_of(&body);
+        let Some(ResponseStreamEvent::Completed { response, .. }) =
+            stream.next_event().await.unwrap()
+        else {
+            panic!("expected a completed event");
+        };
+        let usage = response.usage.expect("usage is carried on completion");
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(
+            usage.input_tokens_details.and_then(|d| d.cached_tokens),
+            Some(900)
+        );
+        assert_eq!(
+            usage.output_tokens_details.and_then(|d| d.reasoning_tokens),
+            Some(150)
+        );
+        let Some(ResponseStreamEvent::Incomplete { response, .. }) =
+            stream.next_event().await.unwrap()
+        else {
+            panic!("expected an incomplete event");
+        };
+        assert_eq!(
+            response
+                .incomplete_details
+                .and_then(|d| d.reason)
+                .as_deref(),
+            Some("max_output_tokens")
+        );
     }
 
     #[tokio::test]
