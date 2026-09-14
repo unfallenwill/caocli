@@ -433,19 +433,12 @@ impl Cell {
     /// The cell's styled spans, without the columns its [`Cell::gutter`] sets it
     /// in, the separating blank line, or the line ending the painter adds.
     ///
-    /// This is the compact form: settled-Done steps hide their children,
-    /// failures auto-expand. The Ctrl-O verbose toggle re-renders with
-    /// [`Cell::spans_with`]`(true)`, which surfaces settled-Done children
-    /// without changing the layout of the running or failed ones.
+    /// The form: settled-Done steps hide their children, failures and
+    /// running steps show theirs, every other cell has one shape. The
+    /// verbose toggle that used to surface settled-Done children on
+    /// Ctrl-O is gone — the thinking widget's expanded view is where the
+    /// detail lives now.
     pub fn spans(&self) -> Vec<Span> {
-        self.spans_with(false)
-    }
-
-    /// The cell's spans at `verbose`. Only `Step` changes shape between
-    /// compact and verbose: every other cell has the same spans in both
-    /// modes, and the parameter is here so the call site reads
-    /// uniformly.
-    pub fn spans_with(&self, verbose: bool) -> Vec<Span> {
         match self {
             Cell::User { text, images } => {
                 let mut spans = Vec::with_capacity(images.len() + 1);
@@ -481,7 +474,7 @@ impl Cell {
             }
             Cell::Reasoning(text) => markdown::parse(text, Style::Reasoning),
             Cell::Content(text) => markdown::parse(text, Style::Plain),
-            Cell::Step(step) => step.spans_with(verbose),
+            Cell::Step(step) => step.spans(),
             Cell::Notice(text) => vec![Span::new(Style::Dim, text.as_str())],
             Cell::Failure(text) => vec![Span::new(Style::Red, format!("error: {text}"))],
             Cell::Interrupted => vec![Span::new(Style::Yellow, "⏹ interrupted (Ctrl-C)")],

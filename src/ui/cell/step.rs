@@ -243,26 +243,52 @@ impl Step {
     /// - `Failed`: yes (while it has them), auto-expand so the reader can
     ///   see why; nothing to show if the tool printed nothing.
     /// - `Denied`: no, the call never ran; no children to show.
-    /// - `Done`: only when `verbose` is on. The Ctrl-O toggle re-exposes
-    ///   settled-Done children on demand; the default keeps successful
-    ///   steps quiet.
-    pub fn shows_children_when(&self, verbose: bool) -> bool {
+    /// - `Done`: no. A successful step is one line on the screen; its
+    ///   children belong to the running log and the thought body it is
+    ///   part of. The thinking widget's expanded view is where the
+    ///   detail lives now — the verbose toggle that used to surface
+    ///   settled-Done children on Ctrl-O is gone.
+    #[allow(dead_code)] // wired up by the thinking widget in a follow-up commit
+    pub fn shows_children(&self) -> bool {
         match self.status {
             StepStatus::Running | StepStatus::Failed => !self.children.is_empty(),
-            StepStatus::Done => verbose && !self.children.is_empty(),
-            StepStatus::Denied => false,
+            StepStatus::Done | StepStatus::Denied => false,
         }
     }
 
-    /// The styled spans this step emits at `verbose`. The header (verb,
-    /// subject, and -- when settled -- verdict) is always there; the
-    /// diff is there for Edit/Write calls (hiding it would mean an Edit
-    /// step tells the reader "yes, edited" without saying what changed);
-    /// the children are there when `shows_children_when` says so.
+    /// The styled spans this step emits. The header (verb, subject, and
+    /// -- when settled -- verdict) is always there; the diff is there for
+    /// Edit/Write calls (hiding it would mean an Edit step tells the
+    /// reader "yes, edited" without saying what changed); the children
+    /// are there when `shows_children` says so.
     ///
     /// The cell layer wraps this in a gutter and a `Vec<Line>`; this
     /// method only hands back the words.
-    pub fn spans_with(&self, verbose: bool) -> Vec<crate::ui::cell::Span> {
+    pub fn spans(&self) -> Vec<crate::ui::cell::Span> {
+        self.spans_with(false)
+    }
+
+    /// The same spans as [`Step::spans`], but with the Done step's
+    /// children included. The thinking widget's expanded view calls
+    /// this so a settled safe tool's output is visible when the
+    /// user asks to see the thought's body — the compact form's rule
+    /// (Done hides children) does not apply inside the expanded
+    /// snapshot, where the detail is exactly what the user came for.
+    #[allow(dead_code)] // wired up by the thinking widget in a follow-up commit
+    pub fn spans_with_done_children(&self) -> Vec<crate::ui::cell::Span> {
+        self.spans_with(true)
+    }
+
+    /// The styled spans this step emits, optionally showing the
+    /// children of a settled-Done step. The header (verb, subject,
+    /// and -- when settled -- verdict) is always there; the diff is
+    /// there for Edit/Write calls (hiding it would mean an Edit step
+    /// tells the reader "yes, edited" without saying what changed);
+    /// the children are there when the status says so.
+    ///
+    /// The cell layer wraps this in a gutter and a `Vec<Line>`; this
+    /// method only hands back the words.
+    fn spans_with(&self, show_done_children: bool) -> Vec<crate::ui::cell::Span> {
         use crate::ui::cell::Style;
         use StepStatus::*;
         let header_style = match self.status {
@@ -274,12 +300,17 @@ impl Step {
         if !self.diff.is_empty() {
             // The diff rides with the cell whether settled or running:
             // an Edit's diff is what the call is for, and the change
-            // would otherwise be invisible until Ctrl-O.
+            // would otherwise be invisible.
             for line in &self.diff {
                 spans.push(diff_span_pub(line));
             }
         }
-        if self.shows_children_when(verbose) {
+        let show_children = match self.status {
+            Running | Failed => !self.children.is_empty(),
+            Done => show_done_children && !self.children.is_empty(),
+            Denied => false,
+        };
+        if show_children {
             for child in &self.children {
                 if child.is_empty() {
                     // Skip the empty tail that `push_output` leaves
@@ -295,7 +326,7 @@ impl Step {
 }
 
 // `diff_span` is a private helper in `cell/mod.rs`; this version lives
-// here for `spans_with` so the cell layer keeps the same wrapping rules.
+// here for `spans` so the cell layer keeps the same wrapping rules.
 // Duplicated because pulling `diff_span` out of `cell/mod.rs` would
 // make that module's re-export surface larger than it needs to be.
 fn diff_span_pub(line: &DiffLine) -> crate::ui::cell::Span {
@@ -464,131 +495,95 @@ mod tests {
     fn shows_children_for_running_or_failed_steps() {
         let mut step = Step::open("Bash", r#"{"command":"ls"}"#);
         step.push_output("line one\nline two\n");
-        assert!(step.shows_children_when(false), "running shows children");
-        assert!(
-            step.shows_children_when(true),
-            "running shows children in verbose too"
-        );
+        assert!(step.shows_children(), "running shows children");
 
         step.settle("exit_code: 0");
         assert!(
-            !step.shows_children_when(false),
-            "settled Done hides children in compact"
-        );
-        assert!(
-            step.shows_children_when(true),
-            "Ctrl-O re-exposes settled children"
+            !step.shows_children(),
+            "settled Done hides children -- the thought body is where the detail lives now"
         );
 
         let mut failed = Step::open("Bash", r#"{"command":"false"}"#);
         failed.push_output("nope\n");
         failed.settle("exit_code: 1");
         assert!(
-            failed.shows_children_when(false),
-            "failed auto-expands even in compact"
-        );
-        assert!(
-            failed.shows_children_when(true),
-            "failed auto-expands in verbose too"
+            failed.shows_children(),
+            "failed auto-expands so the reader sees why"
         );
     }
 
     #[test]
     fn denied_never_shows_children() {
-        // A denied call never ran, so it has no children to display in
-        // any mode. Verbose is irrelevant to a Denied step.
+        // A denied call never ran, so it has no children to display.
         let mut step = Step::open("Bash", r#"{"command":"rm -rf /"}"#);
         step.push_output("would be bad");
         step.deny("user declined");
-        assert!(!step.shows_children_when(false));
-        assert!(!step.shows_children_when(true));
+        assert!(!step.shows_children());
     }
 
     #[test]
     fn settled_done_with_empty_children_never_shows_them() {
-        // Bash that produced no output: a Done step with empty children
-        // has nothing to expand to even at verbose.
+        // Bash that produced no output: a Done step has nothing to expand.
         let mut step = Step::open("Bash", r#"{"command":"true"}"#);
         step.settle("exit_code: 0");
-        assert!(!step.shows_children_when(false));
-        assert!(!step.shows_children_when(true));
+        assert!(!step.shows_children());
     }
 
     #[test]
-    fn spans_with_distinguishes_compact_and_verbose() {
-        // A settled Bash with children: compact shows the verdict line
-        // alone, verbose shows verdict + every child line.
+    fn settled_done_with_children_hides_them_in_spans() {
+        // After removing the verbose toggle, a settled Bash step's
+        // children are no longer auto-expanded by Ctrl-O. The spans are
+        // the verdict alone; the children stay in the step's children
+        // field for the thought body to surface.
         let mut step = Step::open("Bash", r#"{"command":"echo one two"}"#);
         step.push_output("alpha\nbeta\n");
         step.settle("exit_code: 0");
-        let compact = step.spans_with(false);
-        let verbose = step.spans_with(true);
-        // Compact: one span, the verdict header. No children.
-        assert_eq!(compact.len(), 1, "compact is just the header");
-        assert!(!compact[0].text.contains("alpha"));
-        assert!(!compact[0].text.contains("beta"));
-        // Verbose: header + child 'alpha' + child 'beta'.
-        assert!(verbose.len() > compact.len(), "verbose is longer");
-        let joined: String = verbose.iter().map(|s| s.text.clone()).collect();
-        assert!(joined.contains("alpha") && joined.contains("beta"));
+        let spans = step.spans();
+        // Only the header -- no child lines leaked through.
+        assert_eq!(spans.len(), 1, "Done hides children");
+        assert!(!spans[0].text.contains("alpha"));
+        assert!(!spans[0].text.contains("beta"));
     }
 
     #[test]
-    fn spans_with_failed_always_shows_children_regardless_of_verbose() {
-        // Auto-expansion is a separate rule from the Ctrl-O toggle; a
-        // failure that has children shows them in both modes.
+    fn spans_failed_always_shows_children() {
+        // Auto-expansion is a separate rule from the verbose toggle; a
+        // failure that has children shows them.
         let mut step = Step::open("Bash", r#"{"command":"false"}"#);
         step.push_output("boom\n");
         step.settle("exit_code: 1");
-        let compact = step.spans_with(false);
-        let verbose = step.spans_with(true);
-        let compact_joined: String = compact.iter().map(|s| s.text.clone()).collect();
-        let verbose_joined: String = verbose.iter().map(|s| s.text.clone()).collect();
-        assert!(compact_joined.contains("boom"));
-        assert!(verbose_joined.contains("boom"));
+        let spans = step.spans();
+        let joined: String = spans.iter().map(|s| s.text.clone()).collect();
+        assert!(joined.contains("boom"));
     }
 
     #[test]
-    fn spans_with_edit_keeps_diff_in_both_modes() {
+    fn spans_edit_keeps_diff() {
         // An Edit's diff is what the call is for; the verdict line
         // "replaced in X · now Y bytes" without the change would be a
-        // lie. Both compact and verbose keep the diff lines visible.
+        // lie. The diff stays visible.
         let mut step = Step::open(
             "Edit",
             r#"{"file_path":"a.rs","old_string":"one","new_string":"two"}"#,
         );
         step.settle("ok: replaced 1 occurrence; /tmp/a.rs is now 8 bytes");
-        let compact = step.spans_with(false);
-        let verbose = step.spans_with(true);
-        let compact_joined: String = compact.iter().map(|s| s.text.clone()).collect();
-        let verbose_joined: String = verbose.iter().map(|s| s.text.clone()).collect();
-        assert!(
-            compact_joined.contains("- one"),
-            "compact keeps the removed line"
-        );
-        assert!(
-            compact_joined.contains("+ two"),
-            "compact keeps the added line"
-        );
-        assert!(verbose_joined.contains("- one"));
-        assert!(verbose_joined.contains("+ two"));
+        let spans = step.spans();
+        let joined: String = spans.iter().map(|s| s.text.clone()).collect();
+        assert!(joined.contains("- one"), "the removed line stays");
+        assert!(joined.contains("+ two"), "the added line stays");
     }
 
     #[test]
     fn shows_children_is_false_when_there_are_none() {
         let mut step = Step::open("Read", r#"{"file_path":"/a.rs"}"#);
         assert!(
-            !step.shows_children_when(false),
+            !step.shows_children(),
             "running with no children has nothing to show"
         );
         step.settle("error: nope");
         assert!(
-            !step.shows_children_when(false),
+            !step.shows_children(),
             "failed with no children still has nothing"
-        );
-        assert!(
-            !step.shows_children_when(true),
-            "verbose with no children still has nothing"
         );
     }
 }

@@ -48,15 +48,19 @@ impl State {
             let _ = cancel.send(true);
             return;
         }
-        // Ctrl-O flips the verbose toggle during a turn: the running step's
-        // children keep streaming either way, but the *settled* step tail
-        // visible from a scrolled-back view reacts.
+        // Ctrl-O toggles the latest thought block's expanded view. The
+        // active block can be expanded and collapsed; a historical
+        // block that was expanded at the moment it became historical
+        // can be collapsed back to its header; a historical block
+        // that was folded stays folded -- it is not the "latest"
+        // subject of the widget, and there is nothing to expand it
+        // to.
         if let Event::Key(key) = &event
             && key.kind == KeyEventKind::Press
             && key.code == KeyCode::Char('o')
             && key.modifiers.contains(KeyModifiers::CONTROL)
         {
-            self.verbose = !self.verbose;
+            self.toggle_latest_thought();
             return;
         }
         // The panel is up: it takes the keys that choose, and the box takes what
