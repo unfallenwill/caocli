@@ -17,7 +17,7 @@ use ratatui::style::Modifier;
 use crate::config;
 use crate::session;
 
-use super::super::input::{IDLE_PLACEHOLDER, Submitted};
+use super::super::input::{Submitted, idle_placeholder};
 use super::super::picker::{Choice, Choosing, choice_rows, named_rows};
 use super::super::state::State;
 use super::all_rows;
@@ -110,7 +110,7 @@ fn escape_dismisses_the_command_picker_and_the_line_it_was_filtering() {
     );
     assert_eq!(
         screen.edit.textarea.placeholder_text(),
-        IDLE_PLACEHOLDER,
+        idle_placeholder(),
         "the box is back to inviting the next message"
     );
 }
@@ -352,6 +352,44 @@ fn the_picker_is_drawn_over_the_live_area_with_one_row_highlighted() {
         .filter(|c| c.modifier.contains(Modifier::REVERSED))
         .count();
     assert!(selected > 0, "something is highlighted");
+}
+
+#[test]
+fn the_highlighted_row_carries_a_cursor_of_its_own() {
+    // Reverse video is how the selected row is marked, and it is not the only
+    // mark: a whole-row inversion is a strong signal on a terminal that renders
+    // it well and an invisible one on a terminal that renders it faintly, so the
+    // row that `Enter` is about also opens with a cursor in the attention colour.
+    // The two are in different columns -- the cursor is outside the label's
+    // field -- so a row can say both without either standing for the other.
+    let mut screen = screen_for_test(80, 24);
+    let choices: Vec<Choice> = (0..3)
+        .map(|i| Choice {
+            label: format!("row-{i}"),
+            argument: format!("row-{i}"),
+            detail: String::new(),
+        })
+        .collect();
+    screen.state.open_choices(Choosing::Session, choices);
+    screen.state.down();
+    screen.draw().unwrap();
+
+    let cursor = crate::ui::glyphs::get().cursor;
+    let signal = crate::ui::theme::style_of(crate::ui::cell::Style::Yellow).fg;
+    let drawn = all_rows(&screen);
+    let marked: Vec<&String> = drawn
+        .iter()
+        .filter(|r| r.starts_with(cursor.trim_end()))
+        .collect();
+    assert_eq!(marked.len(), 1, "one row has the cursor: {drawn:?}");
+    assert!(marked[0].contains("row-1"), "{:?}", marked[0]);
+
+    // And it is painted, not left in whatever the row's own style is.
+    let buf = screen.terminal.backend().buffer();
+    let y = (0..buf.area.height)
+        .find(|&y| row(&screen, y).starts_with(cursor.trim_end()))
+        .expect("the cursor is on a drawn row");
+    assert_eq!(buf[(0, y)].style().fg, signal);
 }
 
 #[test]

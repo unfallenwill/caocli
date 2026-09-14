@@ -180,12 +180,12 @@ fn wrapping_keeps_each_span_in_its_own_style() {
     assert_eq!(lines[0].spans.len(), 2, "two styles on one line");
     assert_eq!(
         lines[0].spans[0].style.fg,
-        Some(ratatui::style::Color::Rgb(98, 114, 164)),
+        Some(ratatui::style::Color::Rgb(154, 161, 181)),
         "secondary text is the comment colour"
     );
     assert_eq!(
         lines[0].spans[1].style.fg,
-        Some(ratatui::style::Color::Rgb(248, 248, 242)),
+        Some(ratatui::style::Color::Rgb(215, 218, 228)),
         "body text is the foreground"
     );
     // Neither carries the DIM modifier: the colour is the only styling the

@@ -16,6 +16,8 @@ use crate::agent::Agent;
 use crate::config;
 use crate::repl;
 use crate::session;
+use crate::ui::cell::{Style, style_of};
+use crate::ui::glyphs;
 use crate::ui::text;
 
 use super::layout::picker_window;
@@ -42,6 +44,19 @@ pub(super) fn named_rows(rows: Vec<(String, String)>) -> Vec<Choice> {
 
 /// A menu as the picker draws it: the rows are the application's, the drawing is
 /// this front end's.
+/// The style the row cursor is drawn in: the palette's attention colour on the
+/// selected row, so the mark is a colour as well as a shape, and nothing on any
+/// other row. Under reverse video the colour is the *foreground* of an inverted
+/// cell, which is what makes it read as a mark rather than as a highlight of its
+/// own.
+fn cursor_style(selected: bool) -> RStyle {
+    if selected {
+        style_of(Style::Yellow)
+    } else {
+        RStyle::new()
+    }
+}
+
 pub(super) fn choice_rows(rows: Vec<crate::config::Choice>) -> Vec<Choice> {
     rows.into_iter()
         .map(|row| Choice {
@@ -182,7 +197,7 @@ impl State {
                 .map(|s| Choice {
                     label: s.id.clone(),
                     argument: s.id.clone(),
-                    detail: format!("{} messages · {}", s.message_count, s.preview),
+                    detail: format!("{} messages{}{}", s.message_count, glyphs::sep(), s.preview),
                 })
                 .collect(),
         )
@@ -265,17 +280,32 @@ impl State {
         let row = |i: usize| {
             let choice = &picker.choices[i];
             let selected = i == picker.selected;
-            let name = if selected {
-                RStyle::new().add_modifier(Modifier::REVERSED)
-            } else {
-                RStyle::new()
-            };
+            // Reverse video is the one highlight that works in every terminal
+            // without the application knowing the background, which is why the
+            // selected row is marked that way rather than with a colour of its
+            // own: a selection *colour* would be a background, and this process
+            // does not know what background it is being drawn on.
+            let reversed = RStyle::new().add_modifier(Modifier::REVERSED);
+            let name = if selected { reversed } else { RStyle::new() };
+            // The detail is muted, except on the selected row: `DIM` under
+            // reverse video is a modifier whose rendering is undefined, and
+            // painting the muted colour there would be the muted colour asked to
+            // sit on an inverted background. The selected row carries its
+            // hierarchy by position instead -- the detail is the right column.
             let detail = if selected {
-                RStyle::new().add_modifier(Modifier::REVERSED)
+                reversed
             } else {
-                RStyle::new().add_modifier(Modifier::DIM)
+                style_of(Style::Dim)
             };
+            // And a cursor in the signal colour, so that the highlight is not
+            // the only thing saying which row `Enter` is about: `REVERSED` is a
+            // whole-row inversion, which on a narrow terminal or a badly
+            // rendered one is not much of a mark.
             Line::from(vec![
+                RSpan::styled(
+                    if selected { glyphs::get().cursor } else { "  " },
+                    cursor_style(selected),
+                ),
                 RSpan::styled(format!(" {}", text::padded(&choice.label, width)), name),
                 RSpan::styled(format!(" {}", choice.detail), detail),
             ])

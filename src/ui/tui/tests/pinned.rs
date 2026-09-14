@@ -11,7 +11,7 @@ use ratatui::layout::Rect;
 
 use crate::ui::cell::Cell;
 
-use super::super::input::IDLE_PLACEHOLDER;
+use super::super::input::idle_placeholder;
 use super::super::layout::{BOX_ROWS, PINNED_ROWS, screen_rows, todo_rows};
 use super::super::render;
 use super::super::scroll::Scroll;
@@ -47,7 +47,7 @@ fn the_pinned_rows_take_the_bottom_of_the_screen() {
     assert!(
         // The editor puts a space in front of the placeholder, which is where
         // its cursor would stand.
-        row(&screen, last - 2).ends_with(IDLE_PLACEHOLDER),
+        row(&screen, last - 2).ends_with(&idle_placeholder()),
         "its text: {:?}",
         row(&screen, last - 2)
     );
@@ -76,7 +76,7 @@ fn the_queue_is_drawn_above_the_box_until_it_is_run() {
     let waiting_fg = screen.terminal.backend().buffer()[(2, last - 5)].style().fg;
     assert_eq!(
         waiting_fg,
-        Some(ratatui::style::Color::Rgb(98, 114, 164)),
+        Some(ratatui::style::Color::Rgb(154, 161, 181)),
         "waiting: the comment colour, not the foreground"
     );
     // ... and the box and the status line are where they always are: the
@@ -110,13 +110,13 @@ fn the_queue_is_drawn_above_the_box_until_it_is_run() {
     let run_fg = buf[(2, transcript_top(&screen, 1))].style().fg;
     assert_eq!(
         run_fg,
-        Some(ratatui::style::Color::Rgb(248, 248, 242)),
+        Some(ratatui::style::Color::Rgb(215, 218, 228)),
         "the line that ran reads as the session's, not as something waiting"
     );
     let still_waiting_fg = buf[(2, last - 4)].style().fg;
     assert_eq!(
         still_waiting_fg,
-        Some(ratatui::style::Color::Rgb(98, 114, 164)),
+        Some(ratatui::style::Color::Rgb(154, 161, 181)),
         "and the one behind it still waits"
     );
 }
