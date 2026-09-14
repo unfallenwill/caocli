@@ -115,6 +115,9 @@ pub async fn handle(
                 ui.info(&line);
             }
         }
+        _ if line.starts_with("/mcp ") => {
+            mcp_command(agent, ui, argument(line)).await;
+        }
         _ if line.starts_with("/login ") => {
             login(agent, ui, argument(line)).await;
         }
@@ -189,6 +192,61 @@ fn argument(line: &str) -> &str {
     line.split_once(char::is_whitespace)
         .map(|(_, arg)| arg.trim())
         .unwrap_or("")
+}
+
+/// `/mcp <subcommand> [name]`: runtime control over the MCP servers the
+/// session connected to. The bare `/mcp` is the long report (one line per
+/// server, one line for the tools it offers); everything after `/mcp ` is
+/// one of the five subcommands. The hub does the work asynchronously and
+/// tells the caller what happened — the front end only renders the
+/// outcome.
+async fn mcp_command(agent: &mut Agent, ui: &mut dyn Front, arg: &str) {
+    let (subcommand, name) = match arg.split_once(char::is_whitespace) {
+        Some((sub, rest)) => (sub, rest.trim()),
+        None => (arg, ""),
+    };
+    match subcommand {
+        "list" => {
+            for status in agent.mcp.list().await {
+                ui.info(&format_mcp_status(&status));
+            }
+        }
+        "enable" | "disable" | "reconnect" | "disconnect" => {
+            if name.is_empty() {
+                ui.info(&format!(
+                    "missing server name for `/mcp {subcommand}`. Try `/mcp list`."
+                ));
+                return;
+            }
+            let result = match subcommand {
+                "enable" => agent.mcp.enable(name).await,
+                "disable" => agent.mcp.disable(name).await,
+                "reconnect" => agent.mcp.reconnect(name).await,
+                "disconnect" => agent.mcp.disconnect(name).await,
+                _ => unreachable!("matched above"),
+            };
+            match result {
+                Ok(()) => ui.info(&format!("mcp: {subcommand} {name}: done")),
+                Err(why) => ui.error(&format!("mcp: {subcommand} {name}: {why}")),
+            }
+        }
+        _ => ui.info(&format!(
+            "unknown /mcp subcommand: {subcommand:?}. Try one of: list, enable <name>, \
+             disable <name>, reconnect <name>, disconnect <name>."
+        )),
+    }
+}
+
+/// One row of `/mcp list`: the server name, the state it stands in, and
+/// the count of its tools the model currently sees.
+fn format_mcp_status(status: &caocli_mcp::ServerStatus) -> String {
+    let state = match &status.state {
+        caocli_mcp::ServerState::Ready => "ready".to_string(),
+        caocli_mcp::ServerState::Failed(why) => format!("failed ({why})"),
+        caocli_mcp::ServerState::Disabled => "disabled".into(),
+        caocli_mcp::ServerState::Disconnected => "disconnected".into(),
+    };
+    format!("{} · {} · {} tools", status.name, state, status.tools_count)
 }
 
 /// `/login <provider>`: store that provider's API key where it outlives the
@@ -456,7 +514,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/mcp",
-        description: "the MCP servers and the tools they offer",
+        description: "MCP servers: report; subcommands list / enable / disable / reconnect / disconnect",
     },
     Command {
         name: "/exit",
@@ -738,6 +796,150 @@ mod tests {
         assert!(ui.info[0].contains("1 tools"), "{:?}", ui.info);
         assert!(ui.info[1].contains("mcp__stub__echo"), "{:?}", ui.info);
         agent.mcp.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `/mcp list` prints one row per server, with its state and the count of
+    /// its tools the model currently sees.
+    #[tokio::test]
+    async fn mcp_list_prints_one_row_per_server() {
+        let dir = tmpdir("mcp-list");
+        let mut agent = agent_in(&dir, "m");
+        let stub = caocli_mcp::stub::Stub::new();
+        agent.mcp =
+            caocli_mcp::Hub::of_entries(vec![stub.entry(&[("STUB_TOOLS", "echo,fail")])]).await;
+        let mut ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/mcp list").await;
+        assert_eq!(ui.info.len(), 1, "{:?}", ui.info);
+        assert!(
+            ui.info[0].contains("stub · ready · 2 tools"),
+            "{:?}",
+            ui.info
+        );
+        agent.mcp.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `/mcp disable <name>` parks a Ready server, `/mcp enable <name>`
+    /// brings it back. The cycle is the only reason a session would call
+    /// either one — they exist to give a user the lever without forcing
+    /// them to edit `.mcp.json`.
+    #[tokio::test]
+    async fn mcp_disable_then_enable_round_trips_a_server() {
+        let dir = tmpdir("mcp-disable-enable");
+        let mut agent = agent_in(&dir, "m");
+        let stub = caocli_mcp::stub::Stub::new();
+        agent.mcp = caocli_mcp::Hub::of_entries(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await;
+        let mut ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/mcp disable stub").await;
+        assert!(ui.info.last().unwrap().contains("done"), "{:?}", ui.info);
+        // The model no longer sees the tool: `definitions()` dropped it.
+        assert!(agent.mcp.definitions().await.is_empty());
+        // And `/mcp list` shows it as disabled.
+        ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/mcp list").await;
+        assert!(
+            ui.info[0].contains("stub · disabled · 0 tools"),
+            "{:?}",
+            ui.info
+        );
+        // Back on.
+        submit(&mut agent, &mut ui, &dir, "/mcp enable stub").await;
+        assert!(ui.info.last().unwrap().contains("done"), "{:?}", ui.info);
+        ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/mcp list").await;
+        assert!(
+            ui.info[0].contains("stub · ready · 1 tools"),
+            "{:?}",
+            ui.info
+        );
+        agent.mcp.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `/mcp reconnect` is the only way to leave `Disconnected`. The
+    /// disable/enable cycle does not apply once a server has been taken
+    /// offline from the connection side — `reconnect` is.
+    #[tokio::test]
+    async fn mcp_reconnect_brings_a_disconnected_server_back() {
+        let dir = tmpdir("mcp-reconnect");
+        let mut agent = agent_in(&dir, "m");
+        let stub = caocli_mcp::stub::Stub::new();
+        agent.mcp = caocli_mcp::Hub::of_entries(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await;
+        let mut ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/mcp disconnect stub").await;
+        ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/mcp list").await;
+        assert!(ui.info[0].contains("stub · disconnected"), "{:?}", ui.info);
+        submit(&mut agent, &mut ui, &dir, "/mcp reconnect stub").await;
+        assert!(ui.info.last().unwrap().contains("done"), "{:?}", ui.info);
+        ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/mcp list").await;
+        assert!(ui.info[0].contains("stub · ready"), "{:?}", ui.info);
+        agent.mcp.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `enable` on a server that is not Disabled is a user error: the
+    /// command prints what went wrong, rather than succeeding silently.
+    #[tokio::test]
+    async fn mcp_enable_rejects_a_server_that_is_not_disabled() {
+        let dir = tmpdir("mcp-enable-rejects");
+        let mut agent = agent_in(&dir, "m");
+        let stub = caocli_mcp::stub::Stub::new();
+        agent.mcp = caocli_mcp::Hub::of_entries(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await;
+        let mut ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/mcp enable stub").await;
+        assert_eq!(ui.errors.len(), 1, "{:?}", ui.errors);
+        assert!(ui.errors[0].contains("already enabled"), "{:?}", ui.errors);
+        agent.mcp.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `/mcp <verb>` without a server name is a usage error: the front end
+    /// tells the caller what the verb takes, so they do not have to guess.
+    #[tokio::test]
+    async fn mcp_subcommand_without_name_prints_help() {
+        let dir = tmpdir("mcp-usage");
+        let mut agent = agent_in(&dir, "m");
+        let stub = caocli_mcp::stub::Stub::new();
+        agent.mcp = caocli_mcp::Hub::of_entries(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await;
+        let mut ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/mcp disable").await;
+        assert_eq!(ui.info.len(), 1, "{:?}", ui.info);
+        assert!(ui.info[0].contains("missing server name"), "{:?}", ui.info);
+        agent.mcp.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An unknown subcommand is a usage error: the front end names the
+    /// verbs the user might have meant.
+    #[tokio::test]
+    async fn mcp_unknown_subcommand_lists_what_is_available() {
+        let dir = tmpdir("mcp-unknown");
+        let mut agent = agent_in(&dir, "m");
+        let mut ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/mcp frobnicate").await;
+        assert_eq!(ui.info.len(), 1, "{:?}", ui.info);
+        assert!(
+            ui.info[0].contains("unknown /mcp subcommand"),
+            "{:?}",
+            ui.info
+        );
+        assert!(ui.info[0].contains("enable"), "{:?}", ui.info);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Enable and disable against a server that was never configured: the
+    /// hub returns an error, the front end forwards it as one.
+    #[tokio::test]
+    async fn mcp_enable_on_unknown_server_is_an_error() {
+        let dir = tmpdir("mcp-ghost");
+        let mut agent = agent_in(&dir, "m");
+        let mut ui = Recording::default();
+        submit(&mut agent, &mut ui, &dir, "/mcp enable ghost").await;
+        assert_eq!(ui.errors.len(), 1, "{:?}", ui.errors);
+        assert!(ui.errors[0].contains("ghost"), "{:?}", ui.errors);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
