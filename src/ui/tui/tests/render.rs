@@ -14,7 +14,6 @@ use ratatui::style::{Color, Modifier};
 
 use crate::ui::cell::Cell;
 
-use super::super::super::paint::THINKING_LINES;
 use super::super::layout::{BOX_GUTTER, BOX_ROWS, PINNED_ROWS, box_field, box_rows, screen_rows};
 use super::super::notice::{AppNotice, MachineNotice};
 use super::super::render as render_mod;
@@ -124,13 +123,14 @@ fn a_call_with_nothing_to_name_shows_all_of_its_arguments() {
 }
 
 #[test]
-fn thinking_is_set_in_behind_a_rule_of_its_own() {
+fn thinking_is_set_in_by_its_columns_alone() {
     // The thinking is the machinery around an answer rather than the answer, so
-    // it is set in two columns -- faintly, behind a rule -- and no longer on a
-    // ground of its own. The rule is the whole of what says "this is thinking",
-    // which is what makes it a difference a terminal cannot lose: a ground is in
-    // the colors and SGR 2 is not honored everywhere, while the columns are in
-    // the layout.
+    // it is set in two columns -- faintly, and no longer on a ground of its own.
+    // The columns are the whole of what sets it off: the marker it used to carry
+    // is gone, and with it the one sign of "this is thinking" that survived a
+    // terminal honouring neither colour nor dim. What still holds is the edge the
+    // reader reads down -- the answer is the one line that starts in column zero,
+    // and a think that wrapped back to it would read as an answer.
     let mut screen = screen_for_test(40, 20);
     screen
         .state
@@ -145,7 +145,7 @@ fn thinking_is_set_in_behind_a_rule_of_its_own() {
     screen.draw().unwrap();
     let top = transcript_top(&screen, 2);
     let buf = screen.terminal.backend().buffer();
-    assert_eq!(row(&screen, top), "┆ hmm");
+    assert_eq!(row(&screen, top), "  hmm");
     assert_eq!(
         buf[(0, top)].bg,
         Color::Reset,
@@ -222,7 +222,7 @@ fn multiple_attached_images_are_one_line_not_separate_lines() {
 }
 
 #[test]
-fn a_wrapped_think_keeps_the_rule_on_every_line() {
+fn a_wrapped_think_keeps_the_columns_on_every_line() {
     // A continuation line that came back to the left edge would be a line that
     // reads as an answer, in the middle of a block that is not one.
     let mut screen = screen_for_test(12, 20);
@@ -238,17 +238,18 @@ fn a_wrapped_think_keeps_the_rule_on_every_line() {
         .push(Cell::Content("answer".into()));
     screen.draw().unwrap();
     let top = transcript_top(&screen, 3);
-    assert_eq!(row(&screen, top), "┆ aaaa bbbb");
-    assert_eq!(row(&screen, top + 1), "┆ cccc");
+    assert_eq!(row(&screen, top), "  aaaa bbbb");
+    assert_eq!(row(&screen, top + 1), "  cccc");
     assert_eq!(row(&screen, top + 2), "answer");
 }
 
 #[test]
-fn a_long_think_folds_to_its_head_and_a_count() {
+fn a_long_think_is_drawn_whole() {
     // The think is the one block that grows without bound, and the window
-    // pins to the newest line: kept whole, a hundred lines of faint text
-    // would be exactly the thing standing between the reader and the answer
-    // the turn was for.
+    // pins to the newest line -- so a think that ran past the window is
+    // scrolled to, not counted away. What is behind the fold is what the
+    // reader opened the region to read, and the transcript is where a
+    // session's own words are kept.
     let mut screen = screen_for_test(40, 30);
     let think = (0..30)
         .map(|i| format!("line {i}"))
@@ -261,55 +262,15 @@ fn a_long_think_folds_to_its_head_and_a_count() {
         .transcript
         .push(Cell::Content("answer".into()));
     screen.draw().unwrap();
-    let top = transcript_top(&screen, THINKING_LINES as u16 + 2);
-    for i in 0..THINKING_LINES {
-        assert_eq!(row(&screen, top + i as u16), format!("┆ line {i}"));
-    }
-    assert_eq!(
-        row(&screen, top + THINKING_LINES as u16),
-        format!("┆ {} more lines", 30 - THINKING_LINES),
-        "the count wears the block's own rule and says what is behind it"
-    );
-    assert_eq!(
-        row(&screen, top + THINKING_LINES as u16 + 1),
-        "answer",
-        "and the answer is still on the screen the think was folded for"
-    );
-}
-
-#[test]
-fn a_think_at_the_cap_is_not_folded() {
-    // The count exists to say that something was left out; a block that
-    // gave up nothing would be paying a row to say nothing.
-    let mut screen = screen_for_test(40, 30);
-    let think = (0..THINKING_LINES)
-        .map(|i| format!("line {i}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    screen.state.view.transcript.push(Cell::Reasoning(think));
-    screen.draw().unwrap();
     let drawn = all_rows(&screen).join("\n");
     assert!(
-        !drawn.contains("more lines"),
-        "nothing is hidden, so nothing is counted: {drawn}"
+        drawn.contains("  line 29"),
+        "the tail is on screen: {drawn}"
     );
-}
-
-#[test]
-fn only_a_think_folds() {
-    // The fold is about dim machinery evicting the answer. The answer
-    // itself is the thing the transcript is here for, and it is never
-    // counted away.
-    let mut screen = screen_for_test(40, 30);
-    let long = (0..30)
-        .map(|i| format!("line {i}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    screen.state.view.transcript.push(Cell::Content(long));
-    screen.draw().unwrap();
-    let drawn = all_rows(&screen).join("\n");
-    assert!(drawn.contains("line 29"), "kept whole: {drawn}");
-    assert!(!drawn.contains("more lines"), "{drawn}");
+    assert!(
+        !drawn.contains("more lines"),
+        "and nothing stood in for the lines above it: {drawn}"
+    );
 }
 
 /// What a command prints while it runs is watched as it arrives, and the step
@@ -369,24 +330,114 @@ fn a_running_commands_output_is_watched_and_then_kept() {
 }
 
 #[test]
-fn a_folded_think_does_not_jump_open_when_it_closes() {
-    // The live block and the cell it becomes go through the same layout, so
-    // the frame that files the block away is allowed to change nothing: the
-    // think the reader watched is the think the transcript keeps.
+fn a_folded_thought_is_one_ruled_line_no_matter_its_size() {
+    // The fold is structural: a thought region with thirty lines of
+    // reasoning takes one row on the transcript, not thirty. The fold
+    // line names the activity ("thinking") and the elapsed seconds, and
+    // it carries no marker of its own: the region is set in two columns
+    // and the words are the whole of what the line says.
     let mut screen = screen_for_test(40, 30);
     let think = (0..30)
         .map(|i| format!("line {i}"))
         .collect::<Vec<_>>()
         .join("\n");
     screen.state.apply(MachineNotice::Reasoning(think));
+    screen.state.apply(MachineNotice::Content("answer".into()));
     screen.draw().unwrap();
-    let live = render_mod::lines(&mut screen.state.view, 40);
-    screen.state.apply(MachineNotice::FinishTurn);
-    screen.draw().unwrap();
+
+    let lines = render_mod::lines(&mut screen.state.view, 40);
+    // The transcript has three cells: the thought (1 row), the answer
+    // (1 row), and nothing else.
     assert_eq!(
-        render_mod::lines(&mut screen.state.view, 40),
-        live,
-        "the same lines either way"
+        lines.len(),
+        2,
+        "fold takes 1 row, answer takes 1 row: {lines:?}"
+    );
+    assert!(
+        format!("{:?}", lines[0]).contains("Thought for "),
+        "the fold line names the region: {:?}",
+        lines[0]
+    );
+    let top = transcript_top(&screen, 2);
+    assert_eq!(row(&screen, top), "  Thought for  0s");
+    assert_eq!(
+        row(&screen, top + 1),
+        "answer",
+        "and the answer keeps the edge"
+    );
+}
+
+#[test]
+fn every_thought_region_lands_a_fold_line() {
+    // Two thoughts in the transcript (one for each reasoning -> content
+    // stretch) means two fold lines on screen. The active third thought
+    // never closes, so its fold line is what its `Reasoning` cell becomes.
+    let mut screen = screen_for_test(40, 30);
+    screen
+        .state
+        .apply(MachineNotice::Reasoning("first plan".into()));
+    screen
+        .state
+        .apply(MachineNotice::Content("answer one".into()));
+    screen
+        .state
+        .apply(MachineNotice::Reasoning("second plan".into()));
+    screen
+        .state
+        .apply(MachineNotice::Content("answer two".into()));
+    screen.draw().unwrap();
+
+    let rendered = all_rows(&screen).join("");
+    let fold_lines = rendered.matches("Thought").count();
+    assert_eq!(
+        fold_lines, 2,
+        "two closed regions => two fold lines: {rendered}"
+    );
+}
+
+#[test]
+fn a_side_effectful_tool_closes_a_thought_before_its_cell_lands() {
+    // The Edit that closes the thought comes after the fold line: the
+    // region is the planning the model did, and the side-effect cell is
+    // its own row.
+    let mut screen = screen_for_test(40, 30);
+    screen.state.apply(MachineNotice::Reasoning("plan".into()));
+    screen.state.apply(MachineNotice::ToolStart {
+        name: "Edit".into(),
+        args: r#"{"file_path":"a.rs"}"#.into(),
+    });
+    screen.state.apply(MachineNotice::ToolResult("ok".into()));
+    screen.draw().unwrap();
+
+    let rendered = all_rows(&screen).join("");
+    let edit_pos = rendered.find("Edit").expect("Edit cell drawn");
+    let fold_pos = rendered.find("Thought").expect("fold line drawn");
+    assert!(
+        fold_pos < edit_pos,
+        "fold line precedes the Edit that closed the thought: {rendered}"
+    );
+}
+
+#[test]
+fn an_active_thoughts_seconds_are_live_while_a_closed_ones_freeze() {
+    // The active region's elapsed is read live (the same `now` the border
+    // uses); a closed region's elapsed is frozen at the boundary.
+    use crate::ui::cell::Thought;
+    use crate::ui::cell::ThoughtStatus;
+
+    let t0 = Instant::now();
+    let mut active = Thought::open("thinking", Some(t0));
+    let _line_early = active.live_secs(t0);
+    let _line_late = active.live_secs(t0 + Duration::from_secs(3));
+    assert_eq!(active.live_secs(t0), 0);
+    assert_eq!(active.live_secs(t0 + Duration::from_secs(3)), 3);
+
+    active.close(t0 + Duration::from_secs(2));
+    assert_eq!(active.status, ThoughtStatus::Done);
+    assert_eq!(
+        active.live_secs(t0 + Duration::from_secs(999)),
+        2,
+        "closed regions do not age"
     );
 }
 
@@ -453,7 +504,7 @@ fn a_failure_is_drawn_by_weight_and_not_only_by_color() {
         .apply_app(AppNotice::Error("the backend said 402".into()));
     screen.state.apply(MachineNotice::ToolStart {
         name: "Bash".into(),
-        args: r#"{"command":"ls"}"#.into(),
+        args: r#"{"command":"rm -rf /tmp/aaa"}"#.into(),
     });
     screen.draw().unwrap();
     let buf = screen.terminal.backend().buffer();

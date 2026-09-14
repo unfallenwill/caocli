@@ -51,7 +51,6 @@ pub(crate) struct Turn {
     /// Whether the agent is streaming reasoning right now. Drives the
     /// "thinking" phase of the box border; flipped off the moment a
     /// different style or a tool call takes over.
-    #[allow(dead_code)] // read by the activity title in a follow-up commit
     pub(crate) reasoning_in_flight: bool,
     /// The verb of the tool call currently running, or `None` while the
     /// model is reasoning or producing content. Drives the "running X"

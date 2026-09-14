@@ -8,7 +8,7 @@
 //! - [`Edit`] is the input box and the history it browses.
 //! - [`Overlay`] is the picker, the panel, and the answer channel.
 //! - [`Turn`] is the running turn's clock, the queue, the chars-per-token
-//!   counter.
+//!   counter, and which phase the border should name.
 //!
 //! Keeping them separate is what makes the methods on each half its own list
 //! rather than one long `impl State` block that has to reach across concerns:
@@ -21,15 +21,16 @@
 //! move together, the working indicator ticks and reads from both view and
 //! turn. Each is one focused function rather than a god object's middle.
 
+use std::time::Instant;
+
 use tokio::sync::oneshot;
 
 use crate::ui::Verdict;
-use crate::ui::cell::{self, Cell, Style};
+use crate::ui::cell::{self, Cell, Style, Thought, ThoughtStatus};
 
 use super::edit::Edit;
 use super::notice::{AppNotice, MachineNotice};
 use super::overlay::{Answer, Overlay};
-use super::thought::ThoughtBlock;
 use super::turn::Turn;
 use super::view::View;
 
@@ -53,17 +54,6 @@ pub(super) struct State {
     pub(super) overlay: Overlay,
     /// The running turn's clock and the line queue.
     pub(super) turn: Turn,
-    /// The currently-open thought block, if any. `Some` between
-    /// `open_thought` and the next `close_thought`; `None` at the
-    /// start of a turn and between blocks.
-    #[allow(dead_code)] // wired up by the thinking widget in a follow-up commit
-    pub(super) thought: Option<ThoughtBlock>,
-    /// Thought blocks that have closed, in order. The latest one is
-    /// the one Ctrl-O toggles when the active block is folded, and
-    /// the one that may carry an expanded state frozen from when it
-    /// was active.
-    #[allow(dead_code)] // wired up by the thinking widget in a follow-up commit
-    pub(super) historical: Vec<ThoughtBlock>,
     /// The model id in effect. Set once at session start (the front end's
     /// `model_label`) and on `/model`. Drives the per-prompt metadata row
     /// above each User cell. `None` until the agent picks one.
@@ -78,8 +68,6 @@ pub(super) struct State {
     /// the turn, an overlay lands in the overlay.
     pub(super) revision: u64,
 }
-
-// ----------------------------------------------------------------- methods ---
 
 impl State {
     /// A `State` configured for tests that exercise the per-prompt
@@ -109,78 +97,73 @@ impl State {
         self.revision += 1;
         match notice {
             MachineNotice::Reasoning(text) => {
-                // The first reasoning fragment of a thought opens it.
-                // Safe-tool steps and later reasoning fragments leave the
-                // block alone; closing is the boundary events' job.
-                self.open_thought(self.current_activity());
+                // The first reasoning fragment of a turn opens a thought
+                // region as a `Cell::Thought` in the transcript. Subsequent
+                // fragments accumulate into its body. A region opens at the
+                // first fragment because the live block has not yet committed
+                // a body cell, and the cell it commits to (the `Cell::Reasoning`
+                // it becomes on a style change) is the one that goes into the
+                // region's body.
+                self.open_thought_region();
                 self.stream(Style::Reasoning, &text);
+                self.turn.reasoning_in_flight = true;
             }
             MachineNotice::Content(text) => {
-                // Stream before closing: a Reasoning block being
-                // displaced by this Content fragment produces a
-                // Cell::Reasoning that belongs to the open thought's
-                // body. The thought closes only after the cell has
-                // been committed.
+                // Close any open Reasoning before the body lands, and commit
+                // the thought region to the transcript.
+                self.close_open_thought();
                 self.stream(Style::Plain, &text);
-                self.close_thought();
+                self.turn.reasoning_in_flight = false;
             }
             MachineNotice::FinishTurn => {
-                // End the stream before closing the thought, for the
-                // same reason Content does: a Cell::Reasoning that
-                // was being streamed belongs to the just-open block,
-                // and the body needs the cell committed while the
-                // thought is still open to claim it.
                 self.finalize_open_step("interrupted");
+                self.close_open_thought();
+                // Close the open body stream so what was being streamed
+                // lands in the transcript (or, for an open thought, in its
+                // body). FinishTurn is the last notice of the turn.
                 self.end_block();
-                self.close_thought();
+                self.turn.reasoning_in_flight = false;
             }
             MachineNotice::ToolStart { name, args } => {
-                // The call's arguments are output the backend billed for: the
-                // characters join both counters so the usage notice that ends
-                // the next sub-request calibrates against the same text the
-                // completion tokens covered. The notice lands after the
-                // sub-request that declared the call, so its tokens ride one
-                // window late -- an offset a turn with several calls averages
-                // out.
                 let chars = args.chars().count();
                 self.turn.streamed_chars += chars;
                 self.turn.chars_since_usage += chars;
-                // A side-effectful tool ends the thought: writes, edits,
-                // and bash calls whose commands change state are not
-                // something a folded header should hide. Safe tools
-                // (read / glob / grep / read-only bash) continue the
-                // current block.
-                if !crate::tools::keeps_thought_open(&name, &args) {
-                    self.close_thought();
+                let keeps_open = crate::tools::keeps_thought_open(&name, &args);
+                let active_region =
+                    self.view.transcript.iter().any(
+                        |c| matches!(c, Cell::Thought(t) if t.status == ThoughtStatus::Running),
+                    );
+                // A side-effectful tool ends the thought before its own cell
+                // lands, so the fold line in the transcript is the planning
+                // the model did and the side-effect call comes after it.
+                if !keeps_open {
+                    self.close_open_thought();
+                } else {
+                    // A safe tool keeps the thought open; the running cell
+                    // still claims the thought's body.
+                    self.finalize_open_step("interrupted");
                 }
-                // The verb drives the "running X" label on the box's top
-                // border while the tool runs. The result notice clears it
-                // when the step settles.
                 self.turn.current_tool_verb = Some(name.clone());
-                // Close any open step first: a step in flight across two
-                // tool calls would be malformed (the model emits ToolResult
-                // before ToolStart), but an Interrupted turn can leave one
-                // open. Finalizing it as interrupted is the safe default.
                 self.finalize_open_step("interrupted");
-                // `from_tool_call` is the dispatcher: regular tools become
-                // an open Cell::Step, the question and todo tools keep
-                // their own rich cells. The open step's children will be
-                // filled by the ToolOutput notices that follow.
-                self.close_and_push(Cell::from_tool_call(&name, &args));
+                // A new tool step supersedes whatever reason was being
+                // streamed. The reasoning flag flips off when the call starts;
+                // a tool that changes something is not "thinking".
+                self.turn.reasoning_in_flight = false;
+                let step = Cell::from_tool_call(&name, &args);
+                if keeps_open && active_region {
+                    // The Step belongs to the active thought's body; the
+                    // fold line stands in for it on the transcript.
+                    self.end_block();
+                    self.push_body_cell(step);
+                } else {
+                    self.close_and_push(step);
+                }
             }
             MachineNotice::ToolOutput(chunk) => {
-                // Tool output now belongs to the open step, not to the
-                // streaming text block. A step that is still open takes the
-                // chunk as its newest children; a stray chunk (no open
-                // step, perhaps because the result arrived before the
-                // output) is dropped on the floor -- the result carries
-                // whatever the result carries.
                 if let Some(Cell::Step(step)) = self.view.transcript.last_mut()
                     && !step.status.is_settled()
                 {
                     step.push_output(&chunk);
-                    // The last cell changed; the laid cache from this
-                    // index onwards is stale.
                     let stale_from = self.view.transcript.len() - 1;
                     self.view.laid.truncate(stale_from);
                 }
@@ -193,10 +176,6 @@ impl State {
             }
             MachineNotice::Usage(u, _stream) => {
                 self.view.status.record(&u);
-                // Calibrate the live speed estimate: the characters streamed
-                // since the last notice are now known to have been this many
-                // tokens. A sub-request that streamed nothing (a bare tool-call
-                // round) measures nothing and leaves the ratio standing.
                 if self.turn.chars_since_usage > 0 && u.completion_tokens > 0 {
                     self.turn.chars_per_token =
                         self.turn.chars_since_usage as f64 / u.completion_tokens as f64;
@@ -204,28 +183,16 @@ impl State {
                 self.turn.chars_since_usage = 0;
             }
             MachineNotice::Interrupted => {
-                // An interrupted turn closes any open tool step as well as
-                // filing the interruption notice: the children the tool had
-                // accumulated up to that point are what the reader saw, and
-                // dropping them on the floor would mean losing the work.
-                //
-                // End the stream before closing the thought so a
-                // Cell::Reasoning being streamed is claimed by the
-                // thought's body before the thought itself goes away.
                 self.finalize_open_step("interrupted");
-                self.end_block();
-                self.close_thought();
+                self.close_open_thought();
+                self.turn.reasoning_in_flight = false;
                 self.close_and_push(Cell::Interrupted);
             }
             MachineNotice::Truncated(notice) => {
-                // Not an error: the wire's own sentence already says why the
-                // answer stopped, and the transcript's error styling (red,
-                // "error:" prefix) is the wrong bucket for a normal cause.
                 self.close_and_push(Cell::Notice(notice));
             }
             MachineNotice::Approval { name, args } => {
-                self.end_block();
-                self.close_thought();
+                self.close_open_thought();
                 self.view.question = Some(Cell::approval(&name, &args));
             }
         }
@@ -237,9 +204,6 @@ impl State {
         match notice {
             AppNotice::Replay(messages) => {
                 self.end_block();
-                // The metadata row sits above each User cell. Push one
-                // before replaying the user line, so a resumed session
-                // reads the same as one that was watched live.
                 let mut buf = Vec::new();
                 for m in messages {
                     if matches!(m.role, crate::types::Role::User)
@@ -287,98 +251,27 @@ impl State {
     /// ends that block and opens a new block -- the same rule the plain front end
     /// applies, because the style *is* the block's identity.
     pub(super) fn stream(&mut self, style: Style, text: &str) {
-        // Both counters: what the border's speed estimate divides by the clock,
-        // and what the next usage notice calibrates the ratio against.
         let chars = text.chars().count();
         self.turn.streamed_chars += chars;
         self.turn.chars_since_usage += chars;
         if let Some(cell) = self.view.stream.append(style, text) {
-            self.push_cell(cell);
-        }
-    }
-
-    /// Open a thought block with `activity` as its header description.
-    ///
-    /// Idempotent: if a thought block is already open, the call is a
-    /// no-op. That is what makes the state machine safe to drive from
-    /// a stream of fragments — the first reasoning fragment opens
-    /// the block, the rest pass through and `close_thought` runs
-    /// when the boundary event arrives.
-    ///
-    /// The start time is the turn's clock when the turn has one — a
-    /// thought opened at the first reasoning fragment of the turn is
-    /// not really younger than the turn itself, and reading its elapsed
-    /// from the turn's clock keeps the spinner and the seconds
-    /// consistent with the box border's "working" indicator. `None` for
-    /// a resumed block whose turn clock is gone, in which case the
-    /// elapsed always reads `0`.
-    fn open_thought(&mut self, activity: impl Into<String>) {
-        if self.thought.is_some() {
-            return;
-        }
-        let now = self.turn.started.unwrap_or_else(std::time::Instant::now);
-        self.thought = Some(ThoughtBlock::open(activity, now));
-        self.revision += 1;
-    }
-
-    /// Close the currently-open thought block, if any. The block is
-    /// marked Done and pushed onto `historical` so the latest entry
-    /// is the one Ctrl-O can collapse. A no-op when nothing is open.
-    fn close_thought(&mut self) {
-        if let Some(mut block) = self.thought.take() {
-            block.close();
-            self.historical.push(block);
-            self.revision += 1;
-        }
-    }
-
-    /// Whether the most recent thought block (active or historical) is
-    /// expanded. The header rendering asks this to decide whether the
-    /// body should be drawn; the input layer asks this to know whether
-    /// Ctrl-O should collapse.
-    #[allow(dead_code)] // wired up by the thinking widget in a follow-up commit
-    fn latest_thought(&self) -> Option<&ThoughtBlock> {
-        self.thought.as_ref().or_else(|| self.historical.last())
-    }
-
-    /// Toggle the expanded flag of the latest thought block:
-    /// - the active block, when there is one, can be expanded or
-    ///   collapsed; the snapshot is taken on expand and cleared on
-    ///   collapse, so a re-expand reads the (possibly grown) body;
-    /// - the most recent historical block can be collapsed if it was
-    ///   expanded at the moment it became historical (Ctrl-O is the
-    ///   only way back from there), but never expanded;
-    /// - any other block is left alone.
-    ///
-    /// Wired up by Ctrl-O in both the idle and the working input
-    /// handlers. The function is `&mut self` because the toggle can
-    /// touch either the active block (cheap) or the historical tail
-    /// (which `Vec::last_mut` reaches without copying).
-    pub(super) fn toggle_latest_thought(&mut self) {
-        if let Some(active) = self.thought.as_mut() {
-            if active.expanded {
-                active.expanded = false;
-                active.clear_snapshot();
-            } else {
-                active.snapshot_body();
-                active.expanded = true;
+            // A new block opened in a different style. If it is the kind of
+            // cell that belongs inside a thought region (the Reasoning kind
+            // that the machine sends), it goes into the active region's body.
+            // Otherwise it stands on its own and the thought it interrupted
+            // closes.
+            match &cell {
+                Cell::Reasoning(_) => self.push_body_cell(cell),
+                _ => {
+                    self.close_open_thought();
+                    self.push_cell(cell);
+                }
             }
-            self.revision += 1;
-            return;
-        }
-        if let Some(latest) = self.historical.last_mut()
-            && latest.expanded
-        {
-            latest.expanded = false;
-            latest.clear_snapshot();
-            self.revision += 1;
         }
     }
 
-    /// The description the active block's header should show.
-    /// "thinking" by default; a safe tool's running step changes it to
-    /// "running X". Kept as one method so the source of the
-    /// description can be refined without touching the call sites.
+    /// The description the active thought's header would show. Drives the
+    /// "thinking" / "running X" split while the region is open.
     fn current_activity(&self) -> String {
         if let Some(verb) = self.turn.current_tool_verb.as_deref() {
             return format!("running {verb}");
@@ -386,119 +279,134 @@ impl State {
         "thinking".to_owned()
     }
 
-    /// Close the block being streamed, if any, so it becomes a finished cell.
-    ///
-    /// Bumps the revision: this is called from the turn's end as well as from a
-    /// notice, and in the first case it is the only thing that has changed.
+    /// Close the streaming block, if any, so it becomes a finished cell.
     pub(super) fn end_block(&mut self) {
         if let Some(cell) = self.view.stream.close() {
-            self.push_cell(cell);
+            match cell {
+                Cell::Reasoning(_) => self.push_body_cell(cell),
+                other => self.push_cell(other),
+            }
         }
     }
 
-    /// Push a cell to the transcript, and -- if it is a cell that
-    /// belongs to the open thought -- to that thought's body as well.
+    /// Push a cell to the transcript, and -- if a thought region is open and
+    /// the cell is one that belongs inside it -- to that region's body as well.
     ///
-    /// Reasoning text (`Cell::Reasoning`) and safe-tool step cells
-    /// (`Cell::Step`) are the only shapes that arrive while a thought
-    /// is open. Cell::Content closes the thought before it is pushed,
-    /// and session-level cells (Notices, Failures, Interruptions) are
-    /// not part of any thought's narrative -- both end up in the
-    /// transcript but not in any thought's body.
+    /// Reasoning and safe-tool step cells are the only shapes that arrive while
+    /// a thought region is open. Body text closes the region before it is
+    /// pushed, and session-level cells are not part of any region's narrative.
     ///
-    /// The clone is the cost of the frozen-snapshot semantics the
-    /// widget relies on: the body is an independent copy of the
-    /// cells, so settling a step after the body was filled does not
-    /// retroactively change what the expanded view showed when it
-    /// was taken.
+    /// The body holds clones of the cells the region claims, frozen at the
+    /// moment they were claimed: settling a step after the fact settles its
+    /// transcript copy, and the region keeps what was true when the region was
+    /// open. That is the same bargain the snapshot strikes for the expanded
+    /// view one level down.
     fn push_cell(&mut self, cell: Cell) {
-        let in_body = matches!(cell, Cell::Reasoning(_) | Cell::Step(_)) && self.thought.is_some();
-        if in_body && let Some(thought) = self.thought.as_mut() {
-            thought.body.push(cell.clone());
-        }
         self.revision += 1;
         self.view.transcript.push(cell);
     }
 
+    fn push_body_cell(&mut self, cell: Cell) {
+        // The Thought cell is the transcript entry; the body cell is its
+        // own. Claiming a cell for the body does not add it to the
+        // transcript -- the region's fold line already stands in for it.
+        // The fold line itself is unchanged by a body cell, so the laid
+        // cache stays valid; the snapshot the reader is reading (if any)
+        // is what sees the new body.
+        //
+        // Locate by index, not by `last`: a Step cell that arrived
+        // earlier may have settled to transcript, and the body's last
+        // cell may not be the Thought itself.
+        let region_idx = self
+            .view
+            .transcript
+            .iter()
+            .rposition(|c| matches!(c, Cell::Thought(t) if t.status == ThoughtStatus::Running));
+        if let Some(idx) = region_idx
+            && let Some(Cell::Thought(active)) = self.view.transcript.get_mut(idx)
+        {
+            active.push(cell);
+        }
+        self.revision += 1;
+    }
+
     /// Close any streaming block, then push a finished cell.
-    ///
-    /// The pair is the common shape of "a notice arrives while a block
-    /// is streaming": the streaming block has to close before the new
-    /// cell lands, or the reader sees the new cell threaded through
-    /// the tail of the old one. Keeping the pair together is also
-    /// what keeps the call sites readable -- the rule that says "a
-    /// new cell closes the block first" is what the pairing
-    /// expresses.
     fn close_and_push(&mut self, cell: Cell) {
         self.end_block();
         self.push_cell(cell);
+    }
+
+    /// Close the active thought region, if one is open, and commit it as one
+    /// [`Cell::Thought`].
+    ///
+    /// No-op when nothing is open. The region's body freezes at the cells it
+    /// had been claiming -- the ones in its body when this is called.
+    fn close_open_thought(&mut self) {
+        // The open streaming block, when it carries Reasoning text, is the
+        // region's last body cell: capture it before the region closes, so
+        // the body keeps what was being streamed at the boundary.
+        if let Some((Style::Reasoning, _)) = self.view.stream.current() {
+            self.end_block();
+        }
+        // Locate the region's cell by index, not by `last_mut`: closing the
+        // stream above leaves the transcript ending in a `Cell::Reasoning`,
+        // not the thought itself.
+        let region_idx = self
+            .view
+            .transcript
+            .iter()
+            .rposition(|c| matches!(c, Cell::Thought(t) if t.status == ThoughtStatus::Running));
+        if let Some(idx) = region_idx
+            && let Some(Cell::Thought(active)) = self.view.transcript.get_mut(idx)
+        {
+            active.close(Instant::now());
+            // Re-lay the cell so the fold line picks up the frozen seconds,
+            // not the live ones.
+            self.view.laid.truncate(idx);
+            self.revision += 1;
+        }
     }
 
     /// Settle an open [`Cell::Step`] at the end of the transcript with a
     /// failure verdict, when the turn ends (or is interrupted) without a
     /// matching `ToolResult`. Idempotent: a transcript whose last cell is
     /// not an open step is left alone.
-    ///
-    /// The note goes into the verdict, which keeps the failed step on the
-    /// same row as its header line -- the cause of the failure is right
-    /// there in the one line the reader sees.
     fn finalize_open_step(&mut self, note: &str) {
         if let Some(Cell::Step(step)) = self.view.transcript.last_mut()
             && !step.status.is_settled()
         {
             step.interrupt();
-            // The note replaces the "interrupted" default only when the
-            // caller wants to say something more specific; the default is
-            // "interrupted" because that is the most common cause.
             if note != "interrupted" {
                 step.verdict = note.to_owned();
             }
-            // The laid cache for the last cell is stale.
             let stale_from = self.view.transcript.len() - 1;
             self.view.laid.truncate(stale_from);
-            // The tool that was running is no longer running. An
-            // interrupted step leaves the border's "running X" label
-            // pointing at a call that did not actually run, which is
-            // what made `Ctrl-C` the right thing to do -- so it goes.
             self.turn.current_tool_verb = None;
         }
     }
 
     /// Settle the open step (if any) with the result text, or file the
-    /// result as a notice after a question or todo cell. Mirrors what the
-    /// replay path does for the same wire shape.
+    /// result as a notice after a question or todo cell.
     fn finalize_tool_result(&mut self, result: &str) {
-        // Settle the last cell in place if it is an open step.
         if let Some(Cell::Step(step)) = self.view.transcript.last_mut()
             && !step.status.is_settled()
         {
             step.settle(result);
             let stale_from = self.view.transcript.len() - 1;
             self.view.laid.truncate(stale_from);
-            // The tool that was running is no longer running -- the
-            // border's "running X" label picks up the next phase.
             self.turn.current_tool_verb = None;
             return;
         }
-        // No open step: the preceding cell is a question or todo, or
-        // something we did not expect. The result text is what the model
-        // sees; the transcript gets it as a dim notice.
         if matches!(
             self.view.transcript.last(),
             Some(Cell::Question(_)) | Some(Cell::Todo(_))
         ) {
             self.close_and_push(Cell::Notice(result.to_owned()));
         }
-        // Stray tool result with no preceding tool call: dropped. The
-        // machine should not send one without a ToolStart; if it does,
-        // the result has nowhere to land in the cell layer.
     }
 
     /// The per-prompt metadata row's text: `provider/model · effort tier`,
-    /// or `None` when neither field is known yet (the very first turn
-    /// before the agent picks a model). `None` means "do not push a
-    /// metadata cell", which keeps a resumed session that pre-dates
-    /// metadata from picking up an empty notice.
+    /// or `None` when neither field is known yet.
     pub(super) fn metadata_text(&self) -> Option<String> {
         let mut parts = Vec::new();
         if let Some(m) = &self.model
@@ -519,16 +427,14 @@ impl State {
     }
 
     /// A turn is starting at `started`.
-    ///
-    /// The clock is handed in rather than read here, so what a turn's timer
-    /// shows can be exercised without waiting for one.
-    pub(super) fn begin_turn(&mut self, started: std::time::Instant) {
+    pub(super) fn begin_turn(&mut self, started: Instant) {
         self.revision += 1;
         self.turn.running = true;
         self.turn.started = Some(started);
         self.turn.streamed_chars = 0;
         self.turn.chars_since_usage = 0;
-        super::State::refresh_placeholder(self);
+        self.turn.reasoning_in_flight = false;
+        self.refresh_placeholder();
     }
 
     /// The turn is over.
@@ -536,25 +442,19 @@ impl State {
         self.revision += 1;
         self.turn.running = false;
         self.turn.started = None;
-        super::State::refresh_placeholder(self);
+        self.refresh_placeholder();
     }
 
     /// The indicator's heartbeat: bump the revision when the frame the spinner
-    /// shows or the second the clock reads has changed, so the border keeps
-    /// moving while nothing else arrives and no redraw is spent when it has
-    /// nothing new to show.
+    /// shows or the second the clock reads has changed.
     ///
     /// The title itself is computed in [`super::render`]; this method only
     /// runs the cache check that decides whether the screen has anything new
     /// to draw.
-    pub(super) fn tick_activity(&mut self, now: std::time::Instant) {
-        let Some(title) = super::render::activity_title_at(
-            &self.overlay,
-            &self.turn,
-            self.thought.as_ref(),
-            now,
-            usize::MAX,
-        ) else {
+    pub(super) fn tick_activity(&mut self, now: Instant) {
+        let Some(title) =
+            super::render::activity_title_at(&self.overlay, &self.turn, now, usize::MAX)
+        else {
             return;
         };
         if Some(&title) != self.turn.ticked_activity.as_ref() {
@@ -562,49 +462,134 @@ impl State {
             self.revision += 1;
         }
     }
+
+    /// Toggle the expanded view of the most recently-committed thought region.
+    ///
+    /// The active region (the one still in the transcript, whose body is
+    /// still growing) can expand and collapse. A historical region that
+    /// happens to be expanded can be collapsed; any other historical region
+    /// is left alone, because its body is already frozen and the fold line
+    /// already names it.
+    pub(super) fn toggle_latest_thought(&mut self) {
+        // The youngest Thought, not the last transcript cell: a region that
+        // is followed by its own Step is still the active region.
+        if let Some(Cell::Thought(active)) = self
+            .view
+            .transcript
+            .iter_mut()
+            .rev()
+            .find(|c| matches!(c, Cell::Thought(_)))
+        {
+            if active.expanded {
+                active.expanded = false;
+                active.clear_snapshot();
+            } else {
+                active.snapshot_body();
+                active.expanded = true;
+            }
+            self.revision += 1;
+        }
+    }
+
+    /// Open a thought region in the transcript if none is open. Idempotent: a
+    /// region that is already open is left alone, so repeated reasoning
+    /// fragments accumulate into the same one.
+    fn open_thought_region(&mut self) {
+        if matches!(
+            self.view.transcript.last(),
+            Some(Cell::Thought(t)) if t.status == ThoughtStatus::Running
+        ) {
+            return;
+        }
+        let activity = self.current_activity();
+        let started_at = self.turn.started;
+        self.push_cell(Cell::Thought(Thought::open(activity, started_at)));
+    }
+
+    /// The first transcript line to draw.
+    pub(super) fn window(&mut self, total: usize, rows: usize) -> usize {
+        self.view.window(total, rows)
+    }
+
+    /// Page through the transcript.
+    pub(super) fn page(&mut self, step: isize) {
+        self.view.page(step);
+    }
+
+    /// A wheel notch.
+    pub(super) fn wheel(&mut self, kind: crossterm::event::MouseEventKind) {
+        self.view.wheel(kind);
+    }
+
+    /// Back to the end.
+    pub(super) fn follow(&mut self) {
+        self.view.follow();
+    }
+
+    /// The snapshot the expanded view should render, if any.
+    pub(super) fn expanded_snapshot(&self) -> Option<&[Cell]> {
+        // The youngest Thought's snapshot is what the user reads when it
+        // is expanded; a closed region that was expanded at the moment it
+        // closed keeps the snapshot the user opened.
+        self.view.transcript.iter().rev().find_map(|c| match c {
+            Cell::Thought(t) if t.expanded => Some(t.snapshot.as_slice()),
+            _ => None,
+        })
+    }
 }
 
 // --------------------------------------------------------------- delegates --
 //
 // The methods below are thin delegates to the four halves, kept here so the
 // rest of the crate can keep reaching for `state.foo()` rather than
-// `state.edit.foo()` / `state.view.foo()` / etc. The delegate is a one-line
-// pointer that says which half the operation belongs to; the bodies live
-// next to the fields they touch.
+// `state.edit.foo()` / `state.view.foo()` / etc.
 
+/// Test helpers: small predicates over the state, kept here so the tests
+/// above stay short and uniform.
+#[cfg(test)]
+trait StateTestHelpers {
+    fn no_open_thought(&self) -> bool;
+    fn has_running_thought(&self) -> bool;
+    fn has_expanded_thought(&self) -> bool;
+    fn active_thought_body(&self) -> Option<&[Cell]>;
+}
+
+#[cfg(test)]
+impl StateTestHelpers for State {
+    fn no_open_thought(&self) -> bool {
+        self.active_thought().is_none()
+    }
+    fn has_running_thought(&self) -> bool {
+        self.active_thought().is_some()
+    }
+    fn has_expanded_thought(&self) -> bool {
+        self.view
+            .transcript
+            .iter()
+            .any(|c| matches!(c, Cell::Thought(t) if t.expanded))
+    }
+    fn active_thought_body(&self) -> Option<&[Cell]> {
+        self.active_thought().map(|t| t.body.as_slice())
+    }
+}
+
+#[cfg(test)]
 impl State {
-    /// The first transcript line to draw: a window on the end, or the one the
-    /// reader scrolled back to.
-    pub(super) fn window(&mut self, total: usize, rows: usize) -> usize {
-        self.view.window(total, rows)
-    }
-
-    /// Page through the transcript a screen at a time; `-1` is back, `+1` forward.
-    pub(super) fn page(&mut self, step: isize) {
-        self.view.page(step);
-    }
-
-    /// A wheel notch: three lines back, or three lines forward.
-    pub(super) fn wheel(&mut self, kind: crossterm::event::MouseEventKind) {
-        self.view.wheel(kind);
-    }
-
-    /// Back to the end, which is where a new line will appear.
-    pub(super) fn follow(&mut self) {
-        self.view.follow();
+    /// The active (Running) thought, if any. The active region is the
+    /// youngest running Thought in the transcript, not necessarily the
+    /// last cell -- a tool call's Step cell follows it, and the Step is
+    /// part of the region's body while it is open.
+    fn active_thought(&self) -> Option<&Thought> {
+        self.view.transcript.iter().rev().find_map(|c| match c {
+            Cell::Thought(t) if t.status == ThoughtStatus::Running => Some(t),
+            _ => None,
+        })
     }
 }
 
 #[cfg(test)]
 mod thought_state_machine {
-    //! The thought block's open/close lifecycle, exercised against the
-    //! full `apply` path. The machine notices are what drives the
-    //! state: `Reasoning` opens, `Content` / side-effect tool / turn
-    //! end / approval / interrupt close. Safe tools leave the block
-    //! alone.
-    //!
-    //! These tests are the contract the rest of the widget is built on:
-    //! a regression here is a regression in the whole feature.
+    //! The thought region's open/close lifecycle.
 
     use super::*;
 
@@ -612,117 +597,85 @@ mod thought_state_machine {
         State::default()
     }
 
-    /// A reasoning fragment opens a thought block. Two fragments
-    /// (the typical stream shape) leave the same one block open.
     #[test]
-    fn reasoning_opens_a_thought_and_repeated_fragments_keep_it() {
+    fn reasoning_opens_a_thought_and_repeated_fragments_extend_it() {
         let mut s = state();
-        assert!(s.thought.is_none());
+        assert!(s.no_open_thought());
         s.apply(MachineNotice::Reasoning("first".into()));
-        assert!(s.thought.is_some(), "first reasoning opens the block");
-        let id_at_open = s.thought.as_ref().map(|b| b.activity.clone());
+        assert!(s.has_running_thought());
         s.apply(MachineNotice::Reasoning(" more".into()));
-        assert!(s.thought.is_some(), "the block stays open across fragments");
-        assert_eq!(
-            s.thought.as_ref().map(|b| b.activity.clone()),
-            id_at_open,
-            "no new block on continued reasoning"
-        );
+        assert!(s.has_running_thought());
     }
 
-    /// The first content fragment closes the thought that the
-    /// reasoning opened. The thought is moved to `historical`.
     #[test]
     fn content_closes_the_open_thought() {
         let mut s = state();
         s.apply(MachineNotice::Reasoning("thinking".into()));
         s.apply(MachineNotice::Content("answer".into()));
-        assert!(s.thought.is_none(), "content closes the thought");
-        assert_eq!(s.historical.len(), 1, "the closed block is in history");
-        assert_eq!(
-            s.historical[0].status,
-            super::super::thought::ThoughtStatus::Done
-        );
+        assert!(!s.has_running_thought());
+        // The last cell is the running region's closed Thought.
+        match s.view.transcript.last() {
+            Some(Cell::Thought(t)) => {
+                assert_eq!(t.status, ThoughtStatus::Done);
+                assert!(!t.body.is_empty(), "the closed region kept its body");
+            }
+            other => panic!("expected Thought, got {other:?}"),
+        }
     }
 
-    /// A side-effectful tool closes the thought, even when it arrives
-    /// without any preceding reasoning. The tool cell stays visible
-    /// as its own cell; the block is gone.
     #[test]
-    fn side_effect_tool_closes_the_thought() {
+    fn a_side_effect_tool_closes_the_thought_then_its_cell_lands() {
         let mut s = state();
         s.apply(MachineNotice::Reasoning("planning".into()));
         s.apply(MachineNotice::ToolStart {
             name: "Edit".into(),
             args: r#"{"file_path":"a.rs"}"#.into(),
         });
-        assert!(s.thought.is_none(), "Edit closes the thought");
-        assert_eq!(s.historical.len(), 1);
+        assert!(!s.has_running_thought());
+        // The thought came before the Edit on the transcript.
+        let mut iter = s.view.transcript.iter().rev();
+        assert!(matches!(iter.next(), Some(Cell::Step(_))));
+        assert!(matches!(iter.next(), Some(Cell::Thought(_))));
     }
 
-    /// A safe tool (Read) keeps the thought open. The reasoning
-    /// continues into the tool call and resumes after.
     #[test]
-    fn safe_tool_keeps_the_thought_open() {
+    fn a_safe_tool_keeps_the_thought_open_and_appends_to_the_body() {
         let mut s = state();
         s.apply(MachineNotice::Reasoning("looking".into()));
         s.apply(MachineNotice::ToolStart {
             name: "Read".into(),
             args: r#"{"file_path":"a.rs"}"#.into(),
         });
-        assert!(
-            s.thought.is_some(),
-            "Read keeps the thought open across the call"
-        );
         s.apply(MachineNotice::ToolResult("ok".into()));
-        assert!(
-            s.thought.is_some(),
-            "the thought is still open after the safe tool returns"
-        );
         s.apply(MachineNotice::Reasoning("more thinking".into()));
-        assert!(
-            s.thought.is_some(),
-            "the same thought continues into further reasoning"
-        );
+        assert!(s.has_running_thought());
     }
 
-    /// A bash call's command is what decides whether the tool
-    /// keeps the thought open. `cat` is read-only; `rm` is not.
     #[test]
     fn bash_keeps_thought_open_only_for_read_only_commands() {
         let mut s = state();
         s.apply(MachineNotice::Reasoning("looking".into()));
         s.apply(MachineNotice::ToolStart {
             name: "Bash".into(),
-            args: r#"{"command":"cat src/main.rs"}"#.into(),
+            args: r#"{"command":"cat src/main.rs"}"#.to_owned(),
         });
-        assert!(s.thought.is_some(), "cat keeps the thought open");
-
-        // A new thought for the second bash call's reasoning.
+        assert!(s.has_running_thought());
         s.apply(MachineNotice::Reasoning("more".into()));
         s.apply(MachineNotice::ToolStart {
             name: "Bash".into(),
-            args: r#"{"command":"rm /tmp/x"}"#.into(),
+            args: r#"{"command":"rm /tmp/x"}"#.to_owned(),
         });
-        assert!(
-            s.thought.is_none(),
-            "a side-effectful bash call closes the thought"
-        );
+        assert!(!s.has_running_thought());
     }
 
-    /// FinishTurn closes the thought that was open, with no reasoning
-    /// to follow.
     #[test]
     fn finish_turn_closes_the_open_thought() {
         let mut s = state();
         s.apply(MachineNotice::Reasoning("thinking".into()));
         s.apply(MachineNotice::FinishTurn);
-        assert!(s.thought.is_none());
-        assert_eq!(s.historical.len(), 1);
+        assert!(!s.has_running_thought());
     }
 
-    /// An approval gate closes the thought: the user is being asked
-    /// to decide, and the thought that led to the call is over.
     #[test]
     fn approval_closes_the_thought() {
         let mut s = state();
@@ -731,12 +684,9 @@ mod thought_state_machine {
             name: "Bash".into(),
             args: r#"{"command":"rm file"}"#.into(),
         });
-        assert!(s.thought.is_none());
+        assert!(!s.has_running_thought());
     }
 
-    /// After a side-effect tool closes the thought, the next
-    /// reasoning fragment opens a fresh one. Two thoughts in one
-    /// turn: think → edit → think.
     #[test]
     fn reasoning_after_side_effect_opens_a_new_thought() {
         let mut s = state();
@@ -747,196 +697,51 @@ mod thought_state_machine {
         });
         s.apply(MachineNotice::ToolResult("ok".into()));
         s.apply(MachineNotice::Reasoning("second plan".into()));
-        assert!(s.thought.is_some(), "fresh reasoning opens a fresh thought");
-        assert_eq!(
-            s.historical.len(),
-            1,
-            "the first thought is in history already"
-        );
+        assert!(s.has_running_thought());
     }
 
-    /// The latest thought (active or historical) is the one Ctrl-O
-    /// will toggle.
     #[test]
-    fn latest_thought_is_the_active_or_most_recent_historical() {
+    fn the_fold_line_is_one_ruled_line_per_region() {
         let mut s = state();
-        assert!(s.latest_thought().is_none());
-        s.apply(MachineNotice::Reasoning("first".into()));
-        assert!(s.latest_thought().is_some());
-        assert!(s.thought.is_some());
-        // The first thought is the active one.
-        assert!(std::ptr::eq(
-            s.latest_thought().unwrap() as *const _,
-            s.thought.as_ref().unwrap() as *const _,
-        ));
-        s.apply(MachineNotice::Content("answer".into()));
-        // Active is gone; latest is the historical one.
-        assert!(s.thought.is_none());
-        assert!(s.historical.len() == 1);
-        assert!(std::ptr::eq(
-            s.latest_thought().unwrap() as *const _,
-            s.historical.last().unwrap() as *const _,
-        ));
-        s.apply(MachineNotice::Reasoning("second".into()));
-        // A new active block is the latest; the historical one is no
-        // longer the pointer returned.
-        assert!(s.thought.is_some());
-        let active_ptr = s.thought.as_ref().unwrap() as *const _;
-        assert!(std::ptr::eq(
-            s.latest_thought().unwrap() as *const _,
-            active_ptr,
-        ));
+        s.apply(MachineNotice::Reasoning("a".into()));
+        s.apply(MachineNotice::Reasoning("b".into()));
+        s.apply(MachineNotice::Content("done".into()));
+        // Closing the open Reasoning stream before closing the thought is
+        // what gives the region's body a cell to be frozen against.
+        let mut thought_count = 0;
+        for cell in &s.view.transcript {
+            if matches!(cell, Cell::Thought(_)) {
+                thought_count += 1;
+            }
+        }
+        assert_eq!(thought_count, 1);
+        // The fold cell itself is one row.
+        if let Some(Cell::Thought(t)) = s.view.transcript.last() {
+            assert!(!t.body.is_empty());
+        }
     }
 
-    /// Ctrl-O on the active block toggles its `expanded` flag. Two
-    /// presses land it back at `false`; the second press is the
-    /// "exit expand" the user types when they want to type again.
     #[test]
-    fn ctrl_o_toggles_the_active_thought() {
-        let mut s = state();
-        s.apply(MachineNotice::Reasoning("first".into()));
-        assert!(!s.thought.as_ref().unwrap().expanded);
-        s.toggle_latest_thought();
-        assert!(s.thought.as_ref().unwrap().expanded);
-        s.toggle_latest_thought();
-        assert!(!s.thought.as_ref().unwrap().expanded);
-    }
-
-    /// A historical block that was expanded at the moment it closed
-    /// (because the user pressed Ctrl-O and the active block became
-    /// historical while expanded) can be collapsed by Ctrl-O. A
-    /// historical block that was never expanded stays folded -- the
-    /// widget only operates on the latest, and there is nothing to
-    /// "expand" a historical block to.
-    #[test]
-    fn ctrl_o_only_collapses_a_historical_thought_that_was_expanded() {
-        let mut s = state();
-        // Active block is expanded at close -- survives the close.
-        s.apply(MachineNotice::Reasoning("first".into()));
-        s.toggle_latest_thought();
-        assert!(s.thought.as_ref().unwrap().expanded);
-        s.apply(MachineNotice::Content("answer".into()));
-        assert!(s.historical.last().unwrap().expanded);
-
-        // Ctrl-O now collapses the historical block -- the only
-        // meaningful operation on a historical block, since there is
-        // no body to "expand" into.
-        s.toggle_latest_thought();
-        assert!(!s.historical.last().unwrap().expanded);
-
-        // A second Ctrl-O on a folded historical is a no-op: the
-        // "only the latest can be expanded" rule means there is
-        // nothing more to do.
-        s.toggle_latest_thought();
-        assert!(!s.historical.last().unwrap().expanded);
-    }
-
-    /// Reasoning text accumulates into the active thought's body.
-    /// The body is a separate copy of the cell, so a snapshot
-    /// taken at this point sees the reasoning and a later
-    /// snapshot of the same body after settling does not.
-    #[test]
-    fn reasoning_text_lands_in_the_active_thoughts_body() {
+    fn the_active_thought_body_clones_cells_for_the_expanded_view() {
         let mut s = state();
         s.apply(MachineNotice::Reasoning("hmm".into()));
-        assert_eq!(s.thought.as_ref().unwrap().body.len(), 0);
-        // First reasoning fragment: opens the block, no cell
-        // commit yet (the stream is still open in Reasoning).
-        // Switching to Content closes the open Reasoning stream
-        // and commits the cell.
-        s.apply(MachineNotice::Content("answer".into()));
-        // After content, the thought has moved to historical with
-        // the Cell::Reasoning in its body.
-        assert_eq!(s.historical.last().unwrap().body.len(), 1);
-        assert!(matches!(
-            s.historical.last().unwrap().body[0],
-            Cell::Reasoning(_)
-        ));
-    }
-
-    /// A safe tool inside a thought lands in the thought's body.
-    /// A side-effect tool does not — the thought closes before
-    /// the cell is pushed.
-    #[test]
-    fn safe_tool_step_lands_in_the_active_thoughts_body() {
-        let mut s = state();
-        s.apply(MachineNotice::Reasoning("looking".into()));
         s.apply(MachineNotice::ToolStart {
             name: "Read".into(),
             args: r#"{"file_path":"a.rs"}"#.into(),
         });
         s.apply(MachineNotice::ToolResult("ok".into()));
-        // Read keeps the thought open. The Reasoning that was
-        // being streamed gets committed as the tool starts (the
-        // style-switch closes the open block); the Read Step is
-        // pushed right after. Both belong to the thought.
-        let body = &s.thought.as_ref().unwrap().body;
-        assert!(
-            body.iter().any(|c| matches!(c, Cell::Step(_))),
-            "Read step is in the body: {body:?}"
-        );
-
-        // Now a side-effect tool: closes the thought, the cell
-        // lands in transcript but not in any thought's body.
-        s.apply(MachineNotice::ToolStart {
-            name: "Edit".into(),
-            args: r#"{"file_path":"a.rs"}"#.into(),
-        });
-        assert!(s.thought.is_none());
-        // The historical block is the one that was the active
-        // block before the Edit -- its body has the Read step,
-        // not the Edit step (which arrived after the close).
-        assert!(
-            s.historical
-                .last()
-                .unwrap()
-                .body
-                .iter()
-                .any(|c| matches!(c, Cell::Step(_)))
-        );
+        let body = s.active_thought_body().expect("running thought exists");
+        assert!(body.iter().any(|c| matches!(c, Cell::Step(_))));
     }
 
-    /// `snapshot_body` is idempotent: once a snapshot is taken, a
-    /// later toggle (which would re-call it) does not re-snapshot.
-    /// The first snapshot is the one the user reads.
     #[test]
-    fn snapshot_body_is_idempotent() {
+    fn toggle_latest_thought_expands_and_collapsed_snapshots_drop() {
         let mut s = state();
-        s.apply(MachineNotice::Reasoning("first".into()));
-        // Push some reasoning, close with content.
-        s.apply(MachineNotice::Content("answer".into()));
-        let thought = s.historical.last_mut().unwrap();
-        thought.snapshot_body();
-        assert_eq!(thought.snapshot.len(), 1);
-        let snapshot_len = thought.snapshot.len();
-        thought.snapshot_body();
-        assert_eq!(
-            thought.snapshot.len(),
-            snapshot_len,
-            "re-snapshot is a no-op"
-        );
-    }
-
-    /// The cycle that can happen in any turn: thinking, content,
-    /// thinking again. Each phase is its own thought block; the
-    /// first two become historical, the third is active. The body
-    /// of each holds only the cells that arrived during its life.
-    #[test]
-    fn reasoning_content_reasoning_makes_three_separate_blocks() {
-        let mut s = state();
-        s.apply(MachineNotice::Reasoning("planning".into()));
-        s.apply(MachineNotice::Content("first answer".into()));
-        // First thought has the planning reasoning.
-        assert_eq!(s.historical.len(), 1);
-        assert_eq!(s.historical[0].body.len(), 1);
-        assert!(matches!(s.historical[0].body[0], Cell::Reasoning(_)));
-
-        s.apply(MachineNotice::Reasoning("second plan".into()));
-        // Second thought is active; first is still in history.
-        assert!(s.thought.is_some());
-        assert_eq!(s.historical.len(), 1);
-        // The second thought's body is empty (reasoning still in
-        // flight, not yet committed as a cell).
-        assert_eq!(s.thought.as_ref().unwrap().body.len(), 0);
+        s.apply(MachineNotice::Reasoning("thinking".into()));
+        s.apply(MachineNotice::Content("done".into()));
+        s.toggle_latest_thought();
+        assert!(s.has_expanded_thought());
+        s.toggle_latest_thought();
+        assert!(!s.has_expanded_thought());
     }
 }

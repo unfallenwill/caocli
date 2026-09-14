@@ -31,6 +31,7 @@ mod replay;
 pub(super) mod sink;
 mod step;
 mod stream;
+mod thought;
 mod todos;
 pub(super) mod wrap;
 
@@ -56,6 +57,7 @@ pub use sink::CellSink;
 #[allow(unused_imports)]
 pub use step::{Step, StepStatus};
 pub use stream::Stream;
+pub use thought::{Thought, ThoughtStatus};
 pub use todos::{standing_todos, todo_gutter, todo_head_spans, todo_line_spans};
 
 /// A text style, held as data: which of the session's lines this is, not what
@@ -254,6 +256,10 @@ pub enum Cell {
     /// they are read back from the call's own arguments, so a resumed session
     /// shows the questions exactly as the live one did.
     Question(Vec<Question>),
+    /// A folded thought region: the model's reasoning and the calls that only
+    /// look, collected between two boundaries. The fold line is what the
+    /// transcript shows; `Ctrl-O` swaps it for the body.
+    Thought(Thought),
     /// The todo tool's call: the plan for the work in hand.
     ///
     /// A cell of its own rather than a [`Cell::Step`] carrying the raw
@@ -385,18 +391,28 @@ impl Cell {
     ///
     /// The markers are a small vocabulary and it is the whole of what a reader has
     /// to learn here: `›` is something they said, `▸` is something about to happen,
-    /// `┆` is the model thinking, `·` is a result or a note. A line with no marker
-    /// at all is the answer.
+    /// `·` is a result or a note. A line with no marker at all is either the answer,
+    /// which is the one line at the left edge, or a line that is set in by its
+    /// columns alone: the thinking, and the fold line a stretch of it leaves behind.
     pub fn gutter(&self) -> Option<Gutter> {
         match self {
             // The one cell on the left edge.
             Cell::Content(_) => None,
             Cell::User { .. } => Some(Gutter::new(USER_MARKER, "  ", Style::Dim)),
-            // The thinking keeps its rule on every line: it is what makes a long
-            // think read as one asided block rather than as a run of loose text. The
-            // rule is painted in the thinking's own style, not a second one: it is
-            // part of the block, and one block is one style run.
-            Cell::Reasoning(_) => Some(Gutter::new("┆ ", "┆ ", Style::Reasoning)),
+            // The thinking carries no marker: two blank columns, the columns every
+            // line that is only being set off is set off by. The `┆` it used to
+            // wear down its margin was a glyph on every line of a block that can
+            // run for a hundred of them, and the one thing it said -- this is
+            // thinking -- is what the fold line says once the stretch of it is
+            // over, in four words, once. What goes with it is the only cue of the            // block's kind that survived a terminal honouring neither colour nor
+            // dim; what stays is the columns, which are what keeps a wrapped block
+            // off the left edge the answer is read down. Both are painted in the
+            // thinking's own style, so a block is still one run of text.
+            Cell::Reasoning(_) => Some(Gutter::new("  ", "  ", Style::Reasoning)),
+            // A folded thought region: one dim line, its own words carried by the
+            // cell, and no marker either -- for the reason the body it stands for
+            // has none: the two are one region, and the opening word says which.
+            Cell::Thought(_) => Some(Gutter::new("  ", "  ", Style::Dim)),
             // A step opens with the marker the status chose: `▸` for something
             // about to happen, `✔` for something that finished well, `✘` for
             // something that did not. The marker's style carries the verdict's
@@ -473,6 +489,7 @@ impl Cell {
                 spans
             }
             Cell::Reasoning(text) => markdown::parse(text, Style::Reasoning),
+            Cell::Thought(thought) => thought.fold_spans(),
             Cell::Content(text) => markdown::parse(text, Style::Plain),
             Cell::Step(step) => step.spans(),
             Cell::Notice(text) => vec![Span::new(Style::Dim, text.as_str())],
@@ -500,6 +517,9 @@ impl Cell {
             // that opens a turn -- or follows a tool line -- starts tight
             // against it, so a turn is not padded with blank lines.
             Cell::Reasoning(_) | Cell::Content(_) => prev_is_text_block,
+            // A folded thought is one ruled line: it reads as part of what it
+            // follows, so no extra gap.
+            Cell::Thought(_) => false,
             // A step is announced on a line of its own (the header), but the
             // children that follow it are part of the same cell -- the cell's
             // own spans join them with `\n` -- so a step gap_after is false:
@@ -516,6 +536,16 @@ impl Cell {
     /// on.
     pub fn is_text_block(&self) -> bool {
         matches!(self, Cell::Reasoning(_) | Cell::Content(_))
+    }
+
+    /// Whether this cell is a text block, which is what the spacing rule keys
+    /// on, or a folded thought region -- the running of which behaves the
+    /// same way the text blocks do for spacing purposes.
+    pub fn is_text_or_thought_block(&self) -> bool {
+        matches!(
+            self,
+            Cell::Reasoning(_) | Cell::Content(_) | Cell::Thought(_)
+        )
     }
 
     /// Whether the cell ends its line.
@@ -917,6 +947,7 @@ mod tests {
             Cell::user("hi"),
             Cell::Reasoning("hmm".into()),
             Cell::Content("answer".into()),
+            Cell::Thought(Thought::open("thinking", None)),
             Cell::from_tool_call("Bash", r#"{"command":"ls"}"#),
             Cell::from_tool_call(
                 "AskUserQuestion",

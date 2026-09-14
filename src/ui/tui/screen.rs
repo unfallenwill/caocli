@@ -224,8 +224,8 @@ impl<B: Backend> Screen<B> {
             // explicitly asked to see the thought body full-window,
             // and "you can only type again after Ctrl-O" is the
             // contract.
-            if let Some(snapshot) = expanded_snapshot(state) {
-                draw_expanded(frame, state, area, snapshot);
+            if let Some(snapshot) = state.expanded_snapshot() {
+                draw_expanded(frame, area, snapshot);
             } else {
                 let layout = compute_layout(state, area);
                 let transcript = compose_transcript(state, &layout);
@@ -415,12 +415,7 @@ fn draw_over(frame: &mut Frame, lines: &[Line<'static>], transcript: Rect, cap: 
 /// inside the placeholder did.
 fn draw_box(frame: &mut Frame, state: &State, area: Rect) {
     frame.render_widget(
-        render::box_rule(
-            &state.overlay,
-            &state.turn,
-            state.thought.as_ref(),
-            area.width as usize,
-        ),
+        render::box_rule(&state.overlay, &state.turn, area.width as usize),
         area,
     );
     frame.render_widget(
@@ -439,30 +434,10 @@ fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
     frame.render_widget(Paragraph::new(status), area);
 }
 
-/// The snapshot the expanded view should render, if any. The
-/// active thought's snapshot when it is expanded; the most recent
-/// historical block's when it was expanded at the moment it
-/// closed and the active block is no longer expanded.
-///
-/// `None` for the folded case, which is what lets the caller fall
-/// back to the regular transcript-and-box layout.
-fn expanded_snapshot(state: &State) -> Option<&[Cell]> {
-    if let Some(active) = state.thought.as_ref()
-        && active.expanded
-    {
-        return Some(&active.snapshot);
-    }
-    state
-        .historical
-        .last()
-        .filter(|b| b.expanded)
-        .map(|b| b.snapshot.as_slice())
-}
-
 /// The expanded body drawn over the entire screen: the snapshot,
 /// full width, every cell rendered in order with the gaps a normal
 /// transcript keeps between them.
-fn draw_expanded(frame: &mut Frame, _state: &State, area: Rect, snapshot: &[Cell]) {
+fn draw_expanded(frame: &mut Frame, area: Rect, snapshot: &[Cell]) {
     let width = area.width as usize;
     let lines = render::expanded_thought_lines(snapshot, width, true);
     // The snapshot is what the user is reading; pad with blanks if

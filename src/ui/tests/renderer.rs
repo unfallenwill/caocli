@@ -17,7 +17,7 @@ fn reasoning_then_content_are_separate_blocks() {
     r.finish_turn();
     assert_eq!(
         String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-        "\x1b[38;2;98;114;164m┆ thinking...\x1b[0m\n\n\x1b[38;2;248;248;242manswer\x1b[0m\n"
+        "\x1b[38;2;98;114;164m  thinking...\x1b[0m\n\n\x1b[38;2;248;248;242manswer\x1b[0m\n"
     );
 }
 
@@ -29,7 +29,7 @@ fn content_then_reasoning_second_subturn_separated() {
     r.finish_turn();
     assert_eq!(
         String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-        "\x1b[38;2;248;248;242mpartial\x1b[0m\n\n\x1b[38;2;98;114;164m┆ more thinking\x1b[0m\n"
+        "\x1b[38;2;248;248;242mpartial\x1b[0m\n\n\x1b[38;2;98;114;164m  more thinking\x1b[0m\n"
     );
 }
 
@@ -41,7 +41,7 @@ fn no_color_still_separates_blocks() {
     r.finish_turn();
     assert_eq!(
         String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-        "┆ thought\n\ntext\n"
+        "  thought\n\ntext\n"
     );
 }
 
@@ -63,7 +63,7 @@ fn reasoning_only_block_closes_cleanly() {
     r.finish_turn();
     assert_eq!(
         String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-        "\x1b[38;2;98;114;164m┆ hmm\x1b[0m\n"
+        "\x1b[38;2;98;114;164m  hmm\x1b[0m\n"
     );
 }
 
@@ -77,7 +77,7 @@ fn same_mode_deltas_do_not_reopen_block() {
     r.finish_turn();
     assert_eq!(
         String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-        "\x1b[38;2;98;114;164m┆ ab\x1b[0m\n\n\x1b[38;2;248;248;242mxy\x1b[0m\n"
+        "\x1b[38;2;98;114;164m  ab\x1b[0m\n\n\x1b[38;2;248;248;242mxy\x1b[0m\n"
     );
 }
 
@@ -198,7 +198,7 @@ fn replay_renders_history_compactly_with_colors() {
         "{s}"
     );
     assert!(
-        s.contains("\x1b[38;2;98;114;164m┆ let me think\x1b[0m"),
+        s.contains("\x1b[38;2;98;114;164m  let me think\x1b[0m"),
         "thinking is set in behind its own rule: {s}"
     );
     assert!(s.contains("running it"), "{s}");
@@ -373,13 +373,13 @@ fn the_plain_front_ends_stream_is_frozen() {
         "\x1b[38;2;98;114;164m* caocli · session 20260910-213122 (2 messages) · deepseek-v4-pro\x1b[0m\n",
         "\n",
         "\x1b[38;2;98;114;164m› \x1b[0m\x1b[38;2;248;248;242mtake a look\x1b[0m\n",
-        "\x1b[38;2;98;114;164m┆ let me think\x1b[0m\n",
+        "\x1b[38;2;98;114;164m  let me think\x1b[0m\n",
         "\n",
         "\x1b[38;2;248;248;242mrunning it\x1b[0m\n",
         "\n",
         "\n",
         // a resumed history, then a live turn: thinking, then the answer
-        "\x1b[38;2;98;114;164m┆ weigh it\x1b[0m\n",
+        "\x1b[38;2;98;114;164m  weigh it\x1b[0m\n",
         "\n",
         "\x1b[38;2;248;248;242mhere goes\x1b[0m\n",
         // A step opens tight against its predecessor: the cell's own

@@ -43,7 +43,6 @@ mod render;
 mod screen;
 mod scroll;
 mod state;
-mod thought;
 mod turn;
 mod view;
 mod working;

@@ -77,17 +77,6 @@ pub(crate) fn more_line(lead: &str, n: usize) -> Line<'static> {
     Line::styled(format!("{lead}⋮ {n} more"), style_of(Style::Dim))
 }
 
-/// How many lines of a think the transcript keeps before it says how many are
-/// behind it.
-///
-/// Thinking is the one block that grows without bound -- at `max` effort a
-/// hundred lines is an ordinary turn -- and the one block nobody is still
-/// reading by the time the answer lands. Kept whole it evicts the answer from
-/// the window that pins to the newest line; folded to its head and a count it
-/// costs a dozen rows instead of a screenful. The full text stays in the
-/// session log, which is where the durable copy lives either way.
-pub(crate) const THINKING_LINES: usize = 12;
-
 /// The spans a cell is drawn from, given what the screen shows elsewhere.
 ///
 /// One case so far: the tasks of a `TodoWrite` call. The list they belong to
@@ -124,39 +113,49 @@ pub(crate) fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
     // width, so the answer and the machinery around it end in the same column
     // rather than a marker's width apart.
     let mut lines = wrapped_under(&spans_of(cell), width, gutter);
-    // A long think folds to its head and a count. The rule lives in this layer
-    // rather than in the cell because it is a budget of the screen, like the
-    // wrapping width is: the plain front end has no screen to keep one on, and
-    // streams the block as it arrives. It reaches the live block through this
-    // same call, which is what keeps a folded think from jumping open the
-    // moment it closes: the block that is filed away and the block that was
-    // watched have to lay out to the same lines.
-    if matches!(cell, Cell::Reasoning(_)) && lines.len() > THINKING_LINES {
-        let hidden = lines.len() - THINKING_LINES;
-        lines.truncate(THINKING_LINES);
-        lines.push(Line::styled(
-            format!("{}{hidden} more lines", gutter.head),
-            style_of(gutter.style),
-        ));
+    // A folded thought region is one ruled line by definition: it is the
+    // thing the widget swaps for the body on Ctrl-O, so wrapping it the same
+    // way `Cell::Reasoning` used to be wrapped would be a folded region the
+    // reader could not read. Everything else gets the same wrapped form it
+    // always did.
+    if matches!(cell, Cell::Thought(_)) {
+        lines.truncate(1);
     }
     lines
 }
 
 /// The lines one cell occupies at `width` in the thinking widget's
-/// expanded view: the same rules as [`cell_lines`], except a
-/// [`Cell::Step`] renders its children regardless of status. The
-/// compact form hides a Done step's output (a settled success is one
-/// line on the transcript); the expanded view is exactly the place
-/// the detail belongs.
-#[allow(dead_code)] // wired up by the thinking widget in a follow-up commit
+/// expanded view: a [`Cell::Step`] renders its children regardless of
+/// status (a settled success is one line on the transcript; the expanded
+/// view is exactly the place the detail belongs), and a [`Cell::Thought`]
+/// expands into its body's cells laid out the same way the transcript
+/// lays them out, with no fold line.
+#[allow(dead_code)]
 pub(crate) fn expanded_cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
-    if let Cell::Step(step) = cell {
-        let Some(gutter) = cell.gutter() else {
-            return wrapped_lines(&step.spans_with_done_children(), width);
-        };
-        return wrapped_under(&step.spans_with_done_children(), width, gutter);
+    match cell {
+        Cell::Step(step) => {
+            let Some(gutter) = cell.gutter() else {
+                return wrapped_lines(&step.spans_with_done_children(), width);
+            };
+            wrapped_under(&step.spans_with_done_children(), width, gutter)
+        }
+        Cell::Thought(thought) => {
+            // The expanded body lays out its cells flat: every cell as it would
+            // appear on the transcript, with the blank line the gap rule
+            // inserts between text blocks. The fold line is not here.
+            let mut out = Vec::new();
+            let mut prev_is_text = false;
+            for (i, cell) in thought.body.iter().enumerate() {
+                if i > 0 && cell.gap_after(prev_is_text) {
+                    out.push(Line::default());
+                }
+                out.extend(cell_lines(cell, width));
+                prev_is_text = cell.is_text_or_thought_block();
+            }
+            out
+        }
+        _ => cell_lines(cell, width),
     }
-    cell_lines(cell, width)
 }
 
 /// Wrap styled spans into the terminal lines they need at `width` columns.
