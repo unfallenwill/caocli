@@ -1,0 +1,12 @@
+[package]
+name = "caocli-core"
+version = "0.0.0"
+edition = "2024"
+description = "Shared types and small utilities the caocli workspace leans on"
+license = "MIT"
+repository = "https://github.com/unfallenwill/caocli"
+publish = false
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"

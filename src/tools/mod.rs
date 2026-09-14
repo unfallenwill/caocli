@@ -136,7 +136,7 @@ pub fn reports_failure(output: &str) -> bool {
 /// never a panic and never a question nobody can answer.
 #[cfg(test)]
 pub async fn execute(name: &str, args_json: &str) -> String {
-    execute_live(name, args_json, &mut Silent, &crate::mcp::Hub::empty()).await
+    execute_live(name, args_json, &mut Silent, &caocli_mcp::Hub::empty()).await
 }
 
 /// The same, with the output of a command that is still running streamed to `live`
@@ -151,7 +151,7 @@ pub async fn execute_live(
     name: &str,
     args_json: &str,
     live: &mut dyn Live,
-    mcp: &crate::mcp::Hub,
+    mcp: &caocli_mcp::Hub,
 ) -> String {
     match name {
         shell::NAME => shell::execute(args_json, live).await,
@@ -163,7 +163,7 @@ pub async fn execute_live(
         ask::ASK_NAME => {
             format!("error: {ASK_NAME} is answered by the front end and cannot be executed here")
         }
-        other if crate::mcp::is_tool(other) => mcp.call(other, args_json).await,
+        other if caocli_mcp::is_tool(other) => mcp.call(other, args_json).await,
         other => format!(
             "error: unknown tool {other:?}. Available tools: Bash, {}, {}, {}, {}, {}, {}",
             fs::READ_NAME,
@@ -325,8 +325,8 @@ mod tests {
     /// it: what comes back is the hub's answer, which is text either way.
     #[tokio::test]
     async fn dispatch_reaches_an_mcp_server() {
-        let stub = crate::mcp::stub::Stub::new();
-        let hub = crate::mcp::Hub::of_entries(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await;
+        let stub = caocli_mcp::stub::Stub::new();
+        let hub = caocli_mcp::Hub::of_entries(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await;
         let out = execute_live("mcp__stub__echo", r#"{"text":"hi"}"#, &mut Silent, &hub).await;
         assert_eq!(out, "called with {text:hi}");
         // A name the server does not offer, and one no server could: both are
@@ -338,7 +338,7 @@ mod tests {
             "mcp__nobody__nothing",
             "{}",
             &mut Silent,
-            &crate::mcp::Hub::empty(),
+            &caocli_mcp::Hub::empty(),
         )
         .await;
         assert!(empty.contains("no MCP tool named"), "{empty}");

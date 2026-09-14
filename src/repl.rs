@@ -730,9 +730,9 @@ mod tests {
         assert_eq!(ui.info.len(), 1, "{:?}", ui.info);
         assert!(ui.info[0].contains("mcpServers"), "{:?}", ui.info);
 
-        let stub = crate::mcp::stub::Stub::new();
+        let stub = caocli_mcp::stub::Stub::new();
         agent.mcp = std::sync::Arc::new(
-            crate::mcp::Hub::of_entries(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await,
+            caocli_mcp::Hub::of_entries(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await,
         );
         ui = Recording::default();
         submit(&mut agent, &mut ui, &dir, "/mcp").await;

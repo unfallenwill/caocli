@@ -277,15 +277,10 @@ async fn the_notes_say_what_is_wrong_with_an_entry_nobody_could_use() {
     assert!(hub.report()[0].contains("warning"), "{:?}", hub.report());
 }
 
-/// The one test here that reads configuration files, and so the one that needs
-/// a HOME of its own: the guard is held across the awaits on purpose, because
-/// HOME has to stay put for as long as the hub is reading it.
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn the_hub_connects_what_the_files_name() {
-    use crate::config::{env_lock, scratch_home};
-    let _guard = env_lock();
-    let home = scratch_home();
+    let _guard = test_env_lock();
     let stub = Stub::new();
     let workspace = std::env::temp_dir().join(format!("caocli-mcp-hub-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&workspace);
@@ -302,7 +297,7 @@ async fn the_hub_connects_what_the_files_name() {
         .unwrap(),
     )
     .unwrap();
-    let hub = Hub::connect(&workspace).await;
+    let hub = Hub::connect(&workspace, None).await;
     assert_eq!(names(&hub), vec!["mcp__alpha__echo", "mcp__alpha__big"]);
     assert_eq!(
         hub.call("mcp__alpha__echo", r#"{"text":"from the file"}"#)
@@ -310,6 +305,13 @@ async fn the_hub_connects_what_the_files_name() {
         "called with {text:from the file}"
     );
     hub.shutdown().await;
-    std::fs::remove_dir_all(&home).unwrap();
     std::fs::remove_dir_all(&workspace).unwrap();
+}
+
+/// The process-wide environment lock for tests. Kept local to this module:
+/// the binary's own tests hold their own lock, and the two halves do not have
+/// to share — nothing here crosses the process boundary.
+fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }

@@ -64,18 +64,18 @@ pub struct Entry {
 /// The servers to run, in the order their tools are offered, and what had to be
 /// said about the entries on the way (a variable that is not set, a file that
 /// cannot be read).
-pub fn entries(workspace: &Path) -> (Vec<Entry>, Vec<String>) {
+///
+/// `user_settings` is the `mcpServers` table out of the user's settings file,
+/// already read by whoever knows where that file lives (the caocli binary).
+/// Passing it in keeps this crate from having to know that `settings.json`
+/// exists — the binary is the one that loads it, and the binary is the one
+/// that decides what to do when the file is unreadable.
+pub fn entries(workspace: &Path, user_settings: Option<&Value>) -> (Vec<Entry>, Vec<String>) {
     let mut named: BTreeMap<String, (String, Value)> = BTreeMap::new();
     let mut warnings = Vec::new();
 
-    match crate::config::setting("mcpServers") {
-        Ok(Some(value)) => collect(value, "settings.json", &mut named, &mut warnings),
-        Ok(None) => {}
-        // The file this came from is also where the API keys live, so a
-        // problem reading it is reported like any other and the run goes on:
-        // without a key the first request says so, and without servers this
-        // session is the one it would have been before MCP existed.
-        Err(e) => warnings.push(format!("mcpServers: {e:#}")),
+    if let Some(value) = user_settings {
+        collect(value.clone(), "settings.json", &mut named, &mut warnings);
     }
 
     let path = workspace.join(".mcp.json");
@@ -248,13 +248,19 @@ fn lookup(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{env_lock, scratch_home};
     use serde_json::json;
 
     /// One entry's config, as the tests that are not about the files read it.
     fn parsed(raw: Value) -> Result<ServerConfig, String> {
         let mut warnings = Vec::new();
         read("test", &raw, &mut warnings)
+    }
+
+    /// Take the process-wide environment lock. Tests that move the environment
+    /// under it share one lock so they cannot race each other.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The environment the expansion tests read: the lock is held for as long
@@ -452,17 +458,11 @@ mod tests {
         assert!(warnings[0].contains("MCP_NOPE"), "{warnings:?}");
     }
 
-    /// The two files, with a HOME of the test's own. The lock is held for the
-    /// whole test: the environment and the working directory are the process's.
+    /// The two sources of entries: the user settings already read by whoever
+    /// owns that file (the binary), and the workspace's `.mcp.json` written
+    /// here. The workspace is removed at the end so the test's leftovers do not
+    /// accumulate.
     fn files(user: Option<Value>, project: Option<Value>) -> (Vec<Entry>, Vec<String>) {
-        let home = scratch_home();
-        if let Some(value) = &user {
-            std::fs::write(
-                crate::config::settings_file().unwrap(),
-                serde_json::to_string(value).unwrap(),
-            )
-            .unwrap();
-        }
         let workspace = workspace();
         if let Some(value) = &project {
             std::fs::write(
@@ -471,8 +471,7 @@ mod tests {
             )
             .unwrap();
         }
-        let read = entries(&workspace);
-        std::fs::remove_dir_all(&home).unwrap();
+        let read = entries(&workspace, user.as_ref());
         std::fs::remove_dir_all(&workspace).unwrap();
         read
     }
@@ -480,11 +479,14 @@ mod tests {
     #[test]
     fn the_two_files_are_merged_with_the_project_winning() {
         let _g = env_lock();
+        // `user` is the value of the `mcpServers` key in the user's settings
+        // file, already extracted by whoever reads that file. `project` is the
+        // raw `.mcp.json`, which is already shaped as an `mcpServers` table.
         let (found, warnings) = files(
-            Some(json!({"mcpServers": {
+            Some(json!({
                 "shared": {"command": "user-binary"},
                 "mine": {"command": "npx", "args": ["-y", "mcp-files"]}
-            }})),
+            })),
             Some(json!({"mcpServers": {
                 "shared": {"command": "project-binary"},
                 "theirs": {"url": "https://example.test/mcp"}
@@ -514,31 +516,24 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_cannot_be_read_is_a_warning_rather_than_an_error() {
+    fn a_workspace_mcp_json_that_cannot_be_read_is_a_warning_rather_than_an_error() {
         let _g = env_lock();
-        let home = scratch_home();
-        std::fs::write(crate::config::settings_file().unwrap(), "{ not json").unwrap();
         let workspace = workspace();
         std::fs::write(workspace.join(".mcp.json"), "{ also not json").unwrap();
-        let (found, warnings) = entries(&workspace);
+        let (found, warnings) = entries(&workspace, None);
         assert!(found.is_empty());
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(
-            warnings.iter().any(|w| w.contains("settings.json")),
-            "{warnings:?}"
-        );
-        assert!(
-            warnings.iter().any(|w| w.contains(".mcp.json")),
-            "{warnings:?}"
-        );
-        std::fs::remove_dir_all(&home).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(".mcp.json"), "{warnings:?}");
         std::fs::remove_dir_all(&workspace).unwrap();
     }
 
     #[test]
     fn a_table_that_is_not_a_table_is_a_warning() {
         let _g = env_lock();
-        let (found, warnings) = files(Some(json!({"mcpServers": ["npx"]})), None);
+        // `user_settings` is the value of the `mcpServers` key, so a list
+        // rather than an object is the table-that-is-not-a-table the warning
+        // catches.
+        let (found, warnings) = files(Some(json!(["npx"])), None);
         assert!(found.is_empty());
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("not an object"), "{warnings:?}");
@@ -548,10 +543,10 @@ mod tests {
     fn an_entry_that_cannot_be_used_is_kept_as_the_reason() {
         let _g = env_lock();
         let (found, _) = files(
-            Some(json!({"mcpServers": {
+            Some(json!({
                 "broken": {"command": "npx", "url": "https://x.test"},
                 "nameless": {}
-            }})),
+            })),
             None,
         );
         assert_eq!(found.len(), 2);
@@ -564,7 +559,7 @@ mod tests {
     #[test]
     fn an_entry_with_no_name_is_skipped() {
         let _g = env_lock();
-        let (found, warnings) = files(Some(json!({"mcpServers": {" ": {"command": "npx"}}})), None);
+        let (found, warnings) = files(Some(json!({" ": {"command": "npx"}})), None);
         assert!(found.is_empty());
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("no name"), "{warnings:?}");

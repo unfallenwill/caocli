@@ -46,6 +46,12 @@ pub struct Stub {
     dir: PathBuf,
 }
 
+impl Default for Stub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Stub {
     /// A stub in a directory of its own.
     pub fn new() -> Self {

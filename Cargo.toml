@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/anthropic", "crates/openai"]
+members = [
+    "crates/anthropic",
+    "crates/caocli-core",
+    "crates/caocli-mcp",
+    "crates/openai",
+]
 resolver = "3"
 
 [package]
@@ -19,6 +24,14 @@ anthropic = { package = "caocli-anthropic", path = "crates/anthropic" }
 # speak the OpenAI shape with vendor extensions, and the SDK handles HTTP,
 # retries, and SSE framing so the agent's only job is the delta stream.
 openai = { package = "caocli-openai", path = "crates/openai" }
+# Shared types: tool definitions, anything else more than one crate has to
+# agree on. Kept tiny on purpose -- this is a dependency edge, not a shared
+# lib, and crates that need richer surfaces own those surfaces themselves.
+caocli-core = { path = "crates/caocli-core" }
+# MCP client: external servers' tools, offered to the agent. Owns the JSON-RPC
+# transports, the protocol-level handshake, and the routing from a tool name
+# the model called to the server that offers it.
+caocli-mcp = { path = "crates/caocli-mcp" }
 # Markdown rendering for the answer and the thinking block. Pulled with no
 # default features and only the extensions we render -- tables, strikethrough,
 # task-list checkboxes -- so the binary stays small and there is no

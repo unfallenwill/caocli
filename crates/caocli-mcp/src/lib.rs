@@ -28,8 +28,13 @@ mod config;
 mod health;
 mod http;
 mod stdio;
-#[cfg(test)]
-pub(crate) mod stub;
+/// Test fixture: a bash script that speaks the protocol, used by the binary's
+/// tests as well as this crate's. Always compiled (not gated behind
+/// `#[cfg(test)]`) so a binary test that constructs a stub can reach it
+/// through this crate's public surface; the module is `#[doc(hidden)]` so it
+/// does not appear in the rendered docs.
+#[doc(hidden)]
+pub mod stub;
 #[cfg(test)]
 mod tests;
 mod wire;
@@ -40,7 +45,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::types::{FunctionDef, ToolDef};
+use caocli_core::{FunctionDef, ToolDef};
 
 use client::Connection;
 use config::Entry;
@@ -186,8 +191,12 @@ impl Hub {
     /// every server, and doing this one server at a time would make that wait
     /// the sum of theirs. A server that is slow to start is slow either way, and
     /// this way it is no one else's cost.
-    pub async fn connect(workspace: &Path) -> Self {
-        let (entries, warnings) = config::entries(workspace);
+    ///
+    /// `user_settings` is the `mcpServers` table from the user's settings file,
+    /// already read by the binary that knows where that file lives. Passing it
+    /// in keeps this crate from having to know.
+    pub async fn connect(workspace: &Path, user_settings: Option<&Value>) -> Self {
+        let (entries, warnings) = config::entries(workspace, user_settings);
         Self::open(entries, warnings).await
     }
 
@@ -205,10 +214,15 @@ impl Hub {
         Self::assemble(entries, opened, warnings)
     }
 
-    /// [`Hub::open`] for the tests of the dispatch out in `tools`, which need a
-    /// hub with a server behind it and no configuration file to read.
-    #[cfg(test)]
-    pub(crate) async fn of_entries(entries: Vec<Entry>) -> Self {
+    /// [`Hub::connect`] over entries that are already read: the file is where
+    /// a session gets them from, and a test that has its own entries — a stub
+    /// server, and no file to write — has no reason to go through one.
+    ///
+    /// Public so the binary's tests can build a hub the same way; tests are
+    /// the only documented use, and a production caller has no business
+    /// knowing what an `Entry` looks like.
+    #[doc(hidden)]
+    pub async fn of_entries(entries: Vec<Entry>) -> Self {
         Self::open(entries, Vec::new()).await
     }
 

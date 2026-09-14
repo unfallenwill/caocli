@@ -224,6 +224,8 @@ dependencies = [
  "anyhow",
  "bytes",
  "caocli-anthropic",
+ "caocli-core",
+ "caocli-mcp",
  "caocli-openai",
  "chrono",
  "clap",
@@ -246,6 +248,27 @@ name = "caocli-anthropic"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
+name = "caocli-core"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "caocli-mcp"
+version = "0.0.0"
+dependencies = [
+ "caocli-core",
  "futures-util",
  "reqwest",
  "serde",

@@ -11,10 +11,10 @@ use std::sync::Arc;
 
 use crate::api::Client;
 use crate::machine;
-use crate::mcp::Hub;
 use crate::provider;
 use crate::session::Session;
 use crate::types::WireRequest;
+use caocli_mcp::Hub;
 
 /// `pub(crate)` for the wire-mismatch test in `api`, which builds a request
 /// from a preset to check the client takes it.

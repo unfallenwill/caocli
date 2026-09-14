@@ -20,6 +20,15 @@ use super::http::Http;
 use super::stdio::Stdio;
 use super::wire;
 
+/// The result-text ceiling the model is allowed to read. Same number as the
+/// built-in tools use, so that a result the MCP server hands back is bounded
+/// by the same limit a Bash command's stdout is.
+///
+/// Duplicated from `tools::MAX_OUTPUT` rather than pulled in: this crate sits
+/// beside the built-in tools, not below them, and a `caocli-core` round-trip
+/// for one constant would be a dependency the protocol layer does not need.
+const MAX_OUTPUT: usize = 10 * 1024;
+
 /// How long a server is given to start and answer the handshake. Starting can
 /// be slow — `npx` fetches a package the first time it is asked for one — and a
 /// server that has not come up inside this is not coming up.
@@ -39,6 +48,23 @@ const MAX_PAGES: usize = 32;
 /// the session sends, so this is a context-window bound rather than a sanity
 /// check.
 const MAX_TOOLS: usize = 512;
+
+/// Truncate `s` to at most `max` bytes, backing off to a UTF-8 character
+/// boundary so a multi-byte character is never cut in half.
+///
+/// Mirrors `tools::truncate` so the protocol layer has no dependency on the
+/// built-in tools. A future refactor that puts this in `caocli-core` will find
+/// both call sites pointed at the same helper.
+fn truncate(s: &str, max: usize) -> (String, bool) {
+    if s.len() <= max {
+        return (s.to_owned(), false);
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (s[..end].to_owned(), true)
+}
 
 /// The transport a connection speaks through. An enum rather than a boxed trait
 /// object: the set is closed (the specification defines exactly these two), and
@@ -333,11 +359,10 @@ fn render(result: &Value) -> String {
         return "(the tool answered with nothing)".to_string();
     }
     let text = parts.join("\n");
-    let (text, cut) = crate::tools::truncate(&text, crate::tools::MAX_OUTPUT);
+    let (text, cut) = truncate(&text, MAX_OUTPUT);
     if cut {
         return format!(
-            "{text}\n[the result was cut at the {}-byte output limit; the server sent more]",
-            crate::tools::MAX_OUTPUT
+            "{text}\n[the result was cut at the {MAX_OUTPUT}-byte output limit; the server sent more]"
         );
     }
     text
@@ -431,7 +456,7 @@ fn base64_len(data: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::stub::Stub;
+    use crate::stub::Stub;
 
     /// A connection to a stub server, and the stub itself, so a test can ask
     /// what reached it.
@@ -575,11 +600,7 @@ mod tests {
             answer.contains("cut at the 10240-byte output limit"),
             "{answer}"
         );
-        assert!(
-            answer.len() < crate::tools::MAX_OUTPUT + 200,
-            "{} bytes",
-            answer.len()
-        );
+        assert!(answer.len() < MAX_OUTPUT + 200, "{} bytes", answer.len());
         connection.shutdown().await;
     }
 

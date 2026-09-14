@@ -11,6 +11,12 @@ use serde::{Deserialize, Serialize};
 // — see [`WireRequest`] below. What stays in this file is the agent's own
 // vocabulary: the messages as it stores them, the streaming deltas it folds,
 // and the tool definitions it hands to the request builder.
+//
+// `FunctionDef` and `ToolDef` live in `caocli-core`: the MCP hub builds them
+// for the agent's request builder to consume, and the type has to be the
+// same on both sides of the crate boundary.
+
+pub use caocli_core::{FunctionDef, ToolDef};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -20,21 +26,6 @@ pub enum Role {
     User,
     Assistant,
     Tool,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FunctionDef {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parameters: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ToolDef {
-    pub r#type: String,
-    pub function: FunctionDef,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

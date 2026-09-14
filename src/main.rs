@@ -7,7 +7,6 @@ mod front;
 mod history;
 mod image;
 mod machine;
-mod mcp;
 mod provider;
 mod repl;
 mod session;
@@ -46,7 +45,15 @@ async fn run(cli: Cli) -> Result<()> {
     // session that offered some of them would offer a different prefix than
     // the one it will send next. The guard shuts every connection down on
     // drop, so the three front ends all clean up the same way.
-    let mcp = mcp::McpGuard::new(mcp::Hub::connect(&startup.workspace).await);
+    //
+    // `mcpServers` is read by the binary: it is the binary that owns the
+    // settings file, and the crate that knows the protocol is not the one
+    // that knows where the file lives. A missing or unreadable settings
+    // file is not a hub's problem; the hub gets a `None` and carries on.
+    let user_mcp = config::setting("mcpServers").ok().flatten();
+    let mcp = caocli_mcp::McpGuard::new(
+        caocli_mcp::Hub::connect(&startup.workspace, user_mcp.as_ref()).await,
+    );
     let mcp_notes = mcp.notes().to_vec();
 
     let mut agent = Agent::new(startup.client, startup.session, startup.provider);
