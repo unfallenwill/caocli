@@ -406,6 +406,7 @@ fn disable_prompt_terminal() {
 /// controlling terminal: in that case `/dev/tty` is empty and `cfmakeraw`
 /// writes nothing to the fd we actually read from, so the kernel still echoes
 /// what is typed.
+#[cfg(unix)]
 fn set_stdin_echo(on: bool) {
     use std::os::fd::AsRawFd;
     let fd = std::io::stdin().as_raw_fd();
@@ -420,6 +421,12 @@ fn set_stdin_echo(on: bool) {
     }
     let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &attrs) };
 }
+
+/// Windows needs no fd surgery: crossterm drives the console through the
+/// Console API there, and the pty-without-controlling-terminal hole the Unix
+/// branch plugs does not exist.
+#[cfg(not(unix))]
+fn set_stdin_echo(_on: bool) {}
 
 /// Mark the renderer as out of raw mode and tell it to leave the terminal
 /// alone. Called on the way out of the read loop so any later code path
