@@ -15,6 +15,11 @@ semantic-version bumps per release.
   into the left of the screen. A line now breaks at the region's edge and
   nowhere else; the standing task list, the queue waiting to run and the
   question panel were capped by the same call and are uncapped with it.
+- The label a tool call is drawn under is no longer cut at 80 columns
+  either. A call the summariser cannot name -- an MCP tool, arguments that
+  are not JSON -- used to show the first 80 columns of its arguments and
+  drop the rest without a mark; it now shows all of them, wrapped by the
+  region like every other long line. `HINT_COLUMNS` is gone.
 
 ## [0.1.6] — 2026-09-14
 
