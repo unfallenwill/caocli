@@ -617,8 +617,161 @@ async fn mock_anthropic_loop_replays_thinking_blocks_verbatim() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// End to end: two tool calls declared at once. The interpreter must finish
-/// executing both, in declaration order, before sending the second
+/// End to end on the Responses wire: a MiMo turn with a reasoning item and a
+/// sharded function call runs the same loop, and the second sub-request replays
+/// the reasoning item — id and text both — as the item list this wire asks for.
+/// That replay is the chain-of-thought contract: the endpoint documents it as
+/// what keeps the model's own reasoning in its context.
+#[tokio::test]
+async fn mock_responses_loop_replays_reasoning_items() {
+    let server = MockServer::start().await;
+    let ev = |payload: serde_json::Value| format!("data:{payload}\n\n");
+    let turn1 = [
+        ev(json!({"type":"response.created","sequence_number":0,"response":{"id":"resp_1","status":"in_progress"}})),
+        ev(json!({"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"rs_mock_1","type":"reasoning","summary":[],"content":[],"status":"in_progress"}})),
+        ev(json!({"type":"response.reasoning_text.delta","sequence_number":2,"item_id":"rs_mock_1","output_index":0,"content_index":0,"delta":"I need to run "})),
+        ev(json!({"type":"response.reasoning_text.delta","sequence_number":3,"item_id":"rs_mock_1","output_index":0,"content_index":0,"delta":"a command."})),
+        ev(json!({"type":"response.output_item.added","sequence_number":4,"output_index":1,"item":{"id":"fc_mock_1","type":"function_call","call_id":"call_mock_1","name":"Bash","arguments":"","status":"in_progress"}})),
+        ev(json!({"type":"response.function_call_arguments.delta","sequence_number":5,"item_id":"fc_mock_1","output_index":1,"delta":"{\"command\":\"echo "})),
+        ev(json!({"type":"response.function_call_arguments.delta","sequence_number":6,"item_id":"fc_mock_1","output_index":1,"delta":"caocli-mock-marker\"}"})),
+        ev(json!({"type":"response.completed","sequence_number":7,"response":{"id":"resp_1","status":"completed","usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":80},"output_tokens":40,"output_tokens_details":{"reasoning_tokens":30},"total_tokens":140}}})),
+    ]
+    .concat();
+    let turn2 = [
+        ev(json!({"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"msg_mock_2","type":"message","status":"in_progress","role":"assistant","content":[]}})),
+        ev(json!({"type":"response.output_text.delta","sequence_number":1,"item_id":"msg_mock_2","output_index":0,"content_index":0,"delta":"Done "})),
+        ev(json!({"type":"response.output_text.delta","sequence_number":2,"item_id":"msg_mock_2","output_index":0,"content_index":0,"delta":"executing."})),
+        ev(json!({"type":"response.completed","sequence_number":3,"response":{"id":"resp_2","status":"completed","usage":{"input_tokens":50,"input_tokens_details":{"cached_tokens":30},"output_tokens":9,"total_tokens":59}}})),
+    ]
+    .concat();
+    let server = &server;
+    let mount = |body: String, times: Option<u64>| async move {
+        let mock = Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body));
+        match times {
+            Some(n) => mock.up_to_n_times(n).mount(server).await,
+            None => mock.mount(server).await,
+        }
+    };
+    mount(turn1, Some(1)).await;
+    mount(turn2, None).await;
+
+    let dir = tmpdir();
+    let api = Client::new(
+        "test-key".into(),
+        format!("{}/v1/responses", server.uri()),
+        provider::MIMO.wire,
+    )
+    .unwrap();
+    let session = Session::create(
+        &dir,
+        SessionMeta {
+            provider: Some("mimo".into()),
+            model: "mimo-v2.5-pro".into(),
+            reasoning_effort: Some("high".into()),
+            instructions: None,
+        },
+    )
+    .unwrap();
+    let mut agent = Agent::new(api, session, provider::MIMO);
+    let mut ui = Renderer::new();
+    agent
+        .turn(
+            "use a tool to leave a marker",
+            &mut ui,
+            &mut NoCancel,
+            &mut Answer::denies(),
+            &mut NoQuestions,
+        )
+        .await
+        .unwrap();
+    // Cache stats from both sub-requests accumulate: turn 1 hit 80 / miss 20,
+    // turn 2 hit 30 / miss 20. The second sub-request's hit is the point of the
+    // replay: the prefix it shares with the first is what the endpoint cached.
+    let cache = ui.stats();
+    assert_eq!((cache.hit, cache.miss), (110, 40));
+
+    // session history: user / assistant(reasoning + tool_calls) / tool / assistant
+    assert_eq!(agent.session.messages.len(), 4);
+    let assistant1 = &agent.session.messages[1];
+    assert_eq!(
+        assistant1.reasoning,
+        Some(vec![crate::types::ReasoningItem {
+            id: "rs_mock_1".into(),
+            text: "I need to run a command.".into(),
+        }]),
+        "the item the wire assigned an id to is kept whole"
+    );
+    let calls = assistant1.tool_calls.as_ref().unwrap();
+    assert_eq!(calls.len(), 1, "output indexes 0/1 are not tool ordinals");
+    assert_eq!(
+        calls[0].id, "call_mock_1",
+        "the call id is the one a result is addressed by"
+    );
+    assert_eq!(
+        calls[0].function.arguments,
+        r#"{"command":"echo caocli-mock-marker"}"#
+    );
+    // Bash really ran
+    assert!(
+        agent.session.messages[2]
+            .text()
+            .unwrap()
+            .contains("caocli-mock-marker")
+    );
+    assert_eq!(
+        agent.session.messages[3].text().as_deref(),
+        Some("Done executing.")
+    );
+
+    // second round's request body: the same items in the same order, the
+    // reasoning item replayed under the id the endpoint gave it.
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 2);
+    let body: serde_json::Value = serde_json::from_slice(&reqs[1].body).unwrap();
+    assert_eq!(body["model"], "mimo-v2.5-pro");
+    assert_eq!(body["max_output_tokens"], 131_072);
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["tool_choice"], "auto");
+    assert_eq!(body["tools"][0]["name"], "Bash");
+    assert!(
+        body["instructions"]
+            .as_str()
+            .unwrap()
+            .starts_with("You are caocli")
+    );
+    let items = body["input"].as_array().unwrap();
+    let kinds: Vec<&str> = items.iter().map(|i| i["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "message",
+            "reasoning",
+            "function_call",
+            "function_call_output"
+        ]
+    );
+    assert_eq!(items[1]["id"], "rs_mock_1");
+    assert_eq!(items[1]["content"][0]["type"], "reasoning_text");
+    assert_eq!(items[1]["content"][0]["text"], "I need to run a command.");
+    assert_eq!(items[2]["call_id"], "call_mock_1");
+    assert_eq!(
+        items[2]["arguments"],
+        r#"{"command":"echo caocli-mock-marker"}"#
+    );
+    assert_eq!(items[3]["call_id"], "call_mock_1");
+    assert!(
+        items[3]["output"]
+            .as_str()
+            .unwrap()
+            .contains("caocli-mock-marker")
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// End to end: two tool calls declared at once. The interpreter must finish/// executing both, in declaration order, before sending the second
 /// sub-request — sending after only one would leave the history missing a
 /// tool result (API 400).
 #[tokio::test]

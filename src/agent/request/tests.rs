@@ -231,6 +231,7 @@ fn freeze_history() -> Vec<Message> {
             }]),
             tool_call_id: None,
             thinking: None,
+            reasoning: None,
         },
         Message::tool("call_f1", "exit_code: 0"),
         Message::user("again"),
@@ -629,6 +630,7 @@ fn anthropic_request_replays_thinking_blocks_verbatim() {
                 thinking: "I should run it".into(),
                 signature: "sig-cafe".into(),
             }]),
+            reasoning: None,
         },
         Message::tool("call_x", "out"),
     ];
@@ -661,6 +663,7 @@ fn anthropic_request_does_not_replay_openai_style_reasoning() {
         tool_calls: None,
         tool_call_id: None,
         thinking: None,
+        reasoning: None,
     }];
     let req = anthropic_of(&build_request(
         &provider::MINIMAX,
@@ -693,6 +696,7 @@ fn anthropic_request_folds_consecutive_results_into_one_user_turn() {
             tool_calls: Some(vec![call("c1"), call("c2")]),
             tool_call_id: None,
             thinking: None,
+            reasoning: None,
         },
         Message::tool("c1", "first"),
         Message::tool("c2", "second"),
@@ -737,6 +741,7 @@ fn anthropic_request_splits_a_data_url_into_a_base64_image_source() {
         tool_calls: None,
         tool_call_id: None,
         thinking: None,
+        reasoning: None,
     }];
     let req = anthropic_of(&build_request(
         &provider::MINIMAX,
@@ -778,6 +783,7 @@ fn anthropic_request_maps_an_unparseable_call_to_an_empty_input() {
             }]),
             tool_call_id: None,
             thinking: None,
+            reasoning: None,
         },
         Message::tool("c", "result"),
     ];
@@ -854,6 +860,7 @@ fn a_session_that_switched_wires_strips_the_other_wires_thinking() {
             thinking: "reasoned".into(),
             signature: "sig".into(),
         }]),
+        reasoning: None,
     };
     let history = vec![Message::user("hi"), carried.clone()];
     let req = openai_of(&build_request(
@@ -927,4 +934,174 @@ fn request_prefix_for_minimax_records_anthropic_wire_and_joined_system() {
         "system prompt is also there: {:?}",
         prefix.system_prompt
     );
+}
+
+#[test]
+fn request_prefix_for_mimo_records_the_responses_wire_and_its_own_parameters() {
+    let mut meta = test_meta();
+    meta.instructions = Some("project notes".into());
+    let prefix = super::request_prefix(&provider::MIMO, &meta, &[]);
+    assert_eq!(prefix.wire, WireKind::OpenAiResponses);
+    // The preset's URL is the endpoint itself: the trace records what the
+    // client sends to, with nothing appended to it.
+    assert_eq!(prefix.endpoint, provider::MIMO.url);
+    assert_eq!(prefix.endpoint, "https://api.xiaomimimo.com/v1/responses");
+    assert_eq!(
+        prefix.system_prompt,
+        format!("{SYSTEM_PROMPT}\n\nproject notes")
+    );
+    // The parameters are this wire's own field names: the cap is
+    // `max_output_tokens`, and the tier rides inside `reasoning`.
+    assert_eq!(
+        prefix.parameters.get("max_output_tokens"),
+        Some(&serde_json::json!(131_072))
+    );
+    assert_eq!(
+        prefix.parameters.pointer("/reasoning/effort"),
+        Some(&serde_json::json!("high"))
+    );
+    assert!(
+        prefix.parameters.get("reasoning_effort").is_none(),
+        "the chat wire's spelling is not this wire's: {:?}",
+        prefix.parameters
+    );
+}
+
+#[test]
+fn the_endpoint_a_prefix_records_is_the_one_the_client_sends_to() {
+    // Every preset's URL is the endpoint, path and all: a trace that recorded
+    // a longer path than the request went to would be a recipe a reader could
+    // not rebuild the body from.
+    for p in provider::PROVIDERS {
+        let prefix = super::request_prefix(p, &test_meta(), &[]);
+        assert_eq!(prefix.endpoint, p.url, "{} records its own endpoint", p.id);
+    }
+}
+
+fn responses_of(request: &WireRequest) -> openai::ResponseCreateRequest {
+    match request {
+        WireRequest::Responses(r) => (**r).clone(),
+        other => panic!("expected a Responses-shaped request, got {other:?}"),
+    }
+}
+
+/// The request prefix, frozen, for the Responses wire: the same contract as
+/// the other two wires' frozen literals — the body this program sends is a
+/// decision, and a test that fails when it changes is how it stays one.
+#[test]
+fn the_responses_request_prefix_is_frozen() {
+    let history = freeze_history();
+    let req = responses_of(&build_request(
+        &provider::MIMO,
+        &mimo_meta(Some("high")),
+        &history,
+        &[],
+    ));
+    let mut request = req.clone();
+    if let Some(tools) = request.tools.as_mut() {
+        for tool in tools.iter_mut() {
+            // Every tool this program sends is its own function, so the
+            // destructuring has one arm.
+            let openai::ResponseTool::Function(function) = tool;
+            function.description = Some("…".into());
+        }
+    }
+    assert_eq!(
+        serde_json::to_string(&request).unwrap(),
+        r#"{"model":"mimo-v2.5-pro","input":[{"type":"message","content":"freeze","role":"user"},{"type":"function_call","arguments":"{\"command\":\"true\"}","call_id":"call_f1","name":"Bash"},{"type":"function_call_output","call_id":"call_f1","output":"exit_code: 0"},{"type":"message","content":"again","role":"user"}],"instructions":"You are caocli, a coding agent. You and the user share one workspace, and your job is to collaborate with them until their goal is genuinely handled. Keep answers concise. Tool routing: use Read to read a file, Edit to modify an existing file, Write to create or fully rewrite a file, and Bash for everything else (running programs, builds, tests, git, directories, bulk text processing). Prefer absolute paths: each Bash call starts a fresh shell, so cd does not persist.\n\nFormatting: use GitHub-flavored Markdown where it makes the answer easier to scan. Reserve structure (lists, fenced code blocks, headings) for substantive answers, and leave short replies or confirmations as plain sentences. Inline commands, file paths, and environment variables between backticks. The TUI renders fenced and inline code, emphasis, lists, blockquotes, and headings; tables are shown as raw indented markdown. HTML tags and footnotes are not rendered, so emit plain text in their place.","max_output_tokens":131072,"tools":[{"type":"function","name":"Bash","description":"…","parameters":{"properties":{"background":{"description":"start the command and return at once, its output going to the file the result names (default false)","type":"boolean"},"command":{"description":"the bash command to run","type":"string"},"timeout":{"description":"seconds to let the command run before it is killed (default 120, at most 1800); a background run returns at once and takes none","type":"integer"}},"required":["command"],"type":"object"},"strict":false},{"type":"function","name":"Read","description":"…","parameters":{"properties":{"file_path":{"description":"path of the file to read","type":"string"},"limit":{"description":"how many lines to read; default all the way to the end","type":"integer"},"offset":{"description":"the 1-based line number to start reading at; default 1, the first line","type":"integer"}},"required":["file_path"],"type":"object"},"strict":false},{"type":"function","name":"Edit","description":"…","parameters":{"properties":{"file_path":{"description":"path of the file to modify","type":"string"},"new_string":{"description":"the replacement text; an empty string deletes the matched text","type":"string"},"old_string":{"description":"the original text to replace; must occur exactly once in the file","type":"string"}},"required":["file_path","old_string","new_string"],"type":"object"},"strict":false},{"type":"function","name":"Write","description":"…","parameters":{"properties":{"content":{"description":"the full contents to write","type":"string"},"file_path":{"description":"path of the file to write","type":"string"}},"required":["file_path","content"],"type":"object"},"strict":false},{"type":"function","name":"AskUserQuestion","description":"…","parameters":{"properties":{"questions":{"description":"Questions to ask the user before continuing.","items":{"additionalProperties":true,"properties":{"header":{"description":"Optional short heading for the question, such as \"Confirm\" or \"Choose Mode\".","type":"string"},"id":{"description":"Stable id for this question; echoed in the answer.","type":"string"},"multi_select":{"description":"Whether the user may select more than one option. Defaults to false.","type":"boolean"},"options":{"description":"Optional choices to show the user. If you recommend one, put it first and append \"(Recommended)\" to that label.","items":{"additionalProperties":true,"properties":{"description":{"description":"One sentence explaining the tradeoff or impact.","type":"string"},"label":{"description":"Short user-facing option label.","type":"string"}},"required":["label"],"type":"object"},"type":"array"},"question":{"description":"The specific question to ask the user.","type":"string"}},"required":["id","question"],"type":"object"},"type":"array"}},"required":["questions"],"type":"object"},"strict":false},{"type":"function","name":"TodoWrite","description":"…","parameters":{"properties":{"todos":{"description":"The whole list, in the order the work is done. Send an empty array to clear it.","items":{"additionalProperties":true,"properties":{"content":{"description":"What the task is, in the imperative: \"Add the parse function\".","type":"string"},"status":{"description":"Where the task stands. Defaults to pending.","enum":["pending","in_progress","completed"],"type":"string"}},"required":["content"],"type":"object"},"maxItems":20,"type":"array"}},"required":["todos"],"type":"object"},"strict":false},{"type":"function","name":"Glob","description":"…","parameters":{"properties":{"path":{"description":"the directory searched, and the one the pattern's paths are relative to; default the working directory","type":"string"},"pattern":{"description":"the glob matched against each path below path; * and ? stop at a /, ** stands for any number of directories, and a pattern with no / is asked at any depth","type":"string"}},"required":["pattern"],"type":"object"},"strict":false}],"tool_choice":"auto","reasoning":{"effort":"high"},"stream":true}"#
+    );
+}
+
+/// A meta for a MiMo session, with the effort the caller names.
+fn mimo_meta(effort: Option<&str>) -> SessionMeta {
+    SessionMeta {
+        provider: Some("mimo".into()),
+        model: "mimo-v2.5-pro".into(),
+        reasoning_effort: effort.map(str::to_owned),
+        instructions: None,
+    }
+}
+
+#[test]
+fn responses_request_replays_only_this_wires_own_reasoning() {
+    // A session that switched from the chat wire carries the flat reasoning
+    // text and no items: this wire has nothing to replay, and a made-up item
+    // id would be worse than none.
+    let flat = vec![Message {
+        role: Role::Assistant,
+        content: Some("done".into()),
+        reasoning_content: Some("plain reasoning".into()),
+        tool_calls: None,
+        tool_call_id: None,
+        thinking: None,
+        reasoning: None,
+    }];
+    let req = responses_of(&build_request(
+        &provider::MIMO,
+        &mimo_meta(Some("high")),
+        &flat,
+        &[],
+    ));
+    let v = serde_json::to_value(&req).unwrap();
+    let items = v["input"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "only the assistant message: {items:?}");
+    assert_eq!(items[0]["type"], "message");
+    assert_eq!(items[0]["role"], "assistant");
+
+    // A turn that came from this wire carries its items, and they go back
+    // first — in the order the model wrote them — with the calls after them.
+    let carried = vec![Message {
+        role: Role::Assistant,
+        content: Some("done".into()),
+        reasoning_content: Some("reasoned".into()),
+        tool_calls: None,
+        tool_call_id: None,
+        thinking: None,
+        reasoning: Some(vec![crate::types::ReasoningItem {
+            id: "rs_1".into(),
+            text: "reasoned".into(),
+        }]),
+    }];
+    let req = responses_of(&build_request(
+        &provider::MIMO,
+        &mimo_meta(Some("high")),
+        &carried,
+        &[],
+    ));
+    let v = serde_json::to_value(&req).unwrap();
+    let items = v["input"].as_array().unwrap();
+    let kinds: Vec<&str> = items.iter().map(|i| i["type"].as_str().unwrap()).collect();
+    assert_eq!(kinds, vec!["reasoning", "message"]);
+    assert_eq!(items[0]["id"], "rs_1");
+    assert_eq!(items[0]["content"][0]["text"], "reasoned");
+}
+
+#[test]
+fn responses_request_puts_the_system_prompt_in_instructions_not_in_the_input() {
+    let mut meta = mimo_meta(Some("off"));
+    meta.instructions = Some("project notes".into());
+    let req = responses_of(&build_request(
+        &provider::MIMO,
+        &meta,
+        &[Message::user("hi")],
+        &[],
+    ));
+    let v = serde_json::to_value(&req).unwrap();
+    assert_eq!(
+        v["instructions"].as_str().unwrap(),
+        format!("{SYSTEM_PROMPT}\n\nproject notes")
+    );
+    let items = v["input"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "the history only: {items:?}");
+    assert_eq!(items[0]["type"], "message");
+    assert_eq!(items[0]["role"], "user");
+    // The tier is the wire's thinking switch: `off` is `none` on this wire.
+    let req = responses_of(&build_request(
+        &provider::MIMO,
+        &mimo_meta(Some("none")),
+        &[Message::user("hi")],
+        &[],
+    ));
+    let v = serde_json::to_value(&req).unwrap();
+    assert_eq!(v["reasoning"]["effort"], "none");
 }

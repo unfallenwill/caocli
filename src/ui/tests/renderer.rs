@@ -187,6 +187,7 @@ fn replay_renders_history_compactly_with_colors() {
             }]),
             tool_call_id: None,
             thinking: None,
+            reasoning: None,
         },
         Message::tool("call_1", "exit_code: 0\n--- stdout ---\nSECRET_BODY"),
         Message::system("must not appear"),
@@ -263,6 +264,7 @@ fn replay_skips_empty_assistant_fields() {
         tool_calls: None,
         tool_call_id: None,
         thinking: None,
+        reasoning: None,
     }]);
     assert_eq!(
         String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
@@ -306,6 +308,7 @@ fn live_and_replay_lay_out_a_turn_identically() {
             }]),
             tool_call_id: None,
             thinking: None,
+            reasoning: None,
         },
         Message::tool("call_1", "exit_code: 0\n--- stdout ---\nBODY"),
     ]);
@@ -340,6 +343,7 @@ fn the_plain_front_ends_stream_is_frozen() {
             tool_calls: None,
             tool_call_id: None,
             thinking: None,
+            reasoning: None,
         },
     ]);
     r.reasoning_delta("weigh");
@@ -510,6 +514,7 @@ fn a_streamed_block_and_the_same_block_replayed_are_the_same_bytes() {
         tool_calls: None,
         tool_call_id: None,
         thinking: None,
+        reasoning: None,
     }]);
 
     // The replay's own trailing separator is the one thing that is not the same:

@@ -78,6 +78,7 @@ mod tests {
                 tool_calls: Some(vec![call("AskUserQuestion", args)]),
                 tool_call_id: None,
                 thinking: None,
+                reasoning: None,
             },
             crate::types::Message::tool("call_1", "auth: JWT"),
         ]);

@@ -130,6 +130,7 @@ fn replay_and_the_live_stream_produce_the_same_cells() {
             tool_calls: None,
             tool_call_id: None,
             thinking: None,
+            reasoning: None,
         },
         Message::tool("call_1", "exit_code: 0\n--- stdout ---\nbody"),
     ]));
