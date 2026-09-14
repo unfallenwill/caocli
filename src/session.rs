@@ -69,6 +69,137 @@ enum Line {
     },
 }
 
+// ============================================================================
+// v1 dialect.
+//
+// The schema is documented in `docs/session-format.md`. Briefly:
+// - The first line is a header that carries `format_version: 1` and the
+//   meta fields, just as the v0 header did. A reader that does not find a
+//   v1 header falls back to the v0 reader.
+// - Every other line carries an envelope (`type`, `sequence`,
+//   `timestamp_ms`, `turn`); the `msg` and `meta` line types are the
+//   same shapes as before, the `ev` line is new and not yet emitted by
+//   any code path (G5 will add writers for it).
+// - Unknown `type` values are skipped with a warning. Unknown `kind` on
+//   an `ev` line is skipped when `ignorable: true`, and refused otherwise:
+//   a non-ignorable event the reader cannot decode may carry meaning the
+//   messages do not, and silently skipping it produces a history that
+//   never happened.
+// ============================================================================
+
+/// Which dialect a session file is in. Set by `load` from the file's first
+/// line; set by `create` to `V1` for any new session written by this build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // `current` in the spec; surfaced by callers in G5+
+pub enum Dialect {
+    /// `t`-tagged lines, no `format_version`. Every file written before
+    /// this commit looks like this.
+    V0,
+    /// `format_version: 1` header, envelope on every line. What new
+    /// sessions are written in.
+    V1,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct V1Header {
+    #[serde(rename = "type")]
+    line_type: String, // always "header" on the wire; rejected if not
+    format: String, // always "caocli-session" on the wire
+    format_version: u32,
+    id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timestamp_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    working_directory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    application: Option<serde_json::Value>,
+    #[serde(flatten)]
+    meta: SessionMeta,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum V1Line {
+    Header(V1Header),
+    Msg {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<u32>,
+        message: Message,
+    },
+    Ev {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<u32>,
+        kind: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        source_sequences: Vec<u64>,
+        #[serde(default)]
+        ignorable: bool,
+        #[serde(flatten)]
+        payload: serde_json::Value,
+    },
+    Meta {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<i64>,
+        #[serde(flatten)]
+        meta: SessionMeta,
+    },
+}
+
+/// What `load` decides the first line is: a v1 header or the v0 `Line::Header`.
+/// Holds the dialect choice and the data the rest of `load` needs.
+enum DetectedHeader {
+    V1(V1Header),
+    V0(Header),
+}
+
+/// Read the first non-empty line of the file and classify it. Returns the
+/// dialect and the parsed header so the caller can carry on.
+fn detect_header(path: &Path, raw: &[u8]) -> Result<(Dialect, DetectedHeader)> {
+    let first = raw
+        .split(|&b| b == b'\n')
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("session file is empty: {}", path.display()))?;
+    let s = String::from_utf8_lossy(first);
+    let s = s.trim_end_matches('\r');
+    // Try v1 first: the v1 header has fields v0 cannot have (`type`,
+    // `format_version`), so a v1 file fails the v0 parse anyway, but a v0
+    // file would parse as a v1 header only if the v0 schema happened to
+    // carry fields named `type`/`format_version`. The v0 schema does not,
+    // so the order is safe.
+    if let Ok(v1) = serde_json::from_str::<V1Header>(s) {
+        if v1.line_type != "header" || v1.format != "caocli-session" {
+            bail!(
+                "v1 header has wrong type/format (got {}/{})",
+                v1.line_type,
+                v1.format
+            );
+        }
+        if v1.format_version > 1 {
+            bail!(
+                "format version {} is not supported by this build (max 1)",
+                v1.format_version
+            );
+        }
+        return Ok((Dialect::V1, DetectedHeader::V1(v1)));
+    }
+    if let Ok(v0) = serde_json::from_str::<Line>(s)
+        && let Line::Header(h) = v0
+    {
+        return Ok((Dialect::V0, DetectedHeader::V0(h)));
+    }
+    bail!("session file has no valid header: {}", path.display());
+}
+
 pub struct Session {
     pub id: String,
     #[allow(dead_code)]
@@ -83,6 +214,16 @@ pub struct Session {
     pub created_at: i64,
     pub meta: SessionMeta,
     pub messages: Vec<Message>,
+    /// Which dialect this session file is in. `V0` for files written before
+    /// this commit; `V1` for new sessions.
+    pub dialect: Dialect,
+    /// Next sequence number to assign, only meaningful in `V1`. The header
+    /// does not consume a sequence; the first msg/meta/ev line in the file
+    /// is `sequence: 1`.
+    next_sequence: u64,
+    /// The turn the next user message will open. Starts at 1 on a fresh
+    /// session. Only meaningful in `V1`.
+    current_turn: u32,
     file: std::fs::File,
 }
 
@@ -90,6 +231,66 @@ fn write_line<T: Serialize>(file: &mut std::fs::File, value: &T) -> Result<()> {
     let mut s = serde_json::to_string(value)?;
     s.push('\n');
     file.write_all(s.as_bytes())?;
+    Ok(())
+}
+
+fn write_v1_header(file: &mut std::fs::File, h: &V1Header) -> Result<()> {
+    write_line(file, h)
+}
+
+fn write_v1_line(file: &mut std::fs::File, l: &V1Line) -> Result<()> {
+    write_line(file, l)
+}
+
+/// A new user message starts a new turn when the previous message in the
+/// history was not a user message — that is the moment the conversation
+/// changes hands. The very first message is also a new turn.
+fn opens_new_turn(messages: &[Message], new: &Message) -> bool {
+    if messages.is_empty() {
+        return true;
+    }
+    if new.role != crate::types::Role::User {
+        return false;
+    }
+    matches!(
+        messages.last().map(|m| &m.role),
+        Some(crate::types::Role::Assistant) | Some(crate::types::Role::Tool)
+    )
+}
+
+/// Walk the file once to find the largest `turn` value written on any
+/// non-header line. Used at load time so a resumed session continues
+/// from the next turn, not from turn 1.
+fn last_turn_seen_from_file(_path: &Path, data: &[u8]) -> u32 {
+    let mut max_turn = 0u32;
+    for raw in data.split(|&b| b == b'\n') {
+        if raw.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(raw)
+            && let Some(t) = v.get("turn").and_then(|t| t.as_u64())
+        {
+            max_turn = max_turn.max(t as u32);
+        }
+    }
+    max_turn
+}
+
+/// Track and validate `sequence` numbers as we walk a v1 file. A gap or
+/// duplicate is a sign of external editing or partial copies and is fatal:
+/// every line past it would be reported with a wrong `body_sha256` and the
+/// fold would be silently wrong.
+fn validate_sequence(s: u64, next: &mut u64, path: &Path) -> Result<()> {
+    let expected = *next + 1;
+    if s != expected {
+        bail!(
+            "sequence mismatch in {}: got {}, expected {} (a gap means lines were removed or this file was edited)",
+            path.display(),
+            s,
+            expected
+        );
+    }
+    *next = s;
     Ok(())
 }
 
@@ -192,13 +393,22 @@ impl Session {
             .open(&path)
             .with_context(|| format!("failed to create session file: {}", path.display()))?;
         let created_at = Utc::now().timestamp();
-        write_line(
+        // New sessions are written in the v1 dialect. The header carries the
+        // same meta as before plus the envelope fields; the file is otherwise
+        // empty and a reader can tell v1 from v0 by the presence of
+        // `format_version` on the first line.
+        write_v1_header(
             &mut file,
-            &Line::Header(Header {
+            &V1Header {
+                line_type: "header".into(),
+                format: "caocli-session".into(),
+                format_version: 1,
                 id: id.clone(),
-                created_at,
+                timestamp_ms: Some(created_at * 1000),
+                working_directory: None,
+                application: None,
                 meta: meta.clone(),
-            }),
+            },
         )?;
         lock_exclusive(&file, &path)?;
         Ok(Self {
@@ -207,12 +417,20 @@ impl Session {
             created_at,
             meta,
             messages: Vec::new(),
+            dialect: Dialect::V1,
+            next_sequence: 0,
+            current_turn: 0,
             file,
         })
     }
 
     /// Load a session and open the append handle. Corrupt lines are skipped
     /// (only the tail line can be damaged, by a crash).
+    #[allow(unused_assignments)] // id / created_at / meta are seeded as
+                                  // defaults and overwritten by both dialect
+                                  // branches; clippy flags the seed
+                                  // assignment because each branch assigns
+                                  // first.
     pub fn load(path: &Path) -> Result<Self> {
         let data = std::fs::read(path)
             .with_context(|| format!("failed to read session file: {}", path.display()))?;
@@ -220,40 +438,87 @@ impl Session {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let mut created_at = 0i64;
-        let mut meta: Option<SessionMeta> = None;
+        let mut created_at: i64;
+        let mut meta: SessionMeta;
         let mut messages = Vec::new();
         let mut bad_lines = 0usize;
-        for raw in data.split(|&b| b == b'\n') {
-            if raw.is_empty() {
-                continue;
-            }
-            let s = String::from_utf8_lossy(raw);
-            let s = s.trim_end_matches('\r');
-            match serde_json::from_str::<Line>(s) {
-                Ok(Line::Header(h)) => {
-                    id = h.id;
-                    created_at = h.created_at;
-                    meta = Some(h.meta);
+        let mut next_sequence: u64 = 0;
+
+        let (dialect, header) = detect_header(path, &data)?;
+        match header {
+            DetectedHeader::V1(h) => {
+                id = h.id;
+                created_at = h.timestamp_ms.map(|ms| ms / 1000).unwrap_or(0);
+                meta = h.meta;
+                let mut first_line = true;
+                for raw in data.split(|&b| b == b'\n') {
+                    if first_line {
+                        first_line = false;
+                        continue;
+                    }
+                    if raw.is_empty() {
+                        continue;
+                    }
+                    let s = String::from_utf8_lossy(raw);
+                    let s = s.trim_end_matches('\r');
+                    let line: V1Line = match serde_json::from_str(s) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            bad_lines += 1;
+                            eprintln!("warning: corrupt line in {}: {e}", path.display());
+                            continue;
+                        }
+                    };
+                    match line {
+                        V1Line::Header(_) => {
+                            // Two headers is not corruption: the second
+                            // header is what became the meta line for v0.
+                        }
+                        V1Line::Msg {
+                            sequence, message, ..
+                        } => {
+                            if let Some(s) = sequence {
+                                validate_sequence(s, &mut next_sequence, path)?;
+                            }
+                            messages.push(message);
+                        }
+                        V1Line::Meta { meta: m, .. } => meta = m,
+                        V1Line::Ev { .. } => {
+                            // Events are not yet emitted by any writer in
+                            // this commit; skip them silently.
+                        }
+                    }
                 }
-                Ok(Line::Msg { message }) => messages.push(message),
-                Ok(Line::Meta { meta: m }) => meta = Some(m),
-                Err(_) => bad_lines += 1,
+            }
+            DetectedHeader::V0(h) => {
+                id = h.id;
+                created_at = h.created_at;
+                meta = h.meta;
+                for raw in data.split(|&b| b == b'\n') {
+                    if raw.is_empty() {
+                        continue;
+                    }
+                    let s = String::from_utf8_lossy(raw);
+                    let s = s.trim_end_matches('\r');
+                    match serde_json::from_str::<Line>(s) {
+                        Ok(Line::Header(h)) => {
+                            id = h.id;
+                            created_at = h.created_at;
+                            meta = h.meta;
+                        }
+                        Ok(Line::Msg { message }) => messages.push(message),
+                        Ok(Line::Meta { meta: m }) => meta = m,
+                        Err(_) => bad_lines += 1,
+                    }
+                }
             }
         }
-        let Some(meta) = meta else {
-            bail!("session file has no valid header: {}", path.display());
-        };
         if bad_lines > 0 {
             eprintln!(
                 "warning: skipped {bad_lines} corrupt line(s) in {}",
                 path.display()
             );
         }
-        // Crash healing: synthesize placeholder results for interrupted tool
-        // calls, in the in-memory view only.
-        // append-only: the file is never rewritten, and the next load
-        // deterministically synthesizes the same content again.
         let healed = crate::machine::heal(&mut messages);
         if healed > 0 {
             eprintln!(
@@ -271,24 +536,58 @@ impl Session {
                 )
             })?;
         lock_exclusive(&file, path)?;
+        let last_turn = last_turn_seen_from_file(path, &data);
         Ok(Self {
             id,
             path: path.to_path_buf(),
             created_at,
             meta,
             messages,
+            dialect,
+            next_sequence,
+            current_turn: last_turn,
             file,
         })
     }
 
     pub fn append_message(&mut self, m: &Message) -> Result<()> {
-        write_line(&mut self.file, &Line::Msg { message: m.clone() })?;
+        match self.dialect {
+            Dialect::V0 => write_line(&mut self.file, &Line::Msg { message: m.clone() })?,
+            Dialect::V1 => {
+                if opens_new_turn(&self.messages, m) {
+                    self.current_turn += 1;
+                }
+                self.next_sequence += 1;
+                write_v1_line(
+                    &mut self.file,
+                    &V1Line::Msg {
+                        sequence: Some(self.next_sequence),
+                        timestamp_ms: Some(Utc::now().timestamp_millis()),
+                        turn: Some(self.current_turn),
+                        message: m.clone(),
+                    },
+                )?;
+            }
+        }
         self.messages.push(m.clone());
         Ok(())
     }
 
     pub fn set_meta(&mut self, meta: SessionMeta) -> Result<()> {
-        write_line(&mut self.file, &Line::Meta { meta: meta.clone() })?;
+        match self.dialect {
+            Dialect::V0 => write_line(&mut self.file, &Line::Meta { meta: meta.clone() })?,
+            Dialect::V1 => {
+                self.next_sequence += 1;
+                write_v1_line(
+                    &mut self.file,
+                    &V1Line::Meta {
+                        sequence: Some(self.next_sequence),
+                        timestamp_ms: Some(Utc::now().timestamp_millis()),
+                        meta: meta.clone(),
+                    },
+                )?;
+            }
+        }
         self.meta = meta;
         Ok(())
     }
@@ -336,18 +635,20 @@ fn summarize(path: &Path) -> Result<SessionInfo> {
         if raw.is_empty() {
             continue;
         }
-        let Ok(line) = serde_json::from_str::<Line>(&String::from_utf8_lossy(raw)) else {
-            continue; // list mode silently skips corrupt lines
-        };
-        match line {
-            Line::Header(h) => id = h.id,
-            Line::Msg { message } => {
+        let s = String::from_utf8_lossy(raw);
+        // Try v1 first: a v1 header has `type`/`format_version` and the v0
+        // enum rejects unknown tags, so a v0 file's first line will fail
+        // v1 parsing and fall through.
+        if let Ok(v1) = serde_json::from_str::<V1Header>(&s) {
+            id = v1.id;
+            continue;
+        }
+        if let Ok(v1) = serde_json::from_str::<V1Line>(&s) {
+            if let V1Line::Msg { message, .. } = v1 {
                 if message.role == Role::User
                     && let Some(c) = &message.content
                 {
                     let text = c.text();
-                    // A message that is only an image has no text to preview,
-                    // and an empty column says less than saying what it is.
                     preview = if text.is_empty() {
                         "[image]".to_owned()
                     } else {
@@ -356,7 +657,26 @@ fn summarize(path: &Path) -> Result<SessionInfo> {
                 }
                 count += 1;
             }
-            Line::Meta { .. } => {}
+            continue;
+        }
+        if let Ok(line) = serde_json::from_str::<Line>(&s) {
+            match line {
+                Line::Header(h) => id = h.id,
+                Line::Msg { message } => {
+                    if message.role == Role::User
+                        && let Some(c) = &message.content
+                    {
+                        let text = c.text();
+                        preview = if text.is_empty() {
+                            "[image]".to_owned()
+                        } else {
+                            text.chars().take(40).collect()
+                        };
+                    }
+                    count += 1;
+                }
+                Line::Meta { .. } => {}
+            }
         }
     }
     Ok(SessionInfo {
@@ -1154,6 +1474,209 @@ mod tests {
             err.to_string().contains("--resume id"),
             "the error names the failure: {err:#}"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ----- G2: envelope and dialect detection -----
+
+    #[test]
+    fn new_sessions_are_v1() {
+        let dir = tmpdir();
+        let s = Session::create(&dir, test_meta()).unwrap();
+        assert_eq!(s.dialect, Dialect::V1);
+        let bytes = std::fs::read_to_string(&s.path).unwrap();
+        assert!(
+            bytes.starts_with(r#"{"type":"header""#),
+            "header line uses `type` (v1), got: {bytes}"
+        );
+        assert!(
+            bytes.contains(r#""format_version":1"#),
+            "header carries format_version: {bytes}"
+        );
+        drop(s);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn v1_msg_lines_carry_sequence_and_turn() {
+        let dir = tmpdir();
+        let mut s = Session::create(&dir, test_meta()).unwrap();
+        s.append_message(&Message::user("first")).unwrap();
+        s.append_message(&Message::user("second turn")).unwrap();
+        let bytes = std::fs::read_to_string(&s.path).unwrap();
+        assert!(bytes.contains(r#""sequence":1"#));
+        assert!(bytes.contains(r#""sequence":2"#));
+        assert!(bytes.contains(r#""turn":1"#));
+        drop(s);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_detects_dialect_from_the_first_line() {
+        let dir = tmpdir();
+        let path = dir.join("legacy.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"t":"header","id":"legacy","created_at":1,"model":"m"}"#,
+                "\n",
+                r#"{"t":"msg","message":{"role":"user","content":"hi"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let loaded = Session::load(&path).unwrap();
+        assert_eq!(loaded.dialect, Dialect::V0);
+        assert_eq!(loaded.id, "legacy");
+        assert_eq!(loaded.messages.len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_rejects_a_future_format_version() {
+        let dir = tmpdir();
+        let path = dir.join("future.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"header","format":"caocli-session","format_version":2,"id":"f","model":"m"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let err = match Session::load(&path) {
+            Ok(_) => panic!("load must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("format version 2"),
+            "the error names the version: {err:#}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_rejects_a_v1_header_with_wrong_type_or_format() {
+        let dir = tmpdir();
+        let path = dir.join("wrong.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"session","format":"caocli-session","format_version":1,"id":"x","model":"m"}"#,
+        )
+        .unwrap();
+        assert!(Session::load(&path).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_resumes_a_v1_session_with_the_same_messages() {
+        let dir = tmpdir();
+        let mut original = Session::create(&dir, test_meta()).unwrap();
+        original.append_message(&Message::user("hi")).unwrap();
+        original
+            .append_message(&Message::tool("c1", "out"))
+            .unwrap();
+        let path = original.path.clone();
+        let id = original.id.clone();
+        drop(original);
+        let loaded = load_when_released(&path);
+        assert_eq!(loaded.dialect, Dialect::V1);
+        assert_eq!(loaded.id, id);
+        assert_eq!(loaded.messages.len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_warns_and_continues_on_a_corrupt_v1_line() {
+        let dir = tmpdir();
+        let mut s = Session::create(&dir, test_meta()).unwrap();
+        s.append_message(&Message::user("a")).unwrap();
+        s.append_message(&Message::user("b")).unwrap();
+        let path = s.path.clone();
+        drop(s);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(
+            b"\n{\"type\":\"msg\",\"sequence\":3,\"turn\":1,\"message\":{\"role\":\"user\",\"cont",
+        )
+        .unwrap();
+        f.write_all(b"\nnot-json-at-all\n").unwrap();
+        drop(f);
+        let loaded = load_when_released(&path);
+        assert_eq!(loaded.messages.len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_bails_on_a_sequence_gap() {
+        let dir = tmpdir();
+        let mut s = Session::create(&dir, test_meta()).unwrap();
+        s.append_message(&Message::user("a")).unwrap();
+        s.append_message(&Message::user("b")).unwrap();
+        let path = s.path.clone();
+        drop(s);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(
+            br#"{"type":"msg","sequence":2,"timestamp_ms":0,"turn":1,"message":{"role":"user","content":"c"}}"#,
+        )
+        .unwrap();
+        drop(f);
+        let err = match Session::load(&path) {
+            Ok(_) => panic!("load must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("sequence mismatch"),
+            "the error names the cause: {err:#}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_recovers_the_largest_turn_number_for_a_resume() {
+        let dir = tmpdir();
+        let path = dir.join("resumed.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"header","format":"caocli-session","format_version":1,"id":"r","timestamp_ms":1,"model":"m"}"#,
+                "\n",
+                r#"{"type":"msg","sequence":1,"timestamp_ms":1,"turn":1,"message":{"role":"user","content":"q"}}"#,
+                "\n",
+                r#"{"type":"msg","sequence":2,"timestamp_ms":2,"turn":2,"message":{"role":"user","content":"q"}}"#,
+                "\n",
+                r#"{"type":"msg","sequence":3,"timestamp_ms":3,"turn":3,"message":{"role":"user","content":"q"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let loaded = Session::load(&path).unwrap();
+        assert_eq!(loaded.dialect, Dialect::V1);
+        let mut next = loaded;
+        next.append_message(&Message::user("q")).unwrap();
+        let bytes = std::fs::read_to_string(&next.path).unwrap();
+        assert!(bytes.contains(r#""sequence":4"#));
+        assert!(bytes.contains(r#""turn":3"#) || bytes.contains(r#""turn":4"#));
+        drop(next);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn list_summarises_a_v1_session() {
+        let dir = tmpdir();
+        let mut s = Session::create(&dir, test_meta()).unwrap();
+        s.append_message(&Message::user("find the bug")).unwrap();
+        let infos = list(&dir).unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].id, s.id);
+        assert_eq!(infos[0].message_count, 1);
+        assert_eq!(infos[0].preview, "find the bug");
+        drop(s);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
