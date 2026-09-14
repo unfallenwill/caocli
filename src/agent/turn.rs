@@ -231,6 +231,7 @@ impl Turn<'_> {
         let body_value = match &request {
             crate::types::WireRequest::OpenAi(b) => serde_json::to_value(&**b)?,
             crate::types::WireRequest::Anthropic(b) => serde_json::to_value(&**b)?,
+            crate::types::WireRequest::Responses(b) => serde_json::to_value(&**b)?,
         };
         let body_sha256 = crate::canonical::canonical_sha256_hex(&body_value);
         let history_through = self.agent.session.last_sequence();

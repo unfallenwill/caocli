@@ -10,13 +10,18 @@ use crate::types::{
 };
 
 // ============================================================================
-// The two wires, one conversation.
+// The three wires, one conversation.
 //
 // The OpenAI wire is the `openai` crate's: it speaks Chat Completions, does
 // the HTTP, retries, and SSE parsing, and hands over typed chunks. What lives
 // here is the bridge between the agent's internal types (the
 // `crate::types::Message` it stores, the `crate::types::Delta` it folds) and
 // the SDK's. The SDK handles transport; the adapter handles the deltas.
+//
+// The Responses wire is the same crate's other surface: an answer is a list of
+// items rather than a list of choices, so the adapter is its own, but it lands
+// on the same local deltas — and it is where the reasoning items and the
+// prompt-cache counts are read from.
 //
 // The Anthropic wire is the `anthropic` crate's, the same way: typed events in,
 // the same local deltas out. Nothing downstream learns a second protocol
@@ -33,6 +38,11 @@ enum Backend {
     OpenAi(openai::Client),
     /// The Anthropic wire, spoken by the SDK.
     Anthropic(anthropic::Client),
+    /// The OpenAI Responses wire. The same SDK client as the chat wire — one
+    /// client serves both of that API's resources — but a different request
+    /// shape and a different event stream, so the variant is its own: the pair
+    /// (backend, request) is what a mismatched wire is caught by.
+    Responses(openai::Client),
 }
 
 /// The client for one provider: its endpoint, its key and its wire, paired so
@@ -57,14 +67,10 @@ impl Client {
             // where the SDK's default is two: a refusal worth retrying is
             // one this program would rather show. Same reasoning as the
             // Anthropic path below.
-            Wire::OpenAi => Backend::OpenAi(
-                openai::Client::new(
-                    openai::Profile::endpoint(url)
-                        .with_bearer_token(api_key)
-                        .with_max_retries(0),
-                )
-                .map_err(|e| anyhow::anyhow!("failed to build OpenAI client: {e}"))?,
-            ),
+            Wire::OpenAi => Backend::OpenAi(openai_client(api_key, url)?),
+            // The Responses endpoint, named the same way: MiMo's own URL ends
+            // in `/v1/responses`, and the SDK sends to it verbatim.
+            Wire::Responses => Backend::Responses(openai_client(api_key, url)?),
             // The endpoint is the provider's own URL, path and all: an
             // Anthropic-compatible gateway puts the messages where it likes.
             //
@@ -93,6 +99,13 @@ impl Client {
                     .map_err(|e| anyhow::anyhow!("openai stream error: {e}"))?;
                 Ok(ChunkStream::OpenAi(OpenAiStream { inner: sdk_stream }))
             }
+            (Backend::Responses(client), WireRequest::Responses(r)) => {
+                let sdk_stream = client
+                    .stream_responses(r)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("openai responses stream error: {e}"))?;
+                Ok(ChunkStream::Responses(ResponsesStream::new(sdk_stream)))
+            }
             (Backend::Anthropic(client), WireRequest::Anthropic(r)) => Ok(ChunkStream::Anthropic(
                 Box::new(AnthropicStream::new(client.stream(r).await?)),
             )),
@@ -101,15 +114,32 @@ impl Client {
     }
 }
 
+/// The client for one endpoint of either OpenAI wire. Both resources answer on
+/// the same connection with the same auth, and which of them a request goes to
+/// is the request's own business.
+///
+/// No retries, deliberately, where the SDK's default is two: a refusal worth
+/// retrying is one this program would rather show.
+fn openai_client(api_key: String, url: String) -> Result<openai::Client> {
+    openai::Client::new(
+        openai::Profile::endpoint(url)
+            .with_bearer_token(api_key)
+            .with_max_retries(0),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to build OpenAI client: {e}"))
+}
+
 /// One sub-request in flight, whichever wire carries it.
 pub enum ChunkStream {
-    /// The OpenAI wire, adapted from the SDK's typed chunks.
+    /// The OpenAI chat wire, adapted from the SDK's typed chunks.
     OpenAi(OpenAiStream),
     /// The Anthropic wire, adapted from the SDK's typed events. Boxed: it
     /// carries the stream's own buffers and the frame being read, and a variant
     /// that much larger than its sibling would make every value of this enum
     /// that size.
     Anthropic(Box<AnthropicStream>),
+    /// The OpenAI Responses wire, adapted from the SDK's typed events.
+    Responses(ResponsesStream),
 }
 
 impl std::fmt::Debug for ChunkStream {
@@ -120,6 +150,7 @@ impl std::fmt::Debug for ChunkStream {
         match self {
             ChunkStream::OpenAi(_) => f.write_str("ChunkStream::OpenAi(…)"),
             ChunkStream::Anthropic(_) => f.write_str("ChunkStream::Anthropic(…)"),
+            ChunkStream::Responses(_) => f.write_str("ChunkStream::Responses(…)"),
         }
     }
 }
@@ -131,6 +162,7 @@ impl ChunkStream {
         match self {
             ChunkStream::OpenAi(stream) => stream.next_chunk().await,
             ChunkStream::Anthropic(stream) => stream.next_chunk().await,
+            ChunkStream::Responses(stream) => stream.next_chunk().await,
         }
     }
 }
@@ -221,6 +253,7 @@ fn delta_to_local(d: openai::ChoiceDelta) -> Delta {
             .tool_calls
             .map(|tcs| tcs.into_iter().map(delta_tool_to_local).collect()),
         signature: None,
+        reasoning_item_id: None,
     };
     // The deprecated `function_call` form arrives here only on backends that
     // still send it; the agent's TurnAccumulator ignores unknown fields, so
@@ -604,7 +637,6 @@ fn usage_report(usage: &anthropic::Usage) -> Usage {
         prompt_tokens_details: None,
     }
 }
-
 fn chunk_with(delta: Delta) -> ChatChunk {
     ChatChunk {
         choices: vec![crate::types::ChunkChoice {
@@ -612,6 +644,341 @@ fn chunk_with(delta: Delta) -> ChatChunk {
             finish_reason: None,
         }],
         usage: None,
+    }
+}
+
+// ============================================================================
+// The Responses wire: typed events in, the same deltas out.
+//
+// This wire narrates an answer as the *items* it is made of — a reasoning item,
+// a message, a function call — rather than as content blocks or choice deltas.
+// Three things are the whole of the translation:
+//
+// - A function call is announced by its own item, with the call id its result
+//   is addressed by, and its arguments arrive as shards keyed by the item's
+//   *output index*. The accumulator shards calls by ordinal among the calls, so
+//   the adapter is where an output index becomes an ordinal — the same job the
+//   Anthropic adapter does with content-block indexes.
+// - Reasoning streams as text tagged with the id of the item carrying it. That
+//   tag rides along on the local delta, because this wire asks for the item
+//   back whole on the next request (see `Message::reasoning`).
+// - The answer's end is a lifecycle event rather than a `finish_reason` on a
+//   chunk: the status says whether the answer is whole, and `incomplete_details`
+//   says why not, in the words the truncation notice reads.
+// ============================================================================
+
+/// The Responses wire's event stream: the SDK's typed events, adapted.
+pub struct ResponsesStream {
+    inner: openai::ResponseEventStream,
+    /// The function calls declared so far, keyed by the item's *output index* —
+    /// which is not the tool-call ordinal: reasoning and message items take
+    /// indexes too. The value is the call's ordinal among the calls, which is
+    /// what the accumulator shards by.
+    calls: HashMap<u64, u32>,
+    /// The ordinal the next function call gets.
+    next_call: u32,
+}
+
+impl ResponsesStream {
+    pub fn new(inner: openai::ResponseEventStream) -> Self {
+        Self {
+            inner,
+            calls: HashMap::new(),
+            next_call: 0,
+        }
+    }
+
+    /// None means the stream is over. An event that folds into no delta — a
+    /// lifecycle event, a part boundary — continues the loop rather than
+    /// yielding an empty chunk.
+    pub async fn next_chunk(&mut self) -> Result<Option<ChatChunk>> {
+        loop {
+            let Some(event) = self
+                .inner
+                .next_event()
+                .await
+                .map_err(|e| anyhow::anyhow!("openai responses stream read error: {e}"))?
+            else {
+                return Ok(None);
+            };
+            if let Some(chunk) = self.fold(&event)? {
+                return Ok(Some(chunk));
+            }
+        }
+    }
+
+    /// Fold one event. None: nothing to hand downstream.
+    fn fold(&mut self, event: &openai::ResponseStreamEvent) -> Result<Option<ChatChunk>> {
+        use openai::ResponseStreamEvent as E;
+        let chunk = match event {
+            // A call is announced before its arguments: the id its result is
+            // addressed by, and the name, go out with the first shard the way
+            // the Anthropic adapter sends them at block start. Every other
+            // item — a reasoning item, a message — is announced here too, and
+            // announces nothing the deltas that follow do not carry; they fall
+            // through to the read-past arm below.
+            E::OutputItemAdded {
+                output_index,
+                item: openai::ResponseOutputItem::FunctionToolCall(call),
+                ..
+            } => {
+                let ordinal = self.next_call;
+                self.next_call += 1;
+                self.calls.insert(*output_index, ordinal);
+                chunk_with(Delta {
+                    tool_calls: Some(vec![DeltaToolCall {
+                        index: ordinal,
+                        id: Some(call.call_id.clone()),
+                        function: Some(DeltaFunctionCall {
+                            name: Some(call.name.clone()),
+                            arguments: None,
+                        }),
+                    }]),
+                    ..Default::default()
+                })
+            }
+            E::FunctionCallArgumentsDelta {
+                output_index,
+                delta,
+                ..
+            } => {
+                // A shard for a call nobody announced has nowhere to go; the
+                // ordinal it would need is not this shard's to invent.
+                let Some(ordinal) = self.calls.get(output_index).copied() else {
+                    return Ok(None);
+                };
+                chunk_with(Delta {
+                    tool_calls: Some(vec![DeltaToolCall {
+                        index: ordinal,
+                        id: None,
+                        function: Some(DeltaFunctionCall {
+                            name: None,
+                            arguments: Some(delta.clone()),
+                        }),
+                    }]),
+                    ..Default::default()
+                })
+            }
+            E::OutputTextDelta { delta, .. } => chunk_with(Delta {
+                content: Some(delta.clone()),
+                ..Default::default()
+            }),
+            // The reasoning text, tagged with the item it belongs to: this wire
+            // replays the item, so the tag travels with the text.
+            E::ReasoningTextDelta { item_id, delta, .. } => chunk_with(Delta {
+                reasoning_content: Some(delta.clone()),
+                reasoning_item_id: Some(item_id.clone()),
+                ..Default::default()
+            }),
+            // An endpoint that reports its reasoning as a summary instead —
+            // OpenAI's own models do — reveals the same text under another
+            // event. It is shown, and it is deliberately not tagged: a summary
+            // is not the reasoning item's content, and replaying it as one
+            // would put words in the model's mouth.
+            E::ReasoningSummaryTextDelta { delta, .. } => chunk_with(Delta {
+                reasoning_content: Some(delta.clone()),
+                ..Default::default()
+            }),
+            // The answer's end. The status is the wire's own word for whether
+            // the answer is whole; an incomplete one names why, in the words
+            // `Reply::truncation` reads.
+            E::Completed { response, .. } => {
+                end_chunk("stop".to_string(), usage_of(response.usage.as_ref()))
+            }
+            E::Incomplete { response, .. } => end_chunk(
+                incomplete_reason(response.incomplete_details.as_ref()),
+                usage_of(response.usage.as_ref()),
+            ),
+            // An answer that failed is not an answer: the caller must not read
+            // it as one.
+            E::Failed { response, .. } => {
+                let why = response
+                    .error
+                    .as_ref()
+                    .map(|e| format!("{}: {}", e.code, e.message))
+                    .unwrap_or_else(|| "the endpoint reported no reason".to_string());
+                bail!("the response failed: {why}");
+            }
+            // The deltas already carried the whole of these, the item
+            // boundaries carry nothing to fold, and an event type this crate
+            // does not know yet is read past rather than refused.
+            _ => return Ok(None),
+        };
+        Ok(Some(chunk))
+    }
+}
+
+/// The chunk an answer's end rides on: no delta, the wire's word for why it
+/// stopped, and the counts it reported with them.
+fn end_chunk(finish_reason: String, usage: Option<Usage>) -> ChatChunk {
+    ChatChunk {
+        choices: vec![crate::types::ChunkChoice {
+            delta: None,
+            finish_reason: Some(finish_reason),
+        }],
+        usage,
+    }
+}
+
+/// Why an incomplete answer stopped, in the word the caller reads it under. A
+/// ceiling is reported as the chat wire's own word for the same thing, so one
+/// notice covers both wires; every other reason is passed through as the wire
+/// spelled it, which is what the trace records.
+fn incomplete_reason(details: Option<&openai::IncompleteDetails>) -> String {
+    match details.and_then(|d| d.reason.as_deref()) {
+        Some("max_output_tokens") => "max_tokens".to_string(),
+        Some(reason) => reason.to_string(),
+        None => "incomplete".to_string(),
+    }
+}
+
+/// The counts in this crate's spelling. This wire reports the same cache
+/// breakdown the chat wire does — nested, and only when it has one to report —
+/// so the local shape keeps it nested too: details the endpoint left out mean
+/// it said nothing, which is not the same as a reported zero.
+fn usage_of(usage: Option<&openai::ResponseUsageSummary>) -> Option<Usage> {
+    let usage = usage?;
+    Some(Usage {
+        prompt_tokens: usage.input_tokens,
+        completion_tokens: usage.output_tokens,
+        total_tokens: usage.total_tokens,
+        prompt_cache_hit_tokens: 0,
+        prompt_cache_miss_tokens: 0,
+        prompt_tokens_details: usage
+            .input_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+            .map(|cached_tokens| crate::types::PromptTokensDetails { cached_tokens }),
+    })
+}
+
+// ============================================================================
+// The agent's `Message` → the Responses request shape.
+//
+// This wire takes the conversation as `input`: a list of items in the order
+// they happened, not a list of messages with a role each. The mapping is
+// therefore not one message to one item — an assistant turn is the reasoning
+// it did, what it said, and the calls it declared — and, being a list, it is
+// also where a turn's tool results land as items of their own.
+//
+// The system prompt rides in `instructions`, beside the conversation rather
+// than inside it, which is where this wire keeps a prompt that is not a turn.
+// ============================================================================
+
+/// Build the SDK's request for the agent's internal message list.
+pub fn responses_request(
+    model: &str,
+    max_output_tokens: u32,
+    instructions: &str,
+    messages: &[Message],
+    tools: Option<&[ToolDef]>,
+    reasoning_effort: Option<&str>,
+) -> openai::ResponseCreateRequest {
+    let mut input: Vec<openai::ResponseInputItem> = Vec::with_capacity(messages.len());
+    for message in messages {
+        push_input_items(&mut input, message);
+    }
+    let mut request =
+        openai::ResponseCreateRequest::streaming(model, openai::ResponseInput::items(input))
+            .with_instructions(instructions)
+            .with_max_output_tokens(max_output_tokens)
+            // The only mode this program ever asks for, and the only one this wire's
+            // endpoints accept: which call runs is the approval gate's business, not
+            // the request's.
+            .with_tool_choice(openai::ResponseToolChoice::auto());
+    if let Some(defs) = tools {
+        for def in defs {
+            // Not a strict schema: the backend validates the arguments against
+            // it when `strict` is set, and these tools' parameters carry
+            // optional fields a strict validator refuses to accept as-is.
+            request = request.with_tool(openai::ResponseTool::from_function_tool(
+                openai::ResponseFunctionTool::new(
+                    def.function.name.clone(),
+                    def.function
+                        .parameters
+                        .clone()
+                        .unwrap_or_else(|| json!({"type": "object"})),
+                )
+                .with_strict(false)
+                .with_description(def.function.description.clone().unwrap_or_default()),
+            ));
+        }
+    }
+    if let Some(effort) = reasoning_effort.and_then(openai::ResponsesReasoningEffort::from_name) {
+        request = request.with_reasoning(openai::ReasoningConfig::with_effort(effort));
+    }
+    request
+}
+
+/// One agent-internal message as the items this wire replays it as.
+///
+/// The reasoning comes first because that is the order the model produced it
+/// in, and this wire asks for the items back in the order it wrote them: the
+/// chain of thought, then what was said, then what was called — or, for a tool
+/// result, the one output item that answers a call.
+fn push_input_items(items: &mut Vec<openai::ResponseInputItem>, message: &Message) {
+    match message.role {
+        crate::types::Role::System => items.push(openai::ResponseInputItem::Message(
+            openai::EasyInputMessage::system(content_to_input(message.content.as_ref())),
+        )),
+        crate::types::Role::User => items.push(openai::ResponseInputItem::Message(
+            openai::EasyInputMessage::user(content_to_input(message.content.as_ref())),
+        )),
+        crate::types::Role::Assistant => {
+            for item in message.reasoning.iter().flatten() {
+                items.push(openai::ResponseInputItem::Reasoning(
+                    openai::ReasoningItemInput::new(item.id.clone(), item.text.clone()),
+                ));
+            }
+            // A turn that only called tools has nothing to say, and an empty
+            // assistant message is not a thing this wire has: the calls below
+            // carry the turn on their own.
+            if let Some(text) = message.text().filter(|text| !text.is_empty()) {
+                items.push(openai::ResponseInputItem::Message(
+                    openai::EasyInputMessage::assistant(text),
+                ));
+            }
+            for call in message.tool_calls.iter().flatten() {
+                items.push(openai::ResponseInputItem::FunctionCall(
+                    openai::ResponseFunctionToolCall::replay(
+                        call.id.clone(),
+                        call.function.name.clone(),
+                        call.function.arguments.clone(),
+                    ),
+                ));
+            }
+        }
+        crate::types::Role::Tool => items.push(openai::ResponseInputItem::FunctionCallOutput(
+            openai::FunctionCallOutputItem::new(
+                message.tool_call_id.clone().unwrap_or_default(),
+                message.text().unwrap_or_default(),
+            ),
+        )),
+    }
+}
+
+/// A message's content in this wire's vocabulary: the string it is, or the
+/// parts its images become — `input_text` runs and `input_image` sources, which
+/// is what a `data:` URL is on this wire too.
+fn content_to_input(content: Option<&Content>) -> openai::ResponseInputContent {
+    match content {
+        Some(Content::Parts(parts)) => {
+            openai::ResponseInputContent::Parts(parts.iter().map(input_content_part).collect())
+        }
+        Some(Content::Text(text)) => openai::ResponseInputContent::Text(text.clone()),
+        None => openai::ResponseInputContent::Text(String::new()),
+    }
+}
+
+fn input_content_part(part: &ContentPart) -> openai::ResponseInputContentPart {
+    if let Some(text) = &part.text {
+        openai::ResponseInputContentPart::text(text.clone())
+    } else if let Some(image) = &part.image_url {
+        openai::ResponseInputContentPart::image_url(image.url.clone())
+    } else {
+        // An empty part is rare; serde would have rejected it on the way in,
+        // but be defensive.
+        openai::ResponseInputContentPart::text(String::new())
     }
 }
 
@@ -669,7 +1036,7 @@ pub mod test_helpers {
 mod tests {
     use super::test_helpers as h;
     use super::*;
-    use crate::provider::MINIMAX;
+    use crate::provider::{MIMO, MINIMAX};
     use crate::types::TurnAccumulator;
 
     // -----------------------------------------------------------------------
@@ -730,6 +1097,7 @@ mod tests {
                 thinking: "thought".into(),
                 signature: "sig".into(),
             }]),
+            reasoning: None,
         };
         let req = openai_request("minimax", 131_072, &[msg], None, None, false, None);
         let v: serde_json::Value = serde_json::to_value(&req).unwrap();
@@ -1133,6 +1501,7 @@ mod tests {
         let openai =
             Client::new("k".into(), "http://127.0.0.1:1/never".into(), Wire::OpenAi).unwrap();
         let mini = Client::new("k".into(), MINIMAX.url.into(), Wire::Anthropic).unwrap();
+        let responses = Client::new("k".into(), MIMO.url.into(), Wire::Responses).unwrap();
         let meta = crate::session::SessionMeta {
             provider: Some("minimax".into()),
             model: "MiniMax-M3".into(),
@@ -1163,5 +1532,322 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("does not match"), "{err}");
+
+        // The two OpenAI-shaped wires are one client type but not one pair: a
+        // chat request sent to a Responses endpoint is the same misuse, and is
+        // caught the same way.
+        let err = responses
+            .stream_chat(&openai_request)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match"), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // The Responses wire.
+    // -----------------------------------------------------------------------
+
+    /// A body of Responses SSE events as the SDK reads it, adapted by the
+    /// stream the interpreter folds: the same bytes a mock endpoint would
+    /// answer with. The field lines are the endpoint's own spelling — no space
+    /// after the colon, which is what MiMo writes.
+    fn responses_stream(body: &str) -> ChunkStream {
+        let bytes = bytes::Bytes::from(body.to_owned());
+        let events = futures_util::stream::iter(vec![Ok(bytes)]);
+        ChunkStream::Responses(ResponsesStream::new(openai::ResponseEventStream::new(
+            Box::pin(events),
+        )))
+    }
+
+    /// One event in MiMo's own spelling.
+    fn responses_event(payload: serde_json::Value) -> String {
+        format!(
+            "event:{kind}\ndata:{payload}\n\n",
+            kind = payload["type"].as_str().unwrap_or("")
+        )
+    }
+
+    /// A turn as the live endpoint streams it: a reasoning item, a function
+    /// call with sharded arguments, and the completed event with the cache
+    /// breakdown. Captured from `api.xiaomimimo.com`, trimmed of the part
+    /// boundaries nothing folds.
+    fn mimo_tool_turn() -> String {
+        [
+            responses_event(serde_json::json!({"type":"response.created","sequence_number":0,"response":{"id":"resp_1","status":"in_progress"}})),
+            responses_event(serde_json::json!({"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"rs_1","type":"reasoning","summary":[],"content":[],"status":"in_progress"}})),
+            responses_event(serde_json::json!({"type":"response.reasoning_text.delta","sequence_number":2,"item_id":"rs_1","output_index":0,"content_index":0,"delta":"I should run "})),
+            responses_event(serde_json::json!({"type":"response.reasoning_text.delta","sequence_number":3,"item_id":"rs_1","output_index":0,"content_index":0,"delta":"a command."})),
+            responses_event(serde_json::json!({"type":"response.output_item.added","sequence_number":4,"output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Bash","arguments":"","status":"in_progress"}})),
+            responses_event(serde_json::json!({"type":"response.function_call_arguments.delta","sequence_number":5,"item_id":"fc_1","output_index":1,"delta":"{\"command\": "})),
+            responses_event(serde_json::json!({"type":"response.function_call_arguments.delta","sequence_number":6,"item_id":"fc_1","output_index":1,"delta":"\"echo hi\"}"})),
+            responses_event(serde_json::json!({"type":"response.output_item.done","sequence_number":7,"output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Bash","arguments":"{\"command\": \"echo hi\"}","status":"completed"}})),
+            responses_event(serde_json::json!({"type":"response.completed","sequence_number":8,"response":{"id":"resp_1","status":"completed","incomplete_details":null,"output":[{"id":"rs_1","type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"I should run a command."}],"status":"completed"},{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Bash","arguments":"{\"command\": \"echo hi\"}","status":"completed"}],"usage":{"input_tokens":257,"input_tokens_details":{"cached_tokens":192},"output_tokens":17,"output_tokens_details":{"reasoning_tokens":14},"total_tokens":274}}})),
+        ]
+        .concat()
+    }
+
+    #[tokio::test]
+    async fn responses_stream_folds_a_tool_turn_into_one_message() {
+        let mut sse = responses_stream(&mimo_tool_turn());
+        let mut accumulator = TurnAccumulator::default();
+        let mut usage = None;
+        let mut finish = None;
+        while let Some(chunk) = sse.next_chunk().await.unwrap() {
+            for choice in chunk.choices {
+                if let Some(reason) = choice.finish_reason {
+                    finish = Some(reason);
+                }
+                if let Some(delta) = choice.delta {
+                    accumulator.feed(&delta);
+                }
+            }
+            if chunk.usage.is_some() {
+                usage = chunk.usage;
+            }
+        }
+        let message = accumulator.finish();
+        // The call is one call, sharded over two argument deltas, under the
+        // call id its result will be addressed by — not the item id.
+        let calls = message.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.name, "Bash");
+        assert_eq!(calls[0].function.arguments, r#"{"command": "echo hi"}"#);
+        // The reasoning is one item, under the id the endpoint gave it, and the
+        // flat text is there for the front end to show.
+        let reasoning = message.reasoning.as_ref().unwrap();
+        assert_eq!(reasoning.len(), 1);
+        assert_eq!(reasoning[0].id, "rs_1");
+        assert_eq!(reasoning[0].text, "I should run a command.");
+        assert_eq!(
+            message.reasoning_content.as_deref(),
+            Some("I should run a command.")
+        );
+        // The end of the answer, and the prompt-cache counts it carried.
+        assert_eq!(finish.as_deref(), Some("stop"));
+        let usage = usage.expect("the completed event carries the usage");
+        assert_eq!(usage.prompt_tokens, 257);
+        assert_eq!(usage.completion_tokens, 17);
+        let cache = usage.cache().expect("a breakdown was reported");
+        assert_eq!((cache.hit, cache.miss), (192, 65));
+    }
+
+    #[tokio::test]
+    async fn responses_stream_reports_an_answer_that_hit_the_ceiling() {
+        let body = responses_event(serde_json::json!({
+            "type":"response.incomplete",
+            "sequence_number":0,
+            "response":{
+                "id":"resp_1",
+                "status":"incomplete",
+                "incomplete_details":{"reason":"max_output_tokens"},
+                "usage":{"input_tokens":10,"output_tokens":131_072,"total_tokens":131_082}
+            }
+        }));
+        let mut sse = responses_stream(&body);
+        let chunk = sse.next_chunk().await.unwrap().unwrap();
+        // The word `Reply::truncation` knows, whatever this wire calls it.
+        assert_eq!(
+            chunk.choices[0].finish_reason.as_deref(),
+            Some("max_tokens")
+        );
+        assert!(sse.next_chunk().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn responses_stream_without_a_breakdown_reports_no_cache_figure() {
+        // The endpoint said nothing about the cache; that is not a report of
+        // zero, and the status line shows `—` rather than inventing one.
+        let body = responses_event(serde_json::json!({
+            "type":"response.completed",
+            "sequence_number":0,
+            "response":{"id":"resp_1","status":"completed","usage":{"input_tokens":7,"output_tokens":1,"total_tokens":8}}
+        }));
+        let mut sse = responses_stream(&body);
+        let chunk = sse.next_chunk().await.unwrap().unwrap();
+        assert!(chunk.usage.unwrap().cache().is_none());
+    }
+
+    #[tokio::test]
+    async fn responses_stream_fails_on_a_failed_response() {
+        let body = responses_event(serde_json::json!({
+            "type":"response.failed",
+            "sequence_number":0,
+            "response":{"id":"resp_1","status":"failed","error":{"code":"server_error","message":"upstream exploded"}}
+        }));
+        let mut sse = responses_stream(&body);
+        let err = sse.next_chunk().await.unwrap_err().to_string();
+        assert!(err.contains("server_error"), "{err}");
+        assert!(err.contains("upstream exploded"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn responses_stream_reads_past_what_it_does_not_fold() {
+        // Part boundaries, the summary events of an endpoint that reports its
+        // reasoning that way, and an event type this crate has never seen: none
+        // of them is a reason to stop reading, and the text that arrives still
+        // arrives.
+        let body = [
+            responses_event(serde_json::json!({"type":"response.content_part.added","sequence_number":0,"item_id":"rs_1","output_index":0,"content_index":0,"part":{"type":"reasoning_text","text":""}})),
+            responses_event(serde_json::json!({"type":"response.reasoning_summary_text.delta","sequence_number":1,"item_id":"rs_1","output_index":0,"summary_index":0,"delta":"thinking"})),
+            responses_event(serde_json::json!({"type":"response.future_event","sequence_number":2,"whatever":true})),
+            responses_event(serde_json::json!({"type":"response.output_text.delta","sequence_number":3,"item_id":"msg_1","output_index":1,"content_index":0,"delta":"hi"})),
+        ]
+        .concat();
+        let mut sse = responses_stream(&body);
+        let mut texts = Vec::new();
+        while let Some(chunk) = sse.next_chunk().await.unwrap() {
+            for choice in chunk.choices {
+                if let Some(delta) = choice.delta
+                    && let Some(text) = delta.content
+                {
+                    texts.push(text);
+                }
+            }
+        }
+        assert_eq!(texts, vec!["hi".to_string()]);
+    }
+
+    #[test]
+    fn responses_request_carries_instructions_items_and_tools() {
+        let history = vec![
+            Message::user("run it"),
+            Message {
+                role: crate::types::Role::Assistant,
+                content: Some("calling".into()),
+                reasoning_content: Some("I should run a command.".into()),
+                tool_calls: Some(vec![crate::types::ToolCall {
+                    id: "call_1".into(),
+                    r#type: "function".into(),
+                    function: crate::types::ToolCallFunction {
+                        name: "Bash".into(),
+                        arguments: r#"{"command":"echo hi"}"#.into(),
+                    },
+                }]),
+                tool_call_id: None,
+                thinking: None,
+                reasoning: Some(vec![crate::types::ReasoningItem {
+                    id: "rs_1".into(),
+                    text: "I should run a command.".into(),
+                }]),
+            },
+            Message::tool("call_1", "exit_code: 0\nhi"),
+        ];
+        // The thinking block of the *other* wire rides along to prove it is
+        // dropped: this wire has no field for a signed block.
+        let mut carried = history.clone();
+        carried[1].thinking = Some(vec![crate::types::ThinkingBlock {
+            thinking: "other wire".into(),
+            signature: "sig".into(),
+        }]);
+        let request = responses_request(
+            "mimo-v2.5-pro",
+            131_072,
+            "You are caocli.\n\nproject rules",
+            &carried,
+            None,
+            Some("high"),
+        );
+        let v: serde_json::Value = serde_json::to_value(&request).unwrap();
+        assert_eq!(v["model"], "mimo-v2.5-pro");
+        assert_eq!(v["stream"], true);
+        assert_eq!(v["max_output_tokens"], 131_072);
+        assert_eq!(v["instructions"], "You are caocli.\n\nproject rules");
+        assert_eq!(v["tool_choice"], "auto");
+        assert_eq!(v["reasoning"]["effort"], "high");
+        // The items, in the order the model produced them: what it thought,
+        // what it said, what it called — then the result that answers the call.
+        let items = v["input"].as_array().unwrap();
+        let kinds: Vec<&str> = items.iter().map(|i| i["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "message",
+                "reasoning",
+                "message",
+                "function_call",
+                "function_call_output"
+            ]
+        );
+        assert_eq!(items[0]["role"], "user");
+        assert_eq!(items[1]["id"], "rs_1");
+        assert_eq!(items[1]["content"][0]["type"], "reasoning_text");
+        assert_eq!(items[1]["content"][0]["text"], "I should run a command.");
+        assert_eq!(items[2]["role"], "assistant");
+        assert_eq!(items[2]["content"], "calling");
+        assert_eq!(items[3]["call_id"], "call_1");
+        assert_eq!(items[3]["name"], "Bash");
+        assert_eq!(items[3]["arguments"], r#"{"command":"echo hi"}"#);
+        assert_eq!(items[4]["call_id"], "call_1");
+        assert_eq!(items[4]["output"], "exit_code: 0\nhi");
+        // The fields this wire does not have are absent rather than empty, and
+        // every item carries exactly one `type` key of its own — a second one
+        // would be a JSON object with the same key twice.
+        for item in items {
+            let parts = item["content"].as_array().map_or(0, Vec::len);
+            let text = serde_json::to_string(item).unwrap();
+            assert_eq!(
+                text.matches("\"type\"").count(),
+                1 + parts,
+                "the item's own type and its content parts: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn responses_request_omits_an_empty_assistant_turn_and_an_unknown_tier() {
+        // A turn that only called tools says nothing, and this wire has no
+        // empty assistant message: the calls carry it.
+        let history = vec![Message {
+            role: crate::types::Role::Assistant,
+            content: Some("".into()),
+            reasoning_content: None,
+            tool_calls: Some(vec![crate::types::ToolCall {
+                id: "call_1".into(),
+                r#type: "function".into(),
+                function: crate::types::ToolCallFunction {
+                    name: "Bash".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            tool_call_id: None,
+            thinking: None,
+            reasoning: None,
+        }];
+        let request = responses_request(
+            "mimo-v2.5-pro",
+            131_072,
+            "sys",
+            &history,
+            None,
+            // A tier this crate's enum has no word for: left unsent rather than
+            // guessed at, which leaves the endpoint's own default in force.
+            Some("max"),
+        );
+        let v: serde_json::Value = serde_json::to_value(&request).unwrap();
+        let items = v["input"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "function_call");
+        assert!(v.get("reasoning").is_none(), "{v}");
+    }
+
+    #[test]
+    fn responses_request_offers_the_tools_with_the_strict_flag_the_endpoint_lists() {
+        let tools = crate::tools::definitions();
+        let request = responses_request(
+            "mimo-v2.5-pro",
+            131_072,
+            "sys",
+            &[],
+            Some(&tools[..1]),
+            None,
+        );
+        let v: serde_json::Value = serde_json::to_value(&request).unwrap();
+        let tool = &v["tools"][0];
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["name"], tools[0].function.name);
+        assert_eq!(tool["strict"], false);
+        assert!(tool["parameters"]["type"].is_string());
     }
 }
