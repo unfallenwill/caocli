@@ -27,6 +27,7 @@ use tokio::sync::oneshot;
 
 use crate::ui::Verdict;
 use crate::ui::cell::{self, Cell, Style, Thought, ThoughtStatus};
+use crate::ui::glyphs;
 
 use super::edit::Edit;
 use super::notice::{AppNotice, MachineNotice};
@@ -422,7 +423,7 @@ impl State {
         if parts.is_empty() {
             None
         } else {
-            Some(parts.join(" · "))
+            Some(parts.join(glyphs::sep()))
         }
     }
 

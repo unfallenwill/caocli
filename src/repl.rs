@@ -15,7 +15,9 @@ use crate::image;
 use crate::provider;
 use crate::session::{self, Session};
 use crate::ui::Front;
+use crate::ui::glyphs;
 use crate::ui::text::{padded, width};
+use crate::ui::theme;
 use crate::ui::{Approve, Ask, Cancel};
 
 /// What a submitted line asked for.
@@ -583,6 +585,13 @@ pub fn debug_summary(agent: &Agent) -> String {
     if let Some(provider) = agent.provider_meta() {
         out.push_str(&format!("provider:  {}\n", provider));
     }
+    // How the screen is painted, which is the one thing about a session that is
+    // decided before it starts and cannot be asked again from inside it. The two
+    // defaults -- `auto` for the palette, `unicode` for the glyphs -- are the two
+    // that can come out differently from what the user wrote, so this is where a
+    // reader finds out what the terminal said.
+    out.push_str(&format!("theme:  {}\n", theme::theme().describe()));
+    out.push_str(&format!("glyphs:  {}\n", glyphs::get().name()));
     out
 }
 

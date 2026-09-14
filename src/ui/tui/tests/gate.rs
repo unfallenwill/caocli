@@ -14,7 +14,7 @@ use tokio::sync::{oneshot, watch};
 
 use crate::ui::Verdict;
 
-use super::super::input::{SECRET_MASK, SECRET_PLACEHOLDER};
+use super::super::input::{secret_mask, secret_placeholder};
 use super::super::state::State;
 use super::all_rows;
 use super::row;
@@ -120,7 +120,7 @@ fn a_secret_is_typed_into_the_box_and_answered_with_what_was_typed() {
     state.open_secret("glm API key".into(), reply);
     assert_eq!(
         state.edit.textarea.mask_char(),
-        Some(SECRET_MASK),
+        Some(secret_mask()),
         "the text is not on the screen while it is typed"
     );
     type_while_working(&mut state, "sk-test", &cancel);
@@ -165,7 +165,7 @@ fn the_answer_to_a_secret_never_reaches_the_transcript_or_the_queue() {
         drawn.contains("glm API key"),
         "the question is on the screen"
     );
-    assert!(drawn.contains(SECRET_MASK), "masked, not in the clear");
+    assert!(drawn.contains(secret_mask()), "masked, not in the clear");
     assert!(!drawn.contains("sk-do-not-keep-me"), "{drawn}");
     screen
         .state
@@ -189,7 +189,7 @@ fn what_is_drawn_while_a_secret_is_asked_for_says_what_the_box_wants() {
     screen.draw().unwrap();
     let last = screen.terminal.backend().buffer().area.height - 1;
     assert!(
-        row(&screen, last - 2).contains(SECRET_PLACEHOLDER),
+        row(&screen, last - 2).contains(&secret_placeholder()),
         "the box says what Enter does with it: {:?}",
         row(&screen, last - 2)
     );

@@ -63,6 +63,18 @@ pub struct Cli {
     #[arg(long)]
     pub resume: Option<String>,
 
+    /// Palette to paint with: `ink` (the default on a dark terminal), `paper`
+    /// (for a light one), or `auto` to let the terminal say. Overrides the
+    /// `theme` key in `~/.caocli/settings.json`.
+    #[arg(long, value_name = "NAME")]
+    pub theme: Option<String>,
+
+    /// Which characters to draw with: `unicode` (the default) or `ascii`, for a
+    /// terminal that widens ambiguous characters or whose font is missing some.
+    /// Overrides the `glyphs` key in `~/.caocli/settings.json`.
+    #[arg(long, value_name = "SET")]
+    pub glyphs: Option<String>,
+
     /// List sessions and exit
     #[arg(long)]
     pub list: bool,

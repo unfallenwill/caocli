@@ -419,7 +419,7 @@ fn draw_box(frame: &mut Frame, state: &State, area: Rect) {
         area,
     );
     frame.render_widget(
-        Paragraph::new(Line::styled(cell::USER_MARKER, style_of(Style::Dim))),
+        Paragraph::new(Line::styled(cell::user_marker(), style_of(Style::Dim))),
         box_marker(area),
     );
     let field = box_field(area);

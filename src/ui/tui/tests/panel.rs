@@ -14,7 +14,7 @@ use tokio::sync::{oneshot, watch};
 
 use crate::tools::ask::{Answer, Choice, Question};
 
-use super::super::panel::PANEL_PLACEHOLDER;
+use super::super::panel::panel_placeholder;
 use super::super::state::State;
 use super::all_rows;
 
@@ -263,7 +263,7 @@ fn a_panel_left_open_when_the_turn_ends_answers_nothing() {
 fn the_box_says_what_it_is_for_while_a_question_is_open() {
     let mut state = State::default();
     let _answers = open(&mut state, vec![two_options(false)]);
-    assert_eq!(state.placeholder(), PANEL_PLACEHOLDER);
+    assert_eq!(state.placeholder(), panel_placeholder());
 }
 
 #[test]
