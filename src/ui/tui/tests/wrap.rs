@@ -14,6 +14,7 @@ use crate::ui::cell::wrap::wrapped_lines;
 use crate::ui::cell::{Cell, Span, Style};
 use crate::ui::paint::MEASURE;
 use crate::ui::text;
+use ratatui::style::Modifier;
 
 use super::super::layout::BOX_ROWS;
 use super::all_rows;
@@ -171,9 +172,26 @@ fn breaking_exactly_at_the_width_does_not_add_a_blank_line() {
 
 #[test]
 fn wrapping_keeps_each_span_in_its_own_style() {
+    // The two styles of a wrapped line: each carries its own foreground, which
+    // is the palette's, not a modifier that a theme could lose. `Dim` is the
+    // theme's comment colour, `Plain` is the foreground.
     let spans = [Span::new(Style::Dim, "ab"), Span::new(Style::Plain, "cd")];
     let lines = wrapped_lines(&spans, 4);
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0].spans.len(), 2, "two styles on one line");
-    assert_eq!(lines[0].spans[0].style.fg, None, "dim is a modifier");
+    assert_eq!(
+        lines[0].spans[0].style.fg,
+        Some(ratatui::style::Color::Rgb(98, 114, 164)),
+        "secondary text is the comment colour"
+    );
+    assert_eq!(
+        lines[0].spans[1].style.fg,
+        Some(ratatui::style::Color::Rgb(248, 248, 242)),
+        "body text is the foreground"
+    );
+    // Neither carries the DIM modifier: the colour is the only styling the
+    // palette applies, and a theme that ignores SGR 2 sees a colour, not a flag.
+    for s in &lines[0].spans {
+        assert!(!s.style.add_modifier.contains(Modifier::DIM), "{s:?}");
+    }
 }
