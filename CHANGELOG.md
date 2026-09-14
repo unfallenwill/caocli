@@ -26,6 +26,25 @@ semantic-version bumps per release.
   HTML, footnotes and math are dropped silently -- emitting the raw
   bytes would put angle brackets on the screen.
 
+### Changed — system prompt tells the model what the TUI renders
+
+- The system prompt used to be one paragraph: the role, the routing
+  rule, and a `Keep answers concise` reminder. The model defaulted to
+  GitHub-Flavored Markdown regardless, so a heading or a code block
+  landed on the screen as raw markers when the cell layer had not been
+  told how to read them. The prompt now carries a short `Formatting:`
+  paragraph that says: use GFM where it makes the answer easier to
+  scan; reserve lists, fenced code blocks, and headings for substantive
+  answers and leave short replies as plain sentences; inline commands,
+  file paths, and env vars between backticks; the TUI renders fenced
+  and inline code, emphasis, lists, blockquotes, and headings, tables
+  show as raw indented markdown, HTML and footnotes do not render so
+  emit plain text instead. The two frozen wire-prefix snapshots
+  (`the_request_prefix_is_frozen` and
+  `the_anthropic_request_prefix_is_frozen`) were updated to match: by
+  design they fail on any change to the system prompt, so the cache
+  contract is revisited every time the wording moves.
+
 ### Changed — the transcript fills the terminal
 
 - The screen front end used to lay every line out to at most 100 columns,
