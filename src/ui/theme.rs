@@ -23,11 +23,6 @@
 //! `#282a36` background it reads as a line that is not there. The weight is
 //! carried by the colour, which is one of the palette's deliberate choices
 //! rather than a terminal's rendering hint.
-//
-// Everything in this module is the palette's answer to the cell layer's
-// `Style`. The two backends wire to it from commits that follow this one; for
-// now nothing reaches in, and the dead-code warnings are the seam.
-#![allow(dead_code, unused_imports)]
 
 use ratatui::style::{Color, Modifier, Style as RStyle};
 

@@ -17,7 +17,7 @@ fn reasoning_then_content_are_separate_blocks() {
     r.finish_turn();
     assert_eq!(
         String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-        "\x1b[2m┆ thinking...\x1b[0m\n\nanswer\x1b[0m\n"
+        "\x1b[38;2;98;114;164m┆ thinking...\x1b[0m\n\n\x1b[38;2;248;248;242manswer\x1b[0m\n"
     );
 }
 
@@ -29,7 +29,7 @@ fn content_then_reasoning_second_subturn_separated() {
     r.finish_turn();
     assert_eq!(
         String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-        "partial\x1b[0m\n\n\x1b[2m┆ more thinking\x1b[0m\n"
+        "\x1b[38;2;248;248;242mpartial\x1b[0m\n\n\x1b[38;2;98;114;164m┆ more thinking\x1b[0m\n"
     );
 }
 
@@ -52,7 +52,7 @@ fn content_only_has_no_leading_separator() {
     r.finish_turn();
     assert_eq!(
         String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-        "hi\x1b[0m\n"
+        "\x1b[38;2;248;248;242mhi\x1b[0m\n"
     );
 }
 
@@ -63,7 +63,7 @@ fn reasoning_only_block_closes_cleanly() {
     r.finish_turn();
     assert_eq!(
         String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-        "\x1b[2m┆ hmm\x1b[0m\n"
+        "\x1b[38;2;98;114;164m┆ hmm\x1b[0m\n"
     );
 }
 
@@ -77,7 +77,7 @@ fn same_mode_deltas_do_not_reopen_block() {
     r.finish_turn();
     assert_eq!(
         String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
-        "\x1b[2m┆ ab\x1b[0m\n\nxy\x1b[0m\n"
+        "\x1b[38;2;98;114;164m┆ ab\x1b[0m\n\n\x1b[38;2;248;248;242mxy\x1b[0m\n"
     );
 }
 
@@ -118,10 +118,14 @@ fn a_running_commands_output_is_written_as_it_arrives() {
         s.contains("✔ Bash echo one; echo two · exit_code: 0"),
         "{s:?}"
     );
-    // Streamed output is dim; the marker is the header's, not the chunk's.
-    // The second line carries the continuation indent, since the chunk
-    // before it ended with a newline.
-    assert!(s.contains("\x1b[2mone\n  two\x1b[0m\n"), "{s:?}");
+    // Streamed output is the palette's secondary colour, set in by `SgrSink`:
+    // a chunk in `Dim` opens that colour once, the block's marker is the
+    // header's, not the chunk's. The second line carries the continuation
+    // indent, since the chunk before it ended with a newline.
+    assert!(
+        s.contains("\x1b[38;2;98;114;164mone\n  two\x1b[0m\n"),
+        "{s:?}"
+    );
     // Nothing is left on the line the last chunk ended: a chunk that ends with a
     // break ends the block, and the cell after it follows on the next line.
     assert!(!s.contains("  \n"), "no line of nothing but columns: {s:?}");
@@ -139,7 +143,10 @@ fn a_chunk_after_a_break_continues_the_line_it_started() {
     r.tool_output("three");
     r.tool_result("exit_code: 0");
     let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-    assert!(s.contains("\x1b[2mone\n  two\n  three\x1b[0m\n"), "{s:?}");
+    assert!(
+        s.contains("\x1b[38;2;98;114;164mone\n  two\n  three\x1b[0m\n"),
+        "{s:?}"
+    );
 }
 
 /// Nothing is written for a command that printed nothing: an empty chunk is not a
@@ -156,7 +163,7 @@ fn an_empty_chunk_opens_no_block() {
     // and the verdict.
     assert_eq!(
         s,
-        "\x1b[1;32m✔ Bash : # prints nothing · exit_code: 0\x1b[0m\n"
+        "\x1b[1m\x1b[38;2;80;250;123m✔ Bash : # prints nothing · exit_code: 0\x1b[0m\n"
     );
 }
 
@@ -185,9 +192,12 @@ fn replay_renders_history_compactly_with_colors() {
         Message::system("must not appear"),
     ]);
     let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-    assert!(s.contains("\x1b[2m› \x1b[0mtake a look"), "{s}");
     assert!(
-        s.contains("\x1b[2m┆ let me think\x1b[0m"),
+        s.contains("\x1b[38;2;98;114;164m› \x1b[0m\x1b[38;2;248;248;242mtake a look"),
+        "{s}"
+    );
+    assert!(
+        s.contains("\x1b[38;2;98;114;164m┆ let me think\x1b[0m"),
         "thinking is set in behind its own rule: {s}"
     );
     assert!(s.contains("running it"), "{s}");
@@ -220,10 +230,16 @@ fn replay_shows_an_attached_image_beside_the_line_it_came_with() {
         vec!["data:image/png;base64,Zm9vYmFy".into()],
     )]);
     let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-    assert!(s.contains("\x1b[2m› \x1b[0mwhat is this?"), "{s}");
+    assert!(
+        s.contains("\x1b[38;2;98;114;164m› \x1b[0m\x1b[38;2;248;248;242mwhat is this?"),
+        "{s}"
+    );
     // The image is a line of the same cell: set in the columns the words are in,
     // and never its bytes, which go to the backend and stay in the log.
-    assert!(s.contains("\x1b[2m\n  [image png · 6 bytes]\x1b[0m"), "{s}");
+    assert!(
+        s.contains("\x1b[38;2;98;114;164m\n  [image png · 6 bytes]\x1b[0m"),
+        "{s}"
+    );
     assert!(!s.contains("Zm9vYmFy"), "the bytes are not shown: {s}");
 }
 
@@ -339,27 +355,29 @@ fn the_plain_front_ends_stream_is_frozen() {
     r.teardown();
 
     // Frozen against the bytes this front end writes today: a move that
-    // changes any of them is a rewrite, not a move.
+    // changes any of them is a rewrite, not a move. Every escape here is the
+    // Dracula palette -- secondary text in the comment colour, body text in
+    // the foreground, weight on the painted styles.
     let expected = concat!(
         // The pinned row is now cache-only: "cache 0.0% · 0/0" is 18
         // columns, so the bar pads 80-18=62 spaces to put it flush with
         // the right edge. The model + effort are gone from this row.
         "\x1b[24;1H\x1b[2K\x1b[1;23r\x1b[23;1H",
         "\x1b7\x1b[24;1H\x1b[2K                                                               ",
-        "\x1b[2mcache 0.0% · 0/0\x1b[0m\x1b8",
-        // the banner is an info cell
-        "\x1b[2m* caocli · session 20260910-213122 (2 messages) · deepseek-v4-pro\x1b[0m\n",
+        "\x1b[38;2;98;114;164mcache 0.0% · 0/0\x1b[0m\x1b8",
+        // the banner is an info cell, set in behind its own marker
+        "\x1b[38;2;98;114;164m* caocli · session 20260910-213122 (2 messages) · deepseek-v4-pro\x1b[0m\n",
         "\n",
-        "\x1b[2m› \x1b[0mtake a look\x1b[0m\n",
-        "\x1b[2m┆ let me think\x1b[0m\n",
+        "\x1b[38;2;98;114;164m› \x1b[0m\x1b[38;2;248;248;242mtake a look\x1b[0m\n",
+        "\x1b[38;2;98;114;164m┆ let me think\x1b[0m\n",
         "\n",
-        "running it\x1b[0m\n",
+        "\x1b[38;2;248;248;242mrunning it\x1b[0m\n",
         "\n",
         "\n",
         // a resumed history, then a live turn: thinking, then the answer
-        "\x1b[2m┆ weigh it\x1b[0m\n",
+        "\x1b[38;2;98;114;164m┆ weigh it\x1b[0m\n",
         "\n",
-        "here goes\x1b[0m\n",
+        "\x1b[38;2;248;248;242mhere goes\x1b[0m\n",
         // A step opens tight against its predecessor: the cell's own
         // line is its own gap. No extra `\n` here.
         // a call, its result, and the usage line
@@ -367,17 +385,17 @@ fn the_plain_front_ends_stream_is_frozen() {
         // verb and subject, and the verdict. Live no longer paints a
         // separate `▸ Bash ls -la` header at `tool_start` -- the step
         // settles in one line, so live and replay read the same.
-        "\x1b[1;32m✔ Bash ls -la · exit_code: 0\x1b[0m\n",
-        "\x1b[2m≡ tokens: in 10/10 · hit 6/miss 4 · out 0\x1b[0m\n",
+        "\x1b[1m\x1b[38;2;80;250;123m✔ Bash ls -la · exit_code: 0\x1b[0m\n",
+        "\x1b[38;2;98;114;164m≡ tokens: in 10/10 · hit 6/miss 4 · out 0\x1b[0m\n",
         // the bar picks up the usage the line just recorded, then the gate asks.
         // The label is now 48 columns (cache 60.0% · 6/4), so the pad is 31.
         // Cache hits accumulate to 60.0% on the second redraw; the row
         // is cache-only now, so the label is "cache 60.0% · 6/4" -- 18
         // columns, 62 spaces of padding.
         "\x1b7\x1b[24;1H\x1b[2K                                                              ",
-        "\x1b[2mcache 60.0% · 6/4\x1b[0m\x1b8\n",
-        "\x1b[1;33m▸ Write /tmp/x · run it? y/N \x1b[0m",
-        "\x1b[1;33m  ⏹ interrupted (Ctrl-C)\x1b[0m\n",
+        "\x1b[38;2;98;114;164mcache 60.0% · 6/4\x1b[0m\x1b8\n",
+        "\x1b[1m\x1b[38;2;255;184;108m▸ Write /tmp/x · run it? y/N \x1b[0m",
+        "\x1b[1m\x1b[38;2;255;184;108m  ⏹ interrupted (Ctrl-C)\x1b[0m\n",
         // and the bar goes down as the terminal is handed back
         "\x1b[r\x1b[24;1H\x1b[2K\r\n",
     );
@@ -448,11 +466,13 @@ fn usage_and_info_render_dims() {
 
 #[test]
 fn color_variants_render_codes_and_plain() {
-    // color=true: info/usage take paint's colored branch; error goes red
+    // color=true: info/usage take paint's coloured branch; error goes red
+    // (the colour is the palette's, not the terminal's -- Dracula's secondary
+    // text, in truecolour SGR)
     let (mut r, buf) = with_buffer(true);
     r.info("ok");
     let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-    assert_eq!(s, "\x1b[2m* ok\x1b[0m\n");
+    assert_eq!(s, "\x1b[38;2;98;114;164m* ok\x1b[0m\n");
     r.error("boom"); // eprintln, does not write to buf; only checks it does not
     // panic and that the red paint call is covered
 }

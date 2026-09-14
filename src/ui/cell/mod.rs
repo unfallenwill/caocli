@@ -45,10 +45,9 @@ use todos::todo_spans;
 //
 // The two that are not producers are the palette's: a `Style` becomes a colour
 // on the way out, in one place both front ends read, and the re-export keeps
-// that call site spelled the way it reads -- `style_of(style)`. The
-// `style_code` half of the pair is the plain front end's, and lands in its
-// own commit.
-pub(crate) use crate::ui::theme::style_of;
+// that call site spelled the way it reads -- `style_of(style)` and the
+// `style_code` half that the plain front end's writer asks the palette for.
+pub(crate) use crate::ui::theme::{style_code, style_of};
 pub use replay::from_messages;
 pub use sink::CellSink;
 // `StepStatus` is re-exported for tests and downstream callers; the cell

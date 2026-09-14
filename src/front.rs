@@ -26,7 +26,7 @@ use crate::image;
 use crate::session;
 use crate::types::Message;
 use crate::ui::tui;
-use crate::ui::{Front, Renderer};
+use crate::ui::{Front, Renderer, Style};
 use crate::ui::{Sigint, StdinApproval, StdinQuestions};
 
 /// One turn with the prompt already known: the only front end that prints
@@ -461,12 +461,13 @@ fn draw_prompt(ui: &mut Renderer, textarea: &TextArea, no_status_bar: bool) {
     let _ = write!(out, "\r\x1b[2K");
     let lines = textarea.lines();
     let placeholder = "type a message · /help for commands";
-    // Whether colour escape sequences are wanted at all: the renderer decides
-    // its own colour mode and the prompt follows it -- a non-colour run gets
-    // the same plain bytes a back-end test asserts against. Asked here via
-    // the renderer's own `paint`, which is the one place that knows.
-    let dim_open = "\x1b[2m";
-    let dim_close = "\x1b[0m";
+    // The escapes the prompt is written in, from the front end that owns them:
+    // the two are empty when the renderer has decided against colour, so a
+    // non-colour run gets the same plain bytes a back-end test asserts against.
+    // The placeholder is the palette's secondary colour, the same one a cell
+    // pays the same question in.
+    let dim_open = ui.open_style(Style::Dim);
+    let dim_close = ui.close_style();
     let marker = "› ";
     let continuation = "  ";
     if lines.is_empty() || (lines.len() == 1 && lines[0].is_empty()) {

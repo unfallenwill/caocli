@@ -46,6 +46,10 @@ pub use answers::{Sigint, StdinApproval, StdinQuestions};
 pub(crate) use banner::banner;
 pub use contract::{Approve, Ask, Cancel, Front, Ui, Verdict};
 pub use renderer::Renderer;
+// The prompt the plain front end draws is written in the palette's secondary
+// colour, and the box that draws it lives outside this module: the label comes
+// out with it rather than the front end reaching into a private one.
+pub(crate) use cell::Style;
 
 #[cfg(test)]
 mod tests;
