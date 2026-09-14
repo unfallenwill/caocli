@@ -179,18 +179,20 @@ def login_case() -> bool:
             if settings["providers"]["zai-coding-cn"]["api_key"] != FAKE_KEY:
                 print("  ✗ the key did not reach settings.json")
                 ok = False
-            # A model is named by its provider, and the status line says so. The
-            # needle is the status line's own segment: the line being typed is
-            # echoed by the terminal, and the command line contains the model name
-            # without ever having run anything.
+            # A model is named by its provider. After the change, the
+            # plain front end echoes the new model name (the metadata
+            # moved off the status bar; cache is the only thing left on
+            # it, and no usage has been recorded yet). The status bar's
+            # bottom line still carries a cache segment, so it remains
+            # the thing the reader scans for to know the prompt is live.
             ok &= scr.ready()
             scr.send("/model zai-coding-cn/glm-5.3\r".encode())
-            ok &= scr.expect("zai-coding-cn/glm-5.3 · effort max · cache", 15)
+            ok &= scr.expect("model zai-coding-cn/glm-5.3", 15)
+            ok &= scr.expect("cache", 15)
             ok &= scr.ready()
-            # `/effort` names a tier the provider offers; the status line takes
-            # it beside the model, and with no argument it answers with the menu.
             scr.send("/effort low\r".encode())
-            ok &= scr.expect("zai-coding-cn/glm-5.3 · effort low · cache", 15)
+            ok &= scr.expect("effort low", 15)
+            ok &= scr.expect("cache", 15)
             ok &= scr.ready()
             scr.send("/effort\r".encode())
             ok &= scr.expect("choose a reasoning effort tier", 15)

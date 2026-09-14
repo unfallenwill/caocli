@@ -34,7 +34,7 @@ fn the_working_border_spins_counts_and_estimates() {
     let s = working(Duration::from_millis(12_345), 4000, 4.0);
     assert_eq!(
         render_mod::activity_title(&s, 60),
-        Some("◑ 12s · ~81 token/s".to_owned())
+        Some("◑ working · 12s · ~81 token/s".to_owned())
     );
 }
 
@@ -43,20 +43,26 @@ fn the_estimate_waits_for_the_average_to_settle() {
     // 2 040 ms: frame 25 % 4 = 1, off a frame boundary so the clock's second
     // read cannot tip it
     let s = working(Duration::from_millis(2_040), 4000, 4.0);
-    assert_eq!(render_mod::activity_title(&s, 60), Some("◓ 2s".to_owned()));
+    assert_eq!(
+        render_mod::activity_title(&s, 60),
+        Some("◓ working · 2s".to_owned())
+    );
 }
 
 #[test]
 fn a_silent_turn_estimates_nothing() {
     let s = working(Duration::from_millis(30_040), 0, 4.0);
-    assert_eq!(render_mod::activity_title(&s, 60), Some("◒ 30s".to_owned()));
+    assert_eq!(
+        render_mod::activity_title(&s, 60),
+        Some("◒ working · 30s".to_owned())
+    );
 }
 
 #[test]
 fn a_narrow_border_drops_the_estimate_then_hides_the_indicator() {
     let s = working(Duration::from_millis(12_345), 4000, 4.0);
     let full = render_mod::activity_title(&s, usize::MAX).unwrap();
-    let count = "◑ 12s".to_owned();
+    let count = "◑ working · 12s".to_owned();
     // one column short of the whole thing, the estimate goes whole
     assert_eq!(
         render_mod::activity_title(&s, crate::ui::text::width(&full) - 1),
@@ -154,6 +160,75 @@ fn a_question_takes_the_border_title_back() {
     let (tx, _rx) = oneshot::channel();
     s.open_question(tx);
     assert_eq!(render_mod::activity_title(&s, 60), None);
+}
+
+/// While a Reasoning block is streaming, the border says "thinking" --
+/// it names the phase the agent is in, not just that something is
+/// happening. The spinner character is unchanged; the word changes.
+#[test]
+fn the_border_says_thinking_while_a_reasoning_block_streams() {
+    let mut s = working(Duration::from_millis(2_500), 100, 4.0);
+    // Open a Reasoning block: stream starts with the Reasoning style.
+    s.apply(MachineNotice::Reasoning("hmm".into()));
+    assert_eq!(
+        render_mod::activity_title(&s, 60),
+        Some("◒ thinking · 2s".to_owned()),
+        "Reasoning in flight -> thinking"
+    );
+    // Close the Reasoning block by switching to Content: the phase
+    // reverts to the generic `working` because the model is producing
+    // body text now, not reasoning.
+    s.end_block();
+    s.apply(MachineNotice::Content("answer".into()));
+    assert_eq!(
+        render_mod::activity_title(&s, 60),
+        Some("◒ working · 2s".to_owned()),
+        "Content in flight -> working"
+    );
+}
+
+/// While a tool call is in flight, the border says "running X" where X
+/// is the tool verb. The result notice clears the verb and the label
+/// reverts to whatever phase the model is in next.
+#[test]
+fn the_border_says_running_verb_while_a_tool_runs() {
+    // Below SPEED_AFTER_SECS so the per-second estimate is not on the
+    // border yet -- this test pins the phase label, not the speed
+    // estimate (which has its own tests).
+    let mut s = working(Duration::from_millis(2_500), 100, 4.0);
+    s.apply(MachineNotice::ToolStart {
+        name: "Bash".into(),
+        args: "{}".into(),
+    });
+    assert_eq!(
+        render_mod::activity_title(&s, 60),
+        Some("◒ running Bash · 2s".to_owned()),
+        "the verb on the border is the one the agent sent"
+    );
+    s.apply(MachineNotice::ToolResult("exit_code: 0".into()));
+    assert_eq!(
+        render_mod::activity_title(&s, 60),
+        Some("◒ working · 2s".to_owned()),
+        "settling the step drops the verb, the border says working"
+    );
+}
+
+/// A Running step's verb carries through to `finalize_open_step` (the
+/// path an interrupted turn follows), so an interrupted tool does not
+/// leave the border pointing at a call that did not run.
+#[test]
+fn an_interrupted_step_clears_the_tool_verb() {
+    let mut s = working(Duration::from_millis(2_500), 100, 4.0);
+    s.apply(MachineNotice::ToolStart {
+        name: "Bash".into(),
+        args: "{}".into(),
+    });
+    s.apply(MachineNotice::Interrupted);
+    assert_eq!(
+        render_mod::activity_title(&s, 60),
+        Some("◒ working · 2s".to_owned()),
+        "interrupted step -> the border's no longer running X"
+    );
 }
 
 #[test]

@@ -41,7 +41,7 @@ fn the_pinned_rows_take_the_bottom_of_the_screen() {
     // The shape the pinned region has to keep, whatever the transcript does:
     // the box, then the status line, on the last rows of the terminal.
     let mut screen = screen_for_test(60, 20);
-    screen.state.view.status.set_model("m-1");
+    screen.state.model = Some("m-1".to_owned());
     screen.draw().unwrap();
     let last = screen.terminal.backend().buffer().area.height - 1;
     assert!(row(&screen, last - 3).starts_with('─'), "the box's top");
@@ -53,7 +53,7 @@ fn the_pinned_rows_take_the_bottom_of_the_screen() {
         row(&screen, last - 2)
     );
     assert!(row(&screen, last - 1).starts_with('─'), "its bottom");
-    assert_eq!(row(&screen, last), "m-1 · cache 0.0% · 0/0");
+    assert_eq!(row(&screen, last), "cache 0.0% · 0/0");
 }
 
 #[test]
@@ -64,7 +64,7 @@ fn the_queue_is_drawn_above_the_box_until_it_is_run() {
     // foot of the transcript -- and it takes rows from the transcript rather
     // than covering it.
     let mut screen = screen_for_test(40, 20);
-    screen.state.view.status.set_model("m-1");
+    screen.state.model = Some("m-1".to_owned());
     let last = screen.terminal.backend().buffer().area.height - 1;
     screen.state.enqueue("first".into());
     screen.state.enqueue("second".into());
@@ -81,7 +81,7 @@ fn the_queue_is_drawn_above_the_box_until_it_is_run() {
     // ... and the box and the status line are where they always are: the
     // queue is inserted, not drawn over anything.
     assert!(row(&screen, last - 3).starts_with('─'), "the box's top");
-    assert_eq!(row(&screen, last), "m-1 · cache 0.0% · 0/0");
+    assert_eq!(row(&screen, last), "cache 0.0% · 0/0");
 
     // Run one: the queue gives a row back, and what ran is drawn as the
     // transcript's own line -- the same line the queue was showing, in the
@@ -104,7 +104,7 @@ fn the_queue_is_drawn_above_the_box_until_it_is_run() {
         "› second",
         "only what is still waiting is in the queue"
     );
-    assert_eq!(row(&screen, last), "m-1 · cache 0.0% · 0/0");
+    assert_eq!(row(&screen, last), "cache 0.0% · 0/0");
     let buf = screen.terminal.backend().buffer();
     assert!(
         !buf[(2, transcript_top(&screen, 1))]

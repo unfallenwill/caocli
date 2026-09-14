@@ -114,10 +114,10 @@ pub(crate) const THINKING_LINES: usize = 12;
 /// list that stands: a cell is laid out once for one width and never revisited,
 /// so a rule that changed with a later cell would rewrite history on the next
 /// resize rather than on the draw that made the list stand.
-fn spans_of(cell: &Cell) -> Vec<Span> {
+fn spans_of(cell: &Cell, verbose: bool) -> Vec<Span> {
     match cell {
         Cell::Todo(todos) => cell::todo_head_spans(todos),
-        _ => cell.spans(),
+        _ => cell.spans_with(verbose),
     }
 }
 
@@ -131,17 +131,17 @@ fn spans_of(cell: &Cell) -> Vec<Span> {
 /// One cell at a time, because a cell is what a draw can keep: it is the unit the
 /// session's output arrives in and it does not change once it is pushed, so it is
 /// also the unit [`State`](crate::ui::tui::state::State) lays out and remembers.
-pub(crate) fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn cell_lines(cell: &Cell, width: usize, verbose: bool) -> Vec<Line<'static>> {
     // Never wider than the measure, however wide the region is: the gutter is
     // inside it, so the answer and the machinery around it end in the same column.
     let width = measure(width);
     let Some(gutter) = cell.gutter() else {
         // The answer: the one cell that starts at the left edge.
-        return wrapped_lines(&spans_of(cell), width);
+        return wrapped_lines(&spans_of(cell, verbose), width);
     };
     // Wrapped into what the gutter leaves, so a line of a set-in cell carries as
     // much as a line of the answer rather than two columns more.
-    let mut lines = wrapped_under(&spans_of(cell), width, gutter);
+    let mut lines = wrapped_under(&spans_of(cell, verbose), width, gutter);
     // A long think folds to its head and a count. The rule lives in this layer
     // rather than in the cell because it is a budget of the screen, like the
     // wrapping width is: the plain front end has no screen to keep one on, and

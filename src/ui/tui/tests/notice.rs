@@ -31,14 +31,38 @@ fn every_notice_becomes_a_cell_or_a_status_change() {
     screen.apply_app(AppNotice::Info("note".into()));
     screen.apply_app(AppNotice::Error("boom".into()));
     screen.apply(MachineNotice::Interrupted);
+    // ToolStart opens a Step; ToolOutput appends to its children; ToolResult
+    // settles it. The transcript now has one Cell::Step where it used to
+    // have three cells.
+    let mut expected_step = Cell::from_tool_call("Bash", r#"{"command":"ls"}"#);
+    if let Cell::Step(step) = &mut expected_step {
+        step.push_output("out\n");
+        step.settle("exit_code: 0\nbody");
+    } else {
+        panic!("from_tool_call should produce a Step for Bash");
+    }
+    // StepId and `started_at` are process-global state that does not
+    // reset between assertions: borrow both from the actual screen so
+    // the comparison only walks the fields that describe what happened
+    // here (verb, subject, status, children, verdict).
+    let actual_step = match &screen.view.transcript[2] {
+        Cell::Step(s) => s.clone(),
+        _ => panic!("transcript[2] should be a Step"),
+    };
+    let expected_step_borrowed = match expected_step {
+        Cell::Step(mut s) => {
+            s.id = actual_step.id;
+            s.started_at = actual_step.started_at;
+            Cell::Step(s)
+        }
+        _ => unreachable!("from_tool_call should produce a Step for Bash"),
+    };
     assert_eq!(
         screen.view.transcript,
         vec![
             Cell::Reasoning("think".into()),
             Cell::Content("answer".into()),
-            Cell::tool_call("Bash", r#"{"command":"ls"}"#),
-            Cell::ToolOutput("out\n".into()),
-            Cell::ToolResult("exit_code: 0\nbody".into()),
+            expected_step_borrowed,
             Cell::Notice("note".into()),
             Cell::Failure("boom".into()),
             Cell::Interrupted,
@@ -66,11 +90,17 @@ fn a_fragment_in_the_other_style_opens_a_new_block() {
     assert!(screen.view.stream.current().is_none());
 }
 
+/// `SetModel` and `SetEffort` notices update the model's metadata
+/// (which rides above each user prompt), not the bottom status line.
+/// `Usage` notices still record cache stats into the status bar.
 #[test]
 fn status_notices_reach_the_status_line() {
     let mut screen = State::default();
     screen.apply_app(AppNotice::SetModel("m-1".into()));
     screen.apply_app(AppNotice::SetEffort("high".into()));
+    // The metadata row carries the model+effort in transcript cells.
+    let meta = screen.metadata_text().expect("model+effort are set");
+    assert_eq!(meta, "m-1 · effort high");
     screen.apply(MachineNotice::Usage(
         Usage {
             prompt_tokens: 6,
@@ -82,15 +112,9 @@ fn status_notices_reach_the_status_line() {
         },
         Duration::ZERO,
     ));
-    assert_eq!(
-        screen.view.status.full_line(),
-        "m-1 · effort high · cache 60.0% · 6/4"
-    );
+    assert_eq!(screen.view.status.full_line(), "cache 60.0% · 6/4");
     screen.apply_app(AppNotice::ResetStats);
-    assert_eq!(
-        screen.view.status.full_line(),
-        "m-1 · effort high · cache 0.0% · 0/0"
-    );
+    assert_eq!(screen.view.status.full_line(), "cache 0.0% · 0/0");
 }
 
 #[test]
@@ -109,13 +133,227 @@ fn replay_and_the_live_stream_produce_the_same_cells() {
         },
         Message::tool("call_1", "exit_code: 0\n--- stdout ---\nbody"),
     ]));
+    // The assistant message has no `tool_calls`, so the Tool message that
+    // follows has no preceding open step to settle. The result text
+    // becomes a dim Notice instead.
     assert_eq!(
         screen.view.transcript,
         vec![
             Cell::Reasoning("let me think".into()),
             Cell::Content("running it".into()),
-            Cell::ToolResult("exit_code: 0\n--- stdout ---\nbody".into()),
+            Cell::Notice("exit_code: 0\n--- stdout ---\nbody".into()),
         ]
+    );
+}
+
+/// A submitted user line gets a metadata row above it on the transcript:
+/// `provider/model · effort tier`, drawn dim, that names which model and
+/// tier ran the line that follows it. The metadata is current at the
+/// time the line is asked, so a session that switches models mid-history
+/// reads the way the user asked it.
+#[test]
+fn submit_pushes_a_metadata_row_above_each_user_line() {
+    let mut screen = State::for_test_with_meta("deepseek/deepseek-v4-flash", "max");
+    screen.submit("first");
+    screen.submit("second");
+
+    // Two user lines, each preceded by its own metadata cell.
+    let cells = &screen.view.transcript;
+    assert!(cells.len() >= 4, "two metadata + two user lines: {cells:?}");
+    let metadata_1 = cells[0].clone();
+    let user_1 = cells[1].clone();
+    let metadata_2 = cells[2].clone();
+    let user_2 = cells[3].clone();
+    if let Cell::Notice(t) = &metadata_1 {
+        assert_eq!(
+            t, "deepseek/deepseek-v4-flash · effort max",
+            "metadata carries the model+effort pair"
+        );
+    } else {
+        panic!("metadata_1 was not a Notice: {metadata_1:?}");
+    }
+    assert!(matches!(user_1, Cell::User { .. }));
+    if let Cell::Notice(t) = &metadata_2 {
+        assert_eq!(
+            t, "deepseek/deepseek-v4-flash · effort max",
+            "same metadata repeated for each user line"
+        );
+    } else {
+        panic!("metadata_2 was not a Notice: {metadata_2:?}");
+    }
+    assert!(matches!(user_2, Cell::User { .. }));
+}
+
+/// Switching models mid-session: the metadata row reflects the model at
+/// the time the line is asked, not the model the session began with.
+#[test]
+fn submit_picks_up_the_current_model_at_submit_time() {
+    let mut screen = State::for_test_with_meta("deepseek/deepseek-v4-flash", "max");
+    screen.submit("first");
+    // The user switches models mid-history.
+    screen.model = Some("deepseek/deepseek-v4-pro".to_owned());
+    screen.submit("second");
+
+    let cells = &screen.view.transcript;
+    let metadata_1 = &cells[0];
+    let user_1 = &cells[1];
+    let metadata_2 = &cells[2];
+    let user_2 = &cells[3];
+    if let Cell::Notice(t) = metadata_1 {
+        assert!(
+            t.contains("v4-flash"),
+            "first line keeps the original model: {metadata_1:?}"
+        );
+    } else {
+        panic!("metadata_1 was not a Notice: {metadata_1:?}");
+    }
+    if let Cell::Notice(t) = metadata_2 {
+        assert!(
+            t.contains("v4-pro"),
+            "second line picks up the switched model: {metadata_2:?}"
+        );
+    } else {
+        panic!("metadata_2 was not a Notice: {metadata_2:?}");
+    }
+    assert!(matches!(user_1, Cell::User { .. }));
+    assert!(matches!(user_2, Cell::User { .. }));
+}
+
+/// A session resumed from a log: each replayed user line picks up the
+/// current model's metadata, so a resumed session reads the same as one
+/// that was watched live. Live and replay produce identical cells.
+#[test]
+fn replay_pushes_metadata_above_each_replayed_user_line() {
+    let mut screen = State::for_test_with_meta("zai-coding-cn/glm-5.3", "high");
+    screen.apply_app(AppNotice::Replay(vec![
+        Message::user("first"),
+        Message::user("second"),
+    ]));
+    let cells = &screen.view.transcript;
+    // Each user line gets its own metadata row above it.
+    let metadata_1 = &cells[0];
+    let user_1 = &cells[1];
+    let metadata_2 = &cells[2];
+    let user_2 = &cells[3];
+    assert!(
+        matches!(metadata_1, Cell::Notice(t) if t == "zai-coding-cn/glm-5.3 · effort high"),
+        "first replayed line gets a metadata row"
+    );
+    assert!(matches!(user_1, Cell::User { .. }));
+    assert!(matches!(metadata_2, Cell::Notice(_)));
+    assert!(matches!(user_2, Cell::User { .. }));
+}
+
+#[test]
+fn metadata_text_is_none_when_no_model_or_effort_is_set() {
+    let screen = State::default();
+    assert!(screen.metadata_text().is_none());
+}
+
+#[test]
+fn metadata_text_omits_a_blank_field() {
+    let screen = State::for_test_with_meta("m-1", "");
+    assert_eq!(screen.metadata_text().as_deref(), Some("m-1"));
+    let screen = State::for_test_with_meta("", "high");
+    assert_eq!(screen.metadata_text().as_deref(), Some("effort high"));
+}
+
+/// The Ctrl-O verbose toggle re-renders settled-Done steps with their
+/// children visible. Running and Failed steps are unchanged: their
+/// children were already on screen.
+#[test]
+fn verbose_toggle_re_exposes_settled_children() {
+    // Build a settled-Done step with children on the transcript.
+    let mut screen = State::default();
+    let step = {
+        let mut s = Cell::from_tool_call("Bash", r#"{"command":"echo a; echo b"}"#);
+        if let Cell::Step(s) = &mut s {
+            s.push_output("alpha\nbeta\n");
+            s.settle("exit_code: 0");
+        }
+        s
+    };
+    screen.apply(MachineNotice::FinishTurn);
+    screen.view.transcript.push(step);
+
+    // Compact: only the verdict header is on screen.
+    let width = 80;
+    let before = render::lines(&mut screen, width);
+    let before_text: String = before
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !before_text.contains("alpha"),
+        "compact hides settled children: {before:?}"
+    );
+    assert!(!before_text.contains("beta"));
+
+    // Toggle verbose on.
+    screen.apply_app(AppNotice::SetVerbose(true));
+    let after = render::lines(&mut screen, width);
+    let after_text: String = after
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        after_text.contains("alpha"),
+        "verbose shows settled children: {after:?}"
+    );
+    assert!(after_text.contains("beta"));
+
+    // And back off: settled children disappear again.
+    screen.apply_app(AppNotice::SetVerbose(false));
+    let restored = render::lines(&mut screen, width);
+    let restored_text: String = restored
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!restored_text.contains("alpha"));
+    assert!(!restored_text.contains("beta"));
+}
+
+/// A failed step auto-expands in both modes: the toggle never hides a
+/// failure. The reader is reading it because something went wrong, and
+/// Ctrl-O is for settled *successes* a reader wants to expand on demand.
+#[test]
+fn verbose_does_not_collapse_a_failed_step() {
+    let mut screen = State::default();
+    let step = {
+        let mut s = Cell::from_tool_call("Bash", r#"{"command":"false"}"#);
+        if let Cell::Step(s) = &mut s {
+            s.push_output("boom\n");
+            s.settle("exit_code: 1");
+        }
+        s
+    };
+    screen.view.transcript.push(step);
+
+    let width = 80;
+    let compact = render::lines(&mut screen, width);
+    let compact_text: String = compact
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        compact_text.contains("boom"),
+        "failed auto-expands in compact: {compact:?}"
+    );
+
+    screen.apply_app(AppNotice::SetVerbose(true));
+    let verbose = render::lines(&mut screen, width);
+    let verbose_text: String = verbose
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        verbose_text.contains("boom"),
+        "failed still expanded in verbose: {verbose:?}"
     );
 }
 

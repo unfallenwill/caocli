@@ -27,7 +27,7 @@ use ratatui::style::{Modifier, Style as RStyle};
 use ratatui::text::Line;
 use ratatui::widgets::Block;
 
-use crate::ui::cell;
+use crate::ui::cell::{self, Style};
 use crate::ui::paint::{cell_lines, standing_todo_lines};
 use crate::ui::tui::layout::BOX_BORDERS;
 use crate::ui::tui::state::State;
@@ -59,11 +59,16 @@ pub(super) const SPEED_AFTER_SECS: u64 = 3;
 /// The cache is a prefix of the transcript: `laid.len() <= transcript.len()`,
 /// and a cell that was laid is laid at the most recent `width`. A different
 /// `width` invalidates every entry, since wrapping depends on width.
+/// A different `verbose` does too, since `Step`'s render shape keys on
+/// it (children visible or not).
 pub(super) fn ensure_laid(state: &mut State, width: usize) {
-    // A different width is a different wrapping of every line there is.
-    if state.view.laid_width != Some(width) {
+    let verbose = state.verbose;
+    // A different width or verbose flag is a different rendering of every
+    // cell there is.
+    if state.view.laid_width != Some(width) || state.view.laid_verbose != Some(verbose) {
         state.view.laid.clear();
         state.view.laid_width = Some(width);
+        state.view.laid_verbose = Some(verbose);
     }
     // Never more cells than the transcript has. Only a test can take one away,
     // and lines of a cell that is gone are worse than laying one out twice.
@@ -74,7 +79,7 @@ pub(super) fn ensure_laid(state: &mut State, width: usize) {
         {
             state.view.laid_cells += 1;
         }
-        state.view.laid.push(cell_lines(cell, width));
+        state.view.laid.push(cell_lines(cell, width, verbose));
     }
 }
 
@@ -132,7 +137,9 @@ pub(super) fn window_lines(
 /// position a reader is sitting on when the model stops typing.
 pub(super) fn live_lines(state: &State, width: usize) -> Vec<Line<'static>> {
     match state.view.stream.current() {
-        Some((style, text)) => cell_lines(&style.stream_cell(text.to_owned()), width),
+        Some((style, text)) => {
+            cell_lines(&style.stream_cell(text.to_owned()), width, state.verbose)
+        }
         None => Vec::new(),
     }
 }
@@ -145,7 +152,7 @@ pub(super) fn live_lines(state: &State, width: usize) -> Vec<Line<'static>> {
 /// answer typed into the box below it starts in the column its own text does.
 pub(super) fn question_lines(state: &State, width: usize) -> Vec<Line<'static>> {
     match &state.view.question {
-        Some(question) => cell_lines(question, width),
+        Some(question) => cell_lines(question, width, state.verbose),
         None => Vec::new(),
     }
 }
@@ -213,6 +220,17 @@ pub(super) fn activity_title(state: &State, width: usize) -> Option<String> {
 }
 
 /// The indicator's words at `now`, without reading the clock.
+///
+/// Phase-aware: the label says what the agent is doing, not just that
+/// something is happening. The phases the border can name are
+/// `thinking` (a Reasoning block is streaming), `running X` (a tool
+/// call is in flight), and `working` (the model is producing content
+/// or the stream has nothing yet). The spinner glyph and the elapsed
+/// seconds stay on every phase; the only thing that changes is the
+/// word between them.
+///
+/// Approval gate keeps the border clear (gate owns it); no turn keeps
+/// the border empty.
 pub(super) fn activity_title_at(state: &State, now: Instant, width: usize) -> Option<String> {
     if state.overlay.reply.is_some() {
         return None;
@@ -220,7 +238,18 @@ pub(super) fn activity_title_at(state: &State, now: Instant, width: usize) -> Op
     let started = state.turn.started?;
     let elapsed = now - started;
     let frame = SPINNER[(elapsed.as_millis() / SPINNER_MS) as usize % SPINNER.len()];
-    let count = format!("{frame} {}s", elapsed.as_secs());
+    // The phase comes from what the turn is doing right now -- the live
+    // stream (Reasoning -> thinking, anything else -> working), or the
+    // open tool call (the verb is the one the agent sent at ToolStart,
+    // kept in `current_tool_verb` until the result settles the step).
+    let phase = if matches!(state.view.stream.current(), Some((Style::Reasoning, _))) {
+        "thinking".to_owned()
+    } else if let Some(verb) = state.turn.current_tool_verb.as_deref() {
+        format!("running {verb}")
+    } else {
+        "working".to_owned()
+    };
+    let count = format!("{frame} {phase} · {}s", elapsed.as_secs());
     let mut title = count.clone();
     if elapsed.as_secs() >= SPEED_AFTER_SECS && state.turn.streamed_chars > 0 {
         // The measured ratio turns characters into tokens; the tilde keeps

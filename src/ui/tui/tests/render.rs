@@ -31,9 +31,11 @@ use crate::types::Usage;
 fn the_status_line_is_the_summary_whether_or_not_a_turn_runs() {
     // The line as drawn, not as formatted: while a turn runs the row is the
     // same session summary it is at rest, and the turn's own doings are the
-    // transcript's cells, not the status line's.
+    // transcript's cells, not the status line's. The model id has moved
+    // to the per-prompt metadata row; the pinned row carries only the
+    // cache stats that are truly session-level.
     let mut screen = screen_for_test(60, 20);
-    screen.state.view.status.set_model("m-1");
+    screen.state.model = Some("m-1".to_owned());
     screen.state.apply(MachineNotice::Usage(
         Usage {
             prompt_cache_hit_tokens: 6,
@@ -44,7 +46,7 @@ fn the_status_line_is_the_summary_whether_or_not_a_turn_runs() {
     ));
     screen.draw().unwrap();
     let last = screen.terminal.backend().buffer().area.height - 1;
-    assert_eq!(row(&screen, last), "m-1 · cache 60.0% · 6/4");
+    assert_eq!(row(&screen, last), "cache 60.0% · 6/4");
     screen.state.begin_turn(Instant::now());
     screen.state.apply(MachineNotice::ToolStart {
         name: "read_file".into(),
@@ -56,7 +58,7 @@ fn the_status_line_is_the_summary_whether_or_not_a_turn_runs() {
     screen.draw().unwrap();
     assert_eq!(
         row(&screen, last),
-        "m-1 · cache 60.0% · 6/4",
+        "cache 60.0% · 6/4",
         "a running turn does not take the row over"
     );
 }
@@ -64,7 +66,7 @@ fn the_status_line_is_the_summary_whether_or_not_a_turn_runs() {
 #[test]
 fn a_tool_call_that_changes_a_file_is_drawn_across_its_lines() {
     let mut screen = screen_for_test(40, 20);
-    screen.state.view.transcript.push(Cell::tool_call(
+    screen.state.view.transcript.push(Cell::from_tool_call(
         "Edit",
         r#"{"file_path":"a.rs","old_string":"one\ntwo","new_string":"three"}"#,
     ));
@@ -85,7 +87,7 @@ fn a_long_line_of_a_change_is_wrapped_like_any_other() {
     // wrap it, or the tail of the line is lost.
     let mut screen = screen_for_test(20, 20);
     let long = "x".repeat(30);
-    screen.state.view.transcript.push(Cell::tool_call(
+    screen.state.view.transcript.push(Cell::from_tool_call(
         "Write",
         &format!(r#"{{"file_path":"a.txt","content":"{long}"}}"#),
     ));
@@ -284,9 +286,9 @@ fn only_a_think_folds() {
     assert!(!drawn.contains("more lines"), "{drawn}");
 }
 
-/// What a command prints while it runs is watched as it arrives, and the block it
-/// arrives in is filed away as a cell of its own when the result lands: the frame
-/// that files it away is not allowed to change anything either.
+/// What a command prints while it runs is watched as it arrives, and the step
+/// it forms settles into the transcript when the result lands: the run of
+/// output is part of the same step cell, not a separate one.
 #[test]
 fn a_running_commands_output_is_watched_and_then_kept() {
     let mut screen = screen_for_test(40, 30);
@@ -301,6 +303,7 @@ fn a_running_commands_output_is_watched_and_then_kept() {
         .state
         .apply(MachineNotice::ToolOutput("two\n".into()));
     screen.draw().unwrap();
+    // While the tool runs, the open step carries the children on screen.
     let live = rendered(&render_mod::lines(&mut screen.state, 40));
     assert!(
         live.iter().any(|(text, _)| text.contains("one")),
@@ -310,15 +313,30 @@ fn a_running_commands_output_is_watched_and_then_kept() {
         .state
         .apply(MachineNotice::ToolResult("exit_code: 0".into()));
     screen.draw().unwrap();
-    assert_eq!(
-        screen.state.view.transcript.last(),
-        Some(&Cell::ToolResult("exit_code: 0".into()))
-    );
-    assert_eq!(
-        screen.state.view.transcript[screen.state.view.transcript.len() - 2],
-        Cell::ToolOutput("one\ntwo\n".into()),
-        "the run of output is one cell, whole"
-    );
+    // One step in the transcript -- the open one that was settled, with its
+    // children kept and a verdict filled in.
+    let mut expected = Cell::from_tool_call("Bash", r#"{"command":"echo one; echo two"}"#);
+    if let Cell::Step(s) = &mut expected {
+        // Two `ToolOutput` notices arrive in the live sequence;
+        // matching that order keeps the children list identical to
+        // the screen's settled step.
+        s.push_output("one\n");
+        s.push_output("two\n");
+        s.settle("exit_code: 0");
+    }
+    // StepId and started_at are process-global; borrow them from the
+    // actual screen so the assertion compares only the fields that
+    // describe what happened here.
+    let actual_last = screen.state.view.transcript.last().expect("step settled");
+    let expected = match (&mut expected, actual_last) {
+        (Cell::Step(s), Cell::Step(actual)) => {
+            s.id = actual.id;
+            s.started_at = actual.started_at;
+            Cell::Step(s.clone())
+        }
+        _ => unreachable!("both are Steps"),
+    };
+    assert_eq!(screen.state.view.transcript.last(), Some(&expected));
     let drawn = rendered(&render_mod::lines(&mut screen.state, 40));
     let drawn: String = drawn.into_iter().map(|(text, _)| text).collect();
     assert!(drawn.contains("one") && drawn.contains("two"), "{drawn}");

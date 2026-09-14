@@ -70,19 +70,20 @@ impl Stream {
 impl Style {
     /// The cell a stream in this style becomes when it closes.
     ///
-    /// Three of the six styles are the ones a stream can be in: reasoning
-    /// becomes [`Cell::Reasoning`], the dim block a command's output is
-    /// streamed in becomes [`Cell::ToolOutput`] (the cell the result the call
-    /// later returns is filed as, but arriving before the call is over), and
-    /// every other style -- which only the body text is -- becomes
-    /// [`Cell::Content`]. The other three are not streaming styles, and would
-    /// be a bug to call this on; they fall through to `Content` so the
-    /// non-streaming callers that reach this through a `Style` get a defined
-    /// answer rather than a panic.
+    /// Two of the six styles are the ones a stream can be in: reasoning
+    /// becomes [`Cell::Reasoning`], every other style -- which only the body
+    /// text is -- becomes [`Cell::Content`]. The other four are not
+    /// streaming styles and would be a bug to call this on; they fall through
+    /// to `Content` so the non-streaming callers that reach this through a
+    /// `Style` get a defined answer rather than a panic.
+    ///
+    /// Tool output no longer flows through the stream: it goes to the
+    /// children of the running [`Cell::Step`] instead. A dim fragment in
+    /// the stream is no longer a reachable state and falls through to
+    /// `Content`; if it ever shows up, it would be a bug worth surfacing.
     pub fn stream_cell(self, text: String) -> Cell {
         match self {
             Style::Reasoning => Cell::Reasoning(text),
-            Style::Dim => Cell::ToolOutput(text),
             _ => Cell::Content(text),
         }
     }
@@ -122,13 +123,6 @@ mod tests {
             Some(Cell::Reasoning("hmm".into()))
         );
         assert_eq!(s.current(), Some((Style::Plain, "answer")));
-        // Tool output streams in `Style::Dim`, which closes as ToolOutput.
-        assert_eq!(
-            s.append(Style::Dim, "compiling\n"),
-            Some(Cell::Content("answer".into()))
-        );
-        assert_eq!(s.current(), Some((Style::Dim, "compiling\n")));
-        assert_eq!(s.close(), Some(Cell::ToolOutput("compiling\n".into())));
     }
 
     /// The plain front end's `open_block` opens a style without writing any

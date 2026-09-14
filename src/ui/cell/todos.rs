@@ -158,7 +158,7 @@ mod tests {
             cells,
             vec![
                 Cell::from_tool_call("TodoWrite", args),
-                Cell::ToolResult("todo list updated (0/1 done)".into()),
+                Cell::Notice("todo list updated (0/1 done)".into()),
             ]
         );
         assert!(matches!(cells[0], Cell::Todo(_)));
@@ -250,7 +250,7 @@ mod tests {
         // The model is answered with the parse failure; the transcript shows the
         // call that could not be read rather than a list nobody wrote.
         let cell = Cell::from_tool_call("TodoWrite", r#"{"todos":"a plan"}"#);
-        assert!(matches!(cell, Cell::ToolCall { .. }), "was {cell:?}");
+        assert!(matches!(cell, Cell::Step(_)), "was {cell:?}");
     }
 
     fn written(todos: serde_json::Value) -> Cell {
@@ -266,7 +266,7 @@ mod tests {
         let cells = vec![
             Cell::Content("thinking about it".into()),
             written(serde_json::json!({"todos": [{"content": "a"}]})),
-            Cell::ToolResult("todo list updated (0/1 done)".into()),
+            Cell::Notice("todo list updated (0/1 done)".into()),
             // The second write replaces the first rather than following it: what
             // the model sends is the whole list, not a change to it.
             written(serde_json::json!({"todos": [
@@ -295,9 +295,9 @@ mod tests {
         assert_eq!(standing_todos(&[]), None);
     }
 
-    /// A call that could not be read is a [`Cell::ToolCall`] and not a list, so the
-    /// fold steps over it: the list that stands is still the last one that was
-    /// actually written.
+    /// A call that could not be read is a step (open, the parser failed) and
+    /// not a list, so the fold steps over it: the list that stands is still
+    /// the last one that was actually written.
     #[test]
     fn a_call_that_could_not_be_read_leaves_the_standing_list_alone() {
         let cells = vec![

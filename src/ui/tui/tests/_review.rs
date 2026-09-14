@@ -18,11 +18,7 @@ use super::screen_for_test;
 #[test]
 fn zz_visual_review_dump() {
     let mut screen = screen_for_test(96, 30);
-    screen
-        .state
-        .view
-        .status
-        .set_model("deepseek/deepseek-flash");
+    screen.state.model = Some("deepseek/deepseek-flash".to_owned());
     screen.state.show(Cell::Notice(
         "caocli \u{b7} session 20260910-224129 (12 messages) \u{b7} deepseek/deepseek-flash".into(),
     ));
@@ -37,22 +33,23 @@ fn zz_visual_review_dump() {
     screen.state.view.transcript.push(Cell::Content(
         "Two things usually dominate: an unoptimized dev profile and relinking every dependency on each edit. Let me look.".into(),
     ));
-    screen.state.view.transcript.push(Cell::tool_call(
+    screen.state.view.transcript.push(Cell::from_tool_call(
         "Bash",
         r#"{"command":"ls -la target/debug | head -20"}"#,
     ));
-    screen.state.view.transcript.push(Cell::ToolResult(
-        "total 4823136\ndrwxr-xr-x 12 user user 4096 ...\n".into(),
-    ));
-    screen.state.view.transcript.push(Cell::tool_call(
+    // Settle the open Bash step in place; its children (the `ls` output)
+    // and its verdict (the parsed exit code) are part of the same cell.
+    if let Some(Cell::Step(s)) = screen.state.view.transcript.last_mut() {
+        s.push_output("total 4823136\ndrwxr-xr-x 12 user user 4096 ...\n");
+        s.settle("exit_code: 0");
+    }
+    screen.state.view.transcript.push(Cell::from_tool_call(
         "Edit",
         r#"{"file_path":"Cargo.toml","old_string":"[profile.dev]\ndebug = 2","new_string":"[profile.dev]\ndebug = 0"}"#,
     ));
-    screen
-        .state
-        .view
-        .transcript
-        .push(Cell::ToolResult("edited Cargo.toml\n".into()));
+    if let Some(Cell::Step(s)) = screen.state.view.transcript.last_mut() {
+        s.settle("ok: replaced 1 occurrence; /tmp/Cargo.toml is now 412 bytes");
+    }
     screen.state.view.transcript.push(Cell::Content(
         "Setting `debug = 0` alone is usually worth a third of the link time. The other half is the linker: with `lld` the final link stops being the long pole.".into(),
     ));
