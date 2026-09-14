@@ -123,6 +123,8 @@ contains newlines also works (bracketed paste).
 | `--ask` | Approval gate: ask y/N before Bash/Edit/Write (Read always allowed, and so is `Glob` — looking for a file to read changes nothing on disk — as is `TodoWrite`; a question reaches you either way). Denials are recorded as deterministic markers the model can see and adapt to. |
 | `--no-tui` | Keep the plain prompt instead of the full-screen front end |
 | `--no-status-bar` | Disable the plain prompt's status bar |
+| `--theme <ink\|paper\|auto>` | Palette: `ink` (dark text on dark — the default on a dark terminal), `paper` (dark text on light, for a light terminal), or `auto` to let `COLORFGBG` and the terminal decide. Persisted in `~/.caocli/settings.json` under `theme`. See [Visual design](docs/visual-design.md) |
+| `--glyphs <unicode\|ascii>` | Character set: `unicode` (the default — Unicode markers and Braille spinner) or `ascii` (every glyph becomes ASCII, for a terminal whose font is missing one or whose ambiguous-width characters come out wide). Persisted under `glyphs` |
 | `-h, --help` / `-V, --version` | Print help / version |
 
 With no `-p`, caocli starts a REPL. CLI flags override the settings stored
