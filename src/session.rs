@@ -136,7 +136,7 @@ fn lock_exclusive(_file: &std::fs::File, _path: &Path) -> Result<()> {
 ///
 /// A real single-writer conflict is permanent, which is why production never
 /// waits: it reports.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn load_when_released(path: &Path) -> Session {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -152,19 +152,17 @@ pub(crate) fn load_when_released(path: &Path) -> Session {
 
 /// The same wait, for a caller that has to go through a path it does not own
 /// (a command that loads the session itself) and only needs the lock gone.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn wait_until_released(path: &Path) {
     drop(load_when_released(path));
 }
 
-#[cfg(not(unix))]
-#[cfg(test)]
+#[cfg(all(test, not(unix)))]
 pub(crate) fn load_when_released(path: &Path) -> Session {
     Session::load(path).unwrap()
 }
 
-#[cfg(not(unix))]
-#[cfg(test)]
+#[cfg(all(test, not(unix)))]
 pub(crate) fn wait_until_released(path: &Path) {
     drop(load_when_released(path));
 }
