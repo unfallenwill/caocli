@@ -83,8 +83,8 @@ fn test_agent(server: &MockServer, dir: &std::path::Path) -> Agent {
     Agent::new(api, session, provider::DEEPSEEK)
 }
 
-#[test]
-fn effort_label_reads_the_stored_tier_or_the_providers_default() {
+#[tokio::test]
+async fn effort_label_reads_the_stored_tier_or_the_providers_default() {
     let dir = tmpdir();
     let s = Session::create(&dir, test_meta()).unwrap();
     let agent = Agent::new(
@@ -1523,7 +1523,7 @@ async fn stream_time_opens_at_the_first_delta() {
     mount_chat(&server, usage_only, None).await;
     let dir = tmpdir();
     let agent = test_agent(&server, &dir);
-    let request = agent.build_request();
+    let request = agent.build_request().await;
     let mut ui = Renderer::new();
     let reply = agent.stream_reply(&request, &mut ui).await.unwrap();
     assert_eq!(
@@ -1551,7 +1551,7 @@ async fn stream_time_opens_at_the_first_delta() {
     mount_chat(&server, with_delta, None).await;
     let dir = tmpdir();
     let agent = test_agent(&server, &dir);
-    let request = agent.build_request();
+    let request = agent.build_request().await;
     let mut ui = Renderer::new();
     let reply = agent.stream_reply(&request, &mut ui).await.unwrap();
     assert!(

@@ -6,6 +6,71 @@ semantic-version bumps per release.
 
 ## [Unreleased]
 
+### Added — runtime control over MCP servers
+
+- The session used to connect its MCP servers once at startup and tear them
+  down on exit; the only verbs were "report" and "no, really, what did the
+  server say". Five new methods on `Hub` give the session a real control
+  surface, all exposed through `/mcp` subcommands:
+
+  | Subcommand | Effect |
+  |---|---|
+  | `/mcp list` | One row per server: name, state (`ready` / `failed` / `disabled` / `disconnected`), count of tools currently offered |
+  | `/mcp disable <name>` | Park a ready server; its tools leave the offered set; calls to them come back with state-aware errors |
+  | `/mcp enable <name>` | Reopen a disabled server with the stored configuration |
+  | `/mcp reconnect <name>` | Reopen any server regardless of state; the operator one-stop for "try again" |
+  | `/mcp disconnect <name>` | Close a ready server's connection without touching its configuration |
+
+  `disable` and `disconnect` are distinct: the first is for "I do not want
+  this server at all right now" (config kept on file, easy to bring back),
+  the second is for "I want to take this connection down but keep the
+  setup intact". State is in-memory only -- nothing is written back to
+  `.mcp.json`, and the next session starts with whatever the file says.
+  A call to a tool whose server is `disabled` or `disconnected` returns
+  `error: … is disabled; enable it with /mcp enable <name>` (or the
+  `disconnected` equivalent) rather than "no such tool", so the model
+  knows what changed.
+
+### Changed — MCP client is its own workspace crate
+
+- The MCP layer used to live at `src/mcp/*` as a sibling of the rest of
+  the agent. It moved to `crates/caocli-mcp/`, alongside `caocli-core`
+  (which now holds `ToolDef` and `FunctionDef` -- the types the hub
+  builds and the agent's request builder consumes, the same on both
+  sides of the crate boundary). The change makes one thing explicit
+  that was implicit: the binary owns the user's settings file, not the
+  protocol layer. `Hub::connect` takes the already-extracted
+  `mcpServers` value (`Option<&Value>`); the binary reads it from
+  `settings.json` before connecting. A missing or unreadable settings
+  file is not the hub's problem; the hub gets `None` and carries on.
+  Behaviour is otherwise unchanged.
+
+### Changed — Hub is an actor
+
+- The `Hub` used to be a struct with borrowed access from `tools`,
+  `repl`, and the agent. Adding `enable`/`disable`/`reconnect`/`disconnect`
+  on top of that would have meant either wrapping the inner state in a
+  `Mutex` (sharing mutable state across call sites is exactly what
+  Rust warns against) or infecting every call site with `&mut Hub`
+  (and the borrow-checker failures that come with it). The hub is now
+  an actor: a thin `mpsc::Sender` wrapping, the actor task owns the
+  only `HubInner`, and every public method sends a `Command` and
+  awaits the reply. There is no shared `&mut`, no lock, and the type
+  signature (`async + &self`) tells the whole story.
+- `definitions()` now returns `Arc<Vec<ToolDef>>` rather than
+  `&[ToolDef]`. The request builder calls `.as_slice()`; the `Arc`
+  means the caller can hold the result across turns without re-asking
+  the actor.
+- The tool order is kept as a per-server list
+  (`BTreeMap<String, Vec<String>>`) rather than a flat `Vec<String>`,
+  so `enable`/`disable` mutate one server's block without touching
+  the others and the rebuilt order stays deterministic. The order is
+  part of the request prefix and affects KV-cache stability.
+- Two sync tests that constructed an `Agent` (`effort_label_reads`,
+  `prompt_metadata_pairs`) became `#[tokio::test]` -- the actor model
+  requires a runtime, and `Hub::empty()` is what surfaces that
+  requirement.
+
 ### Added — render markdown in the answer and the thinking block
 
 - The screen and plain front ends used to lay the model's output down as

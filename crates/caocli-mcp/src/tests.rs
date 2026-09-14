@@ -1,18 +1,23 @@
 //! The hub's own tests: what the tools are called, where a call goes, and what
 //! is said about a server that did not come up.
 //!
-//! The servers are as real as they get without a network: the stub scripts the
-//! other tests use, started through the same path the session uses — entries
-//! read as a configuration reads them, opened as `Hub::connect` opens them, and
-//! assembled into a hub the same way.
+//! The servers are as real as they get without a network: the stub scripts
+//! the other tests use, started through the same path the session uses —
+//! entries read as a configuration reads them, opened as `Hub::of_entries`
+//! opens them, and assembled into a hub the same way.
+//!
+//! Every test goes through the actor boundary: the methods on `Hub` send a
+//! command and await the reply, so what the tests see is what the production
+//! callers see.
 
 use super::config::Entry;
+use super::inner::HubInner;
 use super::stub::Stub;
 use super::*;
 
-/// A hub over the entries, with every server opened the way the session opens
-/// one. An entry that cannot be opened becomes a server that did not come up,
-/// which is exactly what it is.
+/// A hub over the entries, with every server opened the way the session
+/// opens one. An entry that cannot be opened becomes a server that did not
+/// come up, which is exactly what it is.
 async fn hub_of(entries: Vec<Entry>) -> Hub {
     Hub::of_entries(entries).await
 }
@@ -25,11 +30,31 @@ fn named(stub: &Stub, name: &str, vars: &[(&str, &str)]) -> Entry {
 }
 
 /// The tools a hub offers, by name.
-fn names(hub: &Hub) -> Vec<String> {
+async fn names(hub: &Hub) -> Vec<String> {
     hub.definitions()
+        .await
         .iter()
         .map(|tool| tool.function.name.clone())
         .collect()
+}
+
+/// Build an empty hub whose only state is the warnings the caller passed in:
+/// the same shape `Hub::assemble` used to give the tests directly, now
+/// reached through `HubInner` (the only place that owns the warnings field)
+/// before the actor task starts.
+async fn hub_with_warnings(warnings: Vec<String>) -> Hub {
+    let entries = Vec::new();
+    let warnings_clone = warnings.clone();
+    let hub =
+        super::spawn_with(async move { HubInner::from_entries(entries, warnings_clone).await });
+    // Touch the warnings through the report so the actor confirms it has
+    // settled into a state where the warnings are visible to callers.
+    let report = hub.report().await;
+    assert!(
+        report.iter().any(|line| line.contains("warning")),
+        "the warnings never reached the report: {report:?}"
+    );
+    hub
 }
 
 #[test]
@@ -45,15 +70,17 @@ fn a_tool_is_named_by_the_server_it_comes_from() {
 
 #[test]
 fn a_name_a_backend_cannot_read_is_made_readable() {
-    // What a backend takes: letters, digits, underscores, dashes. Anything else
-    // — a space, a dot, a character from another alphabet — is one to a tool
-    // name, and one that says where it came from rather than being dropped.
+    // What a backend takes: letters, digits, underscores, dashes. Anything
+    // else — a space, a dot, a character from another alphabet — is one to
+    // a tool name, and one that says where it came from rather than being
+    // dropped.
     assert_eq!(
         tool_name("my server", "read.file"),
         "mcp__my_server__read_file"
     );
-    // A name from another alphabet becomes underscores — where the tool came
-    // from, without pretending to spell it — and is a name all the same.
+    // A name from another alphabet becomes underscores — where the tool
+    // came from, without pretending to spell it — and is a name all the
+    // same.
     let cjk = tool_name("文件", "读");
     assert!(cjk.starts_with("mcp__"), "{cjk}");
     assert!(
@@ -77,7 +104,8 @@ fn a_name_too_long_for_a_backend_keeps_its_front_and_a_hash_of_the_whole() {
     // The same input is the same name: a session log keeps the name, and a
     // later process has to work out the same one or fail to find the tool.
     assert_eq!(name, tool_name("server", tool));
-    // And two names that agree for the whole of the front are still two names.
+    // And two names that agree for the whole of the front are still two
+    // names.
     let other = tool_name(
         "server",
         "a_very_long_tool_name_that_no_backend_would_take_because_it_is_simply_too_lonG",
@@ -88,10 +116,11 @@ fn a_name_too_long_for_a_backend_keeps_its_front_and_a_hash_of_the_whole() {
 #[tokio::test]
 async fn an_empty_hub_offers_nothing_and_says_where_servers_come_from() {
     let hub = Hub::empty();
-    assert!(hub.definitions().is_empty());
-    assert!(hub.notes().is_empty());
-    assert_eq!(hub.report().len(), 1);
-    assert!(hub.report()[0].contains("mcpServers"), "{:?}", hub.report());
+    assert!(hub.definitions().await.is_empty());
+    assert!(hub.notes().await.is_empty());
+    let report = hub.report().await;
+    assert_eq!(report.len(), 1);
+    assert!(report[0].contains("mcpServers"), "{:?}", report);
     let refused = hub.call("mcp__nobody__nothing", "{}").await;
     assert!(refused.starts_with("error: "), "{refused}");
     assert!(refused.contains("none came up"), "{refused}");
@@ -108,7 +137,7 @@ async fn a_call_goes_to_the_server_that_offers_the_tool() {
     ])
     .await;
     assert_eq!(
-        names(&hub),
+        names(&hub).await,
         vec!["mcp__alpha__echo", "mcp__beta__fail"],
         "in configuration order, which is sorted by name"
     );
@@ -140,13 +169,13 @@ async fn a_server_that_did_not_come_up_costs_nothing_else() {
         broken,
     ])
     .await;
-    assert_eq!(names(&hub), vec!["mcp__alpha__echo"]);
-    let notes = hub.notes();
+    assert_eq!(names(&hub).await, vec!["mcp__alpha__echo"]);
+    let notes = hub.notes().await;
     assert_eq!(notes.len(), 2, "{notes:?}");
     assert!(notes[0].contains("alpha"), "{notes:?}");
     assert!(notes[1].contains("missing"), "{notes:?}");
     assert!(notes[1].contains("failed to start"), "{notes:?}");
-    let report = hub.report();
+    let report = hub.report().await;
     assert!(report[0].contains("protocol"), "{report:?}");
     assert!(report[1].contains("alpha"), "{report:?}");
     assert!(report[2].contains("did not start"), "{report:?}");
@@ -157,18 +186,24 @@ async fn a_server_that_did_not_come_up_costs_nothing_else() {
 async fn two_servers_whose_names_become_one_are_told_apart_by_what_is_said() {
     let first = Stub::new();
     let second = Stub::new();
-    // "a b" and "a_b" are two names to a configuration and one to a backend, so
-    // the tools of the second server would carry the names of the first's.
+    // "a b" and "a_b" are two names to a configuration and one to a backend,
+    // so the tools of the second server would carry the names of the first's.
     let hub = hub_of(vec![
         named(&first, "a b", &[("STUB_TOOLS", "echo")]),
         named(&second, "a_b", &[("STUB_TOOLS", "echo")]),
     ])
     .await;
-    assert_eq!(names(&hub), vec!["mcp__a_b__echo"]);
-    assert_eq!(hub.warnings.len(), 1, "{:?}", hub.warnings);
-    assert!(hub.warnings[0].contains("two tools"), "{:?}", hub.warnings);
-    // The one that is offered is the first server's: it reached that server and
-    // not the other.
+    assert_eq!(names(&hub).await, vec!["mcp__a_b__echo"]);
+    // The warnings the hub collected during assembly end up in the report
+    // as `warning:` lines — the only place the actor makes them visible
+    // to callers, now that the field is no longer public.
+    let report = hub.report().await;
+    assert!(
+        report.iter().any(|line| line.contains("two tools")),
+        "the warning did not reach the report: {report:?}"
+    );
+    // The one that is offered is the first server's: it reached that server
+    // and not the other.
     hub.call("mcp__a_b__echo", r#"{"text":"one"}"#).await;
     assert!(first.received().iter().any(|line| line.contains("one")));
     assert!(!second.received().iter().any(|line| line.contains("one")));
@@ -200,8 +235,8 @@ async fn a_name_nobody_offers_is_answered_with_what_is_offered() {
     let refused = hub.call("mcp__alpha__nowhere", "{}").await;
     assert!(refused.starts_with("error: "), "{refused}");
     assert!(refused.contains("mcp__alpha__a"), "{refused}");
-    // A long list is cut: a failure is a sentence, and the whole tool list is
-    // in the request the model already has.
+    // A long list is cut: a failure is a sentence, and the whole tool list
+    // is in the request the model already has.
     assert!(refused.contains("and 4 more"), "{refused}");
     // A name from a server that is not there at all is answered the same way.
     let nowhere = hub.call("mcp__nowhere__nothing", "{}").await;
@@ -234,7 +269,7 @@ async fn arguments_that_are_not_an_object_are_answered_rather_than_sent() {
 async fn the_report_names_the_tools_the_model_sees() {
     let stub = Stub::new();
     let hub = hub_of(vec![named(&stub, "alpha", &[("STUB_TOOLS", "echo,fail")])]).await;
-    let report = hub.report();
+    let report = hub.report().await;
     assert_eq!(report.len(), 2, "{report:?}");
     assert!(report[1].contains("mcp__alpha__echo"), "{report:?}");
     assert!(report[1].contains("mcp__alpha__fail"), "{report:?}");
@@ -245,7 +280,7 @@ async fn the_report_names_the_tools_the_model_sees() {
         named(&other, "beta", &[("STUB_TOOLS", "fail")]),
     ])
     .await;
-    let report = hub.report();
+    let report = hub.report().await;
     assert!(report[1].contains("mcp__alpha__echo"), "{report:?}");
     assert!(!report[1].contains("mcp__beta__fail"), "{report:?}");
     assert!(report[3].contains("mcp__beta__fail"), "{report:?}");
@@ -268,13 +303,158 @@ async fn shutting_the_hub_down_ends_every_server() {
 }
 
 #[tokio::test]
+async fn list_names_every_server_with_its_state_and_tools_count() {
+    let alpha = Stub::new();
+    let beta = Stub::new();
+    let hub = hub_of(vec![
+        named(&alpha, "alpha", &[("STUB_TOOLS", "echo,fail")]),
+        named(&beta, "beta", &[("STUB_TOOLS", "ping")]),
+    ])
+    .await;
+    let statuses = hub.list().await;
+    assert_eq!(
+        statuses,
+        vec![
+            ServerStatus {
+                name: "alpha".into(),
+                state: ServerState::Ready,
+                tools_count: 2,
+            },
+            ServerStatus {
+                name: "beta".into(),
+                state: ServerState::Ready,
+                tools_count: 1,
+            },
+        ]
+    );
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn disable_takes_a_server_out_of_service_and_pulls_its_tools() {
+    let stub = Stub::new();
+    let hub = hub_of(vec![named(&stub, "alpha", &[("STUB_TOOLS", "echo")])]).await;
+    assert_eq!(names(&hub).await, vec!["mcp__alpha__echo"]);
+
+    hub.disable("alpha").await.expect("disable ready server");
+    assert!(names(&hub).await.is_empty(), "the tools are gone");
+
+    let statuses = hub.list().await;
+    assert_eq!(statuses[0].state, ServerState::Disabled);
+    assert_eq!(statuses[0].tools_count, 0);
+
+    // A call to a tool whose server has been disabled goes through the
+    // routes (so the model gets a meaningful reason, not just "no such
+    // tool") and arrives at the Disabled branch.
+    let refused = hub.call("mcp__alpha__echo", "{}").await;
+    assert!(refused.contains("disabled"), "{refused}");
+
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn enable_brings_a_disabled_server_back_with_its_tools() {
+    let stub = Stub::new();
+    let hub = hub_of(vec![named(&stub, "alpha", &[("STUB_TOOLS", "echo")])]).await;
+    hub.disable("alpha").await.unwrap();
+    hub.enable("alpha").await.unwrap();
+    assert_eq!(names(&hub).await, vec!["mcp__alpha__echo"]);
+    let result = hub.call("mcp__alpha__echo", r#"{"text":"again"}"#).await;
+    assert_eq!(result, "called with {text:again}");
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn enable_rejects_servers_that_are_not_disabled() {
+    let stub = Stub::new();
+    let hub = hub_of(vec![named(&stub, "alpha", &[("STUB_TOOLS", "echo")])]).await;
+
+    // Already Ready -> "already enabled".
+    let err = hub.enable("alpha").await.unwrap_err();
+    assert!(err.contains("already enabled"), "{err}");
+
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn disconnect_closes_the_connection_and_enable_again_does_not_work() {
+    let stub = Stub::new();
+    let hub = hub_of(vec![named(&stub, "alpha", &[("STUB_TOOLS", "echo")])]).await;
+    hub.disconnect("alpha").await.unwrap();
+    let statuses = hub.list().await;
+    assert_eq!(statuses[0].state, ServerState::Disconnected);
+
+    // enable rejects a Disconnected server — the operator wants `reconnect`.
+    let err = hub.enable("alpha").await.unwrap_err();
+    assert!(err.contains("disconnected"), "{err}");
+
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn reconnect_restarts_a_disconnected_or_failed_server() {
+    let stub = Stub::new();
+    let hub = hub_of(vec![named(&stub, "alpha", &[("STUB_TOOLS", "echo")])]).await;
+    hub.disconnect("alpha").await.unwrap();
+    hub.reconnect("alpha").await.unwrap();
+    assert_eq!(
+        hub.list().await[0].state,
+        ServerState::Ready,
+        "reconnect brings a Disconnected server back to Ready"
+    );
+    let result = hub.call("mcp__alpha__echo", r#"{"text":"re"}"#).await;
+    assert_eq!(result, "called with {text:re}");
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn disable_then_reconnect_brings_the_server_back() {
+    // The disable/enable cycle goes through state transitions: Ready ->
+    // Disabled -> Ready. `reconnect` is the same shape regardless of the
+    // starting state, so it works from Disabled too.
+    let stub = Stub::new();
+    let hub = hub_of(vec![named(&stub, "alpha", &[("STUB_TOOLS", "echo")])]).await;
+    hub.disable("alpha").await.unwrap();
+    hub.reconnect("alpha").await.unwrap();
+    assert_eq!(hub.list().await[0].state, ServerState::Ready);
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn disable_disconnect_reconnect_on_a_missing_server_errors() {
+    let hub = Hub::empty();
+    assert!(hub.enable("ghost").await.is_err());
+    assert!(hub.disable("ghost").await.is_err());
+    assert!(hub.reconnect("ghost").await.is_err());
+    assert!(hub.disconnect("ghost").await.is_err());
+}
+
+#[tokio::test]
+async fn list_reports_disabled_and_disconnected_states_for_banner() {
+    let stub = Stub::new();
+    let hub = hub_of(vec![named(&stub, "alpha", &[("STUB_TOOLS", "echo")])]).await;
+    hub.disable("alpha").await.unwrap();
+
+    let notes = hub.notes().await;
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("alpha") && n.contains("disabled")),
+        "notes do not mention the disabled server: {notes:?}"
+    );
+
+    hub.shutdown().await;
+}
+
+#[tokio::test]
 async fn the_notes_say_what_is_wrong_with_an_entry_nobody_could_use() {
-    // A configuration warning is carried through: it is the same "what happened
-    // on the way in" the report is about.
-    let hub = Hub::assemble(Vec::new(), Vec::new(), vec!["${TOKEN} is not set".into()]);
-    assert_eq!(hub.notes().len(), 1, "{:?}", hub.notes());
-    assert!(hub.notes()[0].contains("TOKEN"), "{:?}", hub.notes());
-    assert!(hub.report()[0].contains("warning"), "{:?}", hub.report());
+    // A configuration warning is carried through: it is the same "what
+    // happened on the way in" the report is about.
+    let hub = hub_with_warnings(vec!["${TOKEN} is not set".into()]).await;
+    let notes = hub.notes().await;
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("TOKEN"), "{notes:?}");
+    hub.shutdown().await;
 }
 
 #[tokio::test]
@@ -297,8 +477,11 @@ async fn the_hub_connects_what_the_files_name() {
         .unwrap(),
     )
     .unwrap();
-    let hub = Hub::connect(&workspace, None).await;
-    assert_eq!(names(&hub), vec!["mcp__alpha__echo", "mcp__alpha__big"]);
+    let hub = Hub::spawn(&workspace, None);
+    assert_eq!(
+        names(&hub).await,
+        vec!["mcp__alpha__echo", "mcp__alpha__big"]
+    );
     assert_eq!(
         hub.call("mcp__alpha__echo", r#"{"text":"from the file"}"#)
             .await,
