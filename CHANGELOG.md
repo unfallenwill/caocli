@@ -83,9 +83,27 @@ The schema is documented in `docs/session-format.md`.
 
 ### Fixed
 
-- Tests in `repl.rs` and `session.rs` that touch HOME/PWD now share a
-  process-wide `RUST_TEST_THREADS=1` runner. The CI workflow sets
-  this explicitly; local development can override.
+- `Ctrl-O` acts on the thought region the screen is showing, not on the
+  youngest one. The two were the same region only until output arrived: a
+  body opened mid-stream went historical the moment the next region opened
+  under it, and the next `Ctrl-O` expanded *that* region instead of closing
+  the one on screen. With two regions expanded, the view (the youngest
+  expanded region) and the key (the youngest region) named different
+  regions, and the transcript could not be reached again — every press
+  swapped between the two bodies. The key now closes the body on screen
+  first, whatever the region's status, and opens the youngest region only
+  when none is expanded, so the transcript is one press away at all times.
+  The two key routers (the idle prompt and the running turn) share the one
+  rule; a test drives both.
+- The HOME/PWD tests of `session.rs` serialised on a lock of their own
+  while every other module took `config::env_lock()`. HOME is one
+  variable for the whole test binary, so the two groups could move it
+  under each other and land a test reading a key out of a home nobody
+  had stored it in — `cargo test --workspace` failed with `no API key
+  for MiniMax` in `repl` on roughly one run in three. Every test that
+  touches HOME holds the one lock now, and the parallel suite is green
+  (`RUST_TEST_THREADS=1`, which CI still sets, is no longer what is
+  holding them apart).
 
 ### Added — runtime control over MCP servers
 
@@ -205,6 +223,30 @@ The schema is documented in `docs/session-format.md`.
   are not JSON -- used to show the first 80 columns of its arguments and
   drop the rest without a mark; it now shows all of them, wrapped by the
   region like every other long line. `HINT_COLUMNS` is gone.
+
+### Changed — nothing on the transcript is counted away
+
+- A think longer than twelve lines used to be cut to its head with a
+  `┆ N more lines` row standing in for the rest — on the live
+  transcript, on a resumed one, and inside the expanded view `Ctrl-O`
+  opens, which is where the reader had gone to read exactly that body.
+  `THINKING_LINES` is gone and the thinking is drawn whole wherever it
+  appears; a block that runs past the window is scrolled to, like every
+  other long cell. The transcript is the place a session's own words are
+  kept, and the log has the same text either way.
+
+### Changed — the thinking carries no marker
+
+- The model's thinking used to wear a `┆` down its margin, in both front
+  ends, and the fold line a stretch of it leaves behind wore the same one.
+  Neither carries a marker now: both are set in two columns and dim, and
+  the words are the only thing in the columns. What the marker was for —
+  telling the machinery from the answer on a terminal that honours neither
+  colour nor dim — is the columns' job, and they still do it: the answer
+  is the one line at the left edge, and a think that wrapped back to it
+  would read as an answer. `Ctrl-O`'s expanded view is the same picture
+  one level down, with the tool calls inside the region keeping the markers
+  that carry their verdict.
 
 ## [0.1.6] — 2026-09-14
 
