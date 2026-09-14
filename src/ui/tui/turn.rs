@@ -48,6 +48,11 @@ pub(crate) struct Turn {
     /// The indicator title the last tick saw, so a tick bumps the revision only
     /// when the border would show something new.
     pub(crate) ticked_activity: Option<String>,
+    /// Whether the agent is streaming reasoning right now. Drives the
+    /// "thinking" phase of the box border; flipped off the moment a
+    /// different style or a tool call takes over.
+    #[allow(dead_code)] // read by the activity title in a follow-up commit
+    pub(crate) reasoning_in_flight: bool,
     /// The verb of the tool call currently running, or `None` while the
     /// model is reasoning or producing content. Drives the "running X"
     /// label on the box's top border; the runner resets it to `None`
@@ -65,6 +70,7 @@ impl Default for Turn {
             chars_since_usage: 0,
             chars_per_token: BLIND_CHARS_PER_TOKEN,
             ticked_activity: None,
+            reasoning_in_flight: false,
             current_tool_verb: None,
         }
     }
