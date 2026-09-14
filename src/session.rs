@@ -970,6 +970,13 @@ impl SessionSource {
     /// `fresh_meta` is a closure so a `--resume` run does not pay to build it:
     /// reading the workspace's AGENTS.md is filesystem IO, and the only call
     /// sites that need a meta are the ones that create a session.
+    ///
+    /// `--resume <id>` looks in `dir` first (the current workspace's
+    /// per-cwd directory) and then walks every other layout directory,
+    /// because users do name sessions by their stem across workspaces.
+    /// A collision (same id in two workspaces) is the first hit wins, the
+    /// per-workspace directory first; `--list --all` is how a script
+    /// would disambiguate.
     pub fn resolve<F>(self, dir: &Path, fresh_meta: F) -> Result<Session>
     where
         F: FnOnce() -> Result<SessionMeta>,
@@ -977,8 +984,29 @@ impl SessionSource {
         match self {
             SessionSource::Resume { id } => {
                 validate_resume_id(&id)?;
-                let path = dir.join(format!("{id}.jsonl"));
-                Session::load(&path).with_context(|| format!("failed to resume session {id}"))
+                let local = dir.join(format!("{id}.jsonl"));
+                if local.exists() {
+                    return Session::load(&local)
+                        .with_context(|| format!("failed to resume session {id}"));
+                }
+                // Walk the other layout directories for a session with
+                // this id; the first hit wins. A directory whose name
+                // does not parse is left alone — it cannot contain a
+                // session we know how to read.
+                let all = crate::config::all_sessions_dirs()
+                    .context("looking up the session across workspaces")?;
+                for (path, _cwd) in all {
+                    if path == dir {
+                        continue;
+                    }
+                    let candidate = path.join(format!("{id}.jsonl"));
+                    if candidate.exists() {
+                        return Session::load(&candidate).with_context(|| {
+                            format!("failed to resume session {id} (found in another workspace)")
+                        });
+                    }
+                }
+                bail!("no session file found for id {id} in this workspace or any other");
             }
             SessionSource::ContinueLatest => match latest(dir.to_path_buf())? {
                 Some(path) => Session::load(&path),
@@ -1048,7 +1076,6 @@ pub fn validate_resume_id(id: &str) -> Result<()> {
 /// Turn an absolute working directory into a layout-safe directory name.
 /// `None` (cwd not known) maps to a fixed sentinel that no escaped absolute
 /// path can produce (every escaped absolute path starts with `%2F`).
-#[allow(dead_code)] // see the module-level note on layout wiring.
 pub fn escape_working_directory(cwd: Option<&Path>) -> Result<String> {
     let Some(path) = cwd else {
         return Ok("_no-working-directory".to_string());
@@ -1069,7 +1096,6 @@ pub fn escape_working_directory(cwd: Option<&Path>) -> Result<String> {
 /// Inverse of [`escape_working_directory`]. Used by a `--resume` that walks
 /// across workspaces and by `--list --all`, which names directories back to
 /// the user.
-#[allow(dead_code)] // see the module-level note on layout wiring.
 pub fn unescape_working_directory(name: &str) -> Result<PathBuf> {
     if name == "_no-working-directory" {
         bail!("this directory holds sessions whose working directory was not recorded");
@@ -1997,5 +2023,81 @@ mod tests {
         assert!(s.last_sequence().is_none());
         drop(s);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ----- G7: layout (per-cwd session directories) -----
+
+    /// Tests in this module change HOME and walk the layout. The
+    /// shared env lock in `config::tests` is private to that module;
+    /// use a dedicated one and serialise on it. The tests are also
+    /// marked `--test-threads=1`-safe by virtue of taking this lock.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn next_counter() -> usize {
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn with_env_home<F: FnOnce(&std::path::Path)>(f: F) {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let scratch = std::env::temp_dir().join(format!(
+            "caocli-session-layout-{}-{}",
+            std::process::id(),
+            next_counter()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        // SAFETY: tests in this module serialise on ENV_LOCK.
+        unsafe {
+            std::env::set_var("HOME", &scratch);
+        }
+        f(&scratch);
+    }
+
+    #[test]
+    fn resolve_resume_finds_a_session_in_another_workspace() {
+        with_env_home(|scratch| {
+            let base = scratch.join(".caocli").join("sessions");
+            let dir_a = base.join("aaaaaaaa-aaaaaaaa");
+            let dir_b = base.join("bbbbbbbb-bbbbbbbb");
+            std::fs::create_dir_all(&dir_a).unwrap();
+            std::fs::create_dir_all(&dir_b).unwrap();
+
+            let mut s = Session::create(&dir_a, test_meta()).unwrap();
+            s.append_message(&Message::user("from a")).unwrap();
+            let id = s.id.clone();
+            drop(s);
+
+            // Resume from dir_b: the session is not in this workspace's
+            // dir_b path, but the cross-workspace walk finds it in dir_a.
+            let loaded = SessionSource::Resume { id: id.clone() }
+                .resolve(&dir_b, || panic!("resume must not build a fresh meta"))
+                .unwrap();
+            assert_eq!(loaded.id, id);
+            assert_eq!(loaded.messages.len(), 1);
+
+            let _ = std::fs::remove_dir_all(scratch);
+        });
+    }
+
+    #[test]
+    fn resolve_resume_says_not_found_when_no_workspace_has_it() {
+        with_env_home(|scratch| {
+            let base = scratch.join(".caocli").join("sessions");
+            std::fs::create_dir_all(&base).unwrap();
+
+            let result = SessionSource::Resume {
+                id: "no-such-session".into(),
+            }
+            .resolve(&base, || panic!("must not build a fresh meta"));
+            let err = match result {
+                Ok(_) => panic!("resume must fail"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("no session file found"),
+                "the error names the cause: {err:#}"
+            );
+            let _ = std::fs::remove_dir_all(scratch);
+        });
     }
 }

@@ -107,8 +107,32 @@ impl FrontEnd {
 }
 
 /// Print the session list and exit. The terminal does not need to be a TTY:
-/// `--list` is the verb a script uses.
-pub(crate) fn print_sessions(sessions_dir: &Path) -> Result<()> {
+/// `--list` is the verb a script uses. `all = true` walks every
+/// workspace under `~/.caocli/sessions/`; the default is this workspace
+/// only.
+pub(crate) fn print_sessions(sessions_dir: &Path, all: bool) -> Result<()> {
+    if all {
+        let dirs = crate::config::all_sessions_dirs()?;
+        if dirs.is_empty() {
+            return Ok(());
+        }
+        // Sort by cwd label so a script's output is stable across runs.
+        let mut dirs = dirs;
+        dirs.sort_by(|a, b| a.1.cmp(&b.1));
+        for (path, cwd) in &dirs {
+            for s in session::list(path)? {
+                println!(
+                    "{}\t{}\t{} messages\t{}\t{}",
+                    cwd,
+                    s.id,
+                    s.message_count,
+                    s.preview,
+                    s.path.display()
+                );
+            }
+        }
+        return Ok(());
+    }
     for s in session::list(sessions_dir)? {
         println!(
             "{}\t{} messages\t{}\t{}",

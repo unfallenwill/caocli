@@ -67,6 +67,11 @@ pub struct Cli {
     #[arg(long)]
     pub list: bool,
 
+    /// With `--list`, include sessions from every workspace on this
+    /// machine. The default is "this workspace only".
+    #[arg(long, requires = "list")]
+    pub list_all: bool,
+
     /// Disable the REPL status bar (cache hit rate)
     #[arg(long)]
     pub no_status_bar: bool,

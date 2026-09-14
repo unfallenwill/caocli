@@ -41,13 +41,12 @@ async fn run(cli: Cli) -> Result<()> {
         let sessions_dir = config::sessions_dir()?;
         return cli::run_migrate(&cli, &sessions_dir);
     }
-
     let mut ui = Renderer::new();
     let startup = startup::resolve_startup(&cli)?;
 
     // List sessions: a CLI verb that exits before the agent is built.
     if matches!(startup.mode, Mode::ListSessions) {
-        return front::print_sessions(&startup.sessions_dir);
+        return front::print_sessions(&startup.sessions_dir, cli.list_all);
     }
 
     // The MCP servers this workspace and the user's settings name, connected

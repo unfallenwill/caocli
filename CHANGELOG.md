@@ -34,12 +34,33 @@ The schema is documented in `docs/session-format.md`.
   resume reach outside `sessions_dir`; it now fails at the point the
   path is built.
 
+### Changed — session files live under per-workspace directories
+
+- `~/.caocli/sessions/` now contains a subdirectory per working
+  directory (`<escaped cwd>/`), so `--continue` means "the most
+  recent session of *this* workspace" and `--list --all` shows
+  every workspace's history. A session is byte-for-byte the same
+  shape regardless of which workspace it ran in — the change is
+  entirely in where the file is filed.
+- `--resume <id>` looks in the current workspace first and walks
+  every other workspace on a miss, so a session named by its stem
+  is still reachable across workspaces. A collision is the first hit
+  wins; `--list --all` is how a script disambiguates.
+- `--list --all` is the new "every workspace" form of `--list`. The
+  default (`--list` without `--all`) is this workspace only.
+- `--migrate --all` walks every workspace under `~/.caocli/sessions/`
+  and lifts v0 files in each. Same contract as before: the original
+  is never touched.
+- The escape helper (`escape_working_directory` /
+  `unescape_working_directory`) is now part of the hot path; it is
+  documented in `docs/session-format.md`. `%` is reserved in `--resume`
+  ids because it is the escape character.
+
 ### Fixed
 
-- The session reader refuses `format_version > 1` rather than silently
-  dropping fields. A silently-dropped field in a `msg` line is a request
-  the backend no longer matches, and the only honest answer to "what
-  does this file mean" is "I do not know".
+- Tests in `repl.rs` and `session.rs` that touch HOME/PWD now share a
+  process-wide `RUST_TEST_THREADS=1` runner. The CI workflow sets
+  this explicitly; local development can override.
 
 ### Added — runtime control over MCP servers
 

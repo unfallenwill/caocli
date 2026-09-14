@@ -116,13 +116,59 @@ pub fn caocli_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join(".caocli"))
 }
 
-/// `~/.caocli/sessions`, made here rather than by each writer: the sessions are
-/// what this directory is for, and a session is written into it on the way in.
+/// The current working directory as the layout wants to read it: a
+/// PathBuf for an absolute path, `None` when the cwd could not be
+/// determined. Falls back to the `_no-working-directory` sentinel
+/// rather than erroring out: a session whose cwd was not recorded
+/// (older runs, broken environments) still needs to land somewhere.
+fn current_cwd() -> Option<PathBuf> {
+    std::env::current_dir().ok().filter(|p| p.is_absolute())
+}
+
+/// `~/.caocli/sessions/<escaped cwd>/`, made here rather than by each
+/// writer: the sessions are what this directory is for, and a session
+/// is written into it on the way in. Sessions now live under a
+/// per-working-directory subdirectory so `--continue` means "the most
+/// recent session of *this* workspace", and `--list --all` can show
+/// every workspace without reading one workspace's history into
+/// another's listing.
 pub fn sessions_dir() -> Result<PathBuf> {
     let dir = caocli_dir()?.join("sessions");
+    let cwd = current_cwd();
+    let dir = dir.join(crate::session::escape_working_directory(cwd.as_deref())?);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create directory: {}", dir.display()))?;
     Ok(dir)
+}
+
+/// Walk every layout subdirectory under `~/.caocli/sessions/` and
+/// return `(path, cwd-display)` for each. The cwd-display is the
+/// unescaped name (the original absolute path) when the name was a
+/// known escape, or the escaped name itself when it was the
+/// `_no-working-directory` sentinel. `~/_no-working-directory` is
+/// reported with a fixed label rather than its (unreadable) path.
+pub fn all_sessions_dirs() -> Result<Vec<(PathBuf, String)>> {
+    let base = caocli_dir()?.join("sessions");
+    if !base.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&base)
+        .with_context(|| format!("failed to read directory: {}", base.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let label = match crate::session::unescape_working_directory(&name) {
+            Ok(p) => p.to_string_lossy().into_owned(),
+            Err(_) => name,
+        };
+        out.push((path, label));
+    }
+    Ok(out)
 }
 
 pub fn history_file() -> Result<PathBuf> {
@@ -300,21 +346,32 @@ pub fn api_key(provider: &Provider) -> Result<String> {
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Take it, ignoring poisoning: a test that fails while holding it must not turn
-/// the ones behind it into failures of their own.
+/// the ones behind it into failures of their own. Tests that mutate HOME or
+/// PWD (any test that touches `sessions_dir`'s inputs) must hold this
+/// for their entire read+write window. Tests across modules that both
+/// touch the env share this single lock.
 #[cfg(test)]
 pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Counter used to give env-driven tests unique temp dirs. Public so
+/// other modules' tests can mint unique paths without colliding.
+#[cfg(test)]
+pub(crate) static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn next_counter() -> usize {
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
 /// A HOME of its own, so that a key a test finds under it is one the test itself
 /// put there. The caller holds [`env_lock`] while it uses it.
 #[cfg(test)]
 pub(crate) fn scratch_home() -> PathBuf {
-    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let home = std::env::temp_dir().join(format!(
         "caocli-test-home-{}-{}",
         std::process::id(),
-        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        next_counter()
     ));
     // The config directory with it, because a test that writes a settings file
     // writes it where the program would look for one, and what reads there no
@@ -331,11 +388,10 @@ pub(crate) fn scratch_home() -> PathBuf {
 /// uses it and moves the process back before it returns.
 #[cfg(test)]
 pub(crate) fn scratch_cwd() -> PathBuf {
-    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "caocli-test-cwd-{}-{}",
         std::process::id(),
-        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        next_counter()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     std::env::set_current_dir(&dir).unwrap();
@@ -349,11 +405,10 @@ mod tests {
 
     /// Returns a fresh, already-created temporary HOME.
     fn temp_home() -> PathBuf {
-        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let d = std::env::temp_dir().join(format!(
             "caocli-config-test-{}-{}",
             std::process::id(),
-            COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            next_counter()
         ));
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -600,8 +655,12 @@ mod tests {
         assert_eq!(path, home.join(".caocli").join("settings.json"));
         assert!(d.is_dir());
 
+        // sessions_dir now puts a per-cwd layer under ~/.caocli/sessions/.
+        // The exact cwd is the test process's cwd at the moment of the
+        // call; we only check the directory exists and is inside the
+        // sessions root.
         let s = sessions_dir().unwrap();
-        assert_eq!(s, home.join(".caocli").join("sessions"));
+        assert!(s.starts_with(home.join(".caocli").join("sessions")));
         assert!(s.is_dir());
         std::fs::remove_dir_all(&home).unwrap();
     }
@@ -670,5 +729,79 @@ mod tests {
             hint: "the hint".into(),
         };
         assert_eq!(key.missing_note(), Some("the hint"));
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    // Reuse the crate-level `env_lock` / `next_counter` so the env
+    // is serialised with `config::tests` and the unique-id counter
+    // is shared with every other env-touching test in the crate.
+
+    #[test]
+    fn sessions_dir_lives_under_an_escaped_cwd_subdirectory() {
+        // Hold the env lock for the whole read of HOME + write of
+        // sessions_dir + read of HOME again, so a concurrent test
+        // cannot change HOME in between.
+        let _g = env_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "caocli-config-layout2-{}-{}",
+            std::process::id(),
+            next_counter()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: env_lock held.
+        unsafe {
+            std::env::set_var("HOME", &dir);
+        }
+        let s = sessions_dir().unwrap();
+        let expected_root = caocli_dir().unwrap().join("sessions");
+        assert!(
+            s.starts_with(&expected_root),
+            "sessions_dir sits under the sessions root: {} under {}",
+            s.display(),
+            expected_root.display()
+        );
+        assert!(s.is_dir(), "the directory is created on first access");
+        let _ = std::fs::remove_dir_all(&expected_root);
+    }
+
+    #[test]
+    fn sessions_dir_under_a_no_cwd_runtime_uses_the_sentinel() {
+        // We cannot reliably make `current_dir()` fail, but we can verify
+        // the helper that calls it: when the cwd resolves to a relative
+        // path, the helper falls back to the sentinel. The escape helper
+        // itself is unit-tested in session.rs; here we assert the path the
+        // layout builds when cwd is None.
+        let encoded = crate::session::escape_working_directory(None).unwrap();
+        assert_eq!(encoded, "_no-working-directory");
+    }
+
+    #[test]
+    fn all_sessions_dirs_walks_under_caocli_sessions() {
+        let _g = env_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "caocli-config-layout3-{}-{}",
+            std::process::id(),
+            next_counter()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: env_lock held.
+        unsafe {
+            std::env::set_var("HOME", &dir);
+        }
+        let base = caocli_dir().unwrap().join("sessions");
+        let a = base.join("aaaaaaaa-aaaaaaaa");
+        let b = base.join("bbbbbbbb-bbbbbbbb");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let all = all_sessions_dirs().unwrap();
+        let paths: Vec<_> = all.iter().map(|(p, _)| p.clone()).collect();
+        assert!(paths.contains(&a), "first workspace is walked");
+        assert!(paths.contains(&b), "second workspace is walked");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

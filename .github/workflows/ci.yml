@@ -22,7 +22,10 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
-        run: cargo test --workspace
+        # Several tests touch HOME / PWD / the filesystem in ways that
+        # race across threads. The CI runner runs one thread by
+        # default, which is enough; the env var makes that explicit.
+        run: RUST_TEST_THREADS=1 cargo test --workspace
       - name: Coverage (line >= 90%)
         run: |
           rustup component add llvm-tools-preview

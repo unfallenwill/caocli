@@ -26,9 +26,10 @@ keep their diff visible in both modes, because the change is what the call is fo
 files are read when a session starts and sent with every request (see
 [Project instructions](#project-instructions-agentsmd)).
 Sessions are append-only JSONL
-logs under `~/.caocli/sessions/`, resumable across runs and replayed
-byte-for-byte so the backend's prefix cache keeps hitting. The file is the
-session's execution trace, and its format is specified in
+logs under `~/.caocli/sessions/`, one subdirectory per working
+directory, resumable across runs and replayed byte-for-byte so the
+backend's prefix cache keeps hitting. The file is the session's
+execution trace, and its format is specified in
 [`docs/session-format.md`](docs/session-format.md).
 
 ## Requirements
@@ -112,10 +113,11 @@ contains newlines also works (bracketed paste).
 | `--image <PATH>` | Attach an image to `-p`'s prompt; repeat for more than one. In an interactive session, `/image` is how one is attached |
 | `--model <MODEL>` | Model id as `<provider>/<modelid>` (e.g. `deepseek/deepseek-v4-pro`, `zai-coding-cn/glm-5.3`); a bare id is rejected. With no `--model`, the first provider with a stored key runs its `models[0]` |
 | `--effort <EFFORT>` | Reasoning effort: `low`, `high`, or `max` (default `max`); other values are rejected locally. `/effort` switches it inside a session. On GLM, `low` answers without emitting `reasoning_content`. |
-| `-c, --cont` | Continue the most recent session of this workspace (the file with the latest mtime under the workspace's sessions directory) |
-| `--resume <ID>` | Resume a specific session by id. Ids containing `/`, `..`, `\`, `%` or NUL are rejected — `--resume` cannot reach outside `sessions_dir`. |
+| `-c, --cont` | Continue the most recent session of this workspace (the file with the latest mtime under `~/.caocli/sessions/<escaped cwd>/`) |
+| `--resume <ID>` | Resume a specific session by id. Looks in this workspace first, then walks every other workspace under `~/.caocli/sessions/`. Ids containing `/`, `..`, `\`, `%` or NUL are rejected — `--resume` cannot reach outside `sessions_dir`. |
 | `--list` | List sessions of this workspace and exit (use `--migrate --all` to lift old v0 files to v1 — see `docs/session-format.md`) |
-| `--migrate <ID>` | Read a v0 session file and write a v1 sibling (`<id>-v1.jsonl`) beside it; the original is not touched. Combine with `--all` to migrate every v0 file in the sessions directory. |
+| `--list --all` | List sessions from every workspace on this machine, with their working directory |
+| `--migrate <ID>` | Read a v0 session file and write a v1 sibling (`<id>-v1.jsonl`) beside it; the original is not touched. Combine with `--all` to migrate every v0 file across every workspace. |
 | `--ask` | Approval gate: ask y/N before Bash/Edit/Write (Read always allowed, and so is `Glob` — looking for a file to read changes nothing on disk — as is `TodoWrite`; a question reaches you either way). Denials are recorded as deterministic markers the model can see and adapt to. |
 | `--no-tui` | Keep the plain prompt instead of the full-screen front end |
 | `--no-status-bar` | Disable the plain prompt's status bar |
