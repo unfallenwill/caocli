@@ -4,6 +4,41 @@ A session file is the **execution trace of one caocli session**: the events of
 the run, in the order they happened, in a form that can be read back both by
 caocli itself and by a person with `jq`.
 
+## [Unreleased]
+
+### Added — Xiaomi MiMo V2.5
+
+A third wire and a fourth provider. Xiaomi's `https://api.xiaomimimo.com`
+serves its `mimo-v2.5-pro` (the flagship reasoning model) and `mimo-v2.5`
+(the omni-modal one) over the OpenAI Responses API — a list of `input`
+items rather than the chat wire's list of messages, with the system prompt
+riding beside the conversation as `instructions`. The wire speaks the same
+standards: the standard events, the standard `usage.input_tokens_details.
+cached_tokens` for prompt caching, and `response.incomplete_details.reason`
+for the ceiling notice. The reasoning items the model writes come back as
+typed items with an id of their own, and the chain-of-thought replay that
+keeps multi-turn reasoning continuous works on this wire the same way the
+signed blocks do on the Anthropic one: the next request sends them whole,
+in the order the model produced them.
+
+- `crates/openai/src/responses_stream.rs`: `ResponseUsageSummary` keeps the
+  input/output breakdowns and `ResponseSummary` keeps `incomplete_details` —
+  the standard fields the lifecycle events carry and the totals-only shape
+  was dropping. `ResponseInputItem::FunctionCall` is added so a call the
+  model made on an earlier turn replays alongside its `function_call_output`,
+  which is what `is_request_valid`'s tool-result window requires.
+- `src/types.rs::ReasoningItem`: the wire's own form of the chain of
+  thought (id + text), carried on the assistant message alongside the
+  Anthropic `thinking` blocks and the OpenAI `reasoning_content` flat
+  text. The accumulator groups `reasoning_text.delta` fragments under the
+  item id the wire streamed them with, so each item arrives whole.
+- `src/provider.rs::MIMO`: the preset, with `efforts = ["none","low","medium","high"]`,
+  the thinking tier as the wire's `reasoning.effort`, and a `Wire::Responses`
+  variant that names `https://api.xiaomimimo.com/v1/responses` verbatim.
+- `src/session.rs::WireKind::OpenAiResponses` is added to the trace
+  vocabulary, so a reader rebuilding a `request_prefix` event knows which
+  recipe the body was made from.
+
 Two readers, two requirements, one file:
 
 - **the machine** folds the trace back into state (`machine.rs`: *state = a fold
