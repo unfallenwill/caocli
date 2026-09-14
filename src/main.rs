@@ -7,6 +7,7 @@ mod front;
 mod history;
 mod image;
 mod machine;
+mod migrate;
 mod provider;
 mod repl;
 mod session;
@@ -32,6 +33,14 @@ fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    // Migrate: a CLI verb that runs before any agent or MCP work is
+    // started. It only needs the sessions directory, which the cli
+    // path resolution can answer on its own.
+    if matches!(cli.mode()?, cli::Mode::Migrate { .. }) {
+        let sessions_dir = config::sessions_dir()?;
+        return cli::run_migrate(&cli, &sessions_dir);
+    }
+
     let mut ui = Renderer::new();
     let startup = startup::resolve_startup(&cli)?;
 

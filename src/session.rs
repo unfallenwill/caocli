@@ -294,6 +294,89 @@ fn validate_sequence(s: u64, next: &mut u64, path: &Path) -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// Migration helpers.
+//
+// `migrate::migrate_v0_to_v1` writes a v1 file under a caller-chosen path
+// (the migration's `<original-id>-v1.jsonl`) and reuses the same line
+// shapes `Session::create` and `Session::append_message` write, so a
+// migrated file is indistinguishable from one written live. The functions
+// below are the smallest surface that lets the migration module do that
+// without going through `Session::create` (which picks its own timestamp-
+// based id and would not produce the migration target's filename).
+// ============================================================================
+
+/// A `V1Header` whose fields the migration caller fills in directly, instead
+/// of the ones `Session::create` fills in from `Local::now()`. Identical
+/// wire shape — only the construction site differs.
+#[allow(dead_code)]
+pub(crate) struct V1HeaderForMigration {
+    pub line_type: String,
+    pub format: String,
+    pub format_version: u32,
+    pub id: String,
+    pub timestamp_ms: Option<i64>,
+    pub working_directory: Option<String>,
+    pub application: Option<serde_json::Value>,
+    pub meta: SessionMeta,
+}
+
+/// Serialize a migration-prepared v1 header to disk. Mirrors
+/// `write_v1_header` byte-for-byte.
+pub(crate) fn write_v1_header_for_migration(
+    file: &mut std::fs::File,
+    h: &V1HeaderForMigration,
+) -> Result<()> {
+    #[derive(Serialize)]
+    struct Out<'a> {
+        #[serde(rename = "type")]
+        line_type: &'a str,
+        format: &'a str,
+        format_version: u32,
+        id: &'a str,
+        timestamp_ms: Option<i64>,
+        working_directory: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        application: Option<&'a serde_json::Value>,
+        #[serde(flatten)]
+        meta: &'a SessionMeta,
+    }
+    write_line(
+        file,
+        &Out {
+            line_type: &h.line_type,
+            format: &h.format,
+            format_version: h.format_version,
+            id: &h.id,
+            timestamp_ms: h.timestamp_ms,
+            working_directory: h.working_directory.as_deref(),
+            application: h.application.as_ref(),
+            meta: &h.meta,
+        },
+    )
+}
+
+/// Append one message as a v1 `msg` line. The caller passes the
+/// `sequence` number this line should carry, so a migration writer can
+/// advance the counter as it goes. Live sessions use the in-session
+/// counter via `Session::append_message` and ignore the argument.
+pub(crate) fn append_message_for_migration(
+    file: &mut std::fs::File,
+    sequence: u64,
+    msg: &crate::types::Message,
+) -> Result<()> {
+    let turn = 1u32;
+    write_v1_line(
+        file,
+        &V1Line::Msg {
+            sequence: Some(sequence),
+            timestamp_ms: Some(chrono::Utc::now().timestamp_millis()),
+            turn: Some(turn),
+            message: msg.clone(),
+        },
+    )
+}
+
 /// Single-writer enforcement: take an exclusive flock on the session file
 /// (non-blocking, held until the process exits).
 /// Two processes appending to the same session at once would interleave into
@@ -427,10 +510,10 @@ impl Session {
     /// Load a session and open the append handle. Corrupt lines are skipped
     /// (only the tail line can be damaged, by a crash).
     #[allow(unused_assignments)] // id / created_at / meta are seeded as
-                                  // defaults and overwritten by both dialect
-                                  // branches; clippy flags the seed
-                                  // assignment because each branch assigns
-                                  // first.
+    // defaults and overwritten by both dialect
+    // branches; clippy flags the seed
+    // assignment because each branch assigns
+    // first.
     pub fn load(path: &Path) -> Result<Self> {
         let data = std::fs::read(path)
             .with_context(|| format!("failed to read session file: {}", path.display()))?;

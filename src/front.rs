@@ -91,6 +91,7 @@ impl FrontEnd {
                 })
             }
             Mode::ListSessions => unreachable!("ListSessions exits before FrontEnd is constructed"),
+            Mode::Migrate { .. } => unreachable!("Migrate exits before FrontEnd is constructed"),
         }
     }
 

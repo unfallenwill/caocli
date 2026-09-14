@@ -19,6 +19,13 @@ pub(crate) enum Mode {
     Interactive {
         no_status_bar: bool,
     },
+    /// Lift v0 session files to v1 by writing a new file beside each one.
+    /// Either a single id is named (`--migrate <id>`) or every v0 file in
+    /// the sessions directory is migrated (`--migrate --all`).
+    Migrate {
+        id: Option<String>,
+        all: bool,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -74,6 +81,18 @@ pub struct Cli {
     /// nothing on disk -- Read, Glob, TodoWrite -- is always allowed)
     #[arg(long)]
     pub ask: bool,
+
+    /// Migrate a v0 session file to v1 by writing a new file beside it. The
+    /// original is not touched. Pass an id to migrate one session; pass
+    /// `--all` (with `--migrate`) to migrate every v0 file in the sessions
+    /// directory.
+    #[arg(long, value_name = "ID")]
+    pub migrate: Option<String>,
+
+    /// With `--migrate`, lift every v0 session in the sessions directory.
+    /// Sessions already in v1 are left alone.
+    #[arg(long, requires = "migrate")]
+    pub all: bool,
 }
 
 impl Cli {
@@ -88,6 +107,15 @@ impl Cli {
     pub(crate) fn mode(&self) -> Result<Mode> {
         if self.list {
             return Ok(Mode::ListSessions);
+        }
+        if let Some(id) = &self.migrate {
+            return Ok(Mode::Migrate {
+                id: Some(id.clone()),
+                all: self.all,
+            });
+        }
+        if self.all {
+            bail!("--all requires --migrate");
         }
         if let Some(prompt) = &self.prompt {
             return Ok(Mode::OneShot {
@@ -105,6 +133,20 @@ impl Cli {
             no_status_bar: self.no_status_bar,
         })
     }
+}
+
+/// Dispatch the `--migrate` CLI verb: lift one named session, or every
+/// v0 file in the directory. The new files are listed on stdout so a
+/// script can chain off them.
+pub(crate) fn run_migrate(cli: &Cli, dir: &std::path::Path) -> anyhow::Result<()> {
+    let Mode::Migrate { id, all } = cli.mode()? else {
+        unreachable!("run_migrate called without --migrate");
+    };
+    let new_paths = crate::migrate::run(dir, id.as_deref(), all)?;
+    for path in &new_paths {
+        println!("{}", path.display());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
