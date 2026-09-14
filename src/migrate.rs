@@ -135,7 +135,18 @@ pub fn run(dir: &Path, id: Option<&str>, all: bool) -> Result<Vec<PathBuf>> {
             }
             Ok(vec![migrate_v0_to_v1(&path, dir)?])
         }
-        (None, true) => migrate_all_v0_to_v1(dir),
+        (None, true) => {
+            // Walk every layout directory under `~/.caocli/sessions/`
+            // and migrate v0 files in each. A v0 file found anywhere
+            // gets a v1 sibling in the same directory.
+            let dirs = crate::config::all_sessions_dirs()
+                .context("looking up workspaces for --migrate --all")?;
+            let mut all_migrated = Vec::new();
+            for (path, _cwd) in dirs {
+                all_migrated.extend(migrate_all_v0_to_v1(&path)?);
+            }
+            Ok(all_migrated)
+        }
         (Some(_), true) | (None, false) => {
             bail!("--migrate takes either an id or --all, not both / neither");
         }
