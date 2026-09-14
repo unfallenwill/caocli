@@ -177,9 +177,18 @@ impl Session {
             n += 1;
         }
         let path = dir.join(format!("{id}.jsonl"));
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .append(true)
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).append(true);
+        // Mode 0600: the session log holds commands, their output and pasted
+        // secrets, so it is the owner's file. `write_line` is the writer's
+        // tool, so a session that exists is one this binary opened, and the
+        // mode belongs to that one creation.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
             .open(&path)
             .with_context(|| format!("failed to create session file: {}", path.display()))?;
         let created_at = Utc::now().timestamp();
@@ -398,6 +407,7 @@ impl SessionSource {
     {
         match self {
             SessionSource::Resume { id } => {
+                validate_resume_id(&id)?;
                 let path = dir.join(format!("{id}.jsonl"));
                 Session::load(&path).with_context(|| format!("failed to resume session {id}"))
             }
@@ -408,6 +418,114 @@ impl SessionSource {
             SessionSource::Fresh => Session::create(dir, fresh_meta()?),
         }
     }
+}
+
+// ============================================================================
+// Path safety: the things `--resume` and the working-directory layout rely on.
+//
+// A session id is part of a file path (`<id>.jsonl`). Accepting `/` or `..`
+// would let a resume reach outside `sessions_dir`; accepting `%` would clash
+// with the escape used in `escape_working_directory`. The id is therefore a
+// closed character class checked at one place, so the rest of the code can
+// join paths without re-checking.
+//
+// The working-directory layout under `sessions_dir` is the same story in the
+// other direction: an absolute path is the directory the session ran in, and
+// the layout turns it into a directory name. The mapping has to be reversible
+// (`unescape_working_directory` is what `--resume` would walk when looking
+// across workspaces) and injective (no two distinct paths collide on the
+// same name). The order matters: `%` is escaped first, otherwise a literal
+// `%2F` in the original would be double-escaped.
+//
+// `escape_working_directory` and `unescape_working_directory` are not yet
+// wired into `sessions_dir()` — that change moves the layout from flat to
+// nested and is its own commit. They are defined and tested here so the
+// mapping has a unit test before any caller depends on it.
+// ============================================================================
+
+/// Reject an id that would let `--resume` escape `sessions_dir` or clash with
+/// the escape encoding.
+#[allow(dead_code)] // wired into SessionSource::resolve below; the symbol
+// lives at module scope because the unescape helper below
+// is part of the same public surface (used by G3+).
+pub fn validate_resume_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        bail!("--resume id is empty");
+    }
+    if id == "." || id == ".." {
+        bail!("--resume id is a path component");
+    }
+    if id.contains('/') || id.contains('\\') {
+        bail!("--resume id contains a path separator");
+    }
+    if id.contains('\0') {
+        bail!("--resume id contains a NUL byte");
+    }
+    // `%` is reserved by the escape encoding below; reject it so a resume id
+    // can never collide with a layout-escaped directory name.
+    if id.contains('%') {
+        bail!("--resume id contains '%' (reserved by the layout encoding)");
+    }
+    // Reject `..` segments that survive the split (defense in depth: the
+    // membership tests above already caught them as a literal substring).
+    for c in std::path::Path::new(id).components() {
+        if matches!(c, std::path::Component::ParentDir) {
+            bail!("--resume id contains '..'");
+        }
+    }
+    Ok(())
+}
+
+/// Turn an absolute working directory into a layout-safe directory name.
+/// `None` (cwd not known) maps to a fixed sentinel that no escaped absolute
+/// path can produce (every escaped absolute path starts with `%2F`).
+#[allow(dead_code)] // see the module-level note on layout wiring.
+pub fn escape_working_directory(cwd: Option<&Path>) -> Result<String> {
+    let Some(path) = cwd else {
+        return Ok("_no-working-directory".to_string());
+    };
+    if !path.is_absolute() {
+        bail!(
+            "working directory must be absolute for the layout encoding: {}",
+            path.display()
+        );
+    }
+    let s = path.to_string_lossy();
+    // `%` first: escaping it after `/` would produce `%252F` for a literal
+    // `%2F`, and unescape would then need a second pass to recognise.
+    let escaped = s.replace('%', "%25").replace('/', "%2F");
+    Ok(escaped)
+}
+
+/// Inverse of [`escape_working_directory`]. Used by a `--resume` that walks
+/// across workspaces and by `--list --all`, which names directories back to
+/// the user.
+#[allow(dead_code)] // see the module-level note on layout wiring.
+pub fn unescape_working_directory(name: &str) -> Result<PathBuf> {
+    if name == "_no-working-directory" {
+        bail!("this directory holds sessions whose working directory was not recorded");
+    }
+    if !name.starts_with("%2F") {
+        bail!("directory name does not start with '%2F' and is not a known sentinel: {name}");
+    }
+    let mut out = String::with_capacity(name.len());
+    let mut chars = name.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let a = chars.next();
+            let b = chars.next();
+            let Some(hex) = a.zip(b).map(|(a, b)| format!("{a}{b}")) else {
+                bail!("truncated percent escape in directory name: {name}");
+            };
+            let byte = u8::from_str_radix(&hex, 16).map_err(|e| {
+                anyhow::anyhow!("invalid percent escape '%{hex}' in directory name: {e}")
+            })?;
+            out.push(byte as char);
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(PathBuf::from(out))
 }
 
 #[cfg(test)]
@@ -929,6 +1047,113 @@ mod tests {
         let _ = SessionSource::Resume { id }
             .resolve(&dir, || panic!("resume must not build a fresh meta"))
             .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ----- G1: defense-in-depth -----
+
+    #[test]
+    fn a_new_session_file_is_owner_only() {
+        let dir = tmpdir();
+        let s = Session::create(&dir, test_meta()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&s.path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "new session file is owner-only");
+        }
+        drop(s);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn escape_escapes_slashes_and_percent() {
+        assert_eq!(
+            escape_working_directory(Some(Path::new("/home/u/proj"))).unwrap(),
+            "%2Fhome%2Fu%2Fproj"
+        );
+        assert_eq!(
+            escape_working_directory(Some(Path::new("/a%2Fb"))).unwrap(),
+            "%2Fa%252Fb"
+        );
+        assert_eq!(
+            escape_working_directory(Some(Path::new("/"))).unwrap(),
+            "%2F"
+        );
+        assert_eq!(
+            escape_working_directory(None).unwrap(),
+            "_no-working-directory"
+        );
+    }
+
+    #[test]
+    fn escape_rejects_a_relative_path() {
+        assert!(escape_working_directory(Some(Path::new("relative"))).is_err());
+    }
+
+    #[test]
+    fn unescape_is_the_inverse_of_escape() {
+        let original = PathBuf::from("/home/u/proj");
+        let encoded = escape_working_directory(Some(&original)).unwrap();
+        let back = unescape_working_directory(&encoded).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn unescape_rejects_an_escaped_relative_path() {
+        assert!(unescape_working_directory("home").is_err());
+        assert!(unescape_working_directory("foo%2Fbar").is_err());
+    }
+
+    #[test]
+    fn unescape_rejects_truncated_or_invalid_escapes() {
+        assert!(unescape_working_directory("%2").is_err());
+        assert!(unescape_working_directory("%2G").is_err());
+    }
+
+    #[test]
+    fn validate_resume_id_accepts_a_normal_id() {
+        assert!(validate_resume_id("20260101-120000").is_ok());
+        assert!(validate_resume_id("20260101-120000-2").is_ok());
+    }
+
+    #[test]
+    fn validate_resume_id_rejects_path_traversal() {
+        assert!(validate_resume_id("").is_err());
+        assert!(validate_resume_id(".").is_err());
+        assert!(validate_resume_id("..").is_err());
+        assert!(validate_resume_id("../etc/passwd").is_err());
+        assert!(validate_resume_id("foo/../bar").is_err());
+    }
+
+    #[test]
+    fn validate_resume_id_rejects_path_separators() {
+        assert!(validate_resume_id("foo/bar").is_err());
+        assert!(validate_resume_id("foo\\bar").is_err());
+        assert!(validate_resume_id("foo\0bar").is_err());
+    }
+
+    #[test]
+    fn validate_resume_id_rejects_percent() {
+        assert!(validate_resume_id("foo%bar").is_err());
+        assert!(validate_resume_id("100%").is_err());
+    }
+
+    #[test]
+    fn resolve_rejects_an_unsafe_resume_id() {
+        let dir = tmpdir();
+        let result = SessionSource::Resume {
+            id: "../escape".into(),
+        }
+        .resolve(&dir, || panic!("must not build a fresh meta"));
+        let err = match result {
+            Ok(_) => panic!("resolve must fail for an unsafe id"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("--resume id"),
+            "the error names the failure: {err:#}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
