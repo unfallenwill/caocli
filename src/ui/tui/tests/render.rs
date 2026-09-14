@@ -25,6 +25,7 @@ use super::rendered;
 use super::row;
 use super::screen_for_test;
 use super::transcript_top;
+use super::unset;
 use crate::types::Usage;
 
 #[test]
@@ -95,6 +96,31 @@ fn a_long_line_of_a_change_is_wrapped_like_any_other() {
     let top = transcript_top(&screen, 3);
     assert_eq!(row(&screen, top + 1), format!("  + {}", "x".repeat(16)));
     assert_eq!(row(&screen, top + 2), format!("  {}", "x".repeat(14)));
+}
+
+#[test]
+fn a_call_with_nothing_to_name_shows_all_of_its_arguments() {
+    // A call the summariser cannot name -- an MCP tool, or arguments that are
+    // not JSON at all -- is shown by its arguments, and the arguments are
+    // shown whole: the row is wrapped by the region, not cut by a column
+    // count of the painter's own. A cut prefix would be a call whose subject
+    // the reader cannot check before it runs.
+    let mut screen = screen_for_test(40, 20);
+    let args = format!(r#"{{"blob":"{}"}}"#, "x".repeat(90));
+    screen
+        .state
+        .view
+        .transcript
+        .push(Cell::from_tool_call("Mcp", &args));
+    screen.draw().unwrap();
+    // The gutters off each row and the rows run together: the wrap breaks
+    // inside the one long word, so what is on the screen is the arguments back
+    // in the order they were written -- unless a column of them was dropped.
+    let drawn: String = all_rows(&screen).iter().map(|r| unset(r)).collect();
+    assert!(
+        drawn.contains(&args),
+        "the whole of the arguments is drawn, in order: {drawn}"
+    );
 }
 
 #[test]

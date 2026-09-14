@@ -1,19 +1,21 @@
 //! What a call's arguments say in one line: the interesting argument when the
-//! call carries one, the raw arguments clipped when it does not.
-
-use crate::ui::text;
+//! call carries one, the raw arguments when it does not.
 
 /// The argument summary shown for a tool call: the interesting argument when the
-/// call carries one, otherwise the raw arguments clipped to one line's worth of
-/// columns.
+/// call carries one, otherwise the raw arguments.
 ///
 /// A glob call is the one whose interesting arguments are not `command` or
 /// `file_path`: the pattern is the question and the directory is where it is
 /// asked, and both are shown, because a pattern asked of the wrong tree is the
 /// one thing about the call a reader can catch before it runs.
+///
+/// Nothing here is measured against a width. A summary that does not fit is
+/// wrapped by whoever draws it -- the screen writes it into a region and the
+/// plain front end lets the terminal fold it -- so a call whose arguments are
+/// long shows them rather than a cut-off prefix of them.
 pub(crate) fn hint(args: &str) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
-        return text::truncate(args, HINT_COLUMNS).to_owned();
+        return args.to_owned();
     };
     if let Some(named) = v
         .get("command")
@@ -28,11 +30,8 @@ pub(crate) fn hint(args: &str) -> String {
             None => pattern.to_owned(),
         };
     }
-    text::truncate(args, HINT_COLUMNS).to_owned()
+    args.to_owned()
 }
-
-/// Columns of raw arguments kept when they cannot be summarized by name.
-const HINT_COLUMNS: usize = 80;
 
 #[cfg(test)]
 mod tests {
@@ -58,20 +57,13 @@ mod tests {
     }
 
     #[test]
-    fn hint_falls_back_to_clipped_raw_arguments() {
+    fn hint_falls_back_to_the_raw_arguments_whole() {
         assert_eq!(hint("not json at all"), "not json at all");
         assert_eq!(hint(r#"{"other":"x"}"#), r#"{"other":"x"}"#);
-        // a long raw argument is clipped to one line's worth of columns
-        let long = "x".repeat(HINT_COLUMNS + 40);
-        assert_eq!(hint(&long).chars().count(), HINT_COLUMNS);
-    }
-
-    #[test]
-    fn hint_clips_wide_characters_by_column() {
-        // 60 ideographs are 120 columns but only 60 chars; the clip keeps 40
-        let wide = "\u{6df1}".repeat(60);
-        let got = hint(&wide);
-        assert_eq!(crate::ui::text::width(&got), HINT_COLUMNS);
-        assert_eq!(got.chars().count(), HINT_COLUMNS / 2);
+        // Nothing is clipped: a long raw argument is the summary, all of it.
+        // It is the drawing layer that deals with a line too long for the
+        // region, and it wraps rather than cuts.
+        let long = "x".repeat(400);
+        assert_eq!(hint(&long), long);
     }
 }
