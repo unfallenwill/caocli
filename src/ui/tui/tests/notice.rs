@@ -278,7 +278,7 @@ fn verbose_toggle_re_exposes_settled_children() {
 
     // Compact: only the verdict header is on screen.
     let width = 80;
-    let before = render::lines(&mut screen, width);
+    let before = render::lines(&mut screen.view, screen.verbose, width);
     let before_text: String = before
         .iter()
         .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
@@ -292,7 +292,7 @@ fn verbose_toggle_re_exposes_settled_children() {
 
     // Toggle verbose on.
     screen.apply_app(AppNotice::SetVerbose(true));
-    let after = render::lines(&mut screen, width);
+    let after = render::lines(&mut screen.view, screen.verbose, width);
     let after_text: String = after
         .iter()
         .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
@@ -306,7 +306,7 @@ fn verbose_toggle_re_exposes_settled_children() {
 
     // And back off: settled children disappear again.
     screen.apply_app(AppNotice::SetVerbose(false));
-    let restored = render::lines(&mut screen, width);
+    let restored = render::lines(&mut screen.view, screen.verbose, width);
     let restored_text: String = restored
         .iter()
         .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
@@ -333,7 +333,7 @@ fn verbose_does_not_collapse_a_failed_step() {
     screen.view.transcript.push(step);
 
     let width = 80;
-    let compact = render::lines(&mut screen, width);
+    let compact = render::lines(&mut screen.view, screen.verbose, width);
     let compact_text: String = compact
         .iter()
         .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
@@ -345,7 +345,7 @@ fn verbose_does_not_collapse_a_failed_step() {
     );
 
     screen.apply_app(AppNotice::SetVerbose(true));
-    let verbose = render::lines(&mut screen, width);
+    let verbose = render::lines(&mut screen.view, screen.verbose, width);
     let verbose_text: String = verbose
         .iter()
         .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
@@ -365,7 +365,7 @@ fn an_open_question_is_drawn_after_the_transcript() {
         name: "Bash".into(),
         args: r#"{"command":"rm -rf /"}"#.into(),
     });
-    let lines = render::lines(&mut screen, 80);
+    let lines = render::lines(&mut screen.view, screen.verbose, 80);
     assert_eq!(lines.len(), 2, "answer, then the question");
     assert!(format!("{:?}", lines[1]).contains("run it?"));
 }

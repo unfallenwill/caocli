@@ -256,10 +256,10 @@ struct Layout {
 /// are the rows they get.
 fn compute_layout(state: &mut State, area: Rect) -> Layout {
     let width = area.width as usize;
-    let todos = Text::from(render::todo_lines(state, width));
+    let todos = Text::from(render::todo_lines(&state.view, width));
     let todo = todo_rows(todos.height());
     let input = state.input_rows(area.height, todo);
-    let queue = Text::from(render::queue_lines(state, width));
+    let queue = Text::from(render::queue_lines(&state.turn, width));
     let queued = queue.height() as u16;
     let rows = screen_rows(area, todo, input, queued);
     state.reset_box_scroll(input);
@@ -291,10 +291,10 @@ fn compose_transcript(state: &mut State, layout: &Layout) -> Text<'static> {
     // What the transcript has to show, in the three pieces it is made of:
     // the cells that are laid out and kept, then the block still being
     // written, then a question if one is open.
-    render::ensure_laid(state, width);
-    let live = render::live_lines(state, width);
-    let question = render::question_lines(state, width);
-    let total = render::laid_rows(state) + live.len() + question.len();
+    render::ensure_laid(&mut state.view, state.verbose, width);
+    let live = render::live_lines(&state.view, state.verbose, width);
+    let question = render::question_lines(&state.view, state.verbose, width);
+    let total = render::laid_rows(&state.view) + live.len() + question.len();
     // The picker belongs to the line being typed, so it takes the box's end of
     // the transcript with it: a window on the end, not where the reader
     // scrolled back to. The panel is read in `paint` once the transcript's
@@ -328,7 +328,13 @@ fn compose_transcript(state: &mut State, layout: &Layout) -> Text<'static> {
     if above {
         lines.push(paint::edge_line(true, first));
     }
-    lines.extend(render::window_lines(state, first, last, &live, &question));
+    lines.extend(render::window_lines(
+        &state.view,
+        first,
+        last,
+        &live,
+        &question,
+    ));
     if below {
         lines.push(paint::edge_line(false, total - last));
     }
@@ -398,7 +404,15 @@ fn draw_over(frame: &mut Frame, lines: &[Line<'static>], transcript: Rect, cap: 
 /// nothing at all -- and typing cannot take it away, which is what the marker
 /// inside the placeholder did.
 fn draw_box(frame: &mut Frame, state: &State, area: Rect) {
-    frame.render_widget(render::box_rule(state, area.width as usize), area);
+    frame.render_widget(
+        render::box_rule(
+            &state.overlay,
+            &state.turn,
+            &state.view,
+            area.width as usize,
+        ),
+        area,
+    );
     frame.render_widget(
         Paragraph::new(Line::styled(cell::USER_MARKER, style_of(Style::Dim))),
         box_marker(area),
@@ -411,6 +425,6 @@ fn draw_box(frame: &mut Frame, state: &State, area: Rect) {
 
 /// The session summary, pinned under the box.
 fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
-    let status = render::status_line(state, area.width as usize);
+    let status = render::status_line(&state.view, area.width as usize);
     frame.render_widget(Paragraph::new(status), area);
 }

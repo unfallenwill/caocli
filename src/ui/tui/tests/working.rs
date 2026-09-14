@@ -33,7 +33,7 @@ fn the_working_border_spins_counts_and_estimates() {
     // a measured four to the token over 12.3 s rounds to 81 a second.
     let s = working(Duration::from_millis(12_345), 4000, 4.0);
     assert_eq!(
-        render_mod::activity_title(&s, 60),
+        render_mod::activity_title(&s.overlay, &s.turn, &s.view, 60),
         Some("◑ working · 12s · ~81 token/s".to_owned())
     );
 }
@@ -44,7 +44,7 @@ fn the_estimate_waits_for_the_average_to_settle() {
     // read cannot tip it
     let s = working(Duration::from_millis(2_040), 4000, 4.0);
     assert_eq!(
-        render_mod::activity_title(&s, 60),
+        render_mod::activity_title(&s.overlay, &s.turn, &s.view, 60),
         Some("◓ working · 2s".to_owned())
     );
 }
@@ -53,7 +53,7 @@ fn the_estimate_waits_for_the_average_to_settle() {
 fn a_silent_turn_estimates_nothing() {
     let s = working(Duration::from_millis(30_040), 0, 4.0);
     assert_eq!(
-        render_mod::activity_title(&s, 60),
+        render_mod::activity_title(&s.overlay, &s.turn, &s.view, 60),
         Some("◒ working · 30s".to_owned())
     );
 }
@@ -61,17 +61,27 @@ fn a_silent_turn_estimates_nothing() {
 #[test]
 fn a_narrow_border_drops_the_estimate_then_hides_the_indicator() {
     let s = working(Duration::from_millis(12_345), 4000, 4.0);
-    let full = render_mod::activity_title(&s, usize::MAX).unwrap();
+    let full = render_mod::activity_title(&s.overlay, &s.turn, &s.view, usize::MAX).unwrap();
     let count = "◑ working · 12s".to_owned();
     // one column short of the whole thing, the estimate goes whole
     assert_eq!(
-        render_mod::activity_title(&s, crate::ui::text::width(&full) - 1),
+        render_mod::activity_title(
+            &s.overlay,
+            &s.turn,
+            &s.view,
+            crate::ui::text::width(&full) - 1
+        ),
         Some(count.clone())
     );
     // one column short of the count, nothing at all: a clipped spinner is
     // not an indicator
     assert_eq!(
-        render_mod::activity_title(&s, crate::ui::text::width(&count) - 1),
+        render_mod::activity_title(
+            &s.overlay,
+            &s.turn,
+            &s.view,
+            crate::ui::text::width(&count) - 1
+        ),
         None
     );
 }
@@ -159,7 +169,10 @@ fn a_question_takes_the_border_title_back() {
     let mut s = working(Duration::from_secs(12), 4000, 4.0);
     let (tx, _rx) = oneshot::channel();
     s.open_question(tx);
-    assert_eq!(render_mod::activity_title(&s, 60), None);
+    assert_eq!(
+        render_mod::activity_title(&s.overlay, &s.turn, &s.view, 60),
+        None
+    );
 }
 
 /// While a Reasoning block is streaming, the border says "thinking" --
@@ -171,7 +184,7 @@ fn the_border_says_thinking_while_a_reasoning_block_streams() {
     // Open a Reasoning block: stream starts with the Reasoning style.
     s.apply(MachineNotice::Reasoning("hmm".into()));
     assert_eq!(
-        render_mod::activity_title(&s, 60),
+        render_mod::activity_title(&s.overlay, &s.turn, &s.view, 60),
         Some("◒ thinking · 2s".to_owned()),
         "Reasoning in flight -> thinking"
     );
@@ -181,7 +194,7 @@ fn the_border_says_thinking_while_a_reasoning_block_streams() {
     s.end_block();
     s.apply(MachineNotice::Content("answer".into()));
     assert_eq!(
-        render_mod::activity_title(&s, 60),
+        render_mod::activity_title(&s.overlay, &s.turn, &s.view, 60),
         Some("◒ working · 2s".to_owned()),
         "Content in flight -> working"
     );
@@ -201,13 +214,13 @@ fn the_border_says_running_verb_while_a_tool_runs() {
         args: "{}".into(),
     });
     assert_eq!(
-        render_mod::activity_title(&s, 60),
+        render_mod::activity_title(&s.overlay, &s.turn, &s.view, 60),
         Some("◒ running Bash · 2s".to_owned()),
         "the verb on the border is the one the agent sent"
     );
     s.apply(MachineNotice::ToolResult("exit_code: 0".into()));
     assert_eq!(
-        render_mod::activity_title(&s, 60),
+        render_mod::activity_title(&s.overlay, &s.turn, &s.view, 60),
         Some("◒ working · 2s".to_owned()),
         "settling the step drops the verb, the border says working"
     );
@@ -225,7 +238,7 @@ fn an_interrupted_step_clears_the_tool_verb() {
     });
     s.apply(MachineNotice::Interrupted);
     assert_eq!(
-        render_mod::activity_title(&s, 60),
+        render_mod::activity_title(&s.overlay, &s.turn, &s.view, 60),
         Some("◒ working · 2s".to_owned()),
         "interrupted step -> the border's no longer running X"
     );

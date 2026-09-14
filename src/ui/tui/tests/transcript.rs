@@ -413,12 +413,12 @@ fn a_window_is_the_same_lines_as_the_transcript_it_is_a_window_on() {
         .flat_map(|cell| cell_lines(cell, width, screen.state.verbose))
         .collect();
     assert_eq!(
-        render_mod::lines(&mut screen.state, width),
+        render_mod::lines(&mut screen.state.view, screen.state.verbose, width),
         whole,
         "the whole transcript"
     );
     assert_eq!(
-        render_mod::window_lines(&screen.state, 3, 9, &[], &[]),
+        render_mod::window_lines(&screen.state.view, 3, 9, &[], &[]),
         whole[3..9].to_vec(),
         "and a window in the middle of one cell"
     );

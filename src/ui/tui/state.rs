@@ -402,7 +402,13 @@ impl State {
     /// runs the cache check that decides whether the screen has anything new
     /// to draw.
     pub(super) fn tick_activity(&mut self, now: std::time::Instant) {
-        let Some(title) = super::render::activity_title_at(self, now, usize::MAX) else {
+        let Some(title) = super::render::activity_title_at(
+            &self.overlay,
+            &self.turn,
+            &self.view,
+            now,
+            usize::MAX,
+        ) else {
             return;
         };
         if Some(&title) != self.turn.ticked_activity.as_ref() {
