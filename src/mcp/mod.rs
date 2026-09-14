@@ -36,6 +36,7 @@ mod wire;
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -462,5 +463,92 @@ fn how_to_reach(entry: &Entry) -> String {
         }
         (None, Some(url)) => url.clone(),
         (None, None) => "nowhere".to_string(),
+    }
+}
+
+/// A guard around an [`Arc<Hub>`] that shuts every connected server down on
+/// drop. Used in `main::run` so the three exit paths (one-shot, TUI, plain
+/// REPL) all clean up the same way: by going out of scope.
+///
+/// `Hub::shutdown` is async (each stdio connection closes its sink, waits for
+/// the child to leave, and kills it if it has not), and Rust's `Drop` is
+/// sync. The guard spawns shutdown as a detached task on the current tokio
+/// runtime, so the connection close runs to completion on the executor even
+/// after the main task has returned. When no runtime is reachable — an early
+/// exit that unwinds before the runtime is set up — process exit takes care
+/// of the children instead.
+pub struct McpGuard {
+    hub: Option<Arc<Hub>>,
+    notes: Vec<String>,
+}
+
+impl McpGuard {
+    /// Wrap a freshly-connected hub, capturing the notes it had to share on
+    /// the way up. The notes are kept here so they survive any number of
+    /// borrows the rest of the program takes of the hub.
+    pub fn new(hub: Hub) -> Self {
+        let notes = hub.notes();
+        Self {
+            hub: Some(Arc::new(hub)),
+            notes,
+        }
+    }
+
+    /// The hub for the agent to share. The Arc clone keeps the guard alive:
+    /// the guard drops last, after the agent and its `Arc<Hub>` are gone.
+    pub fn hub(&self) -> Arc<Hub> {
+        Arc::clone(self.hub.as_ref().expect("hub is taken only on drop"))
+    }
+
+    /// What the hub said on the way up — for the banner.
+    pub fn notes(&self) -> &[String] {
+        &self.notes
+    }
+}
+
+impl Drop for McpGuard {
+    fn drop(&mut self) {
+        let Some(hub) = self.hub.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                hub.shutdown().await;
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    #[test]
+    fn guard_holds_notes_from_a_freshly_connected_hub() {
+        let hub = Hub::empty();
+        let guard = McpGuard::new(hub);
+        assert!(guard.notes().is_empty(), "an empty hub has no notes");
+    }
+
+    #[test]
+    fn guard_hub_returns_a_shared_arc() {
+        let hub = Hub::empty();
+        let guard = McpGuard::new(hub);
+        let arc = guard.hub();
+        assert_eq!(
+            Arc::strong_count(&arc),
+            2,
+            "guard and the returned Arc share"
+        );
+    }
+
+    #[test]
+    fn drop_without_a_runtime_does_not_panic() {
+        // The Hub's connections are owned; a runtime is what would actually
+        // shut them down. Without one, the OS reaps the children on exit, and
+        // the guard must not panic on its way out.
+        let hub = Hub::empty();
+        let guard = McpGuard::new(hub);
+        drop(guard);
     }
 }

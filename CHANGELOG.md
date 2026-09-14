@@ -72,6 +72,26 @@ semantic-version bumps per release.
   `dequeue` live in a new `queue.rs`, and what remains is just the
   turn-in-flight key routing.
 
+### Changed — the startup phase, the front ends, and the MCP lifecycle
+
+- `main::run` reads as resolve-then-dispatch now: `startup::resolve_startup`
+  bundles the session, provider, client, approval gate, API key and mode
+  into one `Startup`, and what is left in `main` dispatches on it. The
+  decisions that used to be implicit in a chain of `if`s are types --
+  `Mode` (list sessions / one-shot / interactive), `SessionSource`
+  (resume / continue latest / fresh, with the priority in `from_cli`) and
+  `ApiKey` (present / missing, with the hint a banner wants).
+- `front::FrontEnd` owns the two shapes a run can take. `OneShot` and
+  `Interactive` each carry the data their shape needs (banner, history,
+  status-bar flag) and their own teardown, and the plain prompt's read
+  loop moved in with them. A fifth front end is one file and one match
+  arm, rather than another branch threaded through `main`.
+- MCP connections are closed by `McpGuard`'s `Drop` rather than by a
+  `shutdown()` call at each exit. The old discipline was load-bearing:
+  any exit that forgot the call leaked child processes, and the panic
+  path had already forgotten it. The guard hands the agent a shared
+  handle and spawns the async close on the runtime when it drops.
+
 ### Changed
 - The plain REPL's input loop is now built on crossterm raw mode and a
   `ratatui_textarea::TextArea` used as a pure in-memory buffer: every
