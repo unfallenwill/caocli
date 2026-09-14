@@ -313,6 +313,9 @@ pub enum WireKind {
     /// Anthropic Messages.
     #[serde(rename = "anthropic-messages")]
     AnthropicMessages,
+    /// OpenAI Responses.
+    #[serde(rename = "openai-responses")]
+    OpenAiResponses,
 }
 
 /// What the request carried before the messages: the wire, the
@@ -1166,6 +1169,7 @@ mod tests {
             }]),
             tool_call_id: None,
             thinking: None,
+            reasoning: None,
         })
         .unwrap();
         s.append_message(&Message::tool("call_1", "file.txt"))
@@ -1392,6 +1396,7 @@ mod tests {
             ]),
             tool_call_id: None,
             thinking: None,
+            reasoning: None,
         })
         .unwrap();
         s.append_message(&Message::tool("call_1", "ok")).unwrap();
