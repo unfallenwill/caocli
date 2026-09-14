@@ -26,6 +26,7 @@ use crate::ui::plain_writer::PlainWriter;
 use crate::ui::status::Status;
 use crate::ui::status_bar::StatusBar;
 use crate::ui::terminal::{RealTerminal, Terminal};
+use crate::ui::theme;
 
 /// The plain front end's tool-result summary: a one-line rendering of what
 /// came back, matching the cell layer's `Step::settle` verdict line in shape
@@ -130,6 +131,21 @@ impl Renderer {
     /// line for us).
     pub fn set_raw_mode(&mut self, raw: bool) {
         self.in_raw_mode = raw;
+    }
+
+    /// The escape that opens `style`, empty when colours are off. For the bytes
+    /// the front end writes itself -- the prompt box, an answer read in raw
+    /// mode -- which are not a [`Cell`] and so do not go through the writer's
+    /// own path. Asked of the writer rather than spelled out at the call site,
+    /// so the palette and the colour mode are decided in the one place they
+    /// already are.
+    pub(crate) fn open_style(&self, style: Style) -> String {
+        self.writer.open_style(style)
+    }
+
+    /// The escape that closes a style, empty when colours are off.
+    pub(crate) fn close_style(&self) -> &'static str {
+        self.writer.close_style()
     }
 
     /// Sync the status bar against the current terminal size: called when the REPL
@@ -260,19 +276,23 @@ impl Front for Renderer {
 /// Read a secret in raw mode: one event at a time, with the typed character
 /// replaced by a mask. Enter submits, Ctrl-D on an empty buffer cancels (the
 /// same shape as the prompt's Ctrl-D-on-empty), Ctrl-C also cancels. The
-/// prompt is written dim; characters mask as a bullet.
+/// prompt is written in the palette's secondary colour; characters mask as a
+/// bullet.
 ///
 /// Reads crossterm directly rather than through the renderer, because the
 /// renderer is borrowed by the caller and a future inside a trait method is
 /// not the place to reach into it. The bytes this function writes are the same
-/// shape the rest of the prompt uses (`\r\x1b[2K` to clear, plain dim SGR for
-/// the prompt, a mask char for each character) -- what is different is that
-/// they are the prompt's own bytes, not a `Cell`.
+/// shape the rest of the prompt uses (`\r\x1b[2K` to clear, the palette's
+/// secondary colour for the prompt, a mask char for each character) -- what is
+/// different is that they are the prompt's own bytes, not a `Cell`.
 async fn read_secret_raw(prompt: &str) -> Option<String> {
     use std::io::Write;
     let mut stdout = std::io::stdout();
-    let dim_open = "\x1b[2m";
-    let dim_close = "\x1b[0m";
+    // The palette's own secondary colour: the prompt is written by the front end
+    // that owns the box rather than through a cell, and "dim" is a colour here,
+    // not a modifier.
+    let dim_open = theme::sgr_color(theme::color_of(Style::Dim));
+    let dim_close = theme::RESET;
     let mask: String = "•".repeat(0);
     let _ = write!(
         stdout,
@@ -479,25 +499,30 @@ impl Ui for Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::super::plain_writer::style_code;
-    use crate::ui::cell::Style;
+    use crate::ui::cell::{Style, style_code};
 
     /// The plain front end's mapping: a semantic [`Style`] to the SGR escape
-    /// sequence it becomes when colors are enabled. The mapping lives here
-    /// rather than on the [`Style`] enum, on purpose: the cell is data and the
-    /// escape sequence is the renderer that owns the wire.
+    /// sequence it becomes when colors are enabled. What the palette is spelled
+    /// as is the [theme](crate::ui::theme)'s to say; this is the front end
+    /// saying it writes the theme's answer and nothing of its own.
     #[test]
     fn styles_map_to_their_escape_sequences() {
-        assert_eq!(style_code(Style::Plain), "");
-        assert_eq!(style_code(Style::Dim), "\x1b[2m");
-        // The same weight as `Dim`, and deliberately: thinking is told apart from a
-        // tool result by the rule in its gutter, which the terminal cannot lose, not
-        // by a color it may or may not honor.
-        assert_eq!(style_code(Style::Reasoning), "\x1b[2m");
-        // Painted styles carry the weight as well as the color: the color comes
-        // from a palette the terminal chose for a background this code cannot see.
-        assert_eq!(style_code(Style::Yellow), "\x1b[1;33m");
-        assert_eq!(style_code(Style::Green), "\x1b[1;32m");
-        assert_eq!(style_code(Style::Red), "\x1b[1;31m");
+        for style in [
+            Style::Plain,
+            Style::Dim,
+            Style::Reasoning,
+            Style::Yellow,
+            Style::Green,
+            Style::Red,
+        ] {
+            assert_eq!(
+                style_code(style),
+                crate::ui::theme::style_code(style),
+                "{style:?} comes from the palette"
+            );
+        }
+        // The two styles the reader sees most: body text and secondary text
+        // are two different colours, not "colour" and "nothing".
+        assert_ne!(style_code(Style::Plain), style_code(Style::Dim));
     }
 }

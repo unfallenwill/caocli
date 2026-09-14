@@ -8,7 +8,6 @@
 //! between transcript, queue and the standing list.
 
 use ratatui::layout::Rect;
-use ratatui::style::Modifier;
 
 use crate::ui::cell::Cell;
 
@@ -60,9 +59,9 @@ fn the_pinned_rows_take_the_bottom_of_the_screen() {
 fn the_queue_is_drawn_above_the_box_until_it_is_run() {
     // What was typed during a turn has to be visible somewhere, or the only
     // proof it arrived is that something happens later. It is drawn as the
-    // user line it is about to become, dimmed to say it has not run, at the
-    // foot of the transcript -- and it takes rows from the transcript rather
-    // than covering it.
+    // user line it is about to become, set in the palette's secondary
+    // colour to say it has not run, at the foot of the transcript -- and it
+    // takes rows from the transcript rather than covering it.
     let mut screen = screen_for_test(40, 20);
     screen.state.model = Some("m-1".to_owned());
     let last = screen.terminal.backend().buffer().area.height - 1;
@@ -71,12 +70,14 @@ fn the_queue_is_drawn_above_the_box_until_it_is_run() {
     screen.draw().unwrap();
     assert_eq!(row(&screen, last - 5), "› first");
     assert_eq!(row(&screen, last - 4), "› second");
-    assert!(
-        screen.terminal.backend().buffer()[(0, last - 5)]
-            .style()
-            .add_modifier
-            .contains(Modifier::DIM),
-        "dimmed: it is waiting, not part of the session"
+    // The waiting line is the palette's secondary colour -- the theme's
+    // `comment`. The session's own user line is the foreground, so a line
+    // that has not run reads differently from a line that has.
+    let waiting_fg = screen.terminal.backend().buffer()[(2, last - 5)].style().fg;
+    assert_eq!(
+        waiting_fg,
+        Some(ratatui::style::Color::Rgb(98, 114, 164)),
+        "waiting: the comment colour, not the foreground"
     );
     // ... and the box and the status line are where they always are: the
     // queue is inserted, not drawn over anything.
@@ -85,7 +86,7 @@ fn the_queue_is_drawn_above_the_box_until_it_is_run() {
 
     // Run one: the queue gives a row back, and what ran is drawn as the
     // transcript's own line -- the same line the queue was showing, in the
-    // place the session keeps it, and no longer dimmed.
+    // place the session keeps it, and no longer in the secondary colour.
     screen.state.submit("first");
     assert_eq!(screen.state.dequeue().as_deref(), Some("first"));
     screen.draw().unwrap();
@@ -106,18 +107,16 @@ fn the_queue_is_drawn_above_the_box_until_it_is_run() {
     );
     assert_eq!(row(&screen, last), "cache 0.0% · 0/0");
     let buf = screen.terminal.backend().buffer();
-    assert!(
-        !buf[(2, transcript_top(&screen, 1))]
-            .style()
-            .add_modifier
-            .contains(Modifier::DIM),
+    let run_fg = buf[(2, transcript_top(&screen, 1))].style().fg;
+    assert_eq!(
+        run_fg,
+        Some(ratatui::style::Color::Rgb(248, 248, 242)),
         "the line that ran reads as the session's, not as something waiting"
     );
-    assert!(
-        buf[(2, last - 4)]
-            .style()
-            .add_modifier
-            .contains(Modifier::DIM),
+    let still_waiting_fg = buf[(2, last - 4)].style().fg;
+    assert_eq!(
+        still_waiting_fg,
+        Some(ratatui::style::Color::Rgb(98, 114, 164)),
         "and the one behind it still waits"
     );
 }

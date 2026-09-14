@@ -22,15 +22,10 @@
 use std::io::Write;
 
 use crate::types::Message;
-use crate::ui::cell::{Cell, Stream, Style};
+use crate::ui::cell::{Cell, Stream, Style, style_code};
+use crate::ui::theme;
 
 use super::cell::CellSink;
-
-/// The SGR reset byte, the one a cell's open style closes with so the next cell
-/// starts unstyled. Defined here rather than in `contract` because the only
-/// place this byte is needed is the bytes-on-the-wire half of the plain front
-/// end -- the TUI renders styles through ratatui, never as raw escape codes.
-const RESET: &str = "\x1b[0m";
 
 /// The plain front end's [`CellSink`]: turns the cell layer's calls into
 /// SGR bytes on a `Write`. Holds the open style for the duration of one cell
@@ -76,7 +71,11 @@ impl<'a> SgrSink<'a> {
             if self.open.is_some() {
                 let _ = self.out.write_all(self.reset().as_bytes());
             }
-            let code = if self.color { style_code(style) } else { "" };
+            let code = if self.color {
+                style_code(style)
+            } else {
+                String::new()
+            };
             let _ = self.out.write_all(code.as_bytes());
             self.open = Some(style);
         }
@@ -95,7 +94,7 @@ impl<'a> SgrSink<'a> {
     /// has no use for is one the terminal could still echo back, and that is
     /// a byte the test suite would pin as a one-line oversight.
     fn reset(&self) -> &'static str {
-        if self.color { RESET } else { "" }
+        if self.color { theme::RESET } else { "" }
     }
 }
 
@@ -125,36 +124,6 @@ impl<'a> CellSink for SgrSink<'a> {
             let _ = self.out.write_all(self.reset().as_bytes());
             self.open = None;
         }
-    }
-}
-
-/// The SGR escape that opens `style`.
-///
-/// This is the plain front end's backend: the place where the semantic
-/// [`Style`] the cell carries becomes bytes on the wire. The cell module
-/// deliberately does not know about SGR -- a [`Style`] is a label, and the
-/// two front ends render it their own way. The TUI renders it through
-/// `cell::style_of` into ratatui's [`ratatui::style::Style`] and lets the
-/// backend decide; this one writes SGR directly because it owns its writer,
-/// not a ratatui frame.
-///
-/// The dim/bold decisions come from [`Style::modifiers`] -- the same method
-/// the TUI uses -- so the two front ends cannot disagree on what a
-/// `Reasoning` line looks like. The colour is this front end's own: a palette
-/// the terminal chose for a background this code cannot see.
-pub fn style_code(style: Style) -> &'static str {
-    let m = style.modifiers();
-    if m.bold {
-        match style {
-            Style::Yellow => "\x1b[1;33m",
-            Style::Green => "\x1b[1;32m",
-            Style::Red => "\x1b[1;31m",
-            _ => "",
-        }
-    } else if m.dim {
-        "\x1b[2m"
-    } else {
-        ""
     }
 }
 
@@ -206,19 +175,27 @@ impl PlainWriter {
     }
 
     /// The escape that opens `style`, empty when colors are off.
-    pub(crate) fn open_style(&self, style: Style) -> &'static str {
-        if self.color { style_code(style) } else { "" }
+    pub(crate) fn open_style(&self, style: Style) -> String {
+        if self.color {
+            style_code(style)
+        } else {
+            String::new()
+        }
     }
 
     /// The escape that closes a style, empty when colors are off.
     pub(crate) fn close_style(&self) -> &'static str {
-        if self.color { RESET } else { "" }
+        if self.color { theme::RESET } else { "" }
     }
 
     /// Wrap `s` in `style`. Styles are applied per span, so no call site has to
     /// know whether colors are enabled.
     pub(crate) fn paint(&self, style: Style, s: &str) -> String {
-        format!("{}{s}{}", self.open_style(style), self.close_style())
+        let open = self.open_style(style);
+        if open.is_empty() {
+            return s.to_owned();
+        }
+        format!("{open}{s}{}", self.close_style())
     }
 
     /// Write a cell: the blank line separating it from the previous one, its
@@ -264,7 +241,7 @@ impl PlainWriter {
         if spacing.gap_after(self.prev_was_block) {
             self.emit("\n");
         }
-        self.emit(self.open_style(style));
+        self.emit(&self.open_style(style));
         if let Some(gutter) = spacing.gutter() {
             self.emit(gutter.head);
         }

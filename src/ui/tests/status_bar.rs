@@ -73,10 +73,11 @@ fn status_bar_render_right_aligns_and_paints() {
     let painted = r.writer.paint(Style::Dim, label);
     bar.render(r.writer.out.as_mut(), label, &painted);
     let s = buf_of(&buf);
-    // 39 - 23 = 16 spaces of left padding, right aligned
+    // 39 - 23 = 16 spaces of left padding, right aligned; the label is in
+    // the palette's secondary colour, spelled out in truecolour.
     assert!(
         s.contains(&format!(
-            "\x1b7\x1b[10;1H\x1b[2K{}\x1b[2m{label}\x1b[0m\x1b8",
+            "\x1b7\x1b[10;1H\x1b[2K{}\x1b[38;2;98;114;164m{label}\x1b[0m\x1b8",
             " ".repeat(16)
         )),
         "{s:?}"

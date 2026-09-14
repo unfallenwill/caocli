@@ -8,9 +8,10 @@
 //! The data here is deliberately terminal-agnostic. [`Style`] is a semantic
 //! label rather than an escape sequence, on purpose: the plain front end
 //! renders it to ANSI bytes and the TUI front end renders it to ratatui
-//! styles, both from the same enum. Anything that would only matter to one
-//! of them -- an SGR code, a ratatui `Color` -- lives on that front end's
-//! side of the seam, not on the cell's.
+//! styles, both off the palette in [`crate::ui::theme`]. Anything that would
+//! only matter to one of them -- an SGR code, a ratatui `Color` -- lives on
+//! that front end's side of the seam, not on the cell's; the palette is the
+//! one thing on this side of it that both ends are told to agree on.
 
 use std::borrow::Cow;
 use std::time::Duration;
@@ -41,6 +42,12 @@ use todos::todo_spans;
 // crate reaches for. The producers live in their own module next to the
 // helper that needs them; the re-export is what keeps `cell::` working as
 // the entry point for the data layer.
+//
+// The two that are not producers are the palette's: a `Style` becomes a colour
+// on the way out, in one place both front ends read, and the re-export keeps
+// that call site spelled the way it reads -- `style_of(style)` and the
+// `style_code` half that the plain front end's writer asks the palette for.
+pub(crate) use crate::ui::theme::{style_code, style_of};
 pub use replay::from_messages;
 pub use sink::CellSink;
 // `StepStatus` is re-exported for tests and downstream callers; the cell
@@ -50,18 +57,16 @@ pub use step::{Step, StepStatus};
 pub use stream::Stream;
 pub use todos::{standing_todos, todo_gutter, todo_head_spans, todo_line_spans};
 
-/// A text style, held as data. Whether it becomes an escape sequence is decided
-/// by the front end that renders it, which is why there is no escape-sequence
-/// method on this type -- a `Style::Yellow` here is the same value the plain
-/// front end's writer and the TUI's `style_of` start from, and the bytes it
-/// becomes are decided in only one place each.
+/// A text style, held as data: which of the session's lines this is, not what
+/// colour it is painted in. The colour lives in [`crate::ui::theme`], one
+/// palette both front ends read -- the plain front end's writer spells it out
+/// as SGR, the TUI hands it to `ratatui`, and neither chooses one of its own.
 ///
-/// The visual rules shared by both front ends -- the "looks dim" and "carries
-/// weight" properties a terminal or a theme cannot undo -- live on this type
-/// as [`Style::is_dim`] and [`Style::is_bold`]. Each front end still picks its
-/// own colour: that part is a palette the theme chose for a background this
-/// code cannot see, and the half that does not depend on the theme is the one
-/// the methods expose.
+/// The visual rules shared by both front ends -- "is this line secondary" and
+/// "does it carry weight" -- live on this type as [`Style::is_dim`] and
+/// [`Style::is_bold`]. What colour each of them is painted in is
+/// [`crate::ui::theme`]'s: the palette is one value both front ends read, and
+/// the half that does not depend on it is the one the methods expose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Style {
     /// Unstyled text: body text.
@@ -87,31 +92,46 @@ pub enum Style {
 }
 
 impl Style {
-    /// Whether this style is rendered dim (no colour of its own).
+    /// Whether this style is secondary text: the lines that stand behind the
+    /// session rather than in it.
     ///
-    /// The one rule both front ends agree on without looking at the terminal:
-    /// thinking looks like a dim line, not because the colours match but because
-    /// the layout marks it as thinking in a way that does not depend on either.
+    /// The one rule both front ends agree on without looking at the terminal.
+    /// What it means for the painting is the palette's: Dracula paints these in
+    /// its `comment` colour, and the line a tool result is set on is told apart
+    /// from the answer by a colour and by the layout -- the marker in its gutter
+    /// -- neither of which depends on a terminal honoring SGR 2.
+    ///
+    /// Kept public alongside the cell layer's contract: a future backend that
+    /// cannot ask the palette directly (a third front end, a static export)
+    /// reads the two rules from here.
+    #[allow(dead_code)]
     pub fn is_dim(self) -> bool {
         matches!(self, Style::Dim | Style::Reasoning)
     }
 
     /// Whether this style carries weight as well as a colour.
     ///
-    /// Weight reads on both a light background and a dark one, while a colour
-    /// at its darkest on a dark background is a line a reader cannot read. The
-    /// plain front end's `style_code` and the TUI's `style_of` apply the same
-    /// rule, which is what this method is the one place for.
+    /// Weight reads on both a light background and a dark one, on a terminal
+    /// that can render it. [`crate::ui::theme::style_code`] and
+    /// [`crate::ui::theme::style_of`] apply the same rule, which is what this
+    /// method is the one place for.
+    ///
+    /// Kept public for the same reason [`Style::is_dim`] is: the cell layer's
+    /// contract, not the palette's. Today's backends ask the palette directly.
+    #[allow(dead_code)]
     pub fn is_bold(self) -> bool {
         matches!(self, Style::Yellow | Style::Green | Style::Red)
     }
 
-    /// The dim/bold modifiers this style carries, in the shape a backend applies.
+    /// The dim/bold modifiers this style carries, in the shape a backend
+    /// applies: the cell layer's answer to "secondary?" and "weight?", for a
+    /// backend that wants both as data rather than as two predicates.
     ///
-    /// The two front ends share these two modifiers as the rules of the cell
-    /// layer; what each backend does with them is its own -- a palette the
-    /// theme chose for a background this code cannot see, so the half that
-    /// does not depend on the theme is what lives here.
+    /// The palette in effect does not need it -- it paints each style its own
+    /// colour, and carries weight from [`Style::is_bold`] directly -- so this is
+    /// the shape the next backend reads, not the one
+    /// [`crate::ui::theme`] happens to.
+    #[allow(dead_code)]
     pub fn modifiers(self) -> Modifiers {
         Modifiers {
             dim: self.is_dim(),
@@ -123,7 +143,10 @@ impl Style {
 /// The dim/bold flags a backend applies to a span: what `Style::modifiers`
 /// returns, decoupled from the enum so each front end can pattern-match on a
 /// struct of booleans rather than re-derive the same answer from `is_dim` and
-/// `is_bold` separately.
+/// `is_bold` separately. Named for the rules they carry -- "secondary text",
+/// "carries weight" -- rather than for one backend's way of expressing them,
+/// which is the palette's to choose.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Modifiers {
     pub dim: bool,
@@ -151,42 +174,6 @@ impl Span {
             text: Cow::Owned(text.into()),
         }
     }
-}
-
-/// Our style, as ratatui sees it. This is what [`Style`] being data buys: the
-/// mapping happens once and is reused by both the painter and the wrap module,
-/// instead of at every call site.
-///
-/// The dim/bold half comes from [`Style::modifiers`] -- the same method the
-/// plain front end uses, so the two front ends cannot disagree on what a
-/// `Reasoning` line looks like. The colour is this front end's own, as a
-/// `Color` the framework hands to the theme: a palette the theme chose for a
-/// background this code cannot see.
-///
-/// Lives on the cell layer rather than on a single front end because the
-/// conversion is a property of the cell type (`Style`) and the framework, not of
-/// whichever front end is rendering: the wrap module that turns spans into
-/// `Line`s needs the same mapping as the painter that lays out a cell.
-pub(crate) fn style_of(style: Style) -> ratatui::style::Style {
-    use ratatui::style::{Color, Modifier, Style as RStyle};
-    let mut s = RStyle::new();
-    let m = style.modifiers();
-    if m.dim {
-        s = s.add_modifier(Modifier::DIM);
-    }
-    if m.bold {
-        s = s.add_modifier(Modifier::BOLD);
-    }
-    let color = match style {
-        Style::Yellow => Some(Color::Yellow),
-        Style::Green => Some(Color::Green),
-        Style::Red => Some(Color::Red),
-        _ => None,
-    };
-    if let Some(c) = color {
-        s = s.fg(c);
-    }
-    s
 }
 
 /// One line of a change, as a tool call shows it.
@@ -1003,21 +990,21 @@ mod tests {
 
     /// The dim/bold rules both front ends build on. The contract is what keeps
     /// the plain SGR mapping and the TUI's ratatui mapping in step: a `Style`
-    /// that is `is_dim` is dim in both, and one that is `is_bold` is bold in
-    /// both. Adding a new coloured style to one place without the other would
-    /// be a one-line oversight; this test is what makes it two.
+    /// that is `is_dim` is secondary text in both, and one that is `is_bold`
+    /// carries weight in both. Adding a new coloured style to one place without
+    /// the other would be a one-line oversight; this test is what makes it two.
     #[test]
     fn the_dim_and_bold_rules_are_what_both_front_ends_agree_on() {
         // Dim and reasoning are the two styles that read as a line about the
-        // answer, not as the answer itself: rendered dim in both front ends,
+        // answer, not as the answer itself: secondary text in both front ends,
         // and the only styles that are.
         for style in [Style::Dim, Style::Reasoning] {
             assert!(style.is_dim(), "{style:?} is dim");
             assert!(!style.is_bold(), "{style:?} carries no weight of its own");
         }
-        // Body text is plain in both, and the rest of the styles are coloured
-        // and therefore bold -- weight being the half that survives a theme
-        // the terminal chose for a background this code cannot see.
+        // Body text is plain in both, and the rest of the styles carry weight
+        // as well as a colour -- weight being the half that survives a reader
+        // who has turned colour off.
         let plain = Style::Plain;
         assert!(!plain.is_dim(), "{plain:?} is not dim");
         assert!(!plain.is_bold(), "{plain:?} carries no weight of its own");
