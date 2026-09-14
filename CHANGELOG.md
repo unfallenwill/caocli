@@ -6,6 +6,8 @@ semantic-version bumps per release.
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-09-14
+
 ### Changed — the transcript is one cell per tool call
 
 - A tool call is one `Step` cell now, rather than three cells (the
