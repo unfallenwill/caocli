@@ -21,6 +21,7 @@ use crate::tools::ask::Question;
 use crate::tools::todo::{self, Todo};
 use crate::types::Usage;
 
+use super::glyphs;
 use super::text;
 
 mod call;
@@ -330,7 +331,14 @@ impl Gutter {
 /// either side of the moment it is submitted: the box draws this itself rather than
 /// carrying it in the placeholder, so it does not move when the typing starts and
 /// does not go away when the hint does.
-pub const USER_MARKER: &str = "› ";
+///
+/// A function rather than a constant because the glyph is the user's to choose
+/// ([`crate::ui::glyphs`]) and the box has to draw the same one the transcript
+/// will: a draft opening in `› ` that submits into `> ` is a line that changes
+/// under the reader at the moment they finish it.
+pub fn user_marker() -> &'static str {
+    glyphs::get().user
+}
 
 /// The columns every gutter takes.
 ///
@@ -398,7 +406,7 @@ impl Cell {
         match self {
             // The one cell on the left edge.
             Cell::Content(_) => None,
-            Cell::User { .. } => Some(Gutter::new(USER_MARKER, "  ", Style::Dim)),
+            Cell::User { .. } => Some(Gutter::new(glyphs::get().user, "  ", Style::Dim)),
             // The thinking carries no marker: two blank columns, the columns every
             // line that is only being set off is set off by. The `┆` it used to
             // wear down its margin was a glyph on every line of a block that can
@@ -429,7 +437,7 @@ impl Cell {
                 },
             )),
             Cell::Approval { .. } | Cell::Question(_) | Cell::Todo(_) => {
-                Some(Gutter::new("▸ ", "  ", Style::Yellow))
+                Some(Gutter::new(glyphs::get().running, "  ", Style::Yellow))
             }
             // A failed step's auto-expanded children take the same dim
             // gutter as their settled result would, so the failure reads as
@@ -442,7 +450,7 @@ impl Cell {
             // carries its own mark: three short rules for "summary / stats /
             // numbers", so a reader with colour turned off still sees the
             // line as the kind of line it is.
-            Cell::Usage { .. } => Some(Gutter::new("≡ ", "  ", Style::Dim)),
+            Cell::Usage { .. } => Some(Gutter::new(glyphs::get().usage, "  ", Style::Dim)),
         }
     }
 
@@ -476,7 +484,11 @@ impl Cell {
                     let total: usize = images.iter().map(|i| i.bytes).sum();
                     spans.push(Span::new(
                         Style::Dim,
-                        format!("{lead}[{} images · {total} bytes]", images.len()),
+                        format!(
+                            "{lead}[{} images{}{total} bytes]",
+                            images.len(),
+                            glyphs::sep()
+                        ),
                     ));
                 } else {
                     for image in images {
@@ -494,13 +506,16 @@ impl Cell {
             Cell::Step(step) => step.spans(),
             Cell::Notice(text) => vec![Span::new(Style::Dim, text.as_str())],
             Cell::Failure(text) => vec![Span::new(Style::Red, format!("error: {text}"))],
-            Cell::Interrupted => vec![Span::new(Style::Yellow, "⏹ interrupted (Ctrl-C)")],
+            Cell::Interrupted => vec![Span::new(
+                Style::Yellow,
+                format!("{} interrupted (Ctrl-C)", glyphs::get().stopped),
+            )],
             Cell::Usage { usage, stream } => {
                 vec![Span::new(Style::Dim, usage_line(usage, *stream))]
             }
             Cell::Approval { name, hint } => vec![Span::new(
                 Style::Yellow,
-                format!("{name} {hint} · run it? y/N "),
+                format!("{name} {hint}{}run it? y/N ", glyphs::sep()),
             )],
             Cell::Question(questions) => question_spans(questions),
             Cell::Todo(todos) => todo_spans(todos),
@@ -557,7 +572,12 @@ impl Cell {
 /// The line an attached image contributes to the user's cell: what it is and how
 /// much of it there is, which is as much as the message says.
 fn image_line(image: &Note) -> String {
-    format!("[image {} · {} bytes]", image.format, image.bytes)
+    format!(
+        "[image {}{}{} bytes]",
+        image.format,
+        glyphs::sep(),
+        image.bytes
+    )
 }
 
 /// The per-sub-request usage line.
@@ -576,15 +596,23 @@ fn image_line(image: &Note) -> String {
 fn usage_line(usage: &Usage, stream: Duration) -> String {
     let cache = match usage.cache() {
         Some(c) => format!("hit {}/miss {}", c.hit, c.miss),
-        None => "cache —".to_string(),
+        None => format!("cache {}", glyphs::get().dash),
     };
     let mut line = format!(
-        "tokens: in {}/{} · {cache} · out {}",
-        usage.prompt_tokens, usage.total_tokens, usage.completion_tokens
+        "tokens: in {}/{}{}{cache}{}out {}",
+        usage.prompt_tokens,
+        usage.total_tokens,
+        glyphs::sep(),
+        glyphs::sep(),
+        usage.completion_tokens
     );
     if usage.completion_tokens > 0 && stream >= Duration::from_secs(1) {
         let per_second = usage.completion_tokens as f64 / stream.as_secs_f64();
-        line.push_str(&format!(" · {} token/s", per_second.round() as u64));
+        line.push_str(&format!(
+            "{}{} token/s",
+            glyphs::sep(),
+            per_second.round() as u64
+        ));
     }
     line
 }
@@ -1005,12 +1033,15 @@ mod tests {
         assert_eq!(first, MARKER_COLUMNS, "and this is the width they all are");
     }
 
-    /// The box draws the user's marker itself, from this constant, so a line being
-    /// typed is marked in the column the same line is marked in once it is submitted.
+    /// The box draws the user's marker itself, from the same source the gutter
+    /// draws from, so a line being typed is marked in the column the same line
+    /// is marked in once it is submitted -- and the two columns the gutter takes
+    /// do not depend on which arm of the glyph set the user picked.
     #[test]
     fn the_user_marker_is_one_marker_wide() {
-        assert_eq!(Cell::user("x").gutter().unwrap().head, USER_MARKER);
-        assert_eq!(text::width(USER_MARKER), MARKER_COLUMNS);
+        let head = Cell::user("x").gutter().unwrap().head;
+        assert_eq!(head, user_marker());
+        assert_eq!(text::width(head), MARKER_COLUMNS);
     }
 
     /// The dim/bold rules both front ends build on. The contract is what keeps

@@ -37,6 +37,7 @@ use crate::tools::todo::{self, Todo};
 use crate::ui::cell::{
     self, Cell, Gutter, Span, Style, layout as cell_layout, style_of, wrap::wrapped_lines,
 };
+use crate::ui::glyphs;
 
 /// The row that says how much of the transcript the window is not showing, drawn
 /// on the edge it was cut at.
@@ -56,7 +57,10 @@ use crate::ui::cell::{
 /// say is two lines, and there is no singular form here.
 pub(crate) fn edge_line(above: bool, n: usize) -> Line<'static> {
     let side = if above { "above" } else { "below" };
-    Line::styled(format!("\u{22ee} {n} lines {side}"), style_of(Style::Dim))
+    Line::styled(
+        format!("{} {n} lines {side}", glyphs::get().more),
+        style_of(Style::Dim),
+    )
 }
 
 /// The row that says how many rows a window is not showing, at the end it was cut
@@ -74,7 +78,10 @@ pub(crate) fn edge_line(above: bool, n: usize) -> Line<'static> {
 /// lists with hidden items; sharing the glyph means a reader who has learned
 /// one of them has learned all of them.
 pub(crate) fn more_line(lead: &str, n: usize) -> Line<'static> {
-    Line::styled(format!("{lead}⋮ {n} more"), style_of(Style::Dim))
+    Line::styled(
+        format!("{lead}{} {n} more", glyphs::get().more),
+        style_of(Style::Dim),
+    )
 }
 
 /// The spans a cell is drawn from, given what the screen shows elsewhere.
@@ -214,7 +221,12 @@ fn wrapped_under(spans: &[Span], width: usize, gutter: Gutter) -> Vec<Line<'stat
 /// result carry, so the three cannot say different things about one list.
 pub(crate) fn todo_title(todos: &[Todo]) -> Line<'static> {
     Line::styled(
-        format!("· todo · {}", todo::summary(todos)),
+        format!(
+            "{} todo{}{}",
+            glyphs::get().bullet,
+            glyphs::sep(),
+            todo::summary(todos)
+        ),
         style_of(Style::Dim),
     )
 }
@@ -288,13 +300,22 @@ pub(crate) fn queued_lines(queued: &[String], width: usize) -> Vec<Line<'static>
 /// which options are chosen. One marker per question kind, so that a row is
 /// never saying two things in one column -- a cursor sitting on a chosen option
 /// still shows both.
-const PANEL_CURSOR: &str = "❯ ";
-const PANEL_CHOSEN: &str = "✓ ";
+fn panel_cursor() -> &'static str {
+    glyphs::get().cursor
+}
+fn panel_chosen() -> &'static str {
+    glyphs::get().chosen
+}
 const PANEL_BLANK: &str = "  ";
 
 /// Lines the panel shows under the options. The keys are the whole of what a
 /// reader has to learn here, and the panel is where they are learnt.
-const PANEL_MOVE: &str = "↑/↓ move";
+/// The keys the panel is listening for. Spelled from the glyph set because the
+/// arrows are two of its Ambiguous characters: a `↑` that takes two columns
+/// re-flows the footer it is in.
+fn panel_move() -> String {
+    format!("{} move", glyphs::get().arrows)
+}
 const PANEL_TOGGLE: &str = "space toggles";
 const PANEL_TYPE: &str = "type to answer in your own words";
 const PANEL_CONFIRM: &str = "Enter confirms";
@@ -324,14 +345,17 @@ pub(crate) fn panel_lines(
         let mut heading = String::new();
         if !question.header.is_empty() {
             heading.push_str(&question.header);
-            heading.push_str(" · ");
+            heading.push_str(glyphs::sep());
         }
         heading.push_str(&format!("question {} of {}", at + 1, questions.len()));
         lines.extend(wrapped_lines(&[Span::new(Style::Dim, heading)], width));
     }
     let mut ask = vec![Span::new(Style::Yellow, question.question.clone())];
     if question.multi_select {
-        ask.push(Span::new(Style::Dim, " · choose any"));
+        ask.push(Span::new(
+            Style::Dim,
+            format!("{}choose any", glyphs::sep()),
+        ));
     }
     lines.extend(wrapped_lines(&ask, width));
     // Every option is drawn: the call allows four of them, so there is
@@ -363,7 +387,7 @@ fn option_lines(
 ) -> Vec<Line<'static>> {
     let option = &question.options[at];
     let cursor_marker = if at == cursor {
-        PANEL_CURSOR
+        panel_cursor()
     } else {
         PANEL_BLANK
     };
@@ -374,7 +398,11 @@ fn option_lines(
             Style::Dim,
             format!(
                 "{cursor_marker}{}",
-                if is_chosen { PANEL_CHOSEN } else { PANEL_BLANK }
+                if is_chosen {
+                    panel_chosen()
+                } else {
+                    PANEL_BLANK
+                }
             ),
         ));
     } else {
@@ -383,7 +411,10 @@ fn option_lines(
     spans.push(Span::new(Style::Dim, format!("{}. ", at + 1)));
     spans.push(Span::new(Style::Plain, option.label.clone()));
     if !option.description.is_empty() {
-        spans.push(Span::new(Style::Dim, format!(" — {}", option.description)));
+        spans.push(Span::new(
+            Style::Dim,
+            format!(" {} {}", glyphs::get().dash, option.description),
+        ));
     }
     let mut lines = wrapped_lines(&spans, width);
     if at == cursor {
@@ -401,14 +432,21 @@ fn option_lines(
 /// What the panel says the keys do, under the options it is offering.
 fn footer(question: &Question) -> String {
     if question.options.is_empty() {
-        return format!("{PANEL_TYPE} · {PANEL_CONFIRM} · {PANEL_SKIP}");
+        return format!(
+            "{PANEL_TYPE}{}{PANEL_CONFIRM}{}{PANEL_SKIP}",
+            glyphs::sep(),
+            glyphs::sep()
+        );
     }
-    let mut keys = vec![PANEL_MOVE];
+    let mut keys = vec![panel_move()];
     if question.multi_select {
-        keys.push(PANEL_TOGGLE);
+        keys.push(PANEL_TOGGLE.to_owned());
     }
     format!(
-        "{} · {PANEL_TYPE} · {PANEL_CONFIRM} · {PANEL_SKIP}",
-        keys.join(" · ")
+        "{}{}{PANEL_TYPE}{}{PANEL_CONFIRM}{}{PANEL_SKIP}",
+        keys.join(glyphs::sep()),
+        glyphs::sep(),
+        glyphs::sep(),
+        glyphs::sep()
     )
 }

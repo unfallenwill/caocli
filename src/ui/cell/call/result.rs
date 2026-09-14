@@ -6,6 +6,7 @@
 //! and an unrecognized prefix falls back to the first line and the byte count.
 
 use crate::ui::cell::Style;
+use crate::ui::glyphs;
 
 /// One line of a result summary, what the transcript says about a tool
 /// returning. The text is the first interesting line and the size is the
@@ -82,7 +83,7 @@ fn write_summary(result: &str) -> Option<String> {
         .and_then(|r| r.strip_suffix(')'))
         && let Some((path, bytes)) = rest.rsplit_once(" (")
     {
-        return Some(format!("wrote {path} · {bytes}"));
+        return Some(format!("wrote {path}{}{bytes}", glyphs::sep()));
     }
     if let Some(rest) = result.strip_prefix("ok: ") {
         // `PATH already has exactly this content (N bytes); left unchanged`
@@ -102,7 +103,7 @@ fn write_summary(result: &str) -> Option<String> {
 fn edit_summary(result: &str) -> Option<String> {
     let rest = result.strip_prefix("ok: replaced 1 occurrence; ")?;
     let (path, bytes) = rest.rsplit_once(" is now ")?;
-    Some(format!("replaced in {path} · now {bytes}"))
+    Some(format!("replaced in {path}{}now {bytes}", glyphs::sep()))
 }
 
 /// The summary every other tool gets: the first line of the result and
@@ -113,8 +114,9 @@ fn default_summary(result: &str) -> (Style, String) {
     (
         Style::Dim,
         format!(
-            "{} · {} bytes",
+            "{}{}{} bytes",
             result.lines().next().unwrap_or(""),
+            glyphs::sep(),
             result.len()
         ),
     )

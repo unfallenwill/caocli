@@ -24,6 +24,7 @@
 
 use std::time::Instant;
 
+use super::glyphs;
 use super::{Cell, Span, Style};
 
 /// What a thought region is doing.
@@ -134,7 +135,7 @@ impl Thought {
         let body = if self.activity == "thinking" {
             "Thought for  ".to_owned()
         } else {
-            format!("Thought · {} · ", self.activity)
+            format!("Thought{}{}{}", glyphs::sep(), self.activity, glyphs::sep())
         };
         vec![Span::new(
             Style::Dim,

@@ -17,7 +17,7 @@ use crate::ui::cell::Cell;
 use super::super::layout::{BOX_GUTTER, BOX_ROWS, PINNED_ROWS, box_field, box_rows, screen_rows};
 use super::super::notice::{AppNotice, MachineNotice};
 use super::super::render as render_mod;
-use super::super::render::SPINNER;
+use super::super::render::spinner;
 use super::super::state::State;
 use super::all_rows;
 use super::rendered;
@@ -25,6 +25,7 @@ use super::row;
 use super::screen_for_test;
 use super::transcript_top;
 use super::unset;
+use super::working;
 use crate::types::Usage;
 
 #[test]
@@ -607,56 +608,66 @@ fn the_box_says_what_enter_will_do() {
     let mut state = State::default();
     assert_eq!(
         state.edit.textarea.placeholder_text(),
-        super::super::input::IDLE_PLACEHOLDER
+        super::super::input::idle_placeholder()
     );
 
     state.begin_turn(Instant::now());
     assert_eq!(
         state.edit.textarea.placeholder_text(),
-        super::super::input::QUEUE_PLACEHOLDER
+        super::super::input::queue_placeholder()
     );
 
     let (reply, _answer) = tokio::sync::oneshot::channel();
     state.open_question(reply);
     assert_eq!(
         state.edit.textarea.placeholder_text(),
-        super::super::input::ANSWER_PLACEHOLDER
+        super::super::input::answer_placeholder()
     );
 
     state.close_question();
     assert_eq!(
         state.edit.textarea.placeholder_text(),
-        super::super::input::QUEUE_PLACEHOLDER,
+        super::super::input::queue_placeholder(),
         "the turn is still running"
     );
 
     state.end_turn();
     assert_eq!(
         state.edit.textarea.placeholder_text(),
-        super::super::input::IDLE_PLACEHOLDER
+        super::super::input::idle_placeholder()
     );
 }
 
 #[test]
-fn the_working_indicator_is_not_dim_on_a_dim_rule() {
+fn the_working_indicator_is_signal_on_a_rule_of_geometry() {
     // While the model is quiet, the spinner on the box's rule is the only thing
-    // on the screen that moves: it is chrome that has to be seen, so it is the
-    // one thing on the box painted at full strength. A dim indicator on a dim
-    // rule is the signal painted out of sight.
+    // on the screen that moves, so it is painted as the signal it is -- the
+    // palette's attention colour -- while the rule it rides on carries the
+    // geometry colour and nothing else. The two used to be told apart by a
+    // modifier, which is the arrangement this test exists to keep out: a
+    // modifier renders as anything between "slightly grey" and "nothing at all"
+    // depending on the terminal, and an indicator the reader cannot see is an
+    // indicator that is not there.
     let mut screen = screen_for_test(60, 20);
-    screen.state = super::working(Duration::from_secs(3), 0, 4.0);
+    screen.state = working(Duration::from_secs(3), 0, 4.0);
     screen.draw().unwrap();
     let rule = screen.terminal.backend().buffer().area.height - 1 - 3;
     let buf = screen.terminal.backend().buffer();
     let at = (0..buf.area.width)
-        .find(|&x| SPINNER.contains(&buf[(x, rule)].symbol().chars().next().unwrap_or(' ')))
+        .find(|&x| spinner().contains(&buf[(x, rule)].symbol().chars().next().unwrap_or(' ')))
         .expect("the indicator is drawn on the box's top rule");
-    assert!(
-        !buf[(at, rule)].style().add_modifier.contains(Modifier::DIM),
-        "the indicator is lit"
+    let signal = crate::ui::theme::style_of(crate::ui::cell::Style::Yellow).fg;
+    let geometry = crate::ui::theme::theme().rule_style().fg;
+    assert_eq!(buf[(at, rule)].style().fg, signal, "the indicator is lit");
+    assert_eq!(
+        buf[(0, rule)].style().fg,
+        geometry,
+        "and the rule is chrome"
     );
-    assert!(
-        buf[(0, rule)].style().add_modifier.contains(Modifier::DIM),
-        "and the rule it sits on is still chrome"
-    );
+    for x in [at, 0] {
+        assert!(
+            !buf[(x, rule)].style().add_modifier.contains(Modifier::DIM),
+            "neither is dimmed: x={x}"
+        );
+    }
 }

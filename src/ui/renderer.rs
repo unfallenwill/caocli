@@ -22,6 +22,7 @@ use std::time::Duration;
 use crate::types::{Message, Usage};
 use crate::ui::cell::{Cell, Step, Style};
 use crate::ui::contract::{Front, Ui};
+use crate::ui::glyphs;
 use crate::ui::plain_writer::PlainWriter;
 use crate::ui::status::Status;
 use crate::ui::status_bar::StatusBar;
@@ -51,8 +52,9 @@ fn call_result_summary(result: &str) -> (Style, String) {
     (
         Style::Dim,
         format!(
-            "{} · {} bytes",
+            "{}{}{} bytes",
             result.lines().next().unwrap_or(""),
+            glyphs::sep(),
             result.len()
         ),
     )
@@ -105,7 +107,12 @@ pub struct Renderer {
 impl Renderer {
     pub fn new() -> Self {
         let term = RealTerminal;
-        let color = term.wants_color();
+        // Not `wants_color()` here: whether colour is wanted is part of the
+        // theme, which `main` installed from the flag, the settings file and the
+        // environment together. Asking the terminal a second time would be a
+        // second answer, and `NO_COLOR` is one of the things the theme already
+        // read.
+        let color = theme::theme().color();
         Self::on(Box::new(std::io::stdout()), color, Box::new(term))
     }
 
@@ -291,9 +298,9 @@ async fn read_secret_raw(prompt: &str) -> Option<String> {
     // The palette's own secondary colour: the prompt is written by the front end
     // that owns the box rather than through a cell, and "dim" is a colour here,
     // not a modifier.
-    let dim_open = theme::sgr_color(theme::color_of(Style::Dim));
+    let dim_open = theme::style_code(Style::Dim);
     let dim_close = theme::RESET;
-    let mask: String = "•".repeat(0);
+    let mask: String = glyphs::get().mask.to_string().repeat(0);
     let _ = write!(
         stdout,
         "\r\x1b[2K{dim_open}{prompt}{dim_close}\n\r\x1b[2K› {mask}"
@@ -333,20 +340,23 @@ async fn read_secret_raw(prompt: &str) -> Option<String> {
                             return None;
                         }
                         buf.pop();
-                        let mask: String = "•".repeat(buf.chars().count());
-                        let _ = write!(stdout, "\r\x1b[2K› {mask}");
+                        let mask: String =
+                            glyphs::get().mask.to_string().repeat(buf.chars().count());
+                        let _ = write!(stdout, "\r\x1b[2K{}{mask}", glyphs::get().user);
                         let _ = stdout.flush();
                     }
                     (crossterm::event::KeyCode::Backspace, _) => {
                         buf.pop();
-                        let mask: String = "•".repeat(buf.chars().count());
-                        let _ = write!(stdout, "\r\x1b[2K› {mask}");
+                        let mask: String =
+                            glyphs::get().mask.to_string().repeat(buf.chars().count());
+                        let _ = write!(stdout, "\r\x1b[2K{}{mask}", glyphs::get().user);
                         let _ = stdout.flush();
                     }
                     (crossterm::event::KeyCode::Char(c), _) => {
                         buf.push(c);
-                        let mask: String = "•".repeat(buf.chars().count());
-                        let _ = write!(stdout, "\r\x1b[2K› {mask}");
+                        let mask: String =
+                            glyphs::get().mask.to_string().repeat(buf.chars().count());
+                        let _ = write!(stdout, "\r\x1b[2K{}{mask}", glyphs::get().user);
                         let _ = stdout.flush();
                     }
                     _ => {}
@@ -354,8 +364,8 @@ async fn read_secret_raw(prompt: &str) -> Option<String> {
             }
             crossterm::event::Event::Paste(text) => {
                 buf.push_str(&text);
-                let mask: String = "•".repeat(buf.chars().count());
-                let _ = write!(stdout, "\r\x1b[2K› {mask}");
+                let mask: String = glyphs::get().mask.to_string().repeat(buf.chars().count());
+                let _ = write!(stdout, "\r\x1b[2K{}{mask}", glyphs::get().user);
                 let _ = stdout.flush();
             }
             _ => {}

@@ -8,14 +8,16 @@
 
 use crate::tools::todo::{self, Status, Todo};
 use crate::ui::cell::{Cell, Gutter, Span, Style};
+use crate::ui::glyphs;
 
 /// What opens a task's line: the mark, and the blank that sets its words apart
 /// from it.
 pub(super) fn todo_head(status: Status) -> &'static str {
+    let set = glyphs::get();
     match status {
-        Status::Pending => "☐ ",
-        Status::InProgress => "▸ ",
-        Status::Completed => "✔ ",
+        Status::Pending => set.pending,
+        Status::InProgress => set.running,
+        Status::Completed => set.done,
     }
 }
 
@@ -49,7 +51,7 @@ pub(super) fn todo_style(status: Status) -> Style {
 pub fn todo_head_spans(todos: &[Todo]) -> Vec<Span> {
     vec![Span::new(
         Style::Yellow,
-        format!("todo · {}", todo::summary(todos)),
+        format!("todo{}{}", glyphs::sep(), todo::summary(todos)),
     )]
 }
 

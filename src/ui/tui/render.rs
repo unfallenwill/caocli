@@ -26,27 +26,40 @@
 
 use std::time::Instant;
 
-use ratatui::style::{Modifier, Style as RStyle};
 use ratatui::text::Line;
 use ratatui::widgets::Block;
 
-use crate::ui::cell;
+use crate::ui::cell::{self, Style, style_of};
+use crate::ui::glyphs;
 use crate::ui::paint::{cell_lines, standing_todo_lines};
-use crate::ui::tui::layout::BOX_BORDERS;
+use crate::ui::theme;
+use crate::ui::tui::layout::{BOX_BORDERS, box_border_set};
 use crate::ui::tui::overlay::Overlay;
 use crate::ui::tui::turn::Turn;
 use crate::ui::tui::view::View;
 
 /// The frames the working spinner cycles through while a turn runs, one per
-/// [`SPINNER_MS`]. Four half-circles rotating around a centre: the convention
-/// terminal spinners settled on in the late 1990s, and narrow enough to sit
-/// inside a border without crowding it.
-pub(super) const SPINNER: [char; 4] = ['◐', '◓', '◑', '◒'];
+/// [`SPINNER_MS`].
+///
+/// The frames come from the glyph set ([`crate::ui::glyphs`]) rather than from
+/// here, because they are not all equal: what this line used to hold was four
+/// half-circles, and half of those are Unicode East Asian *Ambiguous* and half
+/// are *Neutral* -- `◐` is one class and `◓` is the other. A terminal that widens
+/// ambiguous characters therefore drew two frames one column wide and two frames
+/// two columns wide, and the box rule the spinner rides on twitched sideways
+/// twice per revolution, twelve times a second, for as long as a turn ran.
+/// Braille is uniformly Neutral, and it is what the set carries now.
+pub(super) fn spinner() -> &'static [char] {
+    crate::ui::glyphs::get().spinner
+}
 
-/// How long one spinner frame holds, in milliseconds. Twelve-ish frames a
-/// second: fast enough to read as motion, slow enough that a frame is one
-/// redraw and no more.
-pub(super) const SPINNER_MS: u128 = 80;
+/// How long one spinner frame holds, in milliseconds.
+///
+/// A tenth of a second: eight frames to a revolution, which is 0.8s -- fast
+/// enough to read as motion, slow enough that a frame is one redraw and no more,
+/// and slower than the four-frame spin this replaced, because more frames at the
+/// same rate is a faster revolution rather than a smoother one.
+pub(super) const SPINNER_MS: u128 = 100;
 
 /// The live speed estimate appears once the turn has run this many seconds:
 /// before that the cumulative average swings too much to be worth reading.
@@ -222,7 +235,14 @@ pub(super) fn lines(view: &mut View, width: usize) -> Vec<Line<'static>> {
 ///
 /// One column is left free so the write cannot trigger autowrap.
 pub(super) fn status_line(view: &View, width: usize) -> Line<'static> {
-    Line::from(view.status.line(width.saturating_sub(1)))
+    // Painted, not left to the terminal's default: the line is chrome -- the
+    // cache statistics, which are about the session rather than part of it --
+    // and the one thing on this screen that was drawn at full strength while
+    // saying nothing the reader has to act on.
+    Line::styled(
+        view.status.line(width.saturating_sub(1)),
+        style_of(Style::Dim),
+    )
 }
 
 /// The working indicator the input box's top border carries while a turn
@@ -261,7 +281,8 @@ pub(super) fn activity_title_at(
     }
     let started = turn.started?;
     let elapsed = now - started;
-    let frame = SPINNER[(elapsed.as_millis() / SPINNER_MS) as usize % SPINNER.len()];
+    let frames = spinner();
+    let frame = frames[(elapsed.as_millis() / SPINNER_MS) as usize % frames.len()];
     let phase = if let Some(verb) = turn.current_tool_verb.as_deref() {
         format!("running {verb}")
     } else if turn.reasoning_in_flight {
@@ -269,14 +290,14 @@ pub(super) fn activity_title_at(
     } else {
         "working".to_owned()
     };
-    let count = format!("{frame} {phase} · {}s", elapsed.as_secs());
+    let count = format!("{frame} {phase}{}{}s", glyphs::sep(), elapsed.as_secs());
     let mut title = count.clone();
     if elapsed.as_secs() >= SPEED_AFTER_SECS && turn.streamed_chars > 0 {
         // The measured ratio turns characters into tokens; the tilde keeps
         // the estimate honest about being one.
         let per_second = turn.streamed_chars as f64 / turn.chars_per_token / elapsed.as_secs_f64();
         let per_second = per_second.round().max(1.0) as u64;
-        title = format!("{count} · ~{per_second} token/s");
+        title = format!("{count}{}~{per_second} token/s", glyphs::sep());
     }
     if crate::ui::text::width(&title) <= width {
         return Some(title);
@@ -299,19 +320,18 @@ pub(super) fn activity_title_at(
 pub(super) fn box_rule(overlay: &Overlay, turn: &Turn, width: usize) -> Block<'static> {
     let mut block = Block::default()
         .borders(BOX_BORDERS)
-        .border_style(RStyle::new().add_modifier(Modifier::DIM));
+        .border_set(box_border_set())
+        .border_style(theme::rule_style());
     if let Some(title) = activity_title(overlay, turn, width.saturating_sub(2)) {
-        // Not dim, unlike the rule it sits on: it is the one thing on this box
-        // that moves, and the only sign that a turn is still running when the
-        // model has gone quiet. A dim indicator on a dim border is the signal
-        // painted out of sight.
-        //
-        // The dim is taken *off* rather than left unset: a title is written on
-        // the border's own cells, and the border's style is patched into them
-        // before the title is, so a title that says nothing about weight is a
-        // dim title. Only a style that removes the modifier can undo that.
-        let lit = RStyle::new().remove_modifier(Modifier::DIM);
-        block = block.title_top(Line::styled(title, lit).right_aligned());
+        // The one thing on this box that moves, painted as the signal it is: a
+        // running turn is what `signal` means everywhere else on the screen, and
+        // the rule it rides on carries the palette's geometry colour and nothing
+        // else. Painted explicitly rather than left to the terminal, because the
+        // title is written on the border's own cells and the border's style is
+        // patched into them before the title is -- a title that said nothing
+        // about its own colour would be a title in the rule's colour, which is
+        // the indicator drawn out of sight.
+        block = block.title_top(Line::styled(title, style_of(Style::Yellow)).right_aligned());
     }
     block
 }
