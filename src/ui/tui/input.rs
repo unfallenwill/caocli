@@ -155,12 +155,13 @@ impl State {
         {
             return Submitted::Exit;
         }
-        // Ctrl-O flips the verbose toggle. Settled-Done steps reveal their
-        // children when verbose; running and failed steps are unchanged.
-        // Reasoning is folded the same way in both modes -- the toggle is
-        // about settled tool output, not the live block.
+        // Ctrl-O toggles the latest thought block's expanded view. Same
+        // rule as the working handler: the active block can expand
+        // and collapse, the latest historical block can only
+        // collapse if it was already expanded, and any other block
+        // is left alone.
         if matches(key, KeyCode::Char('o'), KeyModifiers::CONTROL) {
-            self.verbose = !self.verbose;
+            self.toggle_latest_thought();
             return Submitted::Nothing;
         }
         // Paging through the transcript. The box scrolls itself with the same

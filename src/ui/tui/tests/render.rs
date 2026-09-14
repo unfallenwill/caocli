@@ -330,11 +330,7 @@ fn a_running_commands_output_is_watched_and_then_kept() {
         .apply(MachineNotice::ToolOutput("two\n".into()));
     screen.draw().unwrap();
     // While the tool runs, the open step carries the children on screen.
-    let live = rendered(&render_mod::lines(
-        &mut screen.state.view,
-        screen.state.verbose,
-        40,
-    ));
+    let live = rendered(&render_mod::lines(&mut screen.state.view, 40));
     assert!(
         live.iter().any(|(text, _)| text.contains("one")),
         "on screen while the command runs: {live:?}"
@@ -367,11 +363,7 @@ fn a_running_commands_output_is_watched_and_then_kept() {
         _ => unreachable!("both are Steps"),
     };
     assert_eq!(screen.state.view.transcript.last(), Some(&expected));
-    let drawn = rendered(&render_mod::lines(
-        &mut screen.state.view,
-        screen.state.verbose,
-        40,
-    ));
+    let drawn = rendered(&render_mod::lines(&mut screen.state.view, 40));
     let drawn: String = drawn.into_iter().map(|(text, _)| text).collect();
     assert!(drawn.contains("one") && drawn.contains("two"), "{drawn}");
 }
@@ -388,11 +380,11 @@ fn a_folded_think_does_not_jump_open_when_it_closes() {
         .join("\n");
     screen.state.apply(MachineNotice::Reasoning(think));
     screen.draw().unwrap();
-    let live = render_mod::lines(&mut screen.state.view, screen.state.verbose, 40);
+    let live = render_mod::lines(&mut screen.state.view, 40);
     screen.state.apply(MachineNotice::FinishTurn);
     screen.draw().unwrap();
     assert_eq!(
-        render_mod::lines(&mut screen.state.view, screen.state.verbose, 40),
+        render_mod::lines(&mut screen.state.view, 40),
         live,
         "the same lines either way"
     );

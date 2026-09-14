@@ -48,10 +48,6 @@ pub(crate) struct View {
     /// The width `laid` was laid at, or `None` when nothing is laid out. Every
     /// line is wrapped to a width, so a different one invalidates all of it.
     pub(crate) laid_width: Option<usize>,
-    /// The verbose flag `laid` was laid at: a `Step`'s render shape depends
-    /// on it (children visible or not), so a flipped toggle has to invalidate
-    /// the cache too. `None` when nothing is laid out.
-    pub(crate) laid_verbose: Option<bool>,
     /// How many cells have been laid out here, over the life of this view.
     ///
     /// Nothing on the screen can show this: a draw that re-wrapped the whole
@@ -86,7 +82,6 @@ impl Default for View {
             transcript: Vec::new(),
             laid: Vec::new(),
             laid_width: None,
-            laid_verbose: None,
             #[cfg(test)]
             laid_cells: 0,
             scroll: Scroll::default(),

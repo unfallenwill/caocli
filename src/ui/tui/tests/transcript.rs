@@ -410,10 +410,10 @@ fn a_window_is_the_same_lines_as_the_transcript_it_is_a_window_on() {
         .view
         .transcript
         .iter()
-        .flat_map(|cell| cell_lines(cell, width, screen.state.verbose))
+        .flat_map(|cell| cell_lines(cell, width))
         .collect();
     assert_eq!(
-        render_mod::lines(&mut screen.state.view, screen.state.verbose, width),
+        render_mod::lines(&mut screen.state.view, width),
         whole,
         "the whole transcript"
     );

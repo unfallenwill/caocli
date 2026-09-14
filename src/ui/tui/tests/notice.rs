@@ -258,12 +258,12 @@ fn metadata_text_omits_a_blank_field() {
     assert_eq!(screen.metadata_text().as_deref(), Some("effort high"));
 }
 
-/// The Ctrl-O verbose toggle re-renders settled-Done steps with their
-/// children visible. Running and Failed steps are unchanged: their
-/// children were already on screen.
+/// Settled-Done step children stay hidden: the verbose toggle that used
+/// to surface them on Ctrl-O is gone. A Done step is one line on screen,
+/// the verdict alone; the detail lives in the thought body the step
+/// belongs to (the thinking widget surfaces it there).
 #[test]
-fn verbose_toggle_re_exposes_settled_children() {
-    // Build a settled-Done step with children on the transcript.
+fn settled_done_step_hides_its_children() {
     let mut screen = State::default();
     let step = {
         let mut s = Cell::from_tool_call("Bash", r#"{"command":"echo a; echo b"}"#);
@@ -273,54 +273,27 @@ fn verbose_toggle_re_exposes_settled_children() {
         }
         s
     };
-    screen.apply(MachineNotice::FinishTurn);
     screen.view.transcript.push(step);
 
-    // Compact: only the verdict header is on screen.
     let width = 80;
-    let before = render::lines(&mut screen.view, screen.verbose, width);
-    let before_text: String = before
+    let lines = render::lines(&mut screen.view, width);
+    let text: String = lines
         .iter()
         .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        !before_text.contains("alpha"),
-        "compact hides settled children: {before:?}"
+        !text.contains("alpha"),
+        "settled children do not surface: {lines:?}"
     );
-    assert!(!before_text.contains("beta"));
-
-    // Toggle verbose on.
-    screen.apply_app(AppNotice::SetVerbose(true));
-    let after = render::lines(&mut screen.view, screen.verbose, width);
-    let after_text: String = after
-        .iter()
-        .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        after_text.contains("alpha"),
-        "verbose shows settled children: {after:?}"
-    );
-    assert!(after_text.contains("beta"));
-
-    // And back off: settled children disappear again.
-    screen.apply_app(AppNotice::SetVerbose(false));
-    let restored = render::lines(&mut screen.view, screen.verbose, width);
-    let restored_text: String = restored
-        .iter()
-        .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(!restored_text.contains("alpha"));
-    assert!(!restored_text.contains("beta"));
+    assert!(!text.contains("beta"));
 }
 
-/// A failed step auto-expands in both modes: the toggle never hides a
-/// failure. The reader is reading it because something went wrong, and
-/// Ctrl-O is for settled *successes* a reader wants to expand on demand.
+/// A failed step auto-expands regardless of mode: the reader is reading
+/// it because something went wrong, and the detail is not optional.
+/// The verbose toggle being gone does not change this.
 #[test]
-fn verbose_does_not_collapse_a_failed_step() {
+fn a_failed_step_auto_expands() {
     let mut screen = State::default();
     let step = {
         let mut s = Cell::from_tool_call("Bash", r#"{"command":"false"}"#);
@@ -333,27 +306,15 @@ fn verbose_does_not_collapse_a_failed_step() {
     screen.view.transcript.push(step);
 
     let width = 80;
-    let compact = render::lines(&mut screen.view, screen.verbose, width);
-    let compact_text: String = compact
+    let lines = render::lines(&mut screen.view, width);
+    let text: String = lines
         .iter()
         .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        compact_text.contains("boom"),
-        "failed auto-expands in compact: {compact:?}"
-    );
-
-    screen.apply_app(AppNotice::SetVerbose(true));
-    let verbose = render::lines(&mut screen.view, screen.verbose, width);
-    let verbose_text: String = verbose
-        .iter()
-        .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        verbose_text.contains("boom"),
-        "failed still expanded in verbose: {verbose:?}"
+        text.contains("boom"),
+        "failed step carries its children: {lines:?}"
     );
 }
 
@@ -365,7 +326,7 @@ fn an_open_question_is_drawn_after_the_transcript() {
         name: "Bash".into(),
         args: r#"{"command":"rm -rf /"}"#.into(),
     });
-    let lines = render::lines(&mut screen.view, screen.verbose, 80);
+    let lines = render::lines(&mut screen.view, 80);
     assert_eq!(lines.len(), 2, "answer, then the question");
     assert!(format!("{:?}", lines[1]).contains("run it?"));
 }

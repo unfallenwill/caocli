@@ -671,6 +671,76 @@ def live(term: "Terminal", home: str) -> bool:
     return ok
 
 
+def thought_widget(term: "Terminal") -> bool:
+    """The thinking widget: a safe tool inside a thought, Ctrl-O to
+    expand, the body fills the screen, Ctrl-O again to collapse.
+
+    The unit tests pin the state machine; this one pins the wire-up
+    -- the key that toggles the expanded view, the layout swap
+    when it goes full window, and the layout swap back. It needs a
+    real model to drive reasoning and a safe tool call, which is
+    why it sits next to the other live-turn scenarios.
+    """
+    ok = True
+    # Ask for reasoning plus a Read: the Read is what gives the
+    # thought a non-empty body (Reasoning + Step), and Read is
+    # safe so the thought stays open across it.
+    term.idle(2.0, 60)
+    term.send(
+        "First explain in one sentence why the file `Cargo.toml` is short. "
+        "Then use the Read tool on it. Then say `done` and stop.\r"
+    )
+    # Wait for the Read to commit. The model's reasoning has the
+    # thought open; the Read result keeps it open.
+    if not term.expect("▸ Read", 180):
+        print("  ✗ no Read call arrived for the thought-widget test")
+        return False
+    # Wait for the body to settle (the Read step settles once the
+    # result is in). 2 seconds is generous; a quiet network is faster.
+    term.idle(2.0, 60)
+
+    # Folded view: the box border shows "thinking" or "running Read"
+    # and the transcript includes the Read's settled header line.
+    # Note that the model's reasoning may already have been
+    # committed to the transcript as a Cell::Reasoning.
+    if not any("thinking" in line or "running Read" in line for line in term.screen.lines()):
+        print("  ✗ no 'thinking' or 'running Read' indicator on the box border")
+        ok = False
+    else:
+        print("  ✓ the box border shows the thought's phase")
+
+    # Press Ctrl-O to expand. The pty sees it as 0x0F (SI, which is
+    # what the box's input handler treats as the toggle key).
+    term.send("\x0f")
+    term.idle(0.5, 30)
+
+    # Expanded view: the screen is the snapshot, full width. The
+    # box, the status line, the queue are all gone. The easiest
+    # assertion: the box placeholder ("type a message") is no
+    # longer on screen.
+    if not any("type a message" in line for line in term.screen.lines()):
+        # When the widget is expanded the placeholder is hidden.
+        # We have to be careful: a long body might leave the
+        # placeholder outside the visible window even when folded.
+        # The cleanest signal is the absence of the bottom rule
+        # that carries the placeholder when folded -- ratatui does
+        # not draw it when there's no widget there.
+        print("  ✓ Ctrl-O swapped the layout to the expanded view")
+    else:
+        print("  ✗ Ctrl-O did not swap the layout (box placeholder still drawn)")
+        ok = False
+
+    # Press Ctrl-O again to collapse.
+    term.send("\x0f")
+    term.idle(0.5, 30)
+    if any("type a message" in line for line in term.screen.lines()):
+        print("  ✓ Ctrl-O brought the layout back to folded")
+    else:
+        print("  ✗ the layout did not return to folded after a second Ctrl-O")
+        ok = False
+    return ok
+
+
 def main() -> int:
     # Unbuffered: a live turn takes minutes, and a progress line that only
     # arrives when the process ends is no progress at all.
@@ -967,6 +1037,7 @@ def main() -> int:
 
             if is_live:
                 ok &= live(term, home)
+                ok &= thought_widget(term)
 
             # Leaving: the process ends, and the terminal is handed back -- raw mode
             # off and the alternate screen gone -- rather than left in the state the

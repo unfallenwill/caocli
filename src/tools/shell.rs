@@ -97,6 +97,30 @@ const WRAPPERS: &[&str] = &[
 /// -batch` is the same idea.
 const SCRIPT_FLAGS: &[&str] = &["-es", "-e", "-E", "--batch", "-batch"];
 
+/// Programs every invocation of which is read-only — they look at the
+/// filesystem or the process's own state and exit without changing anything.
+///
+/// A whitelist and not a blacklist: a program not in this list, when it
+/// appears in a bash call, is treated as side-effectful. The opposite default
+/// (assume-safe until proven otherwise) is the one that surprises a reader
+/// who thought a tool cell would always show what was written.
+///
+/// The list is the read-only side of what a developer reaches for at a shell:
+/// file viewers, directory listings, text searches, and the no-op primitives.
+/// Programs that might write under any flag (`sed -i`, `awk`'s `>` form,
+/// `tee`) are deliberately absent — a conservative call wins more than a
+/// clever one when a Bash cell shows up outside the thought block.
+#[allow(dead_code)] // wired up by the thinking widget in a follow-up commit
+pub const SAFE_BASH_COMMANDS: &[&str] = &[
+    // file viewers
+    "cat", "head", "tail", "less", "more", // listings / metadata
+    "ls", "find", "tree", "pwd", "file", "stat", // counts / comparisons
+    "wc", "diff", "cmp", // text search / slicing
+    "grep", "rg", "ag", "sort", "uniq", "cut", "tr", // system / environment metadata
+    "date", "whoami", "id", "env", "command", "type", "which", // no-op primitives
+    "true", "false", "test",
+];
+
 pub fn definition() -> ToolDef {
     ToolDef {
         r#type: "function".into(),
@@ -328,6 +352,84 @@ fn is_assignment(word: &str) -> bool {
                 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         }
         None => false,
+    }
+}
+
+/// Whether a bash call's `command` is read-only: every simple command names a
+/// program in [`SAFE_BASH_COMMANDS`], and the string contains no output
+/// redirection.
+///
+/// Used by the thinking widget to decide whether a Bash call's tool cell
+/// stays inside the current thought block (safe) or is always shown on its
+/// own like a write or an edit (side-effectful).
+///
+/// Fails safe: a malformed `args_json`, a missing or empty `command`, an
+/// unparseable segment, and any segment whose first program is not in the
+/// whitelist all return `false`. The check is conservative on purpose —
+/// rather flag a benign call as side-effectful than hide a destructive one.
+#[allow(dead_code)] // wired up by the thinking widget in a follow-up commit
+pub fn bash_args_are_read_only(args_json: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(args_json) else {
+        return false;
+    };
+    let Some(command) = value.get("command").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if command.is_empty() {
+        return false;
+    }
+    // Any output redirection anywhere — `>`, `>>`, `2>`, `&>`, `>|` —
+    // turns a read-only program into a write. We are deliberately naive
+    // about quoting: a `>` inside single quotes is harmless, but we still
+    // flag the string. The cost is one Bash cell shown when it didn't have
+    // to be; the alternative is missing a real write.
+    if command.contains('>') {
+        return false;
+    }
+    for segment in simple_commands(command) {
+        let Some(program) = first_program(segment) else {
+            return false;
+        };
+        let name = program.rsplit('/').next().unwrap_or(program);
+        if !SAFE_BASH_COMMANDS.contains(&name) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The first executable word in `segment`. Skips variable assignments at the
+/// head of the segment; then walks through any wrappers (`sudo`, `env`,
+/// `time`, ...). The word returned is the first one past the wrappers, or
+/// — when the segment is nothing but assignments and wrappers — the last
+/// wrapper seen, since that is what a shell would actually execute.
+///
+/// `None` for a segment that is empty or contains only whitespace.
+///
+/// The wrapper fallback is what makes `env | grep FOO` read-only: the first
+/// segment is just `env` (a wrapper with no program after it), but a shell
+/// runs `env` with no arguments and prints the environment — which is
+/// reading, not writing. Returning the last wrapper in that case is what
+/// keeps the check from spuriously flagging benign commands.
+#[allow(dead_code)] // wired up by the thinking widget in a follow-up commit
+fn first_program(segment: &str) -> Option<&str> {
+    let words: Vec<&str> = segment.split_whitespace().collect();
+    if words.is_empty() {
+        return None;
+    }
+    let mut idx = 0;
+    while idx < words.len() && is_assignment(words[idx]) {
+        idx += 1;
+    }
+    let mut last_wrapper: Option<&str> = None;
+    while idx < words.len() && WRAPPERS.contains(&words[idx]) {
+        last_wrapper = Some(words[idx]);
+        idx += 1;
+    }
+    if idx < words.len() {
+        Some(words[idx])
+    } else {
+        last_wrapper
     }
 }
 
@@ -1107,6 +1209,75 @@ mod tests {
         assert!(is_assignment("echo=1=2"));
         assert!(!is_assignment("1FOO=1"));
         assert!(!is_assignment("FOO"));
+    }
+
+    /// A read-only command is read-only: every program named is in the
+    /// whitelist, no output redirection is in the string.
+    #[test]
+    fn read_only_commands_pass() {
+        for command in [
+            r#"{"command":"cat src/main.rs"}"#,
+            r#"{"command":"ls -la"}"#,
+            r#"{"command":"grep -r foo src/"}"#,
+            r#"{"command":"find . -name '*.rs'"}"#,
+            r#"{"command":"cat a | grep foo"}"#,
+            r#"{"command":"ls /tmp; head file.txt"}"#,
+            r#"{"command":"FOO=bar cat src/main.rs"}"#,
+            r#"{"command":"/usr/bin/cat file"}"#,
+            r#"{"command":"env | grep PATH"}"#,
+            r#"{"command":"sudo cat /etc/hosts"}"#,
+            r#"{"command":"time cat file"}"#,
+            r#"{"command":"true"}"#,
+        ] {
+            assert!(
+                bash_args_are_read_only(command),
+                "{command} should be read-only"
+            );
+        }
+    }
+
+    /// A side-effectful command is not read-only: the program named is not
+    /// in the whitelist, or the string contains a write redirection, or both.
+    #[test]
+    fn side_effectful_commands_fail() {
+        for command in [
+            r#"{"command":"rm file"}"#,
+            r#"{"command":"mv a b"}"#,
+            r#"{"command":"cargo build"}"#,
+            r#"{"command":"git push"}"#,
+            r#"{"command":"cat > /tmp/x"}"#,
+            r#"{"command":"echo done >> log.txt"}"#,
+            r#"{"command":"cat file && rm file"}"#,
+            r#"{"command":"rm file; ls"}"#,
+            r#"{"command":"cat | tee /tmp/x"}"#,
+            r#"{"command":""}"#,
+            r#"{}"#,
+            r#"not json"#,
+            r#"{"command":42}"#,
+            r#"{"command":"   "}"#,
+            r#"{"command":"FOO=bar"}"#,
+        ] {
+            assert!(
+                !bash_args_are_read_only(command),
+                "{command} should be side-effectful"
+            );
+        }
+    }
+
+    /// The whitelist itself: a few programs that look read-only at a glance
+    /// but are deliberately absent — `sed` (because of `-i`), `awk` (because
+    /// its `print > file` form writes), `tee`, `xargs`, `cp`, `mv`. Pinning
+    /// them out of the list makes the conservative intent explicit.
+    #[test]
+    fn dangerous_looking_programs_are_not_whitelisted() {
+        for cmd in ["sed", "awk", "tee", "xargs", "cp", "mv", "touch", "mkdir"] {
+            assert!(
+                !SAFE_BASH_COMMANDS.contains(&cmd),
+                "{cmd} should not be in the safe list"
+            );
+            let json = format!(r#"{{"command":"{cmd} foo"}}"#);
+            assert!(!bash_args_are_read_only(&json), "{cmd} should fail");
+        }
     }
 
     /// A short output is the whole output: the head and the tail put back together

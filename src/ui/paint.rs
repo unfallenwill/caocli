@@ -98,10 +98,10 @@ pub(crate) const THINKING_LINES: usize = 12;
 /// list that stands: a cell is laid out once for one width and never revisited,
 /// so a rule that changed with a later cell would rewrite history on the next
 /// resize rather than on the draw that made the list stand.
-fn spans_of(cell: &Cell, verbose: bool) -> Vec<Span> {
+fn spans_of(cell: &Cell) -> Vec<Span> {
     match cell {
         Cell::Todo(todos) => cell::todo_head_spans(todos),
-        _ => cell.spans_with(verbose),
+        _ => cell.spans(),
     }
 }
 
@@ -115,15 +115,15 @@ fn spans_of(cell: &Cell, verbose: bool) -> Vec<Span> {
 /// One cell at a time, because a cell is what a draw can keep: it is the unit the
 /// session's output arrives in and it does not change once it is pushed, so it is
 /// also the unit [`State`](crate::ui::tui::state::State) lays out and remembers.
-pub(crate) fn cell_lines(cell: &Cell, width: usize, verbose: bool) -> Vec<Line<'static>> {
+pub(crate) fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
     let Some(gutter) = cell.gutter() else {
         // The answer: the one cell that starts at the left edge.
-        return wrapped_lines(&spans_of(cell, verbose), width);
+        return wrapped_lines(&spans_of(cell), width);
     };
     // Wrapped into what the gutter leaves: the gutter comes out of the same
     // width, so the answer and the machinery around it end in the same column
     // rather than a marker's width apart.
-    let mut lines = wrapped_under(&spans_of(cell, verbose), width, gutter);
+    let mut lines = wrapped_under(&spans_of(cell), width, gutter);
     // A long think folds to its head and a count. The rule lives in this layer
     // rather than in the cell because it is a budget of the screen, like the
     // wrapping width is: the plain front end has no screen to keep one on, and
@@ -140,6 +140,23 @@ pub(crate) fn cell_lines(cell: &Cell, width: usize, verbose: bool) -> Vec<Line<'
         ));
     }
     lines
+}
+
+/// The lines one cell occupies at `width` in the thinking widget's
+/// expanded view: the same rules as [`cell_lines`], except a
+/// [`Cell::Step`] renders its children regardless of status. The
+/// compact form hides a Done step's output (a settled success is one
+/// line on the transcript); the expanded view is exactly the place
+/// the detail belongs.
+#[allow(dead_code)] // wired up by the thinking widget in a follow-up commit
+pub(crate) fn expanded_cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
+    if let Cell::Step(step) = cell {
+        let Some(gutter) = cell.gutter() else {
+            return wrapped_lines(&step.spans_with_done_children(), width);
+        };
+        return wrapped_under(&step.spans_with_done_children(), width, gutter);
+    }
+    cell_lines(cell, width)
 }
 
 /// Wrap styled spans into the terminal lines they need at `width` columns.

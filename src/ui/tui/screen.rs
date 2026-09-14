@@ -15,7 +15,7 @@ use ratatui::widgets::{Clear, Paragraph};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use ratatui_textarea::ScreenCursor;
 
-use crate::ui::cell::{self, Style, style_of};
+use crate::ui::cell::{self, Cell, Style, style_of};
 use crate::ui::paint;
 use crate::ui::tui::layout::{box_field, box_marker, screen_rows, todo_rows};
 use crate::ui::tui::picker::PICKER_ROWS;
@@ -218,9 +218,19 @@ impl<B: Backend> Screen<B> {
         let drawn = self.terminal.draw(|frame| {
             let state = &mut self.state;
             let area = frame.area();
-            let layout = compute_layout(state, area);
-            let transcript = compose_transcript(state, &layout);
-            paint(&*state, frame, &layout, transcript);
+            // The thinking widget, expanded: the snapshot replaces
+            // the whole screen. Everything else — the transcript,
+            // the box, the status — is hidden, because the user
+            // explicitly asked to see the thought body full-window,
+            // and "you can only type again after Ctrl-O" is the
+            // contract.
+            if let Some(snapshot) = expanded_snapshot(state) {
+                draw_expanded(frame, state, area, snapshot);
+            } else {
+                let layout = compute_layout(state, area);
+                let transcript = compose_transcript(state, &layout);
+                paint(&*state, frame, &layout, transcript);
+            }
         })?;
         Ok(drawn.area)
     }
@@ -291,9 +301,9 @@ fn compose_transcript(state: &mut State, layout: &Layout) -> Text<'static> {
     // What the transcript has to show, in the three pieces it is made of:
     // the cells that are laid out and kept, then the block still being
     // written, then a question if one is open.
-    render::ensure_laid(&mut state.view, state.verbose, width);
-    let live = render::live_lines(&state.view, state.verbose, width);
-    let question = render::question_lines(&state.view, state.verbose, width);
+    render::ensure_laid(&mut state.view, width);
+    let live = render::live_lines(&state.view, width);
+    let question = render::question_lines(&state.view, width);
     let total = render::laid_rows(&state.view) + live.len() + question.len();
     // The picker belongs to the line being typed, so it takes the box's end of
     // the transcript with it: a window on the end, not where the reader
@@ -408,7 +418,7 @@ fn draw_box(frame: &mut Frame, state: &State, area: Rect) {
         render::box_rule(
             &state.overlay,
             &state.turn,
-            &state.view,
+            state.thought.as_ref(),
             area.width as usize,
         ),
         area,
@@ -427,4 +437,43 @@ fn draw_box(frame: &mut Frame, state: &State, area: Rect) {
 fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
     let status = render::status_line(&state.view, area.width as usize);
     frame.render_widget(Paragraph::new(status), area);
+}
+
+/// The snapshot the expanded view should render, if any. The
+/// active thought's snapshot when it is expanded; the most recent
+/// historical block's when it was expanded at the moment it
+/// closed and the active block is no longer expanded.
+///
+/// `None` for the folded case, which is what lets the caller fall
+/// back to the regular transcript-and-box layout.
+fn expanded_snapshot(state: &State) -> Option<&[Cell]> {
+    if let Some(active) = state.thought.as_ref()
+        && active.expanded
+    {
+        return Some(&active.snapshot);
+    }
+    state
+        .historical
+        .last()
+        .filter(|b| b.expanded)
+        .map(|b| b.snapshot.as_slice())
+}
+
+/// The expanded body drawn over the entire screen: the snapshot,
+/// full width, every cell rendered in order with the gaps a normal
+/// transcript keeps between them.
+fn draw_expanded(frame: &mut Frame, _state: &State, area: Rect, snapshot: &[Cell]) {
+    let width = area.width as usize;
+    let lines = render::expanded_thought_lines(snapshot, width, true);
+    // The snapshot is what the user is reading; pad with blanks if
+    // it is shorter than the screen, so the absence of rows reads
+    // as "nothing more to read", not "the layout broke".
+    let height = area.height as usize;
+    let mut all_lines = lines;
+    if all_lines.len() < height {
+        all_lines.resize(height, Line::default());
+    } else if all_lines.len() > height {
+        all_lines.truncate(height);
+    }
+    frame.render_widget(Paragraph::new(Text::from(all_lines)), area);
 }

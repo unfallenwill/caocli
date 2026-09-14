@@ -93,6 +93,27 @@ pub fn changes_files(name: &str) -> bool {
     !matches!(name, READ_NAME | GLOB_NAME | TODO_NAME)
 }
 
+/// Whether a call's tool cell should stay inside the current thought block:
+/// `true` for read-only tools and for bash calls whose command is in the
+/// read-only whitelist, `false` for everything that can change state.
+///
+/// Used by the thinking widget: a call that returns `false` closes the
+/// current thought — its cell stays visible on its own, the same way
+/// [`Cell::Step`] for an edit or a write does. A call that returns `true`
+/// continues within the thought and only surfaces in the expanded view.
+///
+/// The default for an unknown tool is `false` (side-effectful): a tool
+/// added later is one nobody has classified yet, and the safe reading of
+/// "nobody has classified" is to surface it.
+pub fn keeps_thought_open(name: &str, args: &str) -> bool {
+    match name {
+        fs::READ_NAME | glob::NAME | todo::TODO_NAME => true,
+        fs::EDIT_NAME | fs::WRITE_NAME | ask::ASK_NAME => false,
+        shell::NAME => shell::bash_args_are_read_only(args),
+        _ => false,
+    }
+}
+
 /// Whether a call names a file: the three tools that operate on one. These are
 /// the calls whose target directory's own instructions can be discovered from
 /// the call — a Bash command can `cat` anything, and what it named is not
@@ -279,6 +300,52 @@ mod tests {
         // server is not a decision by the user.
         assert!(changes_files("SomeToolAddedLater"));
         assert!(changes_files("mcp__filesystem__read_file"));
+    }
+
+    /// The thinking widget's policy: the read-only tools and the read-only
+    /// bash commands stay inside the current thought block; everything else
+    /// closes it. Same fail-safe direction as the gate — a tool nobody has
+    /// classified is treated as side-effectful.
+    #[test]
+    fn keeps_thought_open_is_true_for_read_only_tools() {
+        for name in [READ_NAME, GLOB_NAME, TODO_NAME] {
+            assert!(
+                keeps_thought_open(name, ""),
+                "{name} is read-only and stays in the thought"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_thought_open_is_false_for_side_effectful_tools() {
+        for name in [fs::EDIT_NAME, fs::WRITE_NAME, ask::ASK_NAME] {
+            assert!(
+                !keeps_thought_open(name, ""),
+                "{name} closes the thought regardless of arguments"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_keeps_thought_open_only_when_command_is_read_only() {
+        // A safe bash call: cat, ls, grep — thought stays open.
+        assert!(keeps_thought_open(shell::NAME, r#"{"command":"cat file"}"#));
+        assert!(keeps_thought_open(shell::NAME, r#"{"command":"ls -la"}"#));
+        // A side-effectful bash call: rm, mv, redirect — thought closes.
+        assert!(!keeps_thought_open(shell::NAME, r#"{"command":"rm file"}"#));
+        assert!(!keeps_thought_open(
+            shell::NAME,
+            r#"{"command":"cat > /tmp/x"}"#
+        ));
+        // Malformed / missing / non-bash arguments default to side-effectful.
+        assert!(!keeps_thought_open(shell::NAME, ""));
+        assert!(!keeps_thought_open(shell::NAME, "not json"));
+    }
+
+    #[test]
+    fn unknown_tool_is_treated_as_side_effectful() {
+        assert!(!keeps_thought_open("SomeToolAddedLater", ""));
+        assert!(!keeps_thought_open("mcp__filesystem__read_file", ""));
     }
 
     #[tokio::test]

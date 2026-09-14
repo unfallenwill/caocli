@@ -1,5 +1,5 @@
-//! The view layer: turning [`View`], [`Turn`], [`Overlay`] and the [`verbose`]
-//! flag into the ratatui lines the screen draws.
+//! The view layer: turning [`View`], [`Turn`] and [`Overlay`] into the ratatui
+//! lines the screen draws.
 //!
 //! Every function here takes only the slices of state it actually reads or
 //! writes -- its parameter list is its dependency list. Pure cell-to-line
@@ -14,14 +14,12 @@
 //! not a change here, because none of these functions can reach it.
 //!
 //! The one bit of state render mutates is the laid cache (`laid`,
-//! `laid_width`, `laid_verbose`, `laid_cells`). The invariant it keeps is that
-//! `laid` is a laid-out prefix of `transcript`: every entry of `laid`
-//! corresponds to a cell in `transcript[0..laid.len()]`, and the two move
-//! together. The transcript pushes cells but does not touch `laid` -- only
-//! [`ensure_laid`] extends it, and only up to the length the transcript has
-//! reached.
+//! `laid_width`, `laid_cells`). The invariant it keeps is that `laid` is a
+//! laid-out prefix of `transcript`: every entry of `laid` corresponds to a
+//! cell in `transcript[0..laid.len()]`, and the two move together. The
+//! transcript pushes cells but does not touch `laid` -- only [`ensure_laid`]
+//! extends it, and only up to the length the transcript has reached.
 //!
-//! [`verbose`]: crate::ui::tui::state::State::verbose
 //! [`View`]: crate::ui::tui::view::View
 //! [`Turn`]: crate::ui::tui::turn::Turn
 //! [`Overlay`]: crate::ui::tui::overlay::Overlay
@@ -32,10 +30,11 @@ use ratatui::style::{Modifier, Style as RStyle};
 use ratatui::text::Line;
 use ratatui::widgets::Block;
 
-use crate::ui::cell::{self, Style};
+use crate::ui::cell;
 use crate::ui::paint::{cell_lines, standing_todo_lines};
 use crate::ui::tui::layout::BOX_BORDERS;
 use crate::ui::tui::overlay::Overlay;
+use crate::ui::tui::thought::ThoughtBlock;
 use crate::ui::tui::turn::Turn;
 use crate::ui::tui::view::View;
 
@@ -66,15 +65,10 @@ pub(super) const SPEED_AFTER_SECS: u64 = 3;
 /// The cache is a prefix of the transcript: `laid.len() <= transcript.len()`,
 /// and a cell that was laid is laid at the most recent `width`. A different
 /// `width` invalidates every entry, since wrapping depends on width.
-/// A different `verbose` does too, since `Step`'s render shape keys on
-/// it (children visible or not).
-pub(super) fn ensure_laid(view: &mut View, verbose: bool, width: usize) {
-    // A different width or verbose flag is a different rendering of every
-    // cell there is.
-    if view.laid_width != Some(width) || view.laid_verbose != Some(verbose) {
+pub(super) fn ensure_laid(view: &mut View, width: usize) {
+    if view.laid_width != Some(width) {
         view.laid.clear();
         view.laid_width = Some(width);
-        view.laid_verbose = Some(verbose);
     }
     // Never more cells than the transcript has. Only a test can take one away,
     // and lines of a cell that is gone are worse than laying one out twice.
@@ -85,7 +79,7 @@ pub(super) fn ensure_laid(view: &mut View, verbose: bool, width: usize) {
         {
             view.laid_cells += 1;
         }
-        view.laid.push(cell_lines(cell, width, verbose));
+        view.laid.push(cell_lines(cell, width));
     }
 }
 
@@ -135,9 +129,9 @@ pub(super) fn window_lines(
 /// merely because the two look alike: a live block that took no gutter would
 /// jump two columns left the moment the block closed, which is the one reading
 /// position a reader is sitting on when the model stops typing.
-pub(super) fn live_lines(view: &View, verbose: bool, width: usize) -> Vec<Line<'static>> {
+pub(super) fn live_lines(view: &View, width: usize) -> Vec<Line<'static>> {
     match view.stream.current() {
-        Some((style, text)) => cell_lines(&style.stream_cell(text.to_owned()), width, verbose),
+        Some((style, text)) => cell_lines(&style.stream_cell(text.to_owned()), width),
         None => Vec::new(),
     }
 }
@@ -148,9 +142,9 @@ pub(super) fn live_lines(view: &View, verbose: bool, width: usize) -> Vec<Line<'
 /// command: one that is clipped gives the user nothing to decide with. It is a
 /// cell like any other, so it carries the marker its kind carries, and the
 /// answer typed into the box below it starts in the column its own text does.
-pub(super) fn question_lines(view: &View, verbose: bool, width: usize) -> Vec<Line<'static>> {
+pub(super) fn question_lines(view: &View, width: usize) -> Vec<Line<'static>> {
     match &view.question {
-        Some(question) => cell_lines(question, width, verbose),
+        Some(question) => cell_lines(question, width),
         None => Vec::new(),
     }
 }
@@ -170,6 +164,35 @@ pub(super) fn todo_lines(view: &View, width: usize) -> Vec<Line<'static>> {
     standing_todo_lines(todos, width)
 }
 
+/// Render the expanded body of a thought block: the cells the
+/// thought "owns", laid out flat, full window width.
+///
+/// Cells come from `thought.snapshot` — the frozen copy taken when
+/// the user pressed Ctrl-O. Step cells render with their children
+/// visible (a Done step's output is exactly the detail the user
+/// opened the expanded view to read); Reasoning cells render the
+/// same way they do on the transcript.
+///
+/// `gap` is the space between two consecutive cells in the body —
+/// the same blank line the transcript puts between cells, kept
+/// consistent so a body that begins with the same cells the
+/// transcript ended with reads as the same picture.
+#[allow(dead_code)] // wired up by the thinking widget in a follow-up commit
+pub(super) fn expanded_thought_lines(
+    snapshot: &[crate::ui::cell::Cell],
+    width: usize,
+    gap: bool,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for (i, cell) in snapshot.iter().enumerate() {
+        if i > 0 && gap {
+            out.push(Line::raw(""));
+        }
+        out.extend(crate::ui::paint::expanded_cell_lines(cell, width));
+    }
+    out
+}
+
 /// The queued lines as the screen draws them. The drawing itself lives in
 /// [`crate::ui::paint::queued_lines`]; this layer only hands the queue over.
 pub(super) fn queue_lines(turn: &Turn, width: usize) -> Vec<Line<'static>> {
@@ -185,10 +208,10 @@ pub(super) fn queue_lines(turn: &Turn, width: usize) -> Vec<Line<'static>> {
 /// the same pieces the draw uses, which is what keeps the two from being two
 /// renderers.
 #[cfg(test)]
-pub(super) fn lines(view: &mut View, verbose: bool, width: usize) -> Vec<Line<'static>> {
-    ensure_laid(view, verbose, width);
-    let live = live_lines(view, verbose, width);
-    let question = question_lines(view, verbose, width);
+pub(super) fn lines(view: &mut View, width: usize) -> Vec<Line<'static>> {
+    ensure_laid(view, width);
+    let live = live_lines(view, width);
+    let question = question_lines(view, width);
     let total = laid_rows(view) + live.len() + question.len();
     window_lines(view, 0, total, &live, &question)
 }
@@ -216,45 +239,58 @@ pub(super) fn status_line(view: &View, width: usize) -> Line<'static> {
 pub(super) fn activity_title(
     overlay: &Overlay,
     turn: &Turn,
-    view: &View,
+    thought: Option<&ThoughtBlock>,
     width: usize,
 ) -> Option<String> {
-    activity_title_at(overlay, turn, view, Instant::now(), width)
+    activity_title_at(overlay, turn, thought, Instant::now(), width)
 }
 
 /// The indicator's words at `now`, without reading the clock.
 ///
 /// Phase-aware: the label says what the agent is doing, not just that
 /// something is happening. The phases the border can name are
-/// `thinking` (a Reasoning block is streaming), `running X` (a tool
-/// call is in flight), and `working` (the model is producing content
-/// or the stream has nothing yet). The spinner glyph and the elapsed
-/// seconds stay on every phase; the only thing that changes is the
-/// word between them.
+/// `thinking` (a thought block is open, no tool running), `running X`
+/// (a tool that keeps the thought open is in flight), and `working`
+/// (the model is producing content or the turn has nothing yet). The
+/// spinner glyph and the elapsed seconds stay on every phase; the
+/// only thing that changes is the word between them.
 ///
 /// Approval gate keeps the border clear (gate owns it); no turn keeps
 /// the border empty.
 pub(super) fn activity_title_at(
     overlay: &Overlay,
     turn: &Turn,
-    view: &View,
+    thought: Option<&ThoughtBlock>,
     now: Instant,
     width: usize,
 ) -> Option<String> {
     if overlay.reply.is_some() {
         return None;
     }
-    let started = turn.started?;
+    // The clock the spinner and the seconds read from. The thought's
+    // own clock when one is open (this is the per-block "how long
+    // has this section been running"); the turn's clock when no
+    // thought is open — a side-effectful tool has just closed the
+    // previous one, the new one has not started, and the turn's
+    // timer is the only one still running.
+    let started = thought.and_then(|t| t.started_at).or(turn.started)?;
     let elapsed = now - started;
     let frame = SPINNER[(elapsed.as_millis() / SPINNER_MS) as usize % SPINNER.len()];
-    // The phase comes from what the turn is doing right now -- the live
-    // stream (Reasoning -> thinking, anything else -> working), or the
-    // open tool call (the verb is the one the agent sent at ToolStart,
-    // kept in `current_tool_verb` until the result settles the step).
-    let phase = if matches!(view.stream.current(), Some((Style::Reasoning, _))) {
-        "thinking".to_owned()
-    } else if let Some(verb) = turn.current_tool_verb.as_deref() {
+    // The phase comes from what the thought (or the running tool) is
+    // doing right now. A tool running inside an open thought is the
+    // "running X" shape; a tool that closed the thought (write,
+    // edit, side-effectful bash) still shows on the border, but as
+    // "running X" without an enclosing thought -- the turn is
+    // still alive, the agent is still working, and saying nothing
+    // would be a regression from the previous border.
+    let phase = if let Some(verb) = turn.current_tool_verb.as_deref() {
         format!("running {verb}")
+    } else if thought.is_some() {
+        // The thought is open and no tool is running: the agent is
+        // either streaming reasoning or just sitting between steps.
+        // Either way, "thinking" is the closer word, and the thought
+        // body's expanded view is where the distinction lives.
+        "thinking".to_owned()
     } else {
         "working".to_owned()
     };
@@ -288,13 +324,13 @@ pub(super) fn activity_title_at(
 pub(super) fn box_rule(
     overlay: &Overlay,
     turn: &Turn,
-    view: &View,
+    thought: Option<&ThoughtBlock>,
     width: usize,
 ) -> Block<'static> {
     let mut block = Block::default()
         .borders(BOX_BORDERS)
         .border_style(RStyle::new().add_modifier(Modifier::DIM));
-    if let Some(title) = activity_title(overlay, turn, view, width.saturating_sub(2)) {
+    if let Some(title) = activity_title(overlay, turn, thought, width.saturating_sub(2)) {
         // Not dim, unlike the rule it sits on: it is the one thing on this box
         // that moves, and the only sign that a turn is still running when the
         // model has gone quiet. A dim indicator on a dim border is the signal
