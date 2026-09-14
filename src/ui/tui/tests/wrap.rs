@@ -12,7 +12,6 @@
 
 use crate::ui::cell::wrap::wrapped_lines;
 use crate::ui::cell::{Cell, Span, Style};
-use crate::ui::paint::MEASURE;
 use crate::ui::text;
 use ratatui::style::Modifier;
 
@@ -87,10 +86,10 @@ fn wrapping_loses_no_column_of_what_is_not_a_break() {
 }
 
 #[test]
-fn a_wide_terminal_keeps_a_line_of_text_to_the_measure() {
-    // The region can be wider than a line of text should be. What is laid out is
-    // laid out to the measure, so the far columns of a wide terminal stay empty
-    // and the eye does not have to run the whole way back.
+fn a_wide_terminal_is_written_in_to_its_last_column() {
+    // The region is the only thing that decides where a line breaks: the
+    // painter keeps no measure of its own, so a wide terminal is not left with
+    // columns nothing is ever written in.
     let mut screen = screen_for_test(200, 30);
     screen
         .state
@@ -106,10 +105,10 @@ fn a_wide_terminal_keeps_a_line_of_text_to_the_measure() {
         .max()
         .unwrap();
     assert!(
-        widest <= MEASURE,
-        "laid out to the measure: {widest} columns"
+        widest > 190,
+        "the far columns are written in: {widest} columns"
     );
-    assert!(widest > MEASURE - 10, "and the measure is used: {widest}");
+    assert!(widest <= 200, "and nothing runs past the region: {widest}");
     let first = transcript
         .iter()
         .find(|row| !row.trim().is_empty())
