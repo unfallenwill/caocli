@@ -111,7 +111,7 @@ pub async fn handle(
         // front ends lay out a notice as a cell, and the report is what tells
         // a user which of their servers answered and what the model can now do.
         "/mcp" => {
-            for line in agent.mcp.report() {
+            for line in agent.mcp.report().await {
                 ui.info(&line);
             }
         }
@@ -731,9 +731,7 @@ mod tests {
         assert!(ui.info[0].contains("mcpServers"), "{:?}", ui.info);
 
         let stub = caocli_mcp::stub::Stub::new();
-        agent.mcp = std::sync::Arc::new(
-            caocli_mcp::Hub::of_entries(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await,
-        );
+        agent.mcp = caocli_mcp::Hub::of_entries(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await;
         ui = Recording::default();
         submit(&mut agent, &mut ui, &dir, "/mcp").await;
         assert_eq!(ui.info.len(), 2, "{:?}", ui.info);
@@ -1525,8 +1523,8 @@ mod tests {
         assert_front::<Recording>();
     }
 
-    #[test]
-    fn prompt_metadata_pairs_model_and_effort() {
+    #[tokio::test]
+    async fn prompt_metadata_pairs_model_and_effort() {
         // The plain front end echoes this line as a dim row before each
         // model run; the TUI carries the same text in a transcript cell
         // above each User prompt. Both surfaces say the same thing.

@@ -199,7 +199,7 @@ impl Turn<'_> {
     /// One sub-request. A cancel drops the stream and writes nothing: the log
     /// stays at a valid prefix, and the cleanup closes what the turn left open.
     async fn call_model(&mut self) -> Result<Step> {
-        let request = self.agent.build_request();
+        let request = self.agent.build_request().await;
         let reply = match race(self.cancel, self.agent.stream_reply(&request, self.ui)).await {
             Ran::Finished(reply) => reply?,
             Ran::Cancelled => return Ok(self.stop()),

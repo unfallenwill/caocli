@@ -10,23 +10,34 @@
 //! Three decisions are made here rather than in any of them:
 //!
 //! - **A tool keeps its own name, inside a name that says whose it is.** Two
-//!   servers may offer a tool called `search`, and the model has to be able to
-//!   say which one it means: [`tool_name`] is `mcp__<server>__<tool>`, the
+//!   servers may offer a tool called `search`, and the model has to be able
+//!   to say which one it means: [`tool_name`] is `mcp__<server>__<tool>`, the
 //!   convention every other client of this protocol uses, so a tool the model
 //!   learned from one is the same name in another.
 //! - **A server that does not come up costs nothing else.** The model is
 //!   offered the tools of the servers that did, the session runs, and `/mcp`
-//!   says which server is missing and why — a workspace whose `.mcp.json` names
-//!   a program this machine does not have is not a workspace nobody can work in.
-//! - **A call that cannot be made is answered in words.** A name nobody offers,
-//!   a server that died, a refusal from the far end: all of them come back as
-//!   the result text, which is the same discipline the built-in tools follow
-//!   and the only one the model can act on.
+//!   says which server is missing and why — a workspace whose `.mcp.json`
+//!   names a program this machine does not have is not a workspace nobody
+//!   can work in.
+//! - **A call that cannot be made is answered in words.** A name nobody
+//!   offers, a server that died, a refusal from the far end: all of them come
+//!   back as the result text, which is the same discipline the built-in tools
+//!   follow and the only one the model can act on.
+//!
+//! ## Shape
+//!
+//! [`Hub`] is the public handle: a cheap clone of an `mpsc::Sender`. All
+//! state lives in an actor task spawned by [`Hub::spawn`] (or [`Hub::empty`]
+//! / [`Hub::of_entries`]); methods on `Hub` send a [`Command`] and await the
+//! actor's reply. Nothing on the outside ever holds a `&mut HubInner`, and
+//! the actor never shares `HubInner` with anyone — which is what keeps
+//! enable / disable / reconnect / disconnect safe to call from any thread.
 
 mod client;
 mod config;
 mod health;
 mod http;
+mod inner;
 mod stdio;
 /// Test fixture: a bash script that speaks the protocol, used by the binary's
 /// tests as well as this crate's. Always compiled (not gated behind
@@ -39,16 +50,15 @@ pub mod stub;
 mod tests;
 mod wire;
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::Value;
+use tokio::sync::{mpsc, oneshot};
 
-use caocli_core::{FunctionDef, ToolDef};
+use caocli_core::ToolDef;
 
-use client::Connection;
-use config::Entry;
+use inner::HubInner;
 
 /// What a tool from a server is named, in front of the tool's own name.
 pub const PREFIX: &str = "mcp__";
@@ -57,11 +67,6 @@ pub const PREFIX: &str = "mcp__";
 /// characters, and a session may be talking to any of the providers in the
 /// preset table, so every name this client sends is one all of them can read.
 const MAX_NAME: usize = 64;
-
-/// How many names a failure or a report lists before it says how many more
-/// there are: the model reads a tool list in the request already, and a user
-/// reading `/mcp` is looking for a name they have in mind.
-const NAMES_SHOWN: usize = 12;
 
 /// Whether a name is one this module answers for. The built-in tools are
 /// dispatched by name too, and this is what keeps the two sets apart.
@@ -72,12 +77,12 @@ pub fn is_tool(name: &str) -> bool {
 /// What the model sees a server's tool called: `mcp__<server>__<tool>`.
 ///
 /// A name may carry characters a function name may not, and a name may be
-/// longer than a backend will take, so both are dealt with here rather than at
-/// every use: what is not a letter, a digit, an underscore or a dash becomes an
-/// underscore, and a name longer than [`MAX_NAME`] keeps its front and ends with
-/// a short hash of the whole. The hash is what keeps two long names from
-/// becoming one: cutting a pair of similar names at the same length would
-/// otherwise be enough to make them the same name.
+/// longer than a backend will take, so both are dealt with here rather than
+/// at every use: what is not a letter, a digit, an underscore or a dash
+/// becomes an underscore, and a name longer than [`MAX_NAME`] keeps its front
+/// and ends with a short hash of the whole. The hash is what keeps two long
+/// names from becoming one: cutting a pair of similar names at the same
+/// length would otherwise be enough to make them the same name.
 pub fn tool_name(server: &str, tool: &str) -> String {
     let name = format!("{PREFIX}{}__{}", sanitize(server), sanitize(tool));
     if name.len() <= MAX_NAME {
@@ -94,8 +99,9 @@ pub fn tool_name(server: &str, tool: &str) -> String {
 }
 
 /// Keep what a name may carry and replace the rest. Two different names may
-/// come out the same (a space and an underscore are one character to a backend)
-/// — that is a collision the hub reports rather than a fix to guess at.
+/// come out the same (a space and an underscore are one character to a
+/// backend) — that is a collision the hub reports rather than a fix to guess
+/// at.
 fn sanitize(text: &str) -> String {
     text.chars()
         .map(|c| {
@@ -111,10 +117,11 @@ fn sanitize(text: &str) -> String {
 /// A short, stable hash of a name.
 ///
 /// FNV-1a, written out rather than taken from a crate: the name it is part of
-/// is written into the session log, and a later process reading that log has to
-/// work out the same name from the same server — so the hash has to be the same
-/// on every machine, in every release, forever. A hash that could change is a
-/// hash that would silently renumber the tools of a resumed session.
+/// is written into the session log, and a later process reading that log has
+/// to work out the same name from the same server — so the hash has to be the
+/// same on every machine, in every release, forever. A hash that could
+/// change is a hash that would silently renumber the tools of a resumed
+/// session.
 fn short_hash(text: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in text.as_bytes() {
@@ -124,394 +131,210 @@ fn short_hash(text: &str) -> String {
     format!("{:08x}", hash & 0xffff_ffff)
 }
 
-/// One server as the session has it: what the configuration called it, how to
-/// reach it, and how it stands.
-struct Server {
-    name: String,
-    /// What the entry says it is — the command line, or the url — for the
-    /// report. Readable rather than parseable: nothing decides anything by it.
-    how: String,
-    /// The file that named it, so that a server in a project's `.mcp.json` is
-    /// told apart from one in the user's own settings.
-    from: String,
-    state: State,
-}
-
-/// How a server stands.
-enum State {
-    /// It came up, and it offered this many tools. The connection is boxed for
-    /// the same reason `WireRequest`'s payloads are: what it carries is a
-    /// transport — a client, a process, a map of waiting requests — and a
-    /// `Server` has no business being that size to say it did not start.
-    Ready {
-        connection: Box<Connection>,
-        tools: usize,
+/// A message to the hub's actor task: do this one thing, then send the result
+/// back over `reply`. `None` of these are constructed by callers outside this
+/// crate — every method on [`Hub`] builds the one its name implies.
+enum Command {
+    Call {
+        tool: String,
+        args: String,
+        reply: oneshot::Sender<String>,
     },
-    /// It did not, and this is what there is to say about it.
-    Failed(String),
+    Definitions {
+        reply: oneshot::Sender<Arc<Vec<ToolDef>>>,
+    },
+    Notes {
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    Report {
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    Shutdown {
+        reply: oneshot::Sender<()>,
+    },
 }
 
-/// Where a tool the model named is: which server offers it, and what it is
-/// called there.
-struct Route {
-    server: usize,
-    tool: String,
-}
-
-/// Every server a session talks to, and the tools they offer between them.
+/// A handle to the hub's actor task.
 ///
-/// The order the tools are offered in is the order the servers are in the
-/// configuration — sorted by name — and, within a server, the order it listed
-/// them. It is part of every request the session sends, so it has to be the same
-/// on every run of the same configuration.
+/// `Hub` is `Clone` — every clone is another sender into the same mailbox — so
+/// callers can hand it out the way they would an `Arc<T>`, without an `Arc`
+/// of their own. Methods are `async + &self` because the actor model is
+/// "send a message, wait for the reply": there is no shared `&mut`, no lock,
+/// and no surprise about who owns what.
+#[derive(Clone)]
 pub struct Hub {
-    servers: Vec<Server>,
-    tools: Vec<ToolDef>,
-    routes: HashMap<String, Route>,
-    /// What had to be said on the way: an entry that cannot be used, a variable
-    /// that is not set, two tools that would carry one name.
-    warnings: Vec<String>,
+    tx: mpsc::Sender<Command>,
 }
 
 impl Hub {
-    /// Nobody to talk to: the hub a session has when there is no configuration,
-    /// and the one every test that is not about MCP gets.
+    /// A hub with no servers behind it. The actor task is started up at once
+    /// and answers every call as though no server were configured: the
+    /// "unknown tool" message is the only thing the model ever sees.
+    ///
+    /// Synchronous because there is nothing to connect to: the actor's inner
+    /// state is ready the moment the future starts polling.
     pub fn empty() -> Self {
-        Self {
-            servers: Vec::new(),
-            tools: Vec::new(),
-            routes: HashMap::new(),
-            warnings: Vec::new(),
-        }
+        spawn_with(async { HubInner::empty() })
     }
 
-    /// Read the configuration and connect to everything it names.
+    /// Read the workspace and the user-supplied mcpServers, then start an
+    /// actor task that connects to everything they name.
     ///
-    /// All of them at once: a session's first request waits for the tools of
-    /// every server, and doing this one server at a time would make that wait
-    /// the sum of theirs. A server that is slow to start is slow either way, and
-    /// this way it is no one else's cost.
-    ///
-    /// `user_settings` is the `mcpServers` table from the user's settings file,
-    /// already read by the binary that knows where that file lives. Passing it
-    /// in keeps this crate from having to know.
-    pub async fn connect(workspace: &Path, user_settings: Option<&Value>) -> Self {
-        let (entries, warnings) = config::entries(workspace, user_settings);
-        Self::open(entries, warnings).await
+    /// Synchronous: the actor connects in the background, and calls made
+    /// before the actor has finished connecting wait in the actor's mailbox
+    /// until the connection step is done. A caller that wants the notes up
+    /// front calls [`Hub::notes`] after — that is the moment the actor's
+    /// inner state has settled into "every server either came up or said why
+    /// it didn't".
+    pub fn spawn(workspace: &Path, user_settings: Option<&Value>) -> Self {
+        let workspace = workspace.to_path_buf();
+        let user_settings = user_settings.cloned();
+        spawn_with(
+            async move { HubInner::from_workspace(&workspace, user_settings.as_ref()).await },
+        )
     }
 
-    /// The same over entries that are already read: the file is where a session
-    /// gets them from, and a test that has its own entries — a stub server, and
-    /// no file to write — has no reason to go through one.
-    async fn open(entries: Vec<Entry>, warnings: Vec<String>) -> Self {
-        let opened = futures_util::future::join_all(entries.iter().map(|entry| async move {
-            match &entry.config {
-                Err(why) => Err(why.clone()),
-                Ok(config) => Connection::open(config).await,
-            }
-        }))
-        .await;
-        Self::assemble(entries, opened, warnings)
-    }
-
-    /// [`Hub::connect`] over entries that are already read: the file is where
-    /// a session gets them from, and a test that has its own entries — a stub
-    /// server, and no file to write — has no reason to go through one.
-    ///
-    /// Public so the binary's tests can build a hub the same way; tests are
-    /// the only documented use, and a production caller has no business
-    /// knowing what an `Entry` looks like.
+    /// Build a hub over a list of entries the caller already has — the test
+    /// path that does not want a configuration file written. Async because
+    /// the actor has to finish connecting before the caller can rely on the
+    /// hub being ready, and a test that races its own fixture against the
+    /// connection step would flake.
     #[doc(hidden)]
-    pub async fn of_entries(entries: Vec<Entry>) -> Self {
-        Self::open(entries, Vec::new()).await
+    pub async fn of_entries(entries: Vec<config::Entry>) -> Self {
+        spawn_with(async move { HubInner::from_entries(entries, Vec::new()).await })
     }
 
-    /// Build the hub from entries and whatever came of opening them: what the
-    /// names are, which of them are offered, and what has to be said.
-    fn assemble(
-        entries: Vec<Entry>,
-        opened: Vec<Result<Connection, String>>,
-        warnings: Vec<String>,
-    ) -> Self {
-        let mut hub = Self {
-            servers: Vec::new(),
-            tools: Vec::new(),
-            routes: HashMap::new(),
-            warnings,
-        };
-        for (entry, opened) in entries.into_iter().zip(opened) {
-            let how = how_to_reach(&entry);
-            let connection = match opened {
-                Ok(connection) => connection,
-                Err(why) => {
-                    hub.servers.push(Server {
-                        name: entry.name,
-                        how,
-                        from: entry.from,
-                        state: State::Failed(why),
-                    });
-                    continue;
-                }
-            };
-            let index = hub.servers.len();
-            let mut offered = 0;
-            for tool in &connection.tools {
-                let name = tool_name(&entry.name, &tool.name);
-                if hub.routes.contains_key(&name) {
-                    hub.warnings.push(format!(
-                        "{name}: two tools would carry this name, so the one from {} is not \
-                         offered",
-                        entry.name
-                    ));
-                    continue;
-                }
-                hub.routes.insert(
-                    name.clone(),
-                    Route {
-                        server: index,
-                        tool: tool.name.clone(),
-                    },
-                );
-                hub.tools.push(ToolDef {
-                    r#type: "function".into(),
-                    function: FunctionDef {
-                        name,
-                        description: tool.description.clone(),
-                        parameters: Some(tool.schema.clone()),
-                    },
-                });
-                offered += 1;
-            }
-            for note in &connection.notes {
-                hub.warnings.push(format!("{}: {note}", entry.name));
-            }
-            hub.servers.push(Server {
-                name: entry.name,
-                how,
-                from: entry.from,
-                state: State::Ready {
-                    connection: Box::new(connection),
-                    tools: offered,
-                },
-            });
+    /// One tool call, answered with the text the model reads. Never fails —
+    /// see the module-level third decision.
+    pub async fn call(&self, tool: &str, args: &str) -> String {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(Command::Call {
+                tool: tool.to_string(),
+                args: args.to_string(),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return "error: mcp hub is shut down".into();
         }
-        hub
+        rx.await
+            .unwrap_or_else(|_| "error: mcp hub dropped the reply".into())
     }
 
-    /// The tools the servers offer, in the order they are offered in: appended
-    /// to the built-in tools, which is where a tool added later goes so that
-    /// every prefix a session has already sent stays what it was.
-    pub fn definitions(&self) -> &[ToolDef] {
-        &self.tools
+    /// The tools currently offered to the model. Returned as an `Arc` so the
+    /// request builder can hand the slice to the request body without
+    /// re-asking the actor every turn.
+    pub async fn definitions(&self) -> Arc<Vec<ToolDef>> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::Definitions { reply }).await.is_err() {
+            return Arc::new(Vec::new());
+        }
+        rx.await.unwrap_or_default()
     }
 
-    /// One tool call, answered with the text the model reads. Never fails: see
-    /// the module's third decision.
-    pub async fn call(&self, name: &str, args_json: &str) -> String {
-        let Some(route) = self.routes.get(name) else {
-            return format!(
-                "error: no MCP tool named {name:?} is offered. The MCP tools this session has \
-                 are: {}",
-                self.offered_names()
-            );
-        };
-        let server = &self.servers[route.server];
-        let State::Ready { connection, .. } = &server.state else {
-            // Unreachable: a route exists only for a server that came up. Said
-            // rather than assumed away, because a panic here would end a turn.
-            return format!("error: mcp server {} is not connected", server.name);
-        };
-        let arguments = match serde_json::from_str::<Value>(args_json) {
-            Ok(Value::Object(fields)) => Value::Object(fields),
-            Ok(_) => {
-                return format!("error: the arguments of {name} have to be a JSON object");
-            }
-            Err(e) => {
-                return format!("error: the arguments of {name} are not valid JSON: {e}");
-            }
-        };
-        match connection.call(&route.tool, arguments).await {
-            Ok(text) => text,
-            Err(why) => format!(
-                "error: mcp server {} could not run {}: {why}",
-                server.name, route.tool
-            ),
+    /// What the session says about MCP when it starts: one line per server
+    /// that came up, one per server that did not, and the warnings picked up
+    /// along the way.
+    pub async fn notes(&self) -> Vec<String> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::Notes { reply }).await.is_err() {
+            return Vec::new();
         }
-    }
-
-    /// The names of the tools it offers, as the model sees them, cut to the
-    /// first few so that a failure stays a sentence.
-    fn offered_names(&self) -> String {
-        if self.tools.is_empty() {
-            return "none came up (see /mcp for which servers did not)".to_string();
-        }
-        let names: Vec<&str> = self
-            .tools
-            .iter()
-            .take(NAMES_SHOWN)
-            .map(|tool| tool.function.name.as_str())
-            .collect();
-        let rest = self.tools.len() - names.len();
-        let mut listed = names.join(", ");
-        if rest > 0 {
-            listed.push_str(&format!(" (and {rest} more)"));
-        }
-        listed
-    }
-
-    /// What the session says about MCP when it starts: one line for the servers
-    /// that came up, one for each that did not, and the notes from the way in.
-    pub fn notes(&self) -> Vec<String> {
-        let mut lines = Vec::new();
-        let ready: Vec<&Server> = self
-            .servers
-            .iter()
-            .filter(|server| matches!(server.state, State::Ready { .. }))
-            .collect();
-        if !ready.is_empty() {
-            lines.push(format!(
-                "mcp: {} · {} tools · /mcp names them",
-                ready
-                    .iter()
-                    .map(|server| server.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                self.tools.len()
-            ));
-        }
-        for server in &self.servers {
-            if let State::Failed(why) = &server.state {
-                lines.push(format!("mcp: {} did not start: {why}", server.name));
-            }
-        }
-        lines.extend(self.warnings.iter().map(|note| format!("mcp: {note}")));
-        lines
+        rx.await.unwrap_or_default()
     }
 
     /// What `/mcp` prints: every server, what it offers, and what is wrong.
-    pub fn report(&self) -> Vec<String> {
-        if self.servers.is_empty() && self.warnings.is_empty() {
-            return vec![
-                "no MCP servers: add them under \"mcpServers\" in ~/.caocli/settings.json or in \
-                 this workspace's .mcp.json"
-                    .to_string(),
-            ];
+    pub async fn report(&self) -> Vec<String> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::Report { reply }).await.is_err() {
+            return Vec::new();
         }
-        let mut lines = Vec::new();
-        for (index, server) in self.servers.iter().enumerate() {
-            match &server.state {
-                State::Ready { connection, tools } => lines.push(format!(
-                    "{} · {} · {} tools · {} · protocol {} · from {}",
-                    server.name,
-                    server.how,
-                    tools,
-                    connection.identity,
-                    connection.protocol,
-                    server.from
-                )),
-                State::Failed(why) => lines.push(format!(
-                    "{} · {} · did not start: {why} · from {}",
-                    server.name, server.how, server.from
-                )),
-            }
-            // The names the model sees, which are the ones a user has to know
-            // to say "that one" about: `mcp__<server>__<tool>`, cut to the first
-            // few rather than printed as a wall. Which names are this server's
-            // is read off the routes rather than puzzled out of the prefix: a
-            // name that collided belongs to the server that got it.
-            let names: Vec<&str> = self
-                .tools
-                .iter()
-                .filter(|tool| {
-                    self.routes
-                        .get(&tool.function.name)
-                        .is_some_and(|route| route.server == index)
-                })
-                .map(|tool| tool.function.name.as_str())
-                .collect();
-            if !names.is_empty() {
-                let shown: Vec<&str> = names.iter().take(NAMES_SHOWN).copied().collect();
-                let rest = names.len() - shown.len();
-                let mut line = format!("  {}", shown.join(", "));
-                if rest > 0 {
-                    line.push_str(&format!(" (and {rest} more)"));
-                }
-                lines.push(line);
-            }
-        }
-        lines.extend(self.warnings.iter().map(|note| format!("warning: {note}")));
-        lines
+        rx.await.unwrap_or_default()
     }
 
-    /// End every connection: what a session does on its way out, so that the
-    /// programs it started do not outlive it.
+    /// End every connection. Used by [`McpGuard`] on the way out — there is
+    /// no public reason to shut a hub down from the inside.
     pub async fn shutdown(&self) {
-        futures_util::future::join_all(self.servers.iter().filter_map(
-            |server| match &server.state {
-                State::Ready { connection, .. } => Some(connection.shutdown()),
-                State::Failed(_) => None,
-            },
-        ))
-        .await;
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::Shutdown { reply }).await.is_ok() {
+            let _ = rx.await;
+        }
     }
 }
 
-/// What the entry says it is, for the report: the command line it runs, or the
-/// url it calls. Quoted where the parts carry spaces, so that a reader can see
-/// where one ends and the next begins.
-fn how_to_reach(entry: &Entry) -> String {
-    let Ok(config) = &entry.config else {
-        return "nothing usable in the entry".to_string();
-    };
-    match (&config.command, &config.url) {
-        (Some(command), _) => {
-            let mut line = format!("stdio: {command}");
-            for arg in &config.args {
-                if arg.contains(' ') {
-                    line.push_str(&format!(" {arg:?}"));
-                } else {
-                    line.push_str(&format!(" {arg}"));
+/// Start an actor task over `init`: a future that builds the initial
+/// `HubInner`. Returns a [`Hub`] the caller can send to.
+fn spawn_with<F>(init: F) -> Hub
+where
+    F: std::future::Future<Output = HubInner> + Send + 'static,
+{
+    let (tx, mut rx) = mpsc::channel::<Command>(64);
+    tokio::spawn(async move {
+        let mut inner = init.await;
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                Command::Call { tool, args, reply } => {
+                    let result = inner.call(&tool, &args).await;
+                    let _ = reply.send(result);
+                }
+                Command::Definitions { reply } => {
+                    let _ = reply.send(inner.definitions());
+                }
+                Command::Notes { reply } => {
+                    let _ = reply.send(inner.notes());
+                }
+                Command::Report { reply } => {
+                    let _ = reply.send(inner.report());
+                }
+                Command::Shutdown { reply } => {
+                    inner.shutdown_all().await;
+                    let _ = reply.send(());
+                    break;
                 }
             }
-            line
         }
-        (None, Some(url)) => url.clone(),
-        (None, None) => "nowhere".to_string(),
-    }
+    });
+    Hub { tx }
 }
 
-/// A guard around an [`Arc<Hub>`] that shuts every connected server down on
-/// drop. Used in `main::run` so the three exit paths (one-shot, TUI, plain
-/// REPL) all clean up the same way: by going out of scope.
+/// A guard around a [`Hub`] that captures the connection notes on the way up
+/// and shuts the connections down on the way out.
 ///
-/// `Hub::shutdown` is async (each stdio connection closes its sink, waits for
-/// the child to leave, and kills it if it has not), and Rust's `Drop` is
-/// sync. The guard spawns shutdown as a detached task on the current tokio
-/// runtime, so the connection close runs to completion on the executor even
-/// after the main task has returned. When no runtime is reachable — an early
-/// exit that unwinds before the runtime is set up — process exit takes care
-/// of the children instead.
+/// Used in `main::run` so the three exit paths (one-shot, TUI, plain REPL)
+/// all clean up the same way: by going out of scope.
+///
+/// `Hub::shutdown` is async, and Rust's `Drop` is sync, so the guard spawns
+/// shutdown as a detached task on the current tokio runtime. The connections
+/// close on the executor even after the main task has returned. When no
+/// runtime is reachable — an early exit that unwinds before the runtime is
+/// set up — process exit takes care of the children instead.
 pub struct McpGuard {
-    hub: Option<Arc<Hub>>,
+    hub: Option<Hub>,
     notes: Vec<String>,
 }
 
 impl McpGuard {
-    /// Wrap a freshly-connected hub, capturing the notes it had to share on
+    /// Wrap a freshly-spawned hub, capturing the notes the actor produced on
     /// the way up. The notes are kept here so they survive any number of
     /// borrows the rest of the program takes of the hub.
-    pub fn new(hub: Hub) -> Self {
-        let notes = hub.notes();
+    pub async fn new(hub: Hub) -> Self {
+        let notes = hub.notes().await;
         Self {
-            hub: Some(Arc::new(hub)),
+            hub: Some(hub),
             notes,
         }
     }
 
-    /// The hub for the agent to share. The Arc clone keeps the guard alive:
-    /// the guard drops last, after the agent and its `Arc<Hub>` are gone.
-    pub fn hub(&self) -> Arc<Hub> {
-        Arc::clone(self.hub.as_ref().expect("hub is taken only on drop"))
+    /// The hub for the agent to share. The clone keeps the guard alive: the
+    /// guard drops last, after the agent and its `Hub` clones are gone.
+    pub fn hub(&self) -> Hub {
+        self.hub
+            .as_ref()
+            .expect("hub is taken only on drop")
+            .clone()
     }
 
     /// What the hub said on the way up — for the banner.
@@ -537,32 +360,25 @@ impl Drop for McpGuard {
 mod guard_tests {
     use super::*;
 
-    #[test]
-    fn guard_holds_notes_from_a_freshly_connected_hub() {
+    #[tokio::test]
+    async fn guard_holds_notes_from_a_freshly_connected_hub() {
         let hub = Hub::empty();
-        let guard = McpGuard::new(hub);
+        let guard = McpGuard::new(hub).await;
         assert!(guard.notes().is_empty(), "an empty hub has no notes");
-    }
-
-    #[test]
-    fn guard_hub_returns_a_shared_arc() {
-        let hub = Hub::empty();
-        let guard = McpGuard::new(hub);
-        let arc = guard.hub();
-        assert_eq!(
-            Arc::strong_count(&arc),
-            2,
-            "guard and the returned Arc share"
-        );
     }
 
     #[test]
     fn drop_without_a_runtime_does_not_panic() {
         // The Hub's connections are owned; a runtime is what would actually
-        // shut them down. Without one, the OS reaps the children on exit, and
-        // the guard must not panic on its way out.
-        let hub = Hub::empty();
-        let guard = McpGuard::new(hub);
-        drop(guard);
+        // shut them down. Without one, the OS reaps the children on exit,
+        // and the guard must not panic on its way out.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let hub = Hub::empty();
+            let guard = McpGuard::new(hub).await;
+            drop(guard);
+        });
     }
 }

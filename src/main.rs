@@ -51,9 +51,11 @@ async fn run(cli: Cli) -> Result<()> {
     // that knows where the file lives. A missing or unreadable settings
     // file is not a hub's problem; the hub gets a `None` and carries on.
     let user_mcp = config::setting("mcpServers").ok().flatten();
-    let mcp = caocli_mcp::McpGuard::new(
-        caocli_mcp::Hub::connect(&startup.workspace, user_mcp.as_ref()).await,
-    );
+    let mcp = caocli_mcp::McpGuard::new(caocli_mcp::Hub::spawn(
+        &startup.workspace,
+        user_mcp.as_ref(),
+    ))
+    .await;
     let mcp_notes = mcp.notes().to_vec();
 
     let mut agent = Agent::new(startup.client, startup.session, startup.provider);
