@@ -99,9 +99,24 @@ pub fn has_key(provider: &Provider) -> bool {
 }
 
 fn home_dir() -> Result<PathBuf> {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .context("cannot determine HOME directory")
+    // HOME first: a login shell on Windows (Git Bash, MSYS) sets one and means
+    // it, and a set-but-empty one counts as none. A plain terminal on Windows
+    // sets no HOME at all, and the home there is USERPROFILE; the drive+path
+    // pair is the last resort when even that is unset.
+    for var in ["HOME", "USERPROFILE"] {
+        if let Ok(dir) = std::env::var(var)
+            && !dir.is_empty()
+        {
+            return Ok(PathBuf::from(dir));
+        }
+    }
+    if let (Ok(drive), Ok(path)) = (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH"))
+        && !drive.is_empty()
+        && !path.is_empty()
+    {
+        return Ok(PathBuf::from(format!("{drive}{path}")));
+    }
+    bail!("cannot determine HOME directory")
 }
 
 /// `~/.caocli`, where the settings, the history and the sessions live.
@@ -320,7 +335,15 @@ pub(crate) fn scratch_home() -> PathBuf {
     // writes it where the program would look for one, and what reads there no
     // longer makes the directory on its way past.
     std::fs::create_dir_all(home.join(".caocli")).unwrap();
-    unsafe { std::env::set_var("HOME", &home) };
+    // Every other home variable cleared, so the HOME this sets is the only one
+    // the program could find: on Windows the fallbacks would otherwise point at
+    // the real user's profile.
+    unsafe {
+        for var in ["USERPROFILE", "HOMEDRIVE", "HOMEPATH"] {
+            std::env::remove_var(var);
+        }
+        std::env::set_var("HOME", &home);
+    }
     home
 }
 
@@ -609,9 +632,35 @@ mod tests {
     #[test]
     fn missing_home_is_error() {
         let _g = env_lock();
-        unsafe { std::env::remove_var("HOME") };
+        for var in ["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"] {
+            unsafe { std::env::remove_var(var) };
+        }
         let err = home_dir().unwrap_err().to_string();
         assert!(err.contains("HOME"), "err: {err}");
+    }
+
+    #[test]
+    fn userprofile_is_the_home_when_home_is_absent() {
+        let _g = env_lock();
+        let home = temp_home();
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::set_var("USERPROFILE", &home);
+        }
+        assert_eq!(caocli_dir().unwrap(), home.join(".caocli"));
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn drive_and_path_are_the_home_of_last_resort() {
+        let _g = env_lock();
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("USERPROFILE");
+            std::env::set_var("HOMEDRIVE", "C:");
+            std::env::set_var("HOMEPATH", r"\Users\somebody");
+        }
+        assert_eq!(home_dir().unwrap(), PathBuf::from(r"C:\Users\somebody"));
     }
 
     #[test]
