@@ -11,7 +11,7 @@
 //! MCP hub is connected afterwards, because that part is async and the
 //! tools it offers are part of every request, not part of the resolution.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
 use crate::agent::Approval;
@@ -50,12 +50,13 @@ pub fn resolve_startup(cli: &Cli) -> Result<Startup> {
     let workspace = std::env::current_dir().context("cannot determine the working directory")?;
     let sessions_dir = config::sessions_dir()?;
 
-    // The provider this run starts from: --provider, or the default.
-    let start = provider::provider(
-        cli.provider
-            .as_deref()
-            .unwrap_or(provider::DEFAULT_PROVIDER),
-    )?;
+    // The provider this run starts from: `--model`, when it names one of its
+    // own; otherwise the first provider with a key behind it — so a fresh run
+    // does not start by talking to a backend it has no key for.
+    let start = match &cli.model {
+        Some(spec) => provider::model_spec(spec)?.0,
+        None => first_available_provider()?,
+    };
 
     let source = SessionSource::from_cli(cli.resume.as_deref(), cli.cont);
     let mut session = source.resolve(&sessions_dir, || fresh_meta(cli, start))?;
@@ -88,6 +89,25 @@ pub fn resolve_startup(cli: &Cli) -> Result<Startup> {
     })
 }
 
+/// First provider in [`provider::PROVIDERS`] that has a stored key, with its
+/// `models[0]` as the model. The fallback path for any "no choice was made"
+/// case: a fresh run with no `--model`, or a resumed session whose meta has no
+/// provider field (the pre-providers sessions). When no provider has a key, the
+/// error explains what to do.
+fn first_available_provider() -> Result<provider::Provider> {
+    for p in provider::PROVIDERS {
+        if config::has_key(p) {
+            return Ok(*p);
+        }
+    }
+    let names = provider::PROVIDERS
+        .iter()
+        .map(|p| format!("{} (/login {})", p.name, p.id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!("no provider has a stored key; run /login <provider id> for one of: {names}")
+}
+
 /// Build the client the session will use, with one-shot runs failing on a
 /// missing key. The key itself is moved into the client on the present path,
 /// and `api_key` is captured separately in `Startup` for the banner.
@@ -101,16 +121,17 @@ fn build_client(provider: &Provider, key: ApiKey, mode: &Mode) -> Result<Client>
     }
 }
 
-/// Meta for a new session: the provider is the one this run selected, and the
-/// model comes from `--model` — which may name a provider of its own as
-/// `<provider>/<modelid>` — otherwise it is that provider's default. The
-/// workspace's project instructions (its AGENTS.md files) are read here, once,
-/// and frozen into the session: everything the session later sends is what it
-/// stored, never what the files say by then.
+/// Meta for a new session: the model comes from `--model`, which names a
+/// provider of its own as `<provider>/<modelid>`. When no `--model` is given,
+/// the run's `start` provider — the first one with a stored key — is used, with
+/// its `models[0]` as the model. The workspace's project instructions (its
+/// AGENTS.md files) are read here, once, and frozen into the session:
+/// everything the session later sends is what it stored, never what the files
+/// say by then.
 fn fresh_meta(cli: &Cli, start: Provider) -> Result<SessionMeta> {
     let (provider, model) = match &cli.model {
-        Some(spec) => provider::model_spec(spec, start.id)?,
-        None => (start, start.default_model().to_string()),
+        Some(spec) => provider::model_spec(spec)?,
+        None => (start, start.models[0].to_string()),
     };
     // Checked against the provider the session will run on — which `--model`
     // may name, independently of the run's own choice.
@@ -131,51 +152,25 @@ fn fresh_meta(cli: &Cli, start: Provider) -> Result<SessionMeta> {
 /// When resuming a session: parameters given explicitly on the command line
 /// override the meta, while those not given keep the value stored in the session.
 /// Returning true means the meta changed (a meta line must be appended).
-fn apply_overrides(
-    meta: &mut SessionMeta,
-    cli: &Cli,
-    fallback: provider::Provider,
-) -> Result<bool> {
+fn apply_overrides(meta: &mut SessionMeta, cli: &Cli, fallback: Provider) -> Result<bool> {
     let mut changed = false;
-    // The provider a bare model id belongs to: the session's own, if it names
-    // one, and this run's choice otherwise.
-    let current = match meta.provider.as_deref() {
-        Some(id) => provider::provider(id)?,
-        None => fallback,
-    };
-    match (&cli.provider, &cli.model) {
-        // An explicit model settles the provider too:
-        // `--model zai-coding-cn/glm-5.3` needs no `--provider` beside it, and a
-        // bare id stays where it was.
-        (_, Some(spec)) => {
-            let id = cli.provider.as_deref().unwrap_or(current.id);
-            let (chosen, model) = provider::model_spec(spec, id)?;
-            if meta.provider.as_deref() != Some(chosen.id) {
-                meta.provider = Some(chosen.id.to_string());
-                changed = true;
-            }
-            if meta.model != model {
-                meta.model = model;
-                changed = true;
-            }
+    if let Some(spec) = &cli.model {
+        let (chosen, model) = provider::model_spec(spec)?;
+        if meta.provider.as_deref() != Some(chosen.id) {
+            meta.provider = Some(chosen.id.to_string());
+            changed = true;
         }
-        // An explicit provider switch without a model: follow that provider's
-        // default model, so the old model name is not sent to the new backend.
-        (Some(id), None) => {
-            let chosen = provider::provider(id)?;
-            if meta.provider.as_deref() != Some(chosen.id) || meta.model != chosen.default_model() {
-                meta.provider = Some(chosen.id.to_string());
-                meta.model = chosen.default_model().to_string();
-                changed = true;
-            }
+        if meta.model != model {
+            meta.model = model;
+            changed = true;
         }
-        (None, None) => {}
     }
-    // The provider the session ends up on: the one `--model`/`--provider` chose
-    // above, or the session's own when neither was given.
+    // The provider the session ends up on: the one `--model` chose above, the
+    // session's own meta when neither was given, or the run's `start` for the
+    // pre-providers sessions whose meta did not record a provider.
     let on = match meta.provider.as_deref() {
         Some(id) => provider::provider(id)?,
-        None => current,
+        None => fallback,
     };
     // The effort, when given, is checked against that provider.
     if let Some(e) = &cli.effort {
@@ -207,6 +202,15 @@ mod tests {
         Cli::parse_from(std::iter::once("caocli").chain(args.iter().copied()))
     }
 
+    /// A HOME of the test's own, with the config lock held, so that `/login`
+    /// writes and key resolution reads under it do not race with another test.
+    /// Returned second is the directory the test should remove when it is done.
+    fn own_home() -> (std::sync::MutexGuard<'static, ()>, std::path::PathBuf) {
+        let guard = crate::config::env_lock();
+        let home = crate::config::scratch_home();
+        (guard, home)
+    }
+
     /// A meta as a session file holds it, with the provider recorded.
     fn meta_of(provider: &str, model: &str) -> SessionMeta {
         SessionMeta {
@@ -230,8 +234,8 @@ mod tests {
 
     #[test]
     fn no_cli_args_keeps_the_sessions_own_provider() {
-        // A resumed session runs where it ran before, whatever this run's
-        // `--provider` default is: the meta is what the session is.
+        // A resumed session runs where it ran before: the meta is what the
+        // session is.
         let mut meta = meta_of("zai-coding-cn", "glm-5.3");
         assert!(!apply_overrides(&mut meta, &cli(&[]), provider::DEEPSEEK).unwrap());
         assert_eq!(meta.provider.as_deref(), Some("zai-coding-cn"));
@@ -239,13 +243,13 @@ mod tests {
     }
 
     #[test]
-    fn explicit_model_overrides_only_model() {
+    fn explicit_model_in_the_same_provider_only_swaps_the_model() {
         let mut meta = meta_of("deepseek", "deepseek-flash");
         meta.reasoning_effort = Some("high".into());
         assert!(
             apply_overrides(
                 &mut meta,
-                &cli(&["--model", "deepseek-v4-pro"]),
+                &cli(&["--model", "deepseek/deepseek-v4-pro"]),
                 provider::DEEPSEEK
             )
             .unwrap()
@@ -257,8 +261,8 @@ mod tests {
 
     #[test]
     fn a_qualified_model_carries_its_own_provider() {
-        // `--model zai-coding-cn/glm-5.3` needs no `--provider` beside it, and on
-        // a session that is running elsewhere it moves the session.
+        // `--model zai-coding-cn/glm-5.3` moves the session from wherever it
+        // was to the provider the name names.
         let mut meta = meta_of("deepseek", "deepseek-flash");
         assert!(
             apply_overrides(
@@ -273,13 +277,19 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_model_stays_with_the_sessions_provider() {
-        let mut meta = meta_of("zai-coding-cn", "glm-5.3-flash");
-        assert!(
-            apply_overrides(&mut meta, &cli(&["--model", "glm-4.6"]), provider::DEEPSEEK).unwrap()
-        );
-        assert_eq!(meta.provider.as_deref(), Some("zai-coding-cn"));
-        assert_eq!(meta.model, "glm-4.6");
+    fn a_bare_model_id_is_rejected() {
+        // A bare id is no longer accepted by `--model` or `/model`: without a
+        // `--provider` to pin the implicit one, the user has to write the
+        // provider into the spec.
+        let mut meta = meta_of("deepseek", "deepseek-flash");
+        let err = apply_overrides(
+            &mut meta,
+            &cli(&["--model", "deepseek-v4-pro"]),
+            provider::DEEPSEEK,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("deepseek/deepseek-flash"), "{err}");
     }
 
     #[test]
@@ -341,60 +351,6 @@ mod tests {
     }
 
     #[test]
-    fn switching_provider_without_model_follows_default_model() {
-        let mut meta = meta_of("deepseek", "deepseek-flash");
-        assert!(
-            apply_overrides(
-                &mut meta,
-                &cli(&["--provider", "zai-coding-cn"]),
-                provider::DEEPSEEK
-            )
-            .unwrap()
-        );
-        assert_eq!(meta.provider.as_deref(), Some("zai-coding-cn"));
-        assert_eq!(meta.model, "glm-5.3-flash");
-
-        // an explicit --model wins over the provider default
-        let mut meta2 = meta_of("deepseek", "deepseek-flash");
-        assert!(
-            apply_overrides(
-                &mut meta2,
-                &cli(&["--provider", "zai-coding-cn", "--model", "glm-4.6"]),
-                provider::DEEPSEEK
-            )
-            .unwrap()
-        );
-        assert_eq!(meta2.provider.as_deref(), Some("zai-coding-cn"));
-        assert_eq!(meta2.model, "glm-4.6");
-    }
-
-    #[test]
-    fn switching_to_the_provider_the_session_already_names_changes_nothing() {
-        // A meta line is a write to an append-only log, so the same choice must
-        // not put another one in it.
-        let mut meta = meta_of("zai-coding-cn", "glm-5.3-flash");
-        assert!(
-            !apply_overrides(
-                &mut meta,
-                &cli(&["--provider", "zai-coding-cn"]),
-                provider::DEEPSEEK
-            )
-            .unwrap()
-        );
-        // ... but a model that is not the provider's default does move.
-        let mut meta2 = meta_of("zai-coding-cn", "glm-4.6");
-        assert!(
-            apply_overrides(
-                &mut meta2,
-                &cli(&["--provider", "zai-coding-cn"]),
-                provider::DEEPSEEK
-            )
-            .unwrap()
-        );
-        assert_eq!(meta2.model, "glm-5.3-flash");
-    }
-
-    #[test]
     fn an_unknown_model_provider_is_rejected_before_anything_runs() {
         let mut meta = meta_of("deepseek", "deepseek-flash");
         let err = apply_overrides(&mut meta, &cli(&["--model", "nope/x"]), provider::DEEPSEEK)
@@ -419,10 +375,12 @@ mod tests {
     }
 
     #[test]
-    fn fresh_meta_defaults() {
+    fn fresh_meta_uses_start_provider_when_no_model_is_given() {
+        // The run's `start` (the first provider with a stored key) is what
+        // a brand-new session is on when no `--model` was passed.
         let meta = fresh_meta(&cli(&[]), provider::DEEPSEEK).unwrap();
         assert_eq!(meta.provider.as_deref(), Some("deepseek"));
-        assert_eq!(meta.model, provider::DEEPSEEK.default_model());
+        assert_eq!(meta.model, provider::DEEPSEEK.models[0]);
         assert_eq!(
             meta.reasoning_effort.as_deref(),
             Some(provider::DEEPSEEK.default_effort)
@@ -430,7 +388,9 @@ mod tests {
     }
 
     #[test]
-    fn fresh_meta_uses_provider_default_model() {
+    fn fresh_meta_falls_back_to_whatever_start_passes_in() {
+        // `resolve_startup` picks the first provider with a key as `start`;
+        // `fresh_meta` only takes that as the fallback, whatever it is.
         let meta = fresh_meta(&cli(&[]), provider::ZAI_CODING_CN).unwrap();
         assert_eq!(meta.provider.as_deref(), Some("zai-coding-cn"));
         assert_eq!(meta.model, "glm-5.3-flash");
@@ -439,12 +399,33 @@ mod tests {
     #[test]
     fn fresh_meta_carries_model_and_effort() {
         let meta = fresh_meta(
-            &cli(&["--model", "deepseek-v4-pro", "--effort", "max"]),
+            &cli(&["--model", "deepseek/deepseek-v4-pro", "--effort", "max"]),
             provider::DEEPSEEK,
         )
         .unwrap();
         assert_eq!(meta.model, "deepseek-v4-pro");
         assert_eq!(meta.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn first_available_provider_walks_to_the_first_with_a_key() {
+        // No keys: the error explains how to land on one.
+        let (guard, home) = own_home();
+        let err = first_available_provider().unwrap_err().to_string();
+        assert!(err.contains("/login"), "{err}");
+        assert!(err.contains("deepseek"), "{err}");
+        assert!(err.contains("zai-coding-cn"), "{err}");
+        assert!(err.contains("minimax"), "{err}");
+        // DeepSeek has no key: the walk steps over it.
+        crate::config::store_key("zai-coding-cn", "sk-test").unwrap();
+        let p = first_available_provider().unwrap();
+        assert_eq!(p.id, "zai-coding-cn");
+        // Add DeepSeek on top: it wins because it is earlier in PROVIDERS.
+        crate::config::store_key("deepseek", "sk-test").unwrap();
+        let p = first_available_provider().unwrap();
+        assert_eq!(p.id, "deepseek");
+        drop(guard);
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]

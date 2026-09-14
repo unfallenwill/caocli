@@ -236,7 +236,7 @@ async fn login(agent: &mut Agent, ui: &mut dyn Front, provider_id: &str) {
 /// it is served by when the model names one. A bare model id stays with the
 /// provider the session already runs on.
 fn choose_model(agent: &mut Agent, ui: &mut dyn Front, spec: &str) {
-    let (provider, model) = match provider::model_spec(spec, agent.provider().id) {
+    let (provider, model) = match provider::model_spec(spec) {
         Ok(choice) => choice,
         Err(e) => return ui.error(&format!("{e:#}")),
     };
@@ -490,7 +490,7 @@ pub fn completions(input: &str) -> Vec<&'static Command> {
 /// The keys the prompt accepts. The startup flags are shared by both front
 /// ends; the input section is split because the keys mean different things
 /// (and there are more of them) on the TUI.
-const STARTUP_FLAGS: &str = "Startup flags:\n  -c / --continue  continue the most recent session\n  --resume <id>    resume a specific session\n  --provider deepseek|zai-coding-cn|minimax\n  --effort low|high|max --model <id>\n  -p \"prompt\"      run once and exit\n  --image <path>   attach an image to -p's prompt";
+const STARTUP_FLAGS: &str = "Startup flags:\n  -c / --continue  continue the most recent session\n  --resume <id>    resume a specific session\n  --model <provider>/<modelid>  the model of the next session; the first provider with a stored key is used otherwise\n  --effort low|high|max (or on|off on the Anthropic wire)\n  -p \"prompt\"      run once and exit\n  --image <path>   attach an image to -p's prompt";
 
 const PLAIN_KEYS: &str = "Input:\n  Enter            submit\n  Ctrl-J           newline (multi-line input)\n  Up / Down        browse history\n  Ctrl-C           clear the line\n  Ctrl-D           exit on an empty line";
 
@@ -1094,7 +1094,7 @@ mod tests {
         for front in [FrontKind::Plain, FrontKind::Tui] {
             for expected in [
                 "-c / --continue",
-                "--provider deepseek|zai-coding-cn|minimax",
+                "--model <provider>/<modelid>",
                 "--effort low|high|max",
                 "-p \"prompt\"",
                 "--image <path>",
@@ -1309,7 +1309,7 @@ mod tests {
         let dir = tmpdir("model-switch");
         let mut agent = agent_in(&dir, "deepseek-flash");
         let mut ui = Recording::default();
-        submit(&mut agent, &mut ui, &dir, "/model deepseek-v4-pro").await;
+        submit(&mut agent, &mut ui, &dir, "/model deepseek/deepseek-v4-pro").await;
         assert!(ui.errors.is_empty(), "{:?}", ui.errors);
         assert_eq!(agent.session.meta.model, "deepseek-v4-pro");
         assert_eq!(agent.session.meta.provider.as_deref(), Some("deepseek"));
