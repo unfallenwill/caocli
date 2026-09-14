@@ -133,12 +133,12 @@ fn the_queue_is_capped_and_keeps_its_end() {
         state.enqueue(format!("line {i}"));
     }
     assert_eq!(
-        render::queue_lines(&state, 40).len(),
+        render::queue_lines(&state.turn, 40).len(),
         QUEUE_ROWS,
         "capped, in rows"
     );
     assert_eq!(
-        render::queue_lines(&state, 40)
+        render::queue_lines(&state.turn, 40)
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>(),
@@ -154,7 +154,7 @@ fn a_queued_line_wider_than_the_screen_is_wrapped_not_clipped() {
     let mut state = State::default();
     let typed = "x".repeat(50);
     state.enqueue(typed.clone());
-    let lines: Vec<String> = render::queue_lines(&state, 20)
+    let lines: Vec<String> = render::queue_lines(&state.turn, 20)
         .iter()
         .map(|l| l.to_string())
         .collect();
@@ -168,7 +168,7 @@ fn the_standing_list_is_the_last_one_written_and_nothing_when_none_is() {
     // Nothing has been written: the block takes no rows at all, so a session that
     // never uses the tool sees exactly the screen it saw before there was one.
     let mut state = State::default();
-    assert!(render::todo_lines(&state, 40).is_empty());
+    assert!(render::todo_lines(&state.view, 40).is_empty());
     assert_eq!(todo_rows(0), 0);
 
     state.show(written(serde_json::json!({"todos": [
@@ -176,7 +176,7 @@ fn the_standing_list_is_the_last_one_written_and_nothing_when_none_is() {
         {"content": "Draw the cell", "status": "in_progress"}
     ]})));
     assert_eq!(
-        render::todo_lines(&state, 40)
+        render::todo_lines(&state.view, 40)
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>(),
@@ -194,7 +194,7 @@ fn the_standing_list_is_the_last_one_written_and_nothing_when_none_is() {
     // one: what stands is the last list written and not the run of them.
     state.show(written(serde_json::json!({"todos": []})));
     assert!(
-        render::todo_lines(&state, 40).is_empty(),
+        render::todo_lines(&state.view, 40).is_empty(),
         "a cleared list is not one to keep in view"
     );
 }
@@ -249,7 +249,7 @@ fn a_task_longer_than_the_screen_is_wrapped_not_clipped() {
     state.show(written(
         serde_json::json!({"todos": [{"content": long, "status": "in_progress"}]}),
     ));
-    let lines: Vec<String> = render::todo_lines(&state, 20)
+    let lines: Vec<String> = render::todo_lines(&state.view, 20)
         .iter()
         .map(|l| l.to_string())
         .collect();
@@ -292,7 +292,7 @@ fn the_block_gives_up_its_rows_before_the_box_does() {
     screen.draw().unwrap();
     // The block is drawn whole, in its own rows directly above the box, and the
     // transcript is the region that gave those rows up.
-    let block: Vec<String> = render::todo_lines(&screen.state, 40)
+    let block: Vec<String> = render::todo_lines(&screen.state.view, 40)
         .iter()
         .map(|l| l.to_string())
         .collect();
@@ -433,7 +433,7 @@ fn a_cramped_screen_windows_the_rows_the_layout_gave_it() {
         screen.draw().unwrap();
         let area = super::origin(&mut screen);
         let input = screen.state.input_rows(height, 0);
-        let queued = render::queue_lines(&screen.state, 40).len() as u16;
+        let queued = render::queue_lines(&screen.state.turn, 40).len() as u16;
         assert_eq!(
             screen.state.view.drawn_rows,
             screen_rows(area, 0, input, queued)[0].height as usize,

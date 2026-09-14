@@ -312,7 +312,7 @@ fn the_queue_counts_the_rows_it_is_not_showing() {
     }
     // A queue with room to spare: every line, and nothing said about rows that
     // are not there.
-    let drawn = super::rendered(&super::super::render::queue_lines(&screen.state, 60));
+    let drawn = super::rendered(&super::super::render::queue_lines(&screen.state.turn, 60));
     assert_eq!(drawn.len(), 3, "{drawn:?}");
     assert!(
         drawn.iter().all(|(text, _)| !text.contains("more")),
@@ -322,7 +322,7 @@ fn the_queue_counts_the_rows_it_is_not_showing() {
     // One more line than the cap, and the row that does not fit is counted on
     // one of the rows the cap allows: the queue never costs more than three.
     screen.state.turn.queued.push_back("/help".into());
-    let drawn = super::rendered(&super::super::render::queue_lines(&screen.state, 60));
+    let drawn = super::rendered(&super::super::render::queue_lines(&screen.state.turn, 60));
     assert_eq!(drawn.len(), QUEUE_ROWS, "{drawn:?}");
     assert!(drawn[0].0.contains("⋮ 2 more"), "{drawn:?}");
     assert!(drawn[1].0.contains("/model"), "{drawn:?}");

@@ -1,25 +1,30 @@
-//! The view layer: turning [`State`] into the ratatui lines the screen draws.
+//! The view layer: turning [`View`], [`Turn`], [`Overlay`] and the [`verbose`]
+//! flag into the ratatui lines the screen draws.
 //!
-//! Every function here reads [`State`] (sometimes mutably, to maintain the
-//! laid cache) and produces a `Line`, a `Block`, or a `Vec<Line>` that the
-//! screen hands to ratatui. Pure cell-to-line rendering lives one layer down
-//! in [`crate::ui::paint`]; what is here is the state-aware composition --
-//! which cells go on screen, which lines of them fit the window, and what the
-//! box's border says while a turn runs.
+//! Every function here takes only the slices of state it actually reads or
+//! writes -- its parameter list is its dependency list. Pure cell-to-line
+//! rendering lives one layer down in [`crate::ui::paint`]; what is here is the
+//! state-aware composition -- which cells go on screen, which lines of them
+//! fit the window, and what the box's border says while a turn runs.
 //!
 //! The split is on purpose: state holds what is true of the session, render
 //! holds what is drawn from it, and the painter holds what a cell becomes --
-//! three layers, each with one job.
+//! three layers, each with one job. The slices this module asks for are the
+//! surface area a function is allowed to touch: adding a field to [`State`] is
+//! not a change here, because none of these functions can reach it.
 //!
-//! The one bit of state render does mutate is the laid cache (`laid`,
-//! `laid_width`, `laid_cells`). The invariant it keeps is that `laid` is a
-//! laid-out prefix of `transcript`: every entry of `laid` corresponds to a
-//! cell in `transcript[0..laid.len()]`, and the two move together. State
-//! pushes cells but does not touch `laid` -- only render extends it, and only
-//! up to the length `transcript` has reached.
+//! The one bit of state render mutates is the laid cache (`laid`,
+//! `laid_width`, `laid_verbose`, `laid_cells`). The invariant it keeps is that
+//! `laid` is a laid-out prefix of `transcript`: every entry of `laid`
+//! corresponds to a cell in `transcript[0..laid.len()]`, and the two move
+//! together. The transcript pushes cells but does not touch `laid` -- only
+//! [`ensure_laid`] extends it, and only up to the length the transcript has
+//! reached.
 //!
-//! `Screen::draw_at` is the only caller that takes a mutable reference to
-//! `State` through here; everywhere else render is `&State`.
+//! [`verbose`]: crate::ui::tui::state::State::verbose
+//! [`View`]: crate::ui::tui::view::View
+//! [`Turn`]: crate::ui::tui::turn::Turn
+//! [`Overlay`]: crate::ui::tui::overlay::Overlay
 
 use std::time::Instant;
 
@@ -30,7 +35,9 @@ use ratatui::widgets::Block;
 use crate::ui::cell::{self, Style};
 use crate::ui::paint::{cell_lines, standing_todo_lines};
 use crate::ui::tui::layout::BOX_BORDERS;
-use crate::ui::tui::state::State;
+use crate::ui::tui::overlay::Overlay;
+use crate::ui::tui::turn::Turn;
+use crate::ui::tui::view::View;
 
 /// The frames the working spinner cycles through while a turn runs, one per
 /// [`SPINNER_MS`]. Four half-circles rotating around a centre: the convention
@@ -61,33 +68,32 @@ pub(super) const SPEED_AFTER_SECS: u64 = 3;
 /// `width` invalidates every entry, since wrapping depends on width.
 /// A different `verbose` does too, since `Step`'s render shape keys on
 /// it (children visible or not).
-pub(super) fn ensure_laid(state: &mut State, width: usize) {
-    let verbose = state.verbose;
+pub(super) fn ensure_laid(view: &mut View, verbose: bool, width: usize) {
     // A different width or verbose flag is a different rendering of every
     // cell there is.
-    if state.view.laid_width != Some(width) || state.view.laid_verbose != Some(verbose) {
-        state.view.laid.clear();
-        state.view.laid_width = Some(width);
-        state.view.laid_verbose = Some(verbose);
+    if view.laid_width != Some(width) || view.laid_verbose != Some(verbose) {
+        view.laid.clear();
+        view.laid_width = Some(width);
+        view.laid_verbose = Some(verbose);
     }
     // Never more cells than the transcript has. Only a test can take one away,
     // and lines of a cell that is gone are worse than laying one out twice.
-    state.view.laid.truncate(state.view.transcript.len());
-    let from = state.view.laid.len();
-    for cell in &state.view.transcript[from..] {
+    view.laid.truncate(view.transcript.len());
+    let from = view.laid.len();
+    for cell in &view.transcript[from..] {
         #[cfg(test)]
         {
-            state.view.laid_cells += 1;
+            view.laid_cells += 1;
         }
-        state.view.laid.push(cell_lines(cell, width, verbose));
+        view.laid.push(cell_lines(cell, width, verbose));
     }
 }
 
 /// The rows the laid cells take: what a window over the transcript is measured
 /// in. A count rather than a copy of the lines, so the part of a long session
 /// that is off the top costs a draw nothing.
-pub(super) fn laid_rows(state: &State) -> usize {
-    state.view.laid.iter().map(Vec::len).sum()
+pub(super) fn laid_rows(view: &View) -> usize {
+    view.laid.iter().map(Vec::len).sum()
 }
 
 /// The rows `[first, last)`, at the width the cells were laid at.
@@ -97,7 +103,7 @@ pub(super) fn laid_rows(state: &State) -> usize {
 /// they are the two blocks that are not laid out with them, because they
 /// change with every fragment and every keystroke.
 pub(super) fn window_lines(
-    state: &State,
+    view: &View,
     first: usize,
     last: usize,
     live: &[Line<'static>],
@@ -105,13 +111,7 @@ pub(super) fn window_lines(
 ) -> Vec<Line<'static>> {
     let mut out = Vec::with_capacity(last.saturating_sub(first));
     let mut at = 0;
-    for segment in state
-        .view
-        .laid
-        .iter()
-        .map(Vec::as_slice)
-        .chain([live, question])
-    {
+    for segment in view.laid.iter().map(Vec::as_slice).chain([live, question]) {
         if at >= last {
             break;
         }
@@ -135,11 +135,9 @@ pub(super) fn window_lines(
 /// merely because the two look alike: a live block that took no gutter would
 /// jump two columns left the moment the block closed, which is the one reading
 /// position a reader is sitting on when the model stops typing.
-pub(super) fn live_lines(state: &State, width: usize) -> Vec<Line<'static>> {
-    match state.view.stream.current() {
-        Some((style, text)) => {
-            cell_lines(&style.stream_cell(text.to_owned()), width, state.verbose)
-        }
+pub(super) fn live_lines(view: &View, verbose: bool, width: usize) -> Vec<Line<'static>> {
+    match view.stream.current() {
+        Some((style, text)) => cell_lines(&style.stream_cell(text.to_owned()), width, verbose),
         None => Vec::new(),
     }
 }
@@ -150,9 +148,9 @@ pub(super) fn live_lines(state: &State, width: usize) -> Vec<Line<'static>> {
 /// command: one that is clipped gives the user nothing to decide with. It is a
 /// cell like any other, so it carries the marker its kind carries, and the
 /// answer typed into the box below it starts in the column its own text does.
-pub(super) fn question_lines(state: &State, width: usize) -> Vec<Line<'static>> {
-    match &state.view.question {
-        Some(question) => cell_lines(question, width, state.verbose),
+pub(super) fn question_lines(view: &View, verbose: bool, width: usize) -> Vec<Line<'static>> {
+    match &view.question {
+        Some(question) => cell_lines(question, width, verbose),
         None => Vec::new(),
     }
 }
@@ -165,8 +163,8 @@ pub(super) fn question_lines(state: &State, width: usize) -> Vec<Line<'static>> 
 /// session keeps exactly the list in view that the session watched live had.
 /// The drawing itself lives in [`crate::ui::paint::standing_todo_lines`]; this
 /// layer only finds the list.
-pub(super) fn todo_lines(state: &State, width: usize) -> Vec<Line<'static>> {
-    let Some(todos) = cell::standing_todos(&state.view.transcript) else {
+pub(super) fn todo_lines(view: &View, width: usize) -> Vec<Line<'static>> {
+    let Some(todos) = cell::standing_todos(&view.transcript) else {
         return Vec::new();
     };
     standing_todo_lines(todos, width)
@@ -174,8 +172,8 @@ pub(super) fn todo_lines(state: &State, width: usize) -> Vec<Line<'static>> {
 
 /// The queued lines as the screen draws them. The drawing itself lives in
 /// [`crate::ui::paint::queued_lines`]; this layer only hands the queue over.
-pub(super) fn queue_lines(state: &State, width: usize) -> Vec<Line<'static>> {
-    let queued: Vec<String> = state.turn.queued.iter().cloned().collect();
+pub(super) fn queue_lines(turn: &Turn, width: usize) -> Vec<Line<'static>> {
+    let queued: Vec<String> = turn.queued.iter().cloned().collect();
     crate::ui::paint::queued_lines(&queued, width)
 }
 
@@ -187,12 +185,12 @@ pub(super) fn queue_lines(state: &State, width: usize) -> Vec<Line<'static>> {
 /// the same pieces the draw uses, which is what keeps the two from being two
 /// renderers.
 #[cfg(test)]
-pub(super) fn lines(state: &mut State, width: usize) -> Vec<Line<'static>> {
-    ensure_laid(state, width);
-    let live = live_lines(state, width);
-    let question = question_lines(state, width);
-    let total = laid_rows(state) + live.len() + question.len();
-    window_lines(state, 0, total, &live, &question)
+pub(super) fn lines(view: &mut View, verbose: bool, width: usize) -> Vec<Line<'static>> {
+    ensure_laid(view, verbose, width);
+    let live = live_lines(view, verbose, width);
+    let question = question_lines(view, verbose, width);
+    let total = laid_rows(view) + live.len() + question.len();
+    window_lines(view, 0, total, &live, &question)
 }
 
 // ----------------------------------------------------------- status / box -
@@ -202,8 +200,8 @@ pub(super) fn lines(state: &mut State, width: usize) -> Vec<Line<'static>> {
 /// what you read when you are about to type rather than while you wait.
 ///
 /// One column is left free so the write cannot trigger autowrap.
-pub(super) fn status_line(state: &State, width: usize) -> Line<'static> {
-    Line::from(state.view.status.line(width.saturating_sub(1)))
+pub(super) fn status_line(view: &View, width: usize) -> Line<'static> {
+    Line::from(view.status.line(width.saturating_sub(1)))
 }
 
 /// The working indicator the input box's top border carries while a turn
@@ -215,8 +213,13 @@ pub(super) fn status_line(state: &State, width: usize) -> Line<'static> {
 /// narrow even for the spinner and the count. A narrow border drops the
 /// estimate whole first and hides the indicator entirely second -- never a
 /// clipped number, the same rule the status line keeps to.
-pub(super) fn activity_title(state: &State, width: usize) -> Option<String> {
-    activity_title_at(state, Instant::now(), width)
+pub(super) fn activity_title(
+    overlay: &Overlay,
+    turn: &Turn,
+    view: &View,
+    width: usize,
+) -> Option<String> {
+    activity_title_at(overlay, turn, view, Instant::now(), width)
 }
 
 /// The indicator's words at `now`, without reading the clock.
@@ -231,31 +234,36 @@ pub(super) fn activity_title(state: &State, width: usize) -> Option<String> {
 ///
 /// Approval gate keeps the border clear (gate owns it); no turn keeps
 /// the border empty.
-pub(super) fn activity_title_at(state: &State, now: Instant, width: usize) -> Option<String> {
-    if state.overlay.reply.is_some() {
+pub(super) fn activity_title_at(
+    overlay: &Overlay,
+    turn: &Turn,
+    view: &View,
+    now: Instant,
+    width: usize,
+) -> Option<String> {
+    if overlay.reply.is_some() {
         return None;
     }
-    let started = state.turn.started?;
+    let started = turn.started?;
     let elapsed = now - started;
     let frame = SPINNER[(elapsed.as_millis() / SPINNER_MS) as usize % SPINNER.len()];
     // The phase comes from what the turn is doing right now -- the live
     // stream (Reasoning -> thinking, anything else -> working), or the
     // open tool call (the verb is the one the agent sent at ToolStart,
     // kept in `current_tool_verb` until the result settles the step).
-    let phase = if matches!(state.view.stream.current(), Some((Style::Reasoning, _))) {
+    let phase = if matches!(view.stream.current(), Some((Style::Reasoning, _))) {
         "thinking".to_owned()
-    } else if let Some(verb) = state.turn.current_tool_verb.as_deref() {
+    } else if let Some(verb) = turn.current_tool_verb.as_deref() {
         format!("running {verb}")
     } else {
         "working".to_owned()
     };
     let count = format!("{frame} {phase} · {}s", elapsed.as_secs());
     let mut title = count.clone();
-    if elapsed.as_secs() >= SPEED_AFTER_SECS && state.turn.streamed_chars > 0 {
+    if elapsed.as_secs() >= SPEED_AFTER_SECS && turn.streamed_chars > 0 {
         // The measured ratio turns characters into tokens; the tilde keeps
         // the estimate honest about being one.
-        let per_second =
-            state.turn.streamed_chars as f64 / state.turn.chars_per_token / elapsed.as_secs_f64();
+        let per_second = turn.streamed_chars as f64 / turn.chars_per_token / elapsed.as_secs_f64();
         let per_second = per_second.round().max(1.0) as u64;
         title = format!("{count} · ~{per_second} token/s");
     }
@@ -277,11 +285,16 @@ pub(super) fn activity_title_at(state: &State, now: Instant, width: usize) -> Op
 /// Built per draw, which costs one small struct: the title is a clock and a
 /// spinner, so there is nothing here worth remembering, and nothing that can go
 /// stale when the editor is replaced whole by a submitted or a cleared line.
-pub(super) fn box_rule(state: &State, width: usize) -> Block<'static> {
+pub(super) fn box_rule(
+    overlay: &Overlay,
+    turn: &Turn,
+    view: &View,
+    width: usize,
+) -> Block<'static> {
     let mut block = Block::default()
         .borders(BOX_BORDERS)
         .border_style(RStyle::new().add_modifier(Modifier::DIM));
-    if let Some(title) = activity_title(state, width.saturating_sub(2)) {
+    if let Some(title) = activity_title(overlay, turn, view, width.saturating_sub(2)) {
         // Not dim, unlike the rule it sits on: it is the one thing on this box
         // that moves, and the only sign that a turn is still running when the
         // model has gone quiet. A dim indicator on a dim border is the signal
