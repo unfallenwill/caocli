@@ -1,6 +1,7 @@
 mod agent;
 mod agents_md;
 mod api;
+mod canonical;
 mod cli;
 mod config;
 mod front;
