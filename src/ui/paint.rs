@@ -38,22 +38,6 @@ use crate::ui::cell::{
     self, Cell, Gutter, Span, Style, layout as cell_layout, style_of, wrap::wrapped_lines,
 };
 
-/// The widest a line of the transcript is laid out, however wide the terminal is.
-///
-/// A line of prose is read by running the eye back to its start, and past a certain
-/// width that return trip costs more than the columns it saved: on a 200-column
-/// terminal, an answer set to the full width is a line the reader has to hunt the
-/// start of. 100 columns is about as wide as a line of monospaced text stays
-/// comfortable, and it is wider than the 80-column terminal most of this is read
-/// on -- so the measure only ever shortens a line on the screens that need it.
-pub(crate) const MEASURE: usize = 100;
-
-/// The columns text is laid out in inside a region `width` wide: as wide as the
-/// region, and no wider than [`MEASURE`].
-pub(crate) fn measure(width: usize) -> usize {
-    width.min(MEASURE)
-}
-
 /// The row that says how much of the transcript the window is not showing, drawn
 /// on the edge it was cut at.
 ///
@@ -132,15 +116,13 @@ fn spans_of(cell: &Cell, verbose: bool) -> Vec<Span> {
 /// session's output arrives in and it does not change once it is pushed, so it is
 /// also the unit [`State`](crate::ui::tui::state::State) lays out and remembers.
 pub(crate) fn cell_lines(cell: &Cell, width: usize, verbose: bool) -> Vec<Line<'static>> {
-    // Never wider than the measure, however wide the region is: the gutter is
-    // inside it, so the answer and the machinery around it end in the same column.
-    let width = measure(width);
     let Some(gutter) = cell.gutter() else {
         // The answer: the one cell that starts at the left edge.
         return wrapped_lines(&spans_of(cell, verbose), width);
     };
-    // Wrapped into what the gutter leaves, so a line of a set-in cell carries as
-    // much as a line of the answer rather than two columns more.
+    // Wrapped into what the gutter leaves: the gutter comes out of the same
+    // width, so the answer and the machinery around it end in the same column
+    // rather than a marker's width apart.
     let mut lines = wrapped_under(&spans_of(cell, verbose), width, gutter);
     // A long think folds to its head and a count. The rule lives in this layer
     // rather than in the cell because it is a budget of the screen, like the
@@ -230,7 +212,6 @@ pub(crate) fn todo_title(todos: &[Todo]) -> Line<'static> {
 /// hand is one of them: a block pinned to the head would hide exactly the row
 /// being worked on.
 pub(crate) fn standing_todo_lines(todos: &[Todo], width: usize) -> Vec<Line<'static>> {
-    let width = measure(width);
     let room = cell_layout::TODO_ROWS.saturating_sub(cell_layout::TODO_HEADS);
     let active = cell_layout::active_task(todos);
     let window = cell_layout::todo_window(todos.len(), active, room);
@@ -269,7 +250,6 @@ pub(crate) fn standing_todo_lines(todos: &[Todo], width: usize) -> Vec<Line<'sta
 /// count is drawn on one of the rows the cap allows rather than on a row of
 /// its own: the cap is what the transcript is paying.
 pub(crate) fn queued_lines(queued: &[String], width: usize) -> Vec<Line<'static>> {
-    let width = measure(width);
     let mut lines = Vec::new();
     for line in queued {
         lines.extend(wrapped_lines(
@@ -323,7 +303,6 @@ pub(crate) fn panel_lines(
     width: usize,
 ) -> Vec<Line<'static>> {
     let question = &questions[at];
-    let width = measure(width);
     let mut lines: Vec<Line<'static>> = Vec::new();
     if !question.header.is_empty() || questions.len() > 1 {
         let mut heading = String::new();
