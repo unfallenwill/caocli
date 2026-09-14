@@ -6,6 +6,41 @@ semantic-version bumps per release.
 
 ## [Unreleased]
 
+### Added — session file format v1
+
+The session log gains an envelope (`type`, `sequence`, `timestamp_ms`,
+`turn`, `kind`, `source_sequences`, `ignorable`) and an event vocabulary
+that records the wire trace of every request: `request_prefix`,
+`request`, `reply`, plus `gate`, `call_end`, `stop` for the harness.
+The schema is documented in `docs/session-format.md`.
+
+- Every `request` event carries a `body_sha256` over the canonical
+  (RFC 8785) JSON of the body the agent sent. A reader rebuilding the
+  body from the trace recipe and the prefix events hashes to the same
+  digest — the end-to-end check that the schema stayed faithful.
+- `--migrate <id>` lifts a v0 file to v1 by writing a new file beside it;
+  the original is never touched. `--migrate --all` does the same for
+  every v0 file in the sessions directory.
+- `canonicalize()` and `canonical_sha256_hex()` (in `src/canonical.rs`)
+  are the wire-fidelity primitives the trace builds on.
+
+### Changed — defensive hardening of session files
+
+- New session files are created with mode `0600` (was the process umask,
+  `0644` in practice). A session log holds commands, their output and
+  pasted secrets — it is the owner's file.
+- `--resume <id>` rejects ids containing `/`, `\`, `..`, `..` segments,
+  `%`, NUL bytes, or the empty string. A bad id would have let a
+  resume reach outside `sessions_dir`; it now fails at the point the
+  path is built.
+
+### Fixed
+
+- The session reader refuses `format_version > 1` rather than silently
+  dropping fields. A silently-dropped field in a `msg` line is a request
+  the backend no longer matches, and the only honest answer to "what
+  does this file mean" is "I do not know".
+
 ### Added — runtime control over MCP servers
 
 - The session used to connect its MCP servers once at startup and tear them
