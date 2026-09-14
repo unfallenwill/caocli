@@ -37,12 +37,9 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub image: Vec<std::path::PathBuf>,
 
-    /// Provider: deepseek (default) | zai-coding-cn | minimax
-    #[arg(long)]
-    pub provider: Option<String>,
-
-    /// Model id as <provider>/<modelid> (defaults to the provider's default
-    /// model; a bare id belongs to --provider)
+    /// Model id as `<provider>/<modelid>` — the provider comes from the name,
+    /// not from a separate flag. When `--model` is not given, the first
+    /// provider with a stored key is used.
     #[arg(long)]
     pub model: Option<String>,
 

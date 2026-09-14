@@ -77,12 +77,21 @@ mod tests {
     }
 
     #[test]
-    fn provider_flag_parses() {
+    fn model_flag_parses() {
+        // `--model` is the one provider-switching flag; it carries its own
+        // `<provider>/<modelid>` shape.
         assert_eq!(
-            cli(&["--provider", "zai-coding-cn"]).provider.as_deref(),
-            Some("zai-coding-cn")
+            cli(&["--model", "zai-coding-cn/glm-5.3"]).model.as_deref(),
+            Some("zai-coding-cn/glm-5.3")
         );
-        assert!(cli(&[]).provider.is_none());
+        assert!(cli(&[]).model.is_none());
+    }
+
+    #[test]
+    fn no_provider_flag_exists() {
+        // The provider is part of the model spec; there is no separate flag.
+        // Passing one is rejected by clap so the user finds out at startup.
+        Cli::try_parse_from(["caocli", "--provider", "zai-coding-cn"]).unwrap_err();
     }
 
     #[test]

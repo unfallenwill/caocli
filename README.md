@@ -5,8 +5,8 @@
 
 A minimal terminal coding agent in Rust, backed by two wire protocols: an
 OpenAI-compatible `/chat/completions` API (DeepSeek by default, Z.AI's GLM
-coding endpoint via `--provider zai-coding-cn`) and an Anthropic-compatible
-`/v1/messages` API (MiniMax's M3 via `--provider minimax`). It streams the
+coding endpoint via `--model zai-coding-cn/glm-5.3`) and an Anthropic-compatible
+`/v1/messages` API (MiniMax's M3 via `--model minimax/MiniMax-M3`). It streams the
 model's thinking (`reasoning_content`) in dim gray, then runs a tool loop over
 seven tools: `Bash`, `Read`, `Glob` (which finds files by name), `Edit`,
 `Write`, `AskUserQuestion` (which asks you rather than the filesystem) and
@@ -40,8 +40,8 @@ byte-for-byte so the backend's prefix cache keeps hitting.
 cargo run --                            # interactive REPL: /login, then chat
 cargo run -- -c -p "check disk usage"   # one-shot, continuing the latest session
 cargo run -- --effort max --model deepseek/deepseek-v4-pro -p "..."
-cargo run -- --provider zai-coding-cn -p "1+1"   # Z.AI Coding CN, glm-5.3-flash
-cargo run -- --provider minimax -p "1+1"         # MiniMax M3 (Anthropic wire)
+cargo run -- --model zai-coding-cn/glm-5.3-flash -p "1+1"   # Z.AI Coding CN
+cargo run -- --model minimax/MiniMax-M3 -p "1+1"          # MiniMax M3 (Anthropic wire)
 cargo run -- -p "what is wrong here?" --image shot.png
 cargo run -- --list                     # list sessions and exit
 ```
@@ -76,10 +76,10 @@ transcript, the session log, or the input history. A login for the provider the
 session is already talking to takes effect on the next turn.
 
 A model is named by the provider that serves it — `deepseek/deepseek-v4-pro`,
-`zai-coding-cn/glm-5.3` — both on the status line and in `/model`. A bare id
-(`/model deepseek-v4-pro`, `--model deepseek-v4-pro`) belongs to the provider
-the session is running on. Switching to a model whose provider has no key yet is
-refused, with `/login <provider id>` as the reason.
+`zai-coding-cn/glm-5.3` — both on the status line and in `/model` and `--model`.
+A bare id is not accepted: the `<provider>/<modelid>` form is the only one the
+parser takes, and one with no slash is rejected. Switching to a model whose
+provider has no key yet is refused, with `/login <provider id>` as the reason.
 
 The reasoning effort is the provider's list too: `/effort` offers the tiers the
 provider in use accepts, and a tier is checked against that list before it is
@@ -89,7 +89,7 @@ same check — the same check `--effort` passes at startup, so neither route can
 value in the session the backend would reject or quietly ignore.
 
 A provider has an id and a name, and they are used for different things: the id
-(`deepseek`, `zai-coding-cn`) is what addresses it — `--provider`, `/login <id>`,
+(`deepseek`, `zai-coding-cn`) is what addresses it — `/login <id>`,
 `<id>/<modelid>`, the session meta, `settings.json` — and the name is what a
 person reads in `/login` and in an error (`no API key for Z.AI Coding CN: run
 /login zai-coding-cn`).
@@ -108,8 +108,7 @@ contains newlines also works (bracketed paste).
 |---|---|
 | `-p <PROMPT>` | Run one prompt (including the tool loop), then exit |
 | `--image <PATH>` | Attach an image to `-p`'s prompt; repeat for more than one. In an interactive session, `/image` is how one is attached |
-| `--provider <NAME>` | Backend provider: `deepseek` (default), `zai-coding-cn` or `minimax`. Settles the endpoint of a new session; a resumed session keeps the one its meta names |
-| `--model <MODEL>` | Model id as `<provider>/<modelid>`, or bare for `--provider`; defaults to the provider's default model |
+| `--model <MODEL>` | Model id as `<provider>/<modelid>` (e.g. `deepseek/deepseek-v4-pro`, `zai-coding-cn/glm-5.3`); a bare id is rejected. With no `--model`, the first provider with a stored key runs its `models[0]` |
 | `--effort <EFFORT>` | Reasoning effort: `low`, `high`, or `max` (default `max`); other values are rejected locally. `/effort` switches it inside a session. On GLM, `low` answers without emitting `reasoning_content`. |
 | `-c, --cont` | Continue the most recent session |
 | `--resume <ID>` | Resume a specific session by id |
@@ -269,17 +268,17 @@ images).
 
 ### Providers
 
-`--provider` selects a static preset: an endpoint, the models it serves and the
-answer ceiling. It is settled per run, and `--model <provider id>/<modelid>` or `/model`
-names a provider of its own. A session records the provider its model belongs
-to, so continuing one (`caocli -c`) resumes on the same backend — no flag
-needed — and `--provider` is how you move it to another one.
+`--model <provider id>/<modelid>` selects an endpoint: the provider the name
+carries, the model it serves and the answer ceiling. It is settled per run, and
+a session records the provider its model belongs to, so continuing one
+(`caocli -c`) resumes on the same backend — no flag needed. To move a session to
+another backend, name the new provider in `--model` or `/model`.
 
 | Provider id | Name | Endpoint | Wire | Models | Max answer |
 |---|---|---|---|---|---|
-| `deepseek` | DeepSeek | `api.deepseek.com` | OpenAI | `deepseek-flash` (default), `deepseek-v4-pro` | 384k tokens |
-| `zai-coding-cn` | Z.AI Coding CN | `open.bigmodel.cn` (coding) | OpenAI | `glm-5.3-flash` (default), `glm-5.3` | 128k tokens |
-| `minimax` | MiniMax | `api.minimax.cn` (`/anthropic/v1/messages`) | Anthropic | `MiniMax-M3` (default) | 128k tokens |
+| `deepseek` | DeepSeek | `api.deepseek.com` | OpenAI | `deepseek-flash`, `deepseek-v4-pro` | 384k tokens |
+| `zai-coding-cn` | Z.AI Coding CN | `open.bigmodel.cn` (coding) | OpenAI | `glm-5.3-flash`, `glm-5.3` | 128k tokens |
+| `minimax` | MiniMax | `api.minimax.cn` (`/anthropic/v1/messages`) | Anthropic | `MiniMax-M3` | 128k tokens |
 
 The id is what the flags, the menus' arguments, the session meta and
 `settings.json` carry; the name is what `/login` lists and what an error message

@@ -115,12 +115,6 @@ impl AnthropicOptions {
 }
 
 impl Provider {
-    /// Model used when no model is named: `--model`, `/model`, or the session's
-    /// own meta all override it.
-    pub fn default_model(&self) -> &'static str {
-        self.models[0]
-    }
-
     /// Reject an effort tier this provider does not offer, before it is ever
     /// sent. DeepSeek returns 400 for an out-of-range value while GLM silently
     /// accepts it and degrades to its default tier — rejecting locally is the
@@ -250,14 +244,18 @@ pub fn provider(id: &str) -> Result<Provider> {
         })
 }
 
-/// A model choice: either the `<provider>/<modelid>` form the picker and the
-/// status line use, or a bare id, which belongs to `current` — the provider in
-/// effect — so `--model deepseek-v4-pro` keeps meaning what it always did.
-pub fn model_spec(spec: &str, current: &str) -> Result<(Provider, String)> {
-    let (id, model) = match spec.split_once('/') {
-        Some((id, model)) => (id.trim(), model.trim()),
-        None => (current, spec.trim()),
-    };
+/// Resolve a model spec into a (provider, model id) pair. The spec must be
+/// `<provider>/<modelid>` — the same shape `/model`, `--model` and the status
+/// line all use. A bare id is not accepted: without a `--provider` flag to pin
+/// the implicit one, it would just be a guess.
+pub fn model_spec(spec: &str) -> Result<(Provider, String)> {
+    let (id, model) = spec.split_once('/').ok_or_else(|| {
+        anyhow::anyhow!(
+            "a model is named <provider>/<modelid>, as in {example}; got {spec:?}",
+            example = example_model()
+        )
+    })?;
+    let (id, model) = (id.trim(), model.trim());
     if model.is_empty() {
         bail!(
             "no model id in {spec:?}; a model is named <provider>/<modelid>, as in {}",
@@ -270,7 +268,7 @@ pub fn model_spec(spec: &str, current: &str) -> Result<(Provider, String)> {
 /// An example of the `<provider>/<modelid>` form, for error messages.
 fn example_model() -> String {
     let p = provider(DEFAULT_PROVIDER).expect("the default provider is in the table");
-    format!("{}/{}", p.id, p.default_model())
+    format!("{}/{}", p.id, p.models[0])
 }
 
 #[cfg(test)]
@@ -287,11 +285,11 @@ mod tests {
         assert_eq!(MINIMAX.name, "MiniMax");
         assert!(provider("nope").unwrap_err().to_string().contains("zai"));
         assert_eq!(DEFAULT_PROVIDER, "deepseek");
-        assert_eq!(DEEPSEEK.default_model(), "deepseek-flash");
-        assert_eq!(ZAI_CODING_CN.default_model(), "glm-5.3-flash");
-        assert_eq!(MINIMAX.default_model(), "MiniMax-M3");
-        // Every preset offers something to pick, and the first of them is what
-        // `default_model` reads: an empty list would panic there.
+        assert_eq!(DEEPSEEK.models[0], "deepseek-flash");
+        assert_eq!(ZAI_CODING_CN.models[0], "glm-5.3-flash");
+        assert_eq!(MINIMAX.models[0], "MiniMax-M3");
+        // Every preset offers something to pick, and `models[0]` is what the
+        // startup fallback reads: an empty list would panic there.
         for p in PROVIDERS {
             assert!(!p.models.is_empty(), "{} offers no model", p.id);
             assert!(!p.id.contains('/'), "a provider id may not carry a slash");
@@ -368,36 +366,32 @@ mod tests {
 
     #[test]
     fn model_spec_takes_a_qualified_id_and_its_own_provider() {
-        let (p, m) = model_spec("zai-coding-cn/glm-5.3", "deepseek").unwrap();
+        let (p, m) = model_spec("zai-coding-cn/glm-5.3").unwrap();
         assert_eq!(p, ZAI_CODING_CN);
         assert_eq!(m, "glm-5.3");
         // Surrounding space is the shell's, not the model's.
-        let (p, m) = model_spec(" deepseek/deepseek-v4-pro ", "zai-coding-cn").unwrap();
+        let (p, m) = model_spec(" deepseek/deepseek-v4-pro ").unwrap();
         assert_eq!(p, DEEPSEEK);
         assert_eq!(m, "deepseek-v4-pro");
     }
 
     #[test]
-    fn model_spec_takes_a_bare_id_as_the_current_provider() {
-        let (p, m) = model_spec("deepseek-v4-pro", "deepseek").unwrap();
-        assert_eq!(p, DEEPSEEK);
-        assert_eq!(m, "deepseek-v4-pro");
-        // A bare id is whatever the current provider serves, even an id its own
-        // menu does not list: the table is a menu, not a whitelist.
-        let (p, m) = model_spec("something-new", "zai-coding-cn").unwrap();
-        assert_eq!(p, ZAI_CODING_CN);
-        assert_eq!(m, "something-new");
+    fn model_spec_rejects_a_bare_id_without_a_provider() {
+        // A bare id is no longer accepted: there is no implicit provider to
+        // belong to, so the user has to write `<provider>/<modelid>`.
+        for bad in ["deepseek-v4-pro", "glm-5.3", "MiniMax-M3"] {
+            let err = model_spec(bad).unwrap_err().to_string();
+            assert!(err.contains("deepseek/deepseek-flash"), "{bad}: {err}");
+        }
     }
 
     #[test]
     fn model_spec_rejects_an_empty_id_or_an_unknown_provider() {
         for bad in ["", "  ", "zai-coding-cn/", "zai-coding-cn/   "] {
-            let err = model_spec(bad, "deepseek").unwrap_err().to_string();
+            let err = model_spec(bad).unwrap_err().to_string();
             assert!(err.contains("deepseek/deepseek-flash"), "{bad}: {err}");
         }
-        let err = model_spec("nope/whatever", "deepseek")
-            .unwrap_err()
-            .to_string();
+        let err = model_spec("nope/whatever").unwrap_err().to_string();
         assert!(err.contains("unknown provider"), "{err}");
     }
 }

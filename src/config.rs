@@ -50,7 +50,9 @@ pub fn provider_choices() -> Vec<Choice> {
 
 /// Every model the preset table offers, named `<provider id>/<modelid>` — which
 /// is what the id is for — with the current one and any that has no key to send
-/// marked.
+/// marked. There is no "default" column: the current model is the only one the
+/// menu singles out, and a model the session is not on is no different from any
+/// other usable choice.
 pub fn model_menu(current: &str) -> Vec<Choice> {
     let mut rows = Vec::new();
     for p in PROVIDERS {
@@ -59,7 +61,6 @@ pub fn model_menu(current: &str) -> Vec<Choice> {
             let detail = match (id == current, has_key(p)) {
                 (true, _) => "current".to_string(),
                 (false, false) => format!("no key: /login {}", p.id),
-                (false, true) if *model == p.default_model() => "default".to_string(),
                 _ => String::new(),
             };
             rows.push(Choice::new(id.clone(), id, detail));
@@ -380,10 +381,10 @@ mod tests {
                 "minimax/MiniMax-M3",
             ]
         );
-        // The current one says so, a provider's default says so, and the
-        // models with no key behind them say where to get one.
+        // The current one says so; a provider with no key behind it says where
+        // to get one; every other funded model is just listed.
         assert_eq!(rows[1].detail, "current");
-        assert_eq!(rows[0].detail, "default");
+        assert_eq!(rows[0].detail, "", "no key column, no default column");
         assert_eq!(rows[2].detail, "no key: /login zai-coding-cn");
         assert_eq!(rows[3].detail, "no key: /login zai-coding-cn");
         assert_eq!(rows[4].detail, "no key: /login minimax");

@@ -105,8 +105,9 @@ impl Agent {
     }
 
     /// The provider id that opened this session: the bare id (`deepseek`,
-    /// `zai-coding-cn`), as it appears in `--provider` and `~/.caocli/`.
-    /// `None` only for sessions written before providers were recorded.
+    /// `zai-coding-cn`), as it appears in `<provider>/<modelid>` and
+    /// `~/.caocli/`. `None` only for sessions written before providers were
+    /// recorded.
     pub fn provider_meta(&self) -> Option<&str> {
         self.session.meta.provider.as_deref()
     }
