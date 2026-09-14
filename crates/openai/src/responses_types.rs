@@ -132,16 +132,14 @@ pub enum InputMessageRole {
 }
 
 /// An input message to the model. Tagged by `type: "message"`, with the role
-/// distinguishing user / system / developer / assistant.
+/// distinguishing user / system / developer / assistant. The type rides on
+/// [`ResponseInputItem`]'s tag, so this struct carries no field for it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EasyInputMessage {
     /// The contents of the message: a plain string or a list of parts.
     pub content: ResponseInputContent,
     /// The role of the message.
     pub role: InputMessageRole,
-    /// The type of the item, always `"message"`. The serializer writes it.
-    #[serde(rename = "type")]
-    pub r#type: ResponseInputItemType,
     /// Whether this is a "commentary" (intermediate thinking) or a "final answer".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<MessagePhase>,
@@ -153,7 +151,6 @@ impl EasyInputMessage {
         Self {
             content: content.into(),
             role: InputMessageRole::User,
-            r#type: ResponseInputItemType::Message,
             phase: None,
         }
     }
@@ -163,7 +160,6 @@ impl EasyInputMessage {
         Self {
             content: content.into(),
             role: InputMessageRole::System,
-            r#type: ResponseInputItemType::Message,
             phase: None,
         }
     }
@@ -173,7 +169,6 @@ impl EasyInputMessage {
         Self {
             content: content.into(),
             role: InputMessageRole::Developer,
-            r#type: ResponseInputItemType::Message,
             phase: None,
         }
     }
@@ -183,7 +178,6 @@ impl EasyInputMessage {
         Self {
             content: content.into(),
             role: InputMessageRole::Assistant,
-            r#type: ResponseInputItemType::Message,
             phase: None,
         }
     }
@@ -205,7 +199,8 @@ pub enum MessagePhase {
     FinalAnswer,
 }
 
-/// The kind of an input item. Tagged by `type` on the wire.
+/// The kind of an input item. Tagged by `type` on the wire, which is
+/// [`ResponseInputItem`]'s own tag: an item writes one `type` key, never two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResponseInputItemType {
     /// A message input.
@@ -214,6 +209,9 @@ pub enum ResponseInputItemType {
     /// A tool result addressed by call id.
     #[serde(rename = "function_call_output")]
     FunctionCallOutput,
+    /// A function call the model made, replayed so its result has a call.
+    #[serde(rename = "function_call")]
+    FunctionCall,
     /// A reference to an item by id, for replaying prior turns.
     #[serde(rename = "item_reference")]
     ItemReference,
@@ -223,16 +221,14 @@ pub enum ResponseInputItemType {
 }
 
 /// A tool result: the function's output, addressed by the call id the model
-/// gave when it made the call.
+/// gave when it made the call. The item's type rides on
+/// [`ResponseInputItem`]'s tag, so this struct carries no field for it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionCallOutputItem {
     /// The id of the function tool call this result is responding to.
     pub call_id: String,
     /// The function's output, as a JSON-encoded string.
     pub output: String,
-    /// The kind of item, always `"function_call_output"`.
-    #[serde(rename = "type")]
-    pub r#type: ResponseInputItemType,
     /// The item's stable id, when the endpoint assigned one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -247,7 +243,6 @@ impl FunctionCallOutputItem {
         Self {
             call_id: call_id.into(),
             output: output.into(),
-            r#type: ResponseInputItemType::FunctionCallOutput,
             id: None,
             status: None,
         }
@@ -272,23 +267,21 @@ pub enum ItemStatus {
 pub struct ItemReference {
     /// The id of the referenced item.
     pub id: String,
-    /// The kind of item, always `"item_reference"`.
-    #[serde(rename = "type")]
-    pub r#type: ResponseInputItemType,
 }
 
 impl ItemReference {
     /// A reference to the item with the given id.
     pub fn new(id: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            r#type: ResponseInputItemType::ItemReference,
-        }
+        Self { id: id.into() }
     }
 }
 
 /// One item in a Responses request's `input`. The kind is the discriminant
 /// on the wire.
+///
+/// The tag is the enum's to write: a payload type that carries a `type` field
+/// of its own reads it on the way in and does not write it back out, so an
+/// item is one JSON object with one `type` key rather than two.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseInputItem {
@@ -298,6 +291,10 @@ pub enum ResponseInputItem {
     /// A tool result.
     #[serde(rename = "function_call_output")]
     FunctionCallOutput(FunctionCallOutputItem),
+    /// A function call the model made on an earlier turn, replayed so the
+    /// result that follows it has the call it answers.
+    #[serde(rename = "function_call")]
+    FunctionCall(ResponseFunctionToolCall),
     /// A reference to an item by id.
     #[serde(rename = "item_reference")]
     ItemReference(ItemReference),
@@ -307,14 +304,12 @@ pub enum ResponseInputItem {
 }
 
 /// A reasoning item being replayed as input, so the next turn's reasoning
-/// stays continuous with the previous one.
+/// stays continuous with the previous one. The item's type rides on
+/// [`ResponseInputItem`]'s tag, so this struct carries no field for it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReasoningItemInput {
     /// The id the endpoint assigned to this reasoning item, kept verbatim.
     pub id: String,
-    /// The kind of item, always `"reasoning"`.
-    #[serde(rename = "type")]
-    pub r#type: ResponseInputItemType,
     /// The summary the model wrote for this reasoning block.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub summary: Vec<ReasoningSummaryText>,
@@ -325,6 +320,22 @@ pub struct ReasoningItemInput {
     /// Replayed so a stateless caller can keep the chain of thought continuous.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_content: Option<String>,
+}
+
+impl ReasoningItemInput {
+    /// A reasoning item to replay: the id the endpoint gave it, and the text
+    /// it wrote.
+    pub fn new(id: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            summary: Vec::new(),
+            content: vec![ReasoningTextContent {
+                text: text.into(),
+                r#type: ReasoningTextKind::ReasoningText,
+            }],
+            encrypted_content: None,
+        }
+    }
 }
 
 /// A summary line the model wrote for a reasoning block.
@@ -841,6 +852,36 @@ pub enum ReasoningEffort {
     High,
     /// The most the model can spend. Not every model supports every tier.
     XHigh,
+}
+
+impl ReasoningEffort {
+    /// The tier as the wire spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::None => "none",
+            ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::XHigh => "xhigh",
+        }
+    }
+
+    /// The tier a name stands for, for a caller holding names — the tiers a
+    /// preset declares its endpoint serves, say. `None` for a name this crate
+    /// does not know, which is a tier to leave unsent rather than to guess at.
+    pub fn from_name(name: &str) -> Option<Self> {
+        [
+            ReasoningEffort::None,
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+        ]
+        .into_iter()
+        .find(|tier| tier.as_str() == name)
+    }
 }
 
 /// The shape of the model's text answer.
@@ -1567,7 +1608,7 @@ pub struct ResponsePromptCacheOptions {
 }
 
 /// Why the response is incomplete.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IncompleteDetails {
     /// The reason: max output tokens hit, the content filter, etc.
     pub reason: Option<String>,
@@ -1653,7 +1694,7 @@ pub struct ResponseUsage {
 }
 
 /// A breakdown of input tokens, when the endpoint reports one.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct InputTokensDetails {
     /// Tokens served from cache.
     #[serde(default)]
@@ -1664,7 +1705,7 @@ pub struct InputTokensDetails {
 }
 
 /// A breakdown of output tokens, when the endpoint reports one.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OutputTokensDetails {
     /// Reasoning tokens spent before the answer.
     #[serde(default)]
@@ -1764,11 +1805,29 @@ pub struct ResponseFunctionToolCall {
     pub name: String,
     /// The unique id of the function tool call item, when the endpoint assigned
     /// one (for replaying it as an `item_reference` on the next turn).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// The status of the item.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<ItemStatus>,
+}
+
+impl ResponseFunctionToolCall {
+    /// A call to replay as an input item: the call id its result answers, the
+    /// function that was called, and the arguments it was called with.
+    pub fn replay(
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        Self {
+            arguments: arguments.into(),
+            call_id: call_id.into(),
+            name: name.into(),
+            id: None,
+            status: None,
+        }
+    }
 }
 
 /// A reasoning item the model produced. Replayed as input on the next turn so
@@ -1866,7 +1925,7 @@ mod tests {
             ResponseInputContentPart::text("what is this?"),
             ResponseInputContentPart::image_url("data:image/png;base64,AAAA"),
         ]));
-        let value = serde_json::to_value(&msg).unwrap();
+        let value = serde_json::to_value(ResponseInputItem::Message(msg)).unwrap();
         assert_eq!(value["role"], json!("user"));
         assert_eq!(value["type"], json!("message"));
         let parts = value["content"].as_array().unwrap();
@@ -2009,7 +2068,7 @@ mod tests {
     #[test]
     fn a_function_tool_call_output_item_carries_call_id_and_output() {
         let item = FunctionCallOutputItem::new("call_1", "sunny");
-        let value = serde_json::to_value(&item).unwrap();
+        let value = serde_json::to_value(ResponseInputItem::FunctionCallOutput(item)).unwrap();
         assert_eq!(value["type"], json!("function_call_output"));
         assert_eq!(value["call_id"], json!("call_1"));
         assert_eq!(value["output"], json!("sunny"));
@@ -2139,7 +2198,7 @@ mod tests {
             ResponseInputContentPart::text("what is this?"),
             ResponseInputContentPart::image_url("data:image/png;base64,AAAA"),
         ]));
-        let value = serde_json::to_value(&msg).unwrap();
+        let value = serde_json::to_value(ResponseInputItem::Message(msg)).unwrap();
         assert_eq!(value["role"], json!("user"));
         assert_eq!(value["type"], json!("message"));
         let parts = value["content"].as_array().unwrap();
@@ -2168,11 +2227,14 @@ mod tests {
     #[test]
     fn function_call_output_item_serializes_with_its_call_id() {
         let item = FunctionCallOutputItem::new("call_1", "sunny");
-        let value = serde_json::to_value(&item).unwrap();
+        let value = serde_json::to_value(ResponseInputItem::FunctionCallOutput(item)).unwrap();
         assert_eq!(value["type"], json!("function_call_output"));
         assert_eq!(value["call_id"], json!("call_1"));
         assert_eq!(value["output"], json!("sunny"));
-        let back: FunctionCallOutputItem = serde_json::from_value(value).unwrap();
+        let back: ResponseInputItem = serde_json::from_value(value).unwrap();
+        let ResponseInputItem::FunctionCallOutput(back) = back else {
+            panic!("expected a function call output");
+        };
         assert_eq!(back.call_id, "call_1");
         assert_eq!(back.output, "sunny");
     }
@@ -2180,7 +2242,7 @@ mod tests {
     #[test]
     fn item_reference_serializes_as_an_id_only() {
         let reference = ItemReference::new("rs_1");
-        let value = serde_json::to_value(&reference).unwrap();
+        let value = serde_json::to_value(ResponseInputItem::ItemReference(reference)).unwrap();
         assert_eq!(value, json!({"type": "item_reference", "id": "rs_1"}));
     }
 
@@ -2188,7 +2250,6 @@ mod tests {
     fn a_reasoning_item_input_round_trips_with_summary_and_content() {
         let item = ReasoningItemInput {
             id: "rs_1".into(),
-            r#type: ResponseInputItemType::Reasoning,
             summary: vec![ReasoningSummaryText {
                 text: "thinking...".into(),
                 r#type: ReasoningTextKind::SummaryText,
@@ -2199,16 +2260,32 @@ mod tests {
             }],
             encrypted_content: Some("ENC".into()),
         };
-        let value = serde_json::to_value(&item).unwrap();
+        let value = serde_json::to_value(ResponseInputItem::Reasoning(item.clone())).unwrap();
         assert_eq!(value["type"], json!("reasoning"));
         assert_eq!(value["summary"][0]["type"], json!("summary_text"));
         assert_eq!(value["content"][0]["type"], json!("reasoning_text"));
         assert_eq!(value["encrypted_content"], json!("ENC"));
-        let back: ReasoningItemInput = serde_json::from_value(value).unwrap();
-        assert_eq!(back.id, "rs_1");
-        assert_eq!(back.summary.len(), 1);
-        assert_eq!(back.content.len(), 1);
-        assert_eq!(back.encrypted_content.as_deref(), Some("ENC"));
+        let back: ResponseInputItem = serde_json::from_value(value).unwrap();
+        let ResponseInputItem::Reasoning(back) = back else {
+            panic!("expected a reasoning item");
+        };
+        assert_eq!(back, item);
+    }
+
+    #[test]
+    fn a_function_call_replayed_as_input_carries_the_call_its_result_answers() {
+        let call = ResponseFunctionToolCall::replay("call_1", "get_weather", r#"{"city":"SF"}"#);
+        let value = serde_json::to_value(ResponseInputItem::FunctionCall(call.clone())).unwrap();
+        assert_eq!(value["type"], json!("function_call"));
+        assert_eq!(value["call_id"], json!("call_1"));
+        assert_eq!(value["name"], json!("get_weather"));
+        assert_eq!(value["arguments"], json!(r#"{"city":"SF"}"#));
+        // The optional fields are left out rather than sent as nulls: an
+        // endpoint that validates the schema takes a string or nothing.
+        assert!(value.get("id").is_none(), "{value}");
+        assert!(value.get("status").is_none(), "{value}");
+        let back: ResponseInputItem = serde_json::from_value(value).unwrap();
+        assert_eq!(back, ResponseInputItem::FunctionCall(call));
     }
 
     #[test]
@@ -2299,6 +2376,25 @@ mod tests {
             ResponseStatus::Unknown("future_status".into()).as_str(),
             "future_status"
         );
+    }
+
+    #[test]
+    fn reasoning_effort_round_trips_through_its_wire_name() {
+        for tier in [
+            ReasoningEffort::None,
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+        ] {
+            assert_eq!(ReasoningEffort::from_name(tier.as_str()), Some(tier));
+            // The name is the wire's own spelling, which is what serde writes.
+            assert_eq!(serde_json::to_value(tier).unwrap(), json!(tier.as_str()));
+        }
+        // A name this crate does not know is a tier to leave unsent.
+        assert_eq!(ReasoningEffort::from_name("max"), None);
+        assert_eq!(ReasoningEffort::from_name("HIGH"), None);
     }
 
     #[test]

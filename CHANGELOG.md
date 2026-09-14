@@ -6,6 +6,31 @@ semantic-version bumps per release.
 
 ## [Unreleased]
 
+### Added — Xiaomi MiMo V2.5
+
+A fourth provider on a third wire. Xiaomi's `https://api.xiaomimimo.com`
+serves its `mimo-v2.5-pro` (the flagship reasoning model) and `mimo-v2.5`
+(the omni-modal one) over the OpenAI Responses API: `--model
+mimo/mimo-v2.5-pro` and `/login mimo`. Two pieces of the contract matter for
+multi-turn tool loops:
+
+- **Prompt caching** is reported as `usage.input_tokens_details.cached_tokens`
+  on the `response.completed` event, the same shape the chat wire reports on
+  the GLM endpoint. The local `Usage::cache()` already reads both flat and
+  nested forms, so the `tokens:` line and the status bar aggregate MiMo hits
+  the way they aggregate DeepSeek and GLM ones.
+- **Chain-of-thought replay** is the model's: every reasoning item comes back
+  with an id of its own, and the chain stays continuous only when the next
+  request sends the item whole — id and text both — in the order the model
+  produced it. The `responses_request` builder maps the internal
+  `Message::reasoning` items onto the wire's input items; the stream adapter
+  groups `reasoning_text.delta` fragments by the item id so each item
+  arrives whole.
+
+The Reasoning switch (`reasoning.effort`) is the wire's knob, and `none`
+turns it off; every other tier the endpoint accepts (`low`/`medium`/`high`)
+is a preset and a status-line option.
+
 ### Added — session file format v1
 
 The session log gains an envelope (`type`, `sequence`, `timestamp_ms`,

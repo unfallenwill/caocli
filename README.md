@@ -45,6 +45,7 @@ cargo run -- -c -p "check disk usage"   # one-shot, continuing the latest sessio
 cargo run -- --effort max --model deepseek/deepseek-v4-pro -p "..."
 cargo run -- --model zai-coding-cn/glm-5.3-flash -p "1+1"   # Z.AI Coding CN
 cargo run -- --model minimax/MiniMax-M3 -p "1+1"          # MiniMax M3 (Anthropic wire)
+cargo run -- --model mimo/mimo-v2.5-pro -p "1+1"        # MiMo V2.5 Pro (Responses wire)
 cargo run -- -p "what is wrong here?" --image shot.png
 cargo run -- --list                     # list sessions and exit
 ```
@@ -284,6 +285,7 @@ another backend, name the new provider in `--model` or `/model`.
 | `deepseek` | DeepSeek | `api.deepseek.com` | OpenAI | `deepseek-flash`, `deepseek-v4-pro` | 384k tokens |
 | `zai-coding-cn` | Z.AI Coding CN | `open.bigmodel.cn` (coding) | OpenAI | `glm-5.3-flash`, `glm-5.3` | 128k tokens |
 | `minimax` | MiniMax | `api.minimax.cn` (`/anthropic/v1/messages`) | Anthropic | `MiniMax-M3` | 128k tokens |
+| `mimo` | MiMo | `api.xiaomimimo.com` (`/v1/responses`) | OpenAI Responses | `mimo-v2.5-pro`, `mimo-v2.5` | 128k tokens |
 
 The id is what the flags, the menus' arguments, the session meta and
 `settings.json` carry; the name is what `/login` lists and what an error message
@@ -293,11 +295,15 @@ The model list is what `/model` offers; naming one the table does not list is
 allowed, and up to the backend to accept or reject. The effort tiers are the
 same table's: `/effort` offers exactly the list `--effort` is checked against.
 
-Two wires are served: the OpenAI chat-completions shape, parsed here, and the
-Anthropic Messages shape, spoken by the `anthropic` crate — the standard
-protocol as types, a client and a typed event stream, with the events folded
-back into the same deltas the accumulator reads so that nothing downstream knows
-a second protocol exists. Thinking is always on.
+Three wires are served: the OpenAI chat-completions shape, parsed here; the
+Anthropic Messages shape, spoken by the `anthropic` crate; and the OpenAI
+Responses shape, spoken by the same `openai` crate — a third resource at
+the same `/v1` root, with the same standards. The internal deltas downstream
+sees are the same on all three: a `Delta` with a content fragment, a reasoning
+fragment, and sharded tool calls; a request builder maps the internal history
+onto one SDK shape or another; a stream adapter folds each wire's events into
+the same `Delta` the accumulator reads. Thinking is always on, the toggle is
+the tier (`/effort` `none` is off, every other tier is on).
 
 That crate is measured against the official client for the API
 (`anthropic-sdk-python`) and follows it: the fields it sends, the events it hands
@@ -666,9 +672,9 @@ wherever the answer is typed:
   note about a server's annotations is why the server's word does not settle
   it.
 - **Cache usage is normalized across providers.** DeepSeek reports flat
-  `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`; GLM/OpenAI report
-  nested `prompt_tokens_details.cached_tokens` (miss derived as
-  `prompt_tokens - cached_tokens`). Both shapes land in the same hit/miss
+  `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`; GLM/OpenAI and MiMo
+  report nested `prompt_tokens_details.cached_tokens` (miss derived as
+  `prompt_tokens - cached_tokens`). All three shapes land in the same hit/miss
   counters; a session that has reported nothing keeps the zero defaults rather
   than a fake-looking rate.
 - **Token usage** is attached to the final content chunk of the stream, not

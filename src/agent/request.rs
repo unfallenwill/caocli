@@ -25,11 +25,12 @@ pub fn request_prefix(
     let wire = match provider.wire {
         Wire::OpenAi => WireKind::OpenAiChat,
         Wire::Anthropic => WireKind::AnthropicMessages,
+        Wire::Responses => WireKind::OpenAiResponses,
     };
-    let endpoint = match wire {
-        WireKind::OpenAiChat => format!("{}/chat/completions", provider.url),
-        WireKind::AnthropicMessages => format!("{}/messages", provider.url),
-    };
+    // The preset's URL is the endpoint itself, path and all — what the client
+    // sends to is what the trace records, so a reader rebuilding the body knows
+    // where it was sent.
+    let endpoint = provider.url.to_string();
     let tools = {
         let mut tools = crate::tools::definitions();
         tools.extend_from_slice(mcp);
@@ -38,15 +39,16 @@ pub fn request_prefix(
     let parameters = build_parameters(provider, meta);
     let system_prompt = match provider.wire {
         Wire::OpenAi => {
-            // On the OpenAI wire the system prompt is the first message,
+            // On the OpenAI chat wire the system prompt is the first message,
             // not a top-level field. Recording it here means a reader has
             // both shapes available for verification.
             crate::agent::request::SYSTEM_PROMPT.to_string()
         }
-        Wire::Anthropic => {
-            // The Anthropic wire joins the system prompt and the session's
-            // stored instructions with "\n\n"; the trace records that
-            // joined form because it is what the request carried.
+        Wire::Anthropic | Wire::Responses => {
+            // On both of these the system prompt is a top-level field beside
+            // the conversation, joined with the session's stored instructions
+            // — `system` on one, `instructions` on the other. The trace records
+            // that joined form because it is what the request carried.
             let mut s = vec![crate::agent::request::SYSTEM_PROMPT.to_string()];
             if let Some(text) = meta.instructions.as_deref().filter(|t| !t.is_empty()) {
                 s.push(text.to_string());
@@ -63,25 +65,49 @@ pub fn request_prefix(
     }
 }
 
-/// The parameters block, in the shape the wire expects: `max_tokens`,
-/// `tool_choice`, `stream`, the vendor `thinking` and `reasoning_effort`
-/// flags when in force. Stored as a generic `Value` so the trace is
-/// faithful to what was sent and does not require us to enumerate every
-/// vendor field here.
+/// The parameters block, in the shape the wire expects: the answer's cap, the
+/// tool choice, `stream`, and the fields that carry the reasoning switch —
+/// under the name and the nesting each wire gives them, taken from the same
+/// helpers the request builder reads, so the trace cannot drift from the body.
+/// Stored as a generic `Value` so the trace stays faithful to what was sent and
+/// does not require us to enumerate every vendor field here.
 fn build_parameters(provider: &Provider, meta: &SessionMeta) -> JsonValue {
     let mut p = serde_json::Map::new();
-    p.insert("max_tokens".into(), json!(provider.max_tokens));
     p.insert("tool_choice".into(), json!("auto"));
     p.insert("stream".into(), json!(true));
-    if provider.send_thinking {
-        p.insert("thinking".into(), json!({"type": "enabled"}));
-    }
-    if let Some(tier) = meta
-        .reasoning_effort
-        .as_deref()
-        .or(Some(provider.default_effort))
-    {
-        p.insert("reasoning_effort".into(), json!(tier));
+    match provider.wire {
+        Wire::OpenAi => {
+            p.insert("max_tokens".into(), json!(provider.max_tokens));
+            if provider.send_thinking {
+                p.insert("thinking".into(), json!({"type": "enabled"}));
+            }
+            p.insert(
+                "reasoning_effort".into(),
+                json!(effort_in_force(provider, meta)),
+            );
+        }
+        Wire::Responses => {
+            p.insert("max_output_tokens".into(), json!(provider.max_tokens));
+            p.insert(
+                "reasoning".into(),
+                json!({"effort": effort_in_force(provider, meta)}),
+            );
+        }
+        Wire::Anthropic => {
+            p.insert("max_tokens".into(), json!(provider.max_tokens));
+            // The switch itself, serialized from the value the builder hands the
+            // request: on this wire the tier is not sent as an effort level.
+            p.insert(
+                "thinking".into(),
+                serde_json::to_value(anthropic_thinking(provider, meta))
+                    .expect("a thinking config is an enum of strings and one integer"),
+            );
+            if provider.anthropic.effort
+                && let Some(effort) = anthropic::Effort::from_name(&effort_in_force(provider, meta))
+            {
+                p.insert("effort".into(), json!(effort.as_str()));
+            }
+        }
     }
     JsonValue::Object(p)
 }
@@ -137,6 +163,9 @@ pub fn build_request(
         Wire::Anthropic => {
             WireRequest::Anthropic(Box::new(anthropic_request(provider, meta, history, mcp)))
         }
+        Wire::Responses => {
+            WireRequest::Responses(Box::new(responses_request(provider, meta, history, mcp)))
+        }
     }
 }
 
@@ -171,15 +200,31 @@ fn openai_request(
     if let Some(text) = meta.instructions.as_deref().filter(|t| !t.is_empty()) {
         messages.push(Message::user(text));
     }
+    // Every wire saves the chain of thought under its own field:
+    // `reasoning_content` (chat wire), `thinking` (Anthropic, signed), and
+    // `reasoning` (Responses, item id + text). The wire we are sending on
+    // reads its own and ignores the others — so before any wire gets the
+    // message, the other two are dropped. Replaying a different wire's
+    // field to a backend that rejects fields it does not know is a 400.
+    // Each wire saves the chain of thought under its own field:
+    // `reasoning_content` (chat wire), `thinking` (Anthropic, signed), and
+    // `reasoning` (Responses, item id + text). The wire we are sending
+    // on reads its own and ignores the others — but a builder that does
+    // not strip them leaks a foreign wire's field to a backend that
+    // rejects fields it does not know. The chat wire's `reasoning_content`
+    // is its own and stays; the other two go.
+    let strip_other_wires = |m: &Message| -> Message {
+        let mut m = m.clone();
+        m.thinking = None;
+        m.reasoning = None;
+        m
+    };
+
     // A message that arrived on the Anthropic wire carries its thinking
     // blocks with it; those are that wire's business and are stripped here,
     // so a session that switched providers never sends them to a backend
     // that rejects fields it does not know.
-    messages.extend(history.iter().map(|m| {
-        let mut m = m.clone();
-        m.thinking = None;
-        m
-    }));
+    messages.extend(history.iter().map(strip_other_wires));
     // Specification tripwire (debug builds only): the history being sent must
     // satisfy the executable specification. A violation is a shape the
     // backend answers with a 400 — catch it during development rather than in
@@ -203,6 +248,67 @@ fn openai_request(
                 .as_deref()
                 .unwrap_or(provider.default_effort),
         ),
+    )
+}
+
+/// The OpenAI Responses shape, built in the `openai` crate's vocabulary: the
+/// conversation is a list of `input` items — a message, a reasoning item, a
+/// function call, a function call's result — and the system prompt rides beside
+/// them in `instructions`.
+///
+/// The reasoning items are replayed here for the same reason the Anthropic
+/// shape replays its thinking blocks: this wire hands the model's chain of
+/// thought back to it, and a turn that dropped it is a turn the model has to
+/// think its way to again. What differs is the form: this wire wants the item,
+/// id and text both, not a signed block.
+fn responses_request(
+    provider: &provider::Provider,
+    meta: &SessionMeta,
+    history: &[Message],
+    mcp: &[ToolDef],
+) -> openai::ResponseCreateRequest {
+    // Specification tripwire, same as the other two shapes: the window
+    // specification is wire-agnostic, so it is checked before the mapping. The
+    // system prompt is not part of it — it rides in `instructions`, not as a
+    // message.
+    debug_assert!(
+        machine::is_request_valid(history),
+        "request history violates the tool_calls window specification: {history:?}"
+    );
+    // A message that arrived on another wire carries that wire's form of the
+    // reasoning with it; this shape reads only its own field, and this is where
+    // the others are dropped. A system message that somehow got into the
+    // history is folded into the instructions rather than replayed as an item.
+    let mut instructions = vec![SYSTEM_PROMPT.to_string()];
+    if let Some(text) = meta.instructions.as_deref().filter(|t| !t.is_empty()) {
+        instructions.push(text.to_string());
+    }
+    let mut replayed = Vec::with_capacity(history.len());
+    for message in history {
+        // Drop the other wires' reasoning fields: the Responses builder
+        // reads its own `reasoning` items and ignores the rest, but a
+        // chat-wire `reasoning_content` or an Anthropic signed block
+        // that followed a switch in providers would survive and reach an
+        // endpoint that rejects it.
+        let mut message = message.clone();
+        message.reasoning_content = None;
+        message.thinking = None;
+        match message.role {
+            crate::types::Role::System => {
+                if let Some(text) = message.text() {
+                    instructions.push(text);
+                }
+            }
+            _ => replayed.push(message),
+        }
+    }
+    api::responses_request(
+        &meta.model,
+        provider.max_tokens,
+        &instructions.join("\n\n"),
+        &replayed,
+        Some(&offered(mcp)),
+        Some(effort_in_force(provider, meta).as_str()),
     )
 }
 
@@ -233,6 +339,14 @@ fn anthropic_request(
         system.push(text.to_string());
     }
     for msg in history {
+        // Drop the other wires' reasoning fields: the Anthropic builder
+        // reads its own `thinking` and ignores the rest, but a chat-wire
+        // `reasoning_content` or a Responses `reasoning` item that
+        // followed a switch in providers would survive the SDK's own
+        // serializer and reach an endpoint that rejects it.
+        let mut msg = msg.clone();
+        msg.reasoning_content = None;
+        msg.reasoning = None;
         match msg.role {
             crate::types::Role::System => {
                 if let Some(text) = msg.text() {
@@ -241,15 +355,15 @@ fn anthropic_request(
             }
             crate::types::Role::User => messages.push(anthropic::MessageParam {
                 role: anthropic::Role::User,
-                content: user_content(msg),
+                content: user_content(&msg),
             }),
-            crate::types::Role::Assistant => messages.push(assistant_message(msg)),
+            crate::types::Role::Assistant => messages.push(assistant_message(&msg)),
             crate::types::Role::Tool => {
                 // Results ride in the user turn that follows the calls, so
                 // consecutive results fold into one user message of
                 // tool_result blocks — the shape the wire expects, and one
                 // the window specification above guarantees is well placed.
-                let block = tool_result_block(msg);
+                let block = tool_result_block(&msg);
                 match messages.last_mut() {
                     Some(anthropic::MessageParam {
                         role: anthropic::Role::User,

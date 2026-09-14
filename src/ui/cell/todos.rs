@@ -140,6 +140,7 @@ mod tests {
             tool_calls: calls,
             tool_call_id: None,
             thinking: None,
+            reasoning: None,
         }
     }
 

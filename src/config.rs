@@ -434,6 +434,8 @@ mod tests {
                 "zai-coding-cn/glm-5.3-flash",
                 "zai-coding-cn/glm-5.3",
                 "minimax/MiniMax-M3",
+                "mimo/mimo-v2.5-pro",
+                "mimo/mimo-v2.5",
             ]
         );
         // The current one says so; a provider with no key behind it says where

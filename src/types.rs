@@ -141,6 +141,21 @@ pub struct ThinkingBlock {
     pub signature: String,
 }
 
+/// A reasoning item as the Responses wire returned it, carried on the assistant
+/// message so the next request on that wire replays it verbatim. This wire
+/// hands the chain of thought over as items tagged with an id of its own, and
+/// asks for them back whole — id and text both — for the same reason: the
+/// model's own context is what the next turn reasons from. Dropping them is not
+/// a 400 on this wire, it is a model that has to re-derive what it already
+/// worked out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningItem {
+    /// The id the endpoint assigned to this item, kept verbatim.
+    pub id: String,
+    /// The reasoning text the item carries.
+    pub text: String,
+}
+
 /// Message. Field names match the API exactly:
 /// - assistant: content / reasoning_content / tool_calls (a request carrying
 ///   tools must send reasoning_content back; missing it means a 400)
@@ -161,6 +176,11 @@ pub struct Message {
     /// the field before an OpenAi-shaped request is serialized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<Vec<ThinkingBlock>>,
+    /// Responses-wire reasoning items, set only for an answer that came from
+    /// that wire. Each builder replays its own wire's form of the reasoning
+    /// and ignores the other two: the flat text, the signed blocks, or these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Vec<ReasoningItem>>,
 }
 
 impl Message {
@@ -218,12 +238,12 @@ impl Message {
 // ============================================================================
 // The wire the request is carried on.
 //
-// The two shapes are the SDK crates': `openai` speaks Chat Completions for
-// DeepSeek and Z.AI, and `anthropic` speaks Messages for MiniMax. Both put
-// the protocol in one place and give us typed requests to send, which is the
-// reason this crate has no request struct of its own — the internal history
-// is provider-agnostic, and the request builder maps it onto one SDK shape
-// or the other.
+// The three shapes are the SDK crates': `openai` speaks Chat Completions for
+// DeepSeek and Z.AI and Responses for MiMo, and `anthropic` speaks Messages for
+// MiniMax. Each puts the protocol in one place and gives us typed requests to
+// send, which is the reason this crate has no request struct of its own — the
+// internal history is provider-agnostic, and the request builder maps it onto
+// one SDK shape or another.
 // ============================================================================
 
 /// The request as the wire that carries it sees it. The client refuses to
@@ -231,11 +251,14 @@ impl Message {
 /// disagree silently.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum WireRequest {
-    /// OpenAI: the SDK's request type, boxed because it carries an
-    /// `extra_body` map and a long `messages` vector that would make every
-    /// value of `WireRequest` that size otherwise.
+    /// OpenAI: the SDK's chat-completions request type, boxed because it
+    /// carries an `extra_body` map and a long `messages` vector that would make
+    /// every value of `WireRequest` that size otherwise.
     OpenAi(Box<openai::ChatCompletionRequest>),
     Anthropic(Box<anthropic::MessagesRequest>),
+    /// OpenAI Responses: the SDK's request type for that resource — `input`
+    /// items rather than messages, and `instructions` beside them.
+    Responses(Box<openai::ResponseCreateRequest>),
 }
 
 // ============================================================================
@@ -268,6 +291,12 @@ pub struct Delta {
     pub content: Option<String>,
     #[serde(default)]
     pub reasoning_content: Option<String>,
+    /// The Responses wire's reasoning item a `reasoning_content` fragment
+    /// belongs to. That wire replays an item whole, so the accumulator groups
+    /// the fragments under the id the wire streams them with; the other wires
+    /// send no id, and their reasoning keeps the flat text alone.
+    #[serde(default)]
+    pub reasoning_item_id: Option<String>,
     #[serde(default)]
     pub tool_calls: Option<Vec<DeltaToolCall>>,
     /// The signature that closes a thinking block on the Anthropic wire. The
@@ -355,6 +384,8 @@ pub struct ChatChunk {
 // first shard, arguments are appended shard by shard. A thinking block on the
 // Anthropic wire ends with a signature delta; the text streamed before it is
 // the block's body, and the pair is kept so the wire can replay it verbatim.
+// A reasoning item on the Responses wire streams under an item id, and the
+// fragments of one item are kept together under it for the same reason.
 // ============================================================================
 
 #[derive(Debug, Default)]
@@ -367,6 +398,8 @@ pub struct TurnAccumulator {
     thinking_buf: String,
     /// Thinking blocks closed by a signature, in arrival order.
     thinking: Vec<ThinkingBlock>,
+    /// Reasoning items the Responses wire streamed, in arrival order.
+    reasoning: Vec<ReasoningItem>,
 }
 
 impl TurnAccumulator {
@@ -377,6 +410,18 @@ impl TurnAccumulator {
         if let Some(s) = &delta.reasoning_content {
             self.reasoning_content.push_str(s);
             self.thinking_buf.push_str(s);
+            // The Responses wire tags each fragment with the item it belongs
+            // to; a change of id opens the next item, and the fragments of one
+            // item stay together under it.
+            if let Some(id) = &delta.reasoning_item_id {
+                match self.reasoning.last_mut() {
+                    Some(item) if &item.id == id => item.text.push_str(s),
+                    _ => self.reasoning.push(ReasoningItem {
+                        id: id.clone(),
+                        text: s.clone(),
+                    }),
+                }
+            }
         }
         if let Some(sig) = &delta.signature {
             // Only a real signature closes a block: an empty one over a
@@ -449,6 +494,13 @@ impl TurnAccumulator {
         } else {
             Some(self.thinking)
         };
+        // A reasoning item is whole by construction — every fragment arrived
+        // under an id the wire assigned — so what is here is what goes back.
+        let reasoning = if self.reasoning.is_empty() {
+            None
+        } else {
+            Some(self.reasoning)
+        };
         Message {
             role: Role::Assistant,
             content: Some(Content::Text(self.content)),
@@ -460,6 +512,7 @@ impl TurnAccumulator {
             tool_calls,
             tool_call_id: None,
             thinking,
+            reasoning,
         }
     }
 }
@@ -484,6 +537,7 @@ mod tests {
             }]),
             tool_call_id: None,
             thinking: None,
+            reasoning: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""reasoning_content":"thinking...""#));
@@ -505,6 +559,7 @@ mod tests {
                 thinking: "reasoned".into(),
                 signature: "cafe".into(),
             }]),
+            reasoning: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""thinking":[{"thinking":"reasoned","signature":"cafe"}]"#));
@@ -628,6 +683,7 @@ mod tests {
             reasoning_content: reasoning.map(str::to_owned),
             tool_calls: tcs,
             signature: None,
+            reasoning_item_id: None,
         };
         let mut acc = TurnAccumulator::default();
         acc.feed(&mk(Some("9.11 "), Some("let me "), None));
@@ -674,6 +730,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Some(tcs),
             signature: None,
+            reasoning_item_id: None,
         };
         let dtc =
             |index: u32, id: Option<&str>, name: Option<&str>, args: Option<&str>| DeltaToolCall {
@@ -721,6 +778,7 @@ mod tests {
             reasoning_content: reasoning.map(str::to_owned),
             tool_calls: None,
             signature: signature.map(str::to_owned),
+            reasoning_item_id: None,
         };
         let mut acc = TurnAccumulator::default();
         // First thinking block: streamed, then closed by a signature.
@@ -758,6 +816,7 @@ mod tests {
             reasoning_content: reasoning.map(str::to_owned),
             tool_calls: None,
             signature: signature.map(str::to_owned),
+            reasoning_item_id: None,
         };
         // A body no signature closes (a truncated stream, or the DeepSeek
         // shape where no signature exists at all) stays out of the blocks;
@@ -779,10 +838,81 @@ mod tests {
     }
 
     #[test]
+    fn accumulator_groups_reasoning_items_by_the_id_they_arrived_under() {
+        // The Responses shape: every fragment carries the id of the item it
+        // belongs to, and the item is what gets replayed. A change of id opens
+        // the next item; the fragments of one item stay together.
+        let delta = |text: &str, item: Option<&str>| Delta {
+            role: None,
+            content: None,
+            reasoning_content: Some(text.to_owned()),
+            tool_calls: None,
+            signature: None,
+            reasoning_item_id: item.map(str::to_owned),
+        };
+        let mut acc = TurnAccumulator::default();
+        acc.feed(&delta("first ", Some("rs_1")));
+        acc.feed(&delta("item.", Some("rs_1")));
+        acc.feed(&delta("second ", Some("rs_2")));
+        acc.feed(&delta("item.", Some("rs_2")));
+        // A wire with no item id at all — the chat shape — adds no item.
+        acc.feed(&delta(" flat tail", None));
+        let msg = acc.finish();
+        assert_eq!(
+            msg.reasoning,
+            Some(vec![
+                ReasoningItem {
+                    id: "rs_1".into(),
+                    text: "first item.".into()
+                },
+                ReasoningItem {
+                    id: "rs_2".into(),
+                    text: "second item.".into()
+                },
+            ])
+        );
+        // The flat field keeps everything, including the text that arrived
+        // without an item to belong to.
+        assert_eq!(
+            msg.reasoning_content.as_deref(),
+            Some("first item.second item. flat tail")
+        );
+        // The other wires' slots stay empty: this message carries no signed
+        // block, and the builder for that wire reads its own field.
+        assert_eq!(msg.thinking, None);
+    }
+
+    #[test]
+    fn reasoning_items_round_trip_and_old_logs_read_on() {
+        let msg = Message {
+            role: Role::Assistant,
+            content: Some("done".into()),
+            reasoning_content: Some("reasoned".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            thinking: None,
+            reasoning: Some(vec![ReasoningItem {
+                id: "rs_1".into(),
+                text: "reasoned".into(),
+            }]),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            json.contains(r#""reasoning":[{"id":"rs_1","text":"reasoned"}]"#),
+            "{json}"
+        );
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, back);
+        // A log line written before the field existed reads back as none.
+        let old: Message = serde_json::from_str(r#"{"role":"assistant","content":"hi"}"#).unwrap();
+        assert_eq!(old.reasoning, None);
+    }
+
+    #[test]
     fn the_wire_enum_carries_the_sdks_own_request() {
         // The Anthropic shape is the `anthropic` crate's, and its JSON is that
         // crate's business — what this crate owes is the enum that says which
-        // of the two shapes a request is, and the shape it hands over.
+        // of the three shapes a request is, and the shape it hands over.
         let request = WireRequest::Anthropic(Box::new(
             anthropic::MessagesRequest::new("MiniMax-M3", 131_072, vec![])
                 .streaming()
@@ -794,7 +924,24 @@ mod tests {
                 assert_eq!(built.max_tokens, 131_072);
                 assert_eq!(built.stream, Some(true));
             }
-            WireRequest::OpenAi(_) => panic!("expected the Anthropic shape"),
+            other => panic!("expected the Anthropic shape, got {other:?}"),
+        }
+        // And the Responses shape the same way: the SDK's own type, built by
+        // the request builder and handed over whole.
+        let request = WireRequest::Responses(Box::new(
+            openai::ResponseCreateRequest::streaming(
+                "mimo-v2.5-pro",
+                openai::ResponseInput::text("hi"),
+            )
+            .with_max_output_tokens(131_072),
+        ));
+        match &request {
+            WireRequest::Responses(built) => {
+                assert_eq!(built.model, "mimo-v2.5-pro");
+                assert_eq!(built.max_output_tokens, Some(131_072));
+                assert!(built.stream);
+            }
+            other => panic!("expected the Responses shape, got {other:?}"),
         }
     }
 

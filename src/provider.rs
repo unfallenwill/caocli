@@ -9,15 +9,19 @@
 
 use anyhow::{Context, Result, bail};
 
-/// The wire protocol a provider speaks. Two shapes are served today: the
-/// OpenAI chat-completions body and SSE chunk stream, parsed here, and the
-/// Anthropic Messages body and event stream, spoken by the `anthropic` crate.
-/// The internal history is provider-agnostic; the request builder and the
-/// stream each branch on this, and both wires arrive at the same deltas.
+/// The wire protocol a provider speaks. Three shapes are served today: the
+/// OpenAI chat-completions body and SSE chunk stream, parsed here, the
+/// Anthropic Messages body and event stream, spoken by the `anthropic` crate,
+/// and the OpenAI Responses body and event stream, also spoken by the
+/// `openai` crate — the same types the crate calls them by, since a Responses
+/// answer is a list of items rather than a list of deltas. The internal
+/// history is provider-agnostic; the request builder and the stream each branch
+/// on this, and all three wires arrive at the same deltas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wire {
     OpenAi,
     Anthropic,
+    Responses,
 }
 
 /// Backend provider presets. Deliberately a static table instead of a trait or
@@ -32,7 +36,9 @@ pub struct Provider {
     /// Name a person reads, and the only thing `/login` shows. English, like
     /// everything else here.
     pub name: &'static str,
-    /// Full chat/completions endpoint.
+    /// Full endpoint of the resource the wire is spoken at — `/chat/completions`
+    /// or `/responses` on the OpenAI shapes, `/messages` on the Anthropic one.
+    /// The client sends to it verbatim, and the trace records it verbatim.
     pub url: &'static str,
     /// The wire protocol the endpoint speaks (see [`Wire`]).
     pub wire: Wire,
@@ -41,25 +47,29 @@ pub struct Provider {
     /// whitelist: any id may be named explicitly, and an id the backend does not
     /// know is the backend's to reject.
     pub models: &'static [&'static str],
-    /// Largest answer the backend will produce, sent as `max_tokens`. Omitting
-    /// it leaves the backend's own default cap in force, which is far below what
-    /// these models can emit — a long `Write` would be cut off mid-file and the
-    /// next `Edit` would then fail to match. The cap is a ceiling, not a
-    /// reservation: a short answer costs nothing extra.
+    /// Largest answer the backend will produce, sent as `max_tokens` on the
+    /// OpenAI chat wire and `max_output_tokens` on the Responses one — on the
+    /// latter, a cap that includes the reasoning tokens. Omitting it leaves the
+    /// backend's own default cap in force, which is far below what these models
+    /// can emit — a long `Write` would be cut off mid-file and the next `Edit`
+    /// would then fail to match. The cap is a ceiling, not a reservation: a
+    /// short answer costs nothing extra.
     ///
     /// This bounds a single completion, not the conversation: the backends take
     /// 1M tokens of context and history is replayed whole (never trimmed), so
     /// there is nothing else here for a context window to do.
     pub max_tokens: u32,
     /// Whether the request carries the DeepSeek-style `thinking` switch (an
-    /// OpenAi-wire field; an Anthropic-wire preset drives thinking through its
-    /// effort tiers instead, see `default_effort`). Both OpenAi-wire backends
+    /// OpenAi chat-wire field; the other two wires drive thinking through their
+    /// effort tiers instead, see `default_effort`). Both chat-wire backends
     /// take `{"type":"enabled"}`; a backend that rejects fields it does not
     /// know sets this to false, and nothing else changes.
     pub send_thinking: bool,
     /// Valid `reasoning_effort` tiers this backend accepts. The tiers are the
     /// backend's answer, not the program's, so they live in the preset: a
     /// provider with other tiers declares them here and nothing else changes.
+    /// On the Responses wire the tier is sent as `reasoning.effort`, which is
+    /// where that wire keeps the same knob.
     pub efforts: &'static [&'static str],
     /// Tier sent when no effort is stored. The backends' own defaults differ
     /// (DeepSeek high, GLM max, MiniMax thinking on), so the preset pins one
@@ -224,7 +234,35 @@ pub const MINIMAX: Provider = Provider {
     },
 };
 
-pub const PROVIDERS: &[Provider] = &[DEEPSEEK, ZAI_CODING_CN, MINIMAX];
+/// Xiaomi's Responses endpoint. `mimo-v2.5-pro` is the flagship reasoning
+/// model and `mimo-v2.5` the omni-modal one; both take a 1M-token context and
+/// emit a full chain of thought, which this wire streams as reasoning items
+/// and hands back on the next request (see `agent::request::responses_request`).
+pub const MIMO: Provider = Provider {
+    id: "mimo",
+    name: "MiMo",
+    url: "https://api.xiaomimimo.com/v1/responses",
+    wire: Wire::Responses,
+    models: &["mimo-v2.5-pro", "mimo-v2.5"],
+    // Both models are documented at a 128 Ki-token maximum output, on a shared
+    // range of [1, 131_072] — the same ceiling the Responses wire's
+    // `max_output_tokens` takes.
+    max_tokens: 131_072,
+    // The thinking switch on this wire is the `reasoning.effort` tier's job:
+    // `none` turns thinking off, and the tiers above it turn it on.
+    send_thinking: false,
+    // Every value the endpoint accepts. It documents the enabled tiers as
+    // indistinguishable today, so they are offered as the backend spells them
+    // rather than collapsed; `none` is the one that means anything different.
+    efforts: &["none", "low", "medium", "high"],
+    // Thinking on, which is what the models do when the field is absent — the
+    // same choice every other preset makes for its own tiers.
+    default_effort: "high",
+    // The Anthropic wire has none of these fields.
+    anthropic: AnthropicOptions::NONE,
+};
+
+pub const PROVIDERS: &[Provider] = &[DEEPSEEK, ZAI_CODING_CN, MINIMAX, MIMO];
 /// Provider used when `--provider` is not given.
 pub const DEFAULT_PROVIDER: &str = "deepseek";
 
@@ -280,40 +318,51 @@ mod tests {
         assert_eq!(provider("deepseek").unwrap(), DEEPSEEK);
         assert_eq!(provider("zai-coding-cn").unwrap(), ZAI_CODING_CN);
         assert_eq!(provider("minimax").unwrap(), MINIMAX);
+        assert_eq!(provider("mimo").unwrap(), MIMO);
         assert_eq!(DEEPSEEK.name, "DeepSeek");
         assert_eq!(ZAI_CODING_CN.name, "Z.AI Coding CN");
         assert_eq!(MINIMAX.name, "MiniMax");
+        assert_eq!(MIMO.name, "MiMo");
         assert!(provider("nope").unwrap_err().to_string().contains("zai"));
         assert_eq!(DEFAULT_PROVIDER, "deepseek");
         assert_eq!(DEEPSEEK.models[0], "deepseek-flash");
         assert_eq!(ZAI_CODING_CN.models[0], "glm-5.3-flash");
         assert_eq!(MINIMAX.models[0], "MiniMax-M3");
+        assert_eq!(MIMO.models[0], "mimo-v2.5-pro");
         // Every preset offers something to pick, and `models[0]` is what the
         // startup fallback reads: an empty list would panic there.
         for p in PROVIDERS {
             assert!(!p.models.is_empty(), "{} offers no model", p.id);
             assert!(!p.id.contains('/'), "a provider id may not carry a slash");
         }
-        // The three backends cap a single answer differently; all are ceilings
+        // The four backends cap a single answer differently; all are ceilings
         // well above the defaults they replace.
         assert_eq!(DEEPSEEK.max_tokens, 384_000);
         assert_eq!(ZAI_CODING_CN.max_tokens, 128_000);
         assert_eq!(MINIMAX.max_tokens, 131_072);
+        assert_eq!(MIMO.max_tokens, 131_072);
         assert!(ZAI_CODING_CN.url.contains("open.bigmodel.cn"));
-        // The wire split: the first two speak the OpenAI shape, MiniMax the
-        // Anthropic one, on its own messages endpoint.
+        // The wire split: the first two speak the OpenAI chat shape, MiniMax
+        // the Anthropic one, MiMo the OpenAI Responses one — each preset naming
+        // the endpoint the wire is spoken at.
         assert_eq!(DEEPSEEK.wire, Wire::OpenAi);
         assert_eq!(ZAI_CODING_CN.wire, Wire::OpenAi);
         assert_eq!(MINIMAX.wire, Wire::Anthropic);
+        assert_eq!(MIMO.wire, Wire::Responses);
         assert!(MINIMAX.url.contains("/anthropic/v1/messages"));
+        assert!(MIMO.url.ends_with("/v1/responses"));
         // The Anthropic wire carries no reasoning_effort: its effort slots are
-        // the thinking switch, and `send_thinking` (an OpenAi-wire field) is
-        // out of service.
+        // the thinking switch, and `send_thinking` (a chat-wire field) is out of
+        // service on both other wires too — on the Responses wire the tier is
+        // `reasoning.effort`, which is the same knob by another name.
         assert_eq!(MINIMAX.efforts, &["on", "off"]);
         assert_eq!(MINIMAX.default_effort, "on");
+        assert_eq!(MIMO.efforts, &["none", "low", "medium", "high"]);
+        assert_eq!(MIMO.default_effort, "high");
         // Through the lookup, so the assertion reads a runtime value rather
         // than folding a const away.
         assert!(!provider("minimax").unwrap().send_thinking);
+        assert!(!provider("mimo").unwrap().send_thinking);
     }
 
     #[test]
@@ -353,15 +402,21 @@ mod tests {
             Some("low")
         );
         assert_eq!(MINIMAX.fit_effort(Some("off")).as_deref(), Some("off"));
+        // MiMo spells its own tiers, one of which is shared with DeepSeek's
+        // list — `low` means the same word on both, so a switch keeps it.
+        assert_eq!(MIMO.fit_effort(Some("low")).as_deref(), Some("low"));
+        assert_eq!(MIMO.fit_effort(Some("none")).as_deref(), Some("none"));
         // One it does not offer is replaced by its own default: MiniMax has a
         // thinking switch, not DeepSeek's tiers, and DeepSeek would answer a
         // request carrying `on` with a 400.
         assert_eq!(MINIMAX.fit_effort(Some("max")).as_deref(), Some("on"));
         assert_eq!(DEEPSEEK.fit_effort(Some("on")).as_deref(), Some("max"));
+        assert_eq!(MIMO.fit_effort(Some("max")).as_deref(), Some("high"));
         // A session that stored no tier keeps storing none: the provider's
         // default is already what the request falls back to.
         assert_eq!(DEEPSEEK.fit_effort(None), None);
         assert_eq!(MINIMAX.fit_effort(None), None);
+        assert_eq!(MIMO.fit_effort(None), None);
     }
 
     #[test]
