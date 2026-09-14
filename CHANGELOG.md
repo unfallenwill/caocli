@@ -6,6 +6,45 @@ semantic-version bumps per release.
 
 ## [Unreleased]
 
+### Added — render markdown in the answer and the thinking block
+
+- The screen and plain front ends used to lay the model's output down as
+  raw text: a heading rendered as `# Title`, a list as `- one\n- two`,
+  a fenced code block as a fence line of backticks followed by the body.
+  Both front ends now parse a CommonMark-flavoured fragment (paragraphs,
+  emphasis, strong, strikethrough, inline code, fenced and indented
+  code blocks, headings, ordered and unordered lists, task-list
+  markers, block quotes, thematic rules, links, images, hard and soft
+  line breaks) and emit the styled spans the cell layer already speaks:
+  bold runs paint yellow, code runs paint dim, headings lead with `##`,
+  list items with `- ` or `1. `, blockquote lines with `> `. Tables fall
+  back to the indented raw source, because column-aligned rendering is
+  the one thing our wrap step cannot do and pretending otherwise would
+  draw a worse table than the source already is. The parser lives at the
+  cell layer (`src/ui/cell/markdown.rs`), so both front ends, live
+  streaming and session replay, see the same answer to the same source.
+  HTML, footnotes and math are dropped silently -- emitting the raw
+  bytes would put angle brackets on the screen.
+
+### Changed — system prompt tells the model what the TUI renders
+
+- The system prompt used to be one paragraph: the role, the routing
+  rule, and a `Keep answers concise` reminder. The model defaulted to
+  GitHub-Flavored Markdown regardless, so a heading or a code block
+  landed on the screen as raw markers when the cell layer had not been
+  told how to read them. The prompt now carries a short `Formatting:`
+  paragraph that says: use GFM where it makes the answer easier to
+  scan; reserve lists, fenced code blocks, and headings for substantive
+  answers and leave short replies as plain sentences; inline commands,
+  file paths, and env vars between backticks; the TUI renders fenced
+  and inline code, emphasis, lists, blockquotes, and headings, tables
+  show as raw indented markdown, HTML and footnotes do not render so
+  emit plain text instead. The two frozen wire-prefix snapshots
+  (`the_request_prefix_is_frozen` and
+  `the_anthropic_request_prefix_is_frozen`) were updated to match: by
+  design they fail on any change to the system prompt, so the cache
+  contract is revisited every time the wording moves.
+
 ### Changed — the transcript fills the terminal
 
 - The screen front end used to lay every line out to at most 100 columns,

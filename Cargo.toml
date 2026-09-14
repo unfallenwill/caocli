@@ -19,6 +19,11 @@ anthropic = { package = "caocli-anthropic", path = "crates/anthropic" }
 # speak the OpenAI shape with vendor extensions, and the SDK handles HTTP,
 # retries, and SSE framing so the agent's only job is the delta stream.
 openai = { package = "caocli-openai", path = "crates/openai" }
+# Markdown rendering for the answer and the thinking block. Pulled with no
+# default features and only the extensions we render -- tables, strikethrough,
+# task-list checkboxes -- so the binary stays small and there is no
+# syntax-highlighting or HTML path we would have to ignore.
+pulldown-cmark = { version = "0.13", default-features = false }
 anyhow = "1.0.104"
 bytes = "1.12.1"
 chrono = { version = "0.4.45", features = ["clock"] }

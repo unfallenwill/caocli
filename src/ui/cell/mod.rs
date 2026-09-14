@@ -25,11 +25,12 @@ use super::text;
 
 mod call;
 pub(super) mod layout;
+mod markdown;
 pub(super) mod question;
 mod replay;
 pub(super) mod sink;
 mod step;
-pub(super) mod stream;
+mod stream;
 mod todos;
 pub(super) mod wrap;
 
@@ -478,8 +479,8 @@ impl Cell {
                 }
                 spans
             }
-            Cell::Reasoning(text) => vec![Span::new(Style::Reasoning, text.as_str())],
-            Cell::Content(text) => vec![Span::new(Style::Plain, text.as_str())],
+            Cell::Reasoning(text) => markdown::parse(text, Style::Reasoning),
+            Cell::Content(text) => markdown::parse(text, Style::Plain),
             Cell::Step(step) => step.spans_with(verbose),
             Cell::Notice(text) => vec![Span::new(Style::Dim, text.as_str())],
             Cell::Failure(text) => vec![Span::new(Style::Red, format!("error: {text}"))],
