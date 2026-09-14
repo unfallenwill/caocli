@@ -66,7 +66,7 @@ place for a key to hide in.
 | `/model` | Choose a model, named `<provider id>/<modelid>` (`deepseek/deepseek-v4-pro`, `zai-coding-cn/glm-5.3`); it switches the model and, when the name carries another provider, the backend with it |
 | `/effort` | Choose the reasoning effort tier — the list is the provider in use's own (`low`, `high`, `max`), with the one in effect marked; the choice is stored in the session, so a resume keeps it |
 | `/image <path> [text]` | Ask about a picture: the image is read and sent with the text that follows the path (none is fine). A path with spaces in it may be quoted with `"` or `'` |
-| `/mcp` | Show the MCP servers of this session: which came up, what they call themselves, and the names their tools are offered under ([MCP servers](#mcp-servers)) |
+| `/mcp` | Show the MCP servers of this session: which came up, what they call themselves, and the names their tools are offered under ([MCP servers](#mcp-servers)). Subcommands (see below): `list`, `enable <name>`, `disable <name>`, `reconnect <name>`, `disconnect <name>` |
 | `/exit`, `/quit`, `/q` | Quit |
 
 `/login` asks for the key as a question rather than as a line: the prompt is
@@ -448,6 +448,21 @@ defines, and its process does not outlive the session that started it. This
 client serves no roots, sampling or elicitation of its own — it offers a server's
 tools to the model and runs them — and refuses those by name rather than leaving
 a server waiting for an answer that is not coming.
+
+A server's tools can be taken offline and brought back at runtime, without
+restarting the session. The bare `/mcp` is the long report; `/mcp <subcommand>`
+is the runtime control surface:
+
+| Subcommand | Effect |
+|---|---|
+| `/mcp list` | One row per server: name, state (`ready` / `failed` / `disabled` / `disconnected`), and the count of its tools the model currently sees |
+| `/mcp disable <name>` | Close a ready server's connection and park it in `disabled`. Its tools disappear from the offered set; calls to them come back as `error: … is disabled; enable it with /mcp enable <name>` |
+| `/mcp enable <name>` | Reopen a `disabled` server with the stored configuration and put its tools back on the wire |
+| `/mcp disconnect <name>` | Close a ready server's connection without touching its configuration. Parked in `disconnected` |
+| `/mcp reconnect <name>` | Reopen any server — works from `ready`, `failed`, `disabled`, or `disconnected`. The operator one-stop for "try again" |
+
+State lives only in memory: a `disable` is not written back to `.mcp.json`, and
+the next session starts with whatever the file says.
 
 What this client implements of the specification (the 2025-06-18 revision):
 
