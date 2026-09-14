@@ -39,6 +39,7 @@ mod status;
 mod status_bar;
 mod terminal;
 pub(crate) mod text;
+pub(crate) mod theme;
 pub mod tui;
 
 pub use answers::{Sigint, StdinApproval, StdinQuestions};
