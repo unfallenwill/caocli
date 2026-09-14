@@ -295,6 +295,115 @@ fn validate_sequence(s: u64, next: &mut u64, path: &Path) -> Result<()> {
 }
 
 // ============================================================================
+// Event payload types (the body of an `ev` line).
+//
+// The wire vocabulary is documented in `docs/session-format.md`. The
+// shapes here match it exactly; the `Ev` enum in `V1Line` flattens one
+// of these into a JSON object together with the envelope fields.
+// ============================================================================
+
+/// The wire a request was carried on. Used by `request_prefix` and
+/// `request` events so a reader knows which recipe to rebuild the body
+/// with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireKind {
+    /// OpenAI Chat Completions.
+    #[serde(rename = "openai-chat")]
+    OpenAiChat,
+    /// Anthropic Messages.
+    #[serde(rename = "anthropic-messages")]
+    AnthropicMessages,
+}
+
+/// What the request carried before the messages: the wire, the
+/// endpoint, the system prompt, the tool list and the parameters.
+/// A reader takes the last `request_prefix` before a `request` event
+/// to know what prefix to rebuild the body under.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestPrefix {
+    pub wire: WireKind,
+    pub endpoint: String,
+    pub system_prompt: String,
+    pub tools: Vec<caocli_core::ToolDef>,
+    pub parameters: serde_json::Value,
+}
+
+/// One HTTP attempt to send a request: the wire and endpoint the
+/// attempt was made on, the model id, the body digest, the attempt
+/// number (1 for the first try, 2+ for SDK-driven retries), the
+/// `sequence` of the last `msg` line that went into the body, and the
+/// duration the request took end-to-end on the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Request {
+    pub wire: WireKind,
+    pub endpoint: String,
+    pub model: String,
+    pub body_sha256: String,
+    pub attempt: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_through_sequence: Option<u64>,
+    pub duration_ms: i64,
+}
+
+/// What the backend answered: the wire's `finish_reason`, whether the
+/// answer was truncated, the model id and the duration of the read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Reply {
+    pub usage: serde_json::Value,
+    pub finish_reason: String,
+    pub truncated: bool,
+    pub duration_ms: i64,
+    pub model: String,
+}
+
+/// The harness's view of one declared tool call: who approved it
+/// (`automatic` for calls that never asked, `user` for those that did)
+/// and the verdict.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Gate {
+    pub tool_call_id: String,
+    pub decided_by: String,
+    pub verdict: String,
+}
+
+/// The harness's closing of a declared tool call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallEnd {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+}
+
+/// Why a turn ended.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Stop {
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// A typed event the harness can append to the log. The envelope
+/// fields (`sequence`, `timestamp_ms`, `turn`, `kind`,
+/// `source_sequences`, `ignorable`) are filled in by `append_event`;
+/// the `ev` line's payload is the rest of the struct's fields,
+/// flattened onto the JSON object.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[allow(dead_code)] // `Gate`/`CallEnd`/`Stop` are wired by future
+// tool-execution commits; the surface is here so
+// a reader that walks a v1 file sees the full set.
+pub enum Event {
+    RequestPrefix(RequestPrefix),
+    Request(Request),
+    Reply(Reply),
+    Gate(Gate),
+    CallEnd(CallEnd),
+    Stop(Stop),
+}
+
+// ============================================================================
 // Migration helpers.
 //
 // `migrate::migrate_v0_to_v1` writes a v1 file under a caller-chosen path
@@ -566,9 +675,16 @@ impl Session {
                             messages.push(message);
                         }
                         V1Line::Meta { meta: m, .. } => meta = m,
-                        V1Line::Ev { .. } => {
-                            // Events are not yet emitted by any writer in
-                            // this commit; skip them silently.
+                        V1Line::Ev { sequence, .. } => {
+                            // Events that fail to parse are dropped
+                            // silently: they describe lines already
+                            // present, and a sequence mismatch here is
+                            // not a fold error (it cannot change the
+                            // messages). But a duplicate or a gap is a
+                            // sign of corruption and worth surfacing.
+                            if let Some(s) = sequence {
+                                validate_sequence(s, &mut next_sequence, path)?;
+                            }
                         }
                     }
                 }
@@ -673,6 +789,56 @@ impl Session {
         }
         self.meta = meta;
         Ok(())
+    }
+
+    /// Append a typed event (`request_prefix`, `request`, `reply`, ...)
+    /// to the log. Only v1 sessions accept events; a v0 session
+    /// refuses because events are part of the schema that v0 does not
+    /// carry.
+    pub fn append_event(&mut self, ev: Event) -> Result<()> {
+        if self.dialect != Dialect::V1 {
+            bail!("events are only supported in v1 dialect");
+        }
+        let (kind_str, payload) = match serde_json::to_value(&ev)? {
+            serde_json::Value::Object(mut map) => {
+                let kind_str = match map.remove("type") {
+                    Some(serde_json::Value::String(s)) => s,
+                    Some(other) => bail!("event payload type tag is not a string: {other}"),
+                    None => bail!("event payload has no type tag"),
+                };
+                (kind_str, serde_json::Value::Object(map))
+            }
+            other => bail!("event payload is not an object: {other}"),
+        };
+        self.next_sequence += 1;
+        write_v1_line(
+            &mut self.file,
+            &V1Line::Ev {
+                sequence: Some(self.next_sequence),
+                timestamp_ms: Some(Utc::now().timestamp_millis()),
+                turn: if self.current_turn == 0 {
+                    None
+                } else {
+                    Some(self.current_turn)
+                },
+                kind: kind_str,
+                source_sequences: Vec::new(),
+                ignorable: true,
+                payload,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// The `sequence` number of the last line written, or `None` if
+    /// nothing has been written yet. Used to stamp
+    /// `history_through_sequence` on a `request` event.
+    pub fn last_sequence(&self) -> Option<u64> {
+        if self.next_sequence == 0 {
+            None
+        } else {
+            Some(self.next_sequence)
+        }
     }
 }
 
@@ -1759,6 +1925,76 @@ mod tests {
         assert_eq!(infos[0].id, s.id);
         assert_eq!(infos[0].message_count, 1);
         assert_eq!(infos[0].preview, "find the bug");
+        drop(s);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ----- G5: events on a v1 session -----
+
+    #[test]
+    fn append_event_writes_an_ev_line_with_envelope() {
+        let dir = tmpdir();
+        let mut s = Session::create(&dir, test_meta()).unwrap();
+        s.append_message(&Message::user("hi")).unwrap();
+        let before = s.last_sequence();
+        s.append_event(Event::Reply(Reply {
+            usage: serde_json::json!({"prompt_tokens": 12, "completion_tokens": 4}),
+            finish_reason: "stop".into(),
+            truncated: false,
+            duration_ms: 100,
+            model: "m".into(),
+        }))
+        .unwrap();
+        let after = s.last_sequence();
+        assert_eq!(after, before.map(|n| n + 1), "sequence advances by one");
+        let bytes = std::fs::read_to_string(&s.path).unwrap();
+        assert!(bytes.contains(r#""type":"ev""#), "ev line type: {bytes}");
+        assert!(bytes.contains(r#""kind":"reply""#), "kind tag: {bytes}");
+        assert!(
+            bytes.contains(r#""ignorable":true"#),
+            "the kind is ignorable: {bytes}"
+        );
+        assert!(
+            bytes.contains(r#""prompt_tokens":12"#),
+            "the payload is flattened, not wrapped: {bytes}"
+        );
+        drop(s);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn append_event_refuses_v0_dialect() {
+        let dir = tmpdir();
+        let path = dir.join("legacy.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"t":"header","id":"legacy","created_at":1,"model":"m"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut s = Session::load(&path).unwrap();
+        assert_eq!(s.dialect, Dialect::V0);
+        let err = match s.append_event(Event::Stop(Stop {
+            reason: "answered".into(),
+            detail: None,
+        })) {
+            Ok(_) => panic!("append_event must fail on a v0 session"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("v1 dialect"),
+            "the error names the cause: {err:#}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn last_sequence_is_none_on_a_fresh_session() {
+        let dir = tmpdir();
+        let s = Session::create(&dir, test_meta()).unwrap();
+        assert!(s.last_sequence().is_none());
         drop(s);
         std::fs::remove_dir_all(&dir).unwrap();
     }

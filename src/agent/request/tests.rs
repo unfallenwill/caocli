@@ -7,7 +7,7 @@
 //! as a literal — for each wire.
 
 use crate::provider;
-use crate::session::SessionMeta;
+use crate::session::{SessionMeta, WireKind};
 use crate::types::{
     Content, FunctionDef, Message, Role, ThinkingBlock, ToolCall, ToolCallFunction, ToolDef,
     WireRequest,
@@ -879,4 +879,52 @@ fn a_session_that_switched_wires_strips_the_other_wires_thinking() {
     // The log's own message is untouched: stripping is on the send path.
     assert!(carried.thinking.is_some());
     carried.thinking = None;
+}
+
+// ============================================================================
+// G5: the trace's prefix snapshot is the wire shape.
+// ============================================================================
+
+#[test]
+fn request_prefix_for_deepseek_records_openai_chat_wire_and_endpoint() {
+    let prefix = super::request_prefix(&provider::DEEPSEEK, &test_meta(), &[]);
+    assert_eq!(prefix.wire, WireKind::OpenAiChat);
+    assert!(
+        prefix.endpoint.ends_with("/chat/completions"),
+        "openai endpoint ends with /chat/completions: {}",
+        prefix.endpoint
+    );
+    assert!(prefix.system_prompt.starts_with("You are caocli"));
+    assert!(
+        prefix.parameters.get("reasoning_effort").is_some(),
+        "the parameter block carries the effort tier: {:?}",
+        prefix.parameters
+    );
+    assert_eq!(
+        prefix.parameters.get("tool_choice"),
+        Some(&serde_json::json!("auto"))
+    );
+}
+
+#[test]
+fn request_prefix_for_minimax_records_anthropic_wire_and_joined_system() {
+    let mut meta = test_meta();
+    meta.instructions = Some("project notes".into());
+    let prefix = super::request_prefix(&provider::MINIMAX, &meta, &[]);
+    assert_eq!(prefix.wire, WireKind::AnthropicMessages);
+    assert!(
+        prefix.endpoint.ends_with("/messages"),
+        "anthropic endpoint ends with /messages: {}",
+        prefix.endpoint
+    );
+    assert!(
+        prefix.system_prompt.contains("project notes"),
+        "instructions are folded into the system prompt: {:?}",
+        prefix.system_prompt
+    );
+    assert!(
+        prefix.system_prompt.contains("You are caocli"),
+        "system prompt is also there: {:?}",
+        prefix.system_prompt
+    );
 }

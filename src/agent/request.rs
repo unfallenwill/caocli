@@ -6,11 +6,89 @@
 //! That is the cache contract made visible — the same three inputs must produce
 //! the same bytes, because the backend's prefix cache matches on them.
 
+use serde_json::Value as JsonValue;
 use serde_json::json;
+
+use crate::provider::{Provider, Wire};
+use crate::session::{RequestPrefix, WireKind};
+
+/// Extract the trace event that describes what the request carried before
+/// the messages: the wire, the endpoint, the system prompt (verbatim),
+/// the tool list, and the parameters. The returned struct is what the
+/// trace records as a `request_prefix` event so a reader rebuilding
+/// the body knows the prefix.
+pub fn request_prefix(
+    provider: &Provider,
+    meta: &SessionMeta,
+    mcp: &[caocli_core::ToolDef],
+) -> RequestPrefix {
+    let wire = match provider.wire {
+        Wire::OpenAi => WireKind::OpenAiChat,
+        Wire::Anthropic => WireKind::AnthropicMessages,
+    };
+    let endpoint = match wire {
+        WireKind::OpenAiChat => format!("{}/chat/completions", provider.url),
+        WireKind::AnthropicMessages => format!("{}/messages", provider.url),
+    };
+    let tools = {
+        let mut tools = crate::tools::definitions();
+        tools.extend_from_slice(mcp);
+        tools
+    };
+    let parameters = build_parameters(provider, meta);
+    let system_prompt = match provider.wire {
+        Wire::OpenAi => {
+            // On the OpenAI wire the system prompt is the first message,
+            // not a top-level field. Recording it here means a reader has
+            // both shapes available for verification.
+            crate::agent::request::SYSTEM_PROMPT.to_string()
+        }
+        Wire::Anthropic => {
+            // The Anthropic wire joins the system prompt and the session's
+            // stored instructions with "\n\n"; the trace records that
+            // joined form because it is what the request carried.
+            let mut s = vec![crate::agent::request::SYSTEM_PROMPT.to_string()];
+            if let Some(text) = meta.instructions.as_deref().filter(|t| !t.is_empty()) {
+                s.push(text.to_string());
+            }
+            s.join("\n\n")
+        }
+    };
+    RequestPrefix {
+        wire,
+        endpoint,
+        system_prompt,
+        tools,
+        parameters,
+    }
+}
+
+/// The parameters block, in the shape the wire expects: `max_tokens`,
+/// `tool_choice`, `stream`, the vendor `thinking` and `reasoning_effort`
+/// flags when in force. Stored as a generic `Value` so the trace is
+/// faithful to what was sent and does not require us to enumerate every
+/// vendor field here.
+fn build_parameters(provider: &Provider, meta: &SessionMeta) -> JsonValue {
+    let mut p = serde_json::Map::new();
+    p.insert("max_tokens".into(), json!(provider.max_tokens));
+    p.insert("tool_choice".into(), json!("auto"));
+    p.insert("stream".into(), json!(true));
+    if provider.send_thinking {
+        p.insert("thinking".into(), json!({"type": "enabled"}));
+    }
+    if let Some(tier) = meta
+        .reasoning_effort
+        .as_deref()
+        .or(Some(provider.default_effort))
+    {
+        p.insert("reasoning_effort".into(), json!(tier));
+    }
+    JsonValue::Object(p)
+}
 
 use crate::api;
 use crate::machine;
-use crate::provider::{self, Wire};
+use crate::provider;
 use crate::session::SessionMeta;
 use crate::tools;
 use crate::types::{Message, ToolDef, WireRequest};

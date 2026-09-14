@@ -229,7 +229,7 @@ impl Message {
 /// The request as the wire that carries it sees it. The client refuses to
 /// send one shape onto the other wire, so a preset and a request can never
 /// disagree silently.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum WireRequest {
     /// OpenAI: the SDK's request type, boxed because it carries an
     /// `extra_body` map and a long `messages` vector that would make every

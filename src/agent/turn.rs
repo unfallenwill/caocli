@@ -19,7 +19,24 @@ use crate::tools;
 use crate::types::{Message, ToolCall};
 use crate::ui::{Approve, Ask, Cancel, Ui, Verdict};
 
+use super::request;
 use super::{Agent, Approval};
+
+/// Translate a `Usage` from its wire-private shape into the four-field
+/// normalized form the trace stores. Both backends' shapes fold into
+/// the same `cache_hit_tokens` / `cache_miss_tokens` pair (see
+/// `types::Usage::cache`); a reader rebuilding the trace does not have
+/// to know which wire the session ran on.
+fn normalize_usage_for_trace(usage: &crate::types::Usage) -> serde_json::Value {
+    use serde_json::json;
+    let (hit, miss) = usage.cache().map(|c| (c.hit, c.miss)).unwrap_or((0, 0));
+    json!({
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "cache_hit_tokens": hit,
+        "cache_miss_tokens": miss,
+    })
+}
 
 /// What one beat did to the turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,14 +216,59 @@ impl Turn<'_> {
     /// One sub-request. A cancel drops the stream and writes nothing: the log
     /// stays at a valid prefix, and the cleanup closes what the turn left open.
     async fn call_model(&mut self) -> Result<Step> {
+        let start = std::time::Instant::now();
         let request = self.agent.build_request().await;
+        // Compute the prefix and the body digest before sending. Both
+        // are written to the trace on a v1 session so a reader can
+        // verify the wire bytes from the recipe.
+        let mcp_defs = self.agent.mcp.definitions().await;
+        let prefix =
+            request::request_prefix(&self.agent.provider, &self.agent.session.meta, &mcp_defs);
+        // The body for hashing is the wire's own request, not the
+        // `WireRequest` enum wrapping it: `WireRequest` serialises
+        // externally-tagged (`{"OpenAi":{...}}`), which is not the
+        // shape the SDK put on the wire. Hash the inner body directly.
+        let body_value = match &request {
+            crate::types::WireRequest::OpenAi(b) => serde_json::to_value(&**b)?,
+            crate::types::WireRequest::Anthropic(b) => serde_json::to_value(&**b)?,
+        };
+        let body_sha256 = crate::canonical::canonical_sha256_hex(&body_value);
+        let history_through = self.agent.session.last_sequence();
+        if self.agent.session.dialect == crate::session::Dialect::V1 {
+            self.agent
+                .session
+                .append_event(crate::session::Event::RequestPrefix(prefix.clone()))?;
+            self.agent
+                .session
+                .append_event(crate::session::Event::Request(crate::session::Request {
+                    wire: prefix.wire,
+                    endpoint: prefix.endpoint.clone(),
+                    model: self.agent.session.meta.model.clone(),
+                    body_sha256: body_sha256.clone(),
+                    attempt: 1,
+                    history_through_sequence: history_through,
+                    duration_ms: 0, // updated after the stream completes
+                }))?;
+        }
         let reply = match race(self.cancel, self.agent.stream_reply(&request, self.ui)).await {
             Ran::Finished(reply) => reply?,
             Ran::Cancelled => return Ok(self.stop()),
         };
+        let elapsed_ms = start.elapsed().as_millis() as i64;
         self.agent.session.append_message(&reply.message)?;
         if let Some(usage) = &reply.usage {
             self.ui.usage(usage, reply.stream_time);
+            if self.agent.session.dialect == crate::session::Dialect::V1 {
+                self.agent
+                    .session
+                    .append_event(crate::session::Event::Reply(crate::session::Reply {
+                        usage: normalize_usage_for_trace(usage),
+                        finish_reason: reply.finish_reason.clone().unwrap_or_else(|| "stop".into()),
+                        truncated: reply.truncation().is_some(),
+                        duration_ms: elapsed_ms,
+                        model: self.agent.session.meta.model.clone(),
+                    }))?;
+            }
         }
         // An answer that was cut off is in the log as it arrived, and the
         // person watching is told why it stops mid-thought.

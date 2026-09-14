@@ -1561,3 +1561,92 @@ async fn stream_time_opens_at_the_first_delta() {
     drop(agent);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ============================================================================
+// G5: a real turn writes a request_prefix, a request, and a reply event,
+// and the request's body_sha256 is the canonical sha256 of the body the
+// agent actually sent.
+// ============================================================================
+
+#[tokio::test]
+async fn a_real_turn_writes_events_and_body_sha256_verifies() {
+    use crate::canonical::canonical_sha256_hex;
+    use crate::session::{Dialect, Reply, Request, RequestPrefix, WireKind};
+
+    let server = MockServer::start().await;
+    let turn = [
+        sse(
+            json!({"content":"hello"}),
+            Some("stop"),
+            Some(json!({"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":10})),
+        ),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    mount_chat(&server, turn, Some(1)).await;
+
+    let dir = tmpdir();
+    let mut agent = test_agent(&server, &dir);
+    let mut ui = Renderer::new();
+    agent
+        .turn(
+            "say hello",
+            &mut ui,
+            &mut NoCancel,
+            &mut Answer::denies(),
+            &mut NoQuestions,
+        )
+        .await
+        .unwrap();
+    drop(agent);
+
+    let session_path = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path();
+    let loaded = crate::session::Session::load(&session_path).unwrap();
+    assert_eq!(loaded.dialect, Dialect::V1);
+
+    let bytes = std::fs::read(&loaded.path).unwrap();
+    let mut prefixes = Vec::new();
+    let mut requests = Vec::new();
+    let mut replies = Vec::new();
+    for raw in bytes.split(|c: &u8| *c == b'\n') {
+        let s = std::str::from_utf8(raw).unwrap_or("");
+        if !s.contains("\"type\":\"ev\"") {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(s).unwrap();
+        match v.get("kind").and_then(|k| k.as_str()) {
+            Some("request_prefix") => prefixes.push(v),
+            Some("request") => requests.push(v),
+            Some("reply") => replies.push(v),
+            _ => {}
+        }
+    }
+    assert_eq!(prefixes.len(), 1, "exactly one request_prefix");
+    assert_eq!(requests.len(), 1, "exactly one request");
+    assert_eq!(replies.len(), 1, "exactly one reply");
+
+    let prefix: RequestPrefix = serde_json::from_value(prefixes[0].clone()).unwrap();
+    assert_eq!(prefix.wire, WireKind::OpenAiChat);
+    let request: Request = serde_json::from_value(requests[0].clone()).unwrap();
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+    let expected_hash = canonical_sha256_hex(&body);
+    assert_eq!(
+        request.body_sha256, expected_hash,
+        "the recorded body_sha256 must be the canonical sha256 of the body the agent sent"
+    );
+    let reply: Reply = serde_json::from_value(replies[0].clone()).unwrap();
+    assert_eq!(reply.finish_reason, "stop");
+    assert!(!reply.truncated);
+    assert_eq!(reply.usage["prompt_tokens"], json!(10));
+    assert_eq!(reply.usage["cache_hit_tokens"], json!(0));
+
+    drop(loaded);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
