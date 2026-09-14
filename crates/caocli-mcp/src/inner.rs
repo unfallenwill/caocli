@@ -26,16 +26,64 @@ struct Route {
 }
 
 /// The state of one server, as the hub sees it.
+///
+/// A summary view over the internal [`ServerState`]: the external callers
+/// do not need to see the [`Connection`] held inside `Ready`, so the public
+/// type is a flat enum that fits a `Vec` for `/mcp list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerState {
+    /// It came up and is offering its tools to the model.
+    Ready,
+    /// It did not, and this is what there is to say about it.
+    Failed(String),
+    /// It was deliberately taken out of service. The connection has been
+    /// closed; the configuration is still on file and a reconnect is one
+    /// command away.
+    Disabled,
+    /// Its connection was closed on purpose but its configuration has not
+    /// been touched. A `reconnect` brings it back; an `enable` would also.
+    Disconnected,
+}
+
+/// What `/mcp list` reports for one server: the name, the state it stands
+/// in, and how many of its tools are currently being offered to the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerStatus {
+    pub name: String,
+    pub state: ServerState,
+    pub tools_count: usize,
+}
+
+/// The state of one server, as the hub sees it.
 #[allow(clippy::large_enum_variant)] // The actor task owns this; boxing Connection would
-                                    // add a heap indirection the only consumer never shares.
-enum ServerState {
-    /// It came up, and it offered this many tools.
+// add a heap indirection the only consumer never shares.
+enum InternalState {
+    /// It came up, and it offered these tools (the server's own names, in the
+    /// order the connection reported them).
     Ready {
         connection: Connection,
         tools: Vec<String>,
     },
     /// It did not, and this is what there is to say about it.
     Failed(String),
+    /// It was deliberately taken out of service. The configuration is kept
+    /// so an `enable` can bring it back without rereading the file.
+    Disabled,
+    /// Its connection was closed; the configuration is kept for the same
+    /// reason as `Disabled`.
+    Disconnected,
+}
+
+impl InternalState {
+    /// The summary callers see, without the `Connection` inside.
+    fn summary(&self) -> ServerState {
+        match self {
+            InternalState::Ready { .. } => ServerState::Ready,
+            InternalState::Failed(why) => ServerState::Failed(why.clone()),
+            InternalState::Disabled => ServerState::Disabled,
+            InternalState::Disconnected => ServerState::Disconnected,
+        }
+    }
 }
 
 /// Everything `Hub` knows about one configured server — both the parts the
@@ -48,13 +96,12 @@ struct ServerEntry {
     /// The file that named it, so that a server in a project's `.mcp.json` is
     /// told apart from one in the user's own settings.
     from: String,
-    /// The parsed configuration, kept around so a future reconnect does not
-    /// have to re-read the file. `Err` is the same reason the connection
-    /// itself failed, kept here so the report can name it without having to
-    /// look up the file again.
-    #[allow(dead_code)] // Phase 4 reconnect reads this; today nothing does.
+    /// The parsed configuration, kept around so a reconnect does not have
+    /// to re-read the file. `Err` is the reason the connection itself
+    /// failed, kept here so the report can name it without having to look
+    /// up the file again.
     config: Result<config::ServerConfig, String>,
-    state: ServerState,
+    state: InternalState,
 }
 
 /// Every server a session talks to, and the tools they offer between them.
@@ -66,13 +113,12 @@ struct ServerEntry {
 /// every run of the same configuration.
 pub(super) struct HubInner {
     servers: BTreeMap<String, ServerEntry>,
-    /// The tools currently offered to the model, in the order the agent's
-    /// request builder must send them. Two parallel data structures on
-    /// purpose: `tool_order` keeps the position each tool sits at (the order
-    /// matters for KV-cache prefix stability), `offered` keeps the name ->
-    /// tool lookup (the lookup matters for `definitions()` and for
-    /// enable/disable mutations that need to keep `tool_order` in step).
-    tool_order: Vec<String>,
+    /// The public names of the tools each ready server offers, in the order
+    /// the connection reported them. Used to rebuild the offered list at
+    /// `definitions()` time — keeping the order as a per-server list lets
+    /// enable / disable mutate the set of offered tools without re-shuffling
+    /// the others.
+    server_tools: BTreeMap<String, Vec<String>>,
     offered: HashMap<String, ToolDef>,
     /// Public name -> which server offers it and what it is called there.
     routes: HashMap<String, Route>,
@@ -87,7 +133,7 @@ impl HubInner {
     pub(super) fn empty() -> Self {
         Self {
             servers: BTreeMap::new(),
-            tool_order: Vec::new(),
+            server_tools: BTreeMap::new(),
             offered: HashMap::new(),
             routes: HashMap::new(),
             warnings: Vec::new(),
@@ -128,7 +174,7 @@ impl HubInner {
     ) -> Self {
         let mut inner = Self {
             servers: BTreeMap::new(),
-            tool_order: Vec::new(),
+            server_tools: BTreeMap::new(),
             offered: HashMap::new(),
             routes: HashMap::new(),
             warnings,
@@ -144,44 +190,13 @@ impl HubInner {
                             how,
                             from: entry.from,
                             config: entry.config,
-                            state: ServerState::Failed(why),
+                            state: InternalState::Failed(why),
                         },
                     );
                     continue;
                 }
             };
-            let mut offered_names = Vec::with_capacity(connection.tools.len());
-            for tool in &connection.tools {
-                let name = tool_name(&entry.name, &tool.name);
-                if inner.routes.contains_key(&name) {
-                    inner.warnings.push(format!(
-                        "{name}: two tools would carry this name, so the one from {} is not \
-                         offered",
-                        entry.name
-                    ));
-                    continue;
-                }
-                inner.routes.insert(
-                    name.clone(),
-                    Route {
-                        server: entry.name.clone(),
-                        tool: tool.name.clone(),
-                    },
-                );
-                inner.offered.insert(
-                    name.clone(),
-                    ToolDef {
-                        r#type: "function".into(),
-                        function: caocli_core::FunctionDef {
-                            name: name.clone(),
-                            description: tool.description.clone(),
-                            parameters: Some(tool.schema.clone()),
-                        },
-                    },
-                );
-                inner.tool_order.push(name);
-                offered_names.push(tool.name.clone());
-            }
+            let offered_names = inner.add_connection_tools(&entry.name, &connection);
             for note in &connection.notes {
                 inner.warnings.push(format!("{}: {note}", entry.name));
             }
@@ -191,7 +206,7 @@ impl HubInner {
                     how,
                     from: entry.from,
                     config: entry.config,
-                    state: ServerState::Ready {
+                    state: InternalState::Ready {
                         connection,
                         tools: offered_names,
                     },
@@ -217,8 +232,26 @@ impl HubInner {
             // rather than assumed away, because a panic here would end a turn.
             return format!("error: mcp server {} is not connected", route.server);
         };
-        let ServerState::Ready { connection, .. } = &server.state else {
-            return format!("error: mcp server {} is not connected", route.server);
+        let connection = match &server.state {
+            InternalState::Ready { connection, .. } => connection,
+            InternalState::Failed(why) => {
+                return format!(
+                    "error: mcp server {} could not run {}: {why}",
+                    route.server, route.tool
+                );
+            }
+            InternalState::Disabled => {
+                return format!(
+                    "error: mcp server {} is disabled; enable it with /mcp enable {}",
+                    route.server, route.server
+                );
+            }
+            InternalState::Disconnected => {
+                return format!(
+                    "error: mcp server {} is disconnected; reconnect it with /mcp reconnect {}",
+                    route.server, route.server
+                );
+            }
         };
         let arguments = match serde_json::from_str::<Value>(args_json) {
             Ok(Value::Object(fields)) => Value::Object(fields),
@@ -243,9 +276,8 @@ impl HubInner {
     /// can hold onto it without re-asking the actor every turn.
     pub(super) fn definitions(&self) -> Arc<Vec<ToolDef>> {
         Arc::new(
-            self.tool_order
-                .iter()
-                .filter_map(|name| self.offered.get(name))
+            self.tool_order()
+                .filter_map(|n| self.offered.get(n))
                 .cloned()
                 .collect(),
         )
@@ -260,7 +292,7 @@ impl HubInner {
             .servers
             .iter()
             .filter_map(|(name, entry)| match entry.state {
-                ServerState::Ready { .. } => Some(name.as_str()),
+                InternalState::Ready { .. } => Some(name.as_str()),
                 _ => None,
             })
             .collect();
@@ -268,12 +300,19 @@ impl HubInner {
             lines.push(format!(
                 "mcp: {} · {} tools · /mcp names them",
                 ready.join(", "),
-                self.tool_order.len()
+                self.offered.len()
             ));
         }
         for (name, entry) in &self.servers {
-            if let ServerState::Failed(why) = &entry.state {
-                lines.push(format!("mcp: {name} did not start: {why}"));
+            match &entry.state {
+                InternalState::Failed(why) => {
+                    lines.push(format!("mcp: {name} did not start: {why}"));
+                }
+                InternalState::Disabled => lines.push(format!("mcp: {name} is disabled")),
+                InternalState::Disconnected => {
+                    lines.push(format!("mcp: {name} is disconnected"));
+                }
+                InternalState::Ready { .. } => {}
             }
         }
         lines.extend(self.warnings.iter().map(|note| format!("mcp: {note}")));
@@ -293,7 +332,7 @@ impl HubInner {
         let mut lines = Vec::new();
         for (name, entry) in &self.servers {
             match &entry.state {
-                ServerState::Ready { connection, tools } => lines.push(format!(
+                InternalState::Ready { connection, tools } => lines.push(format!(
                     "{name} · {} · {} tools · {} · protocol {} · from {}",
                     entry.how,
                     tools.len(),
@@ -301,24 +340,23 @@ impl HubInner {
                     connection.protocol,
                     entry.from
                 )),
-                ServerState::Failed(why) => lines.push(format!(
+                InternalState::Failed(why) => lines.push(format!(
                     "{name} · {} · did not start: {why} · from {}",
                     entry.how, entry.from
                 )),
+                InternalState::Disabled => lines.push(format!(
+                    "{name} · {} · disabled · from {}",
+                    entry.how, entry.from
+                )),
+                InternalState::Disconnected => lines.push(format!(
+                    "{name} · {} · disconnected · from {}",
+                    entry.how, entry.from
+                )),
             }
-            // The names the model sees, which are the ones a user has to know
-            // to say "that one" about: `mcp__<server>__<tool>`, cut to the
-            // first few rather than printed as a wall. Which names are this
-            // server's is read off the routes rather than puzzled out of the
-            // prefix: a name that collided belongs to the server that got it.
-            let names: Vec<&str> = self
-                .routes
-                .iter()
-                .filter(|(_, route)| route.server == *name)
-                .map(|(public, _)| public.as_str())
-                .collect();
-            if !names.is_empty() {
-                let shown: Vec<&str> = names.iter().take(NAMES_SHOWN).copied().collect();
+            if let Some(names) = self.server_tools.get(name)
+                && !names.is_empty()
+            {
+                let shown: Vec<&str> = names.iter().take(NAMES_SHOWN).map(String::as_str).collect();
                 let rest = names.len() - shown.len();
                 let mut line = format!("  {}", shown.join(", "));
                 if rest > 0 {
@@ -331,13 +369,124 @@ impl HubInner {
         lines
     }
 
+    /// One line per server, with the state it stands in and how many of its
+    /// tools are being offered. What `/mcp list` prints.
+    pub(super) fn list(&self) -> Vec<ServerStatus> {
+        self.servers
+            .iter()
+            .map(|(name, entry)| ServerStatus {
+                name: name.clone(),
+                state: entry.state.summary(),
+                tools_count: match &entry.state {
+                    InternalState::Ready { .. } => {
+                        self.server_tools.get(name).map(Vec::len).unwrap_or(0)
+                    }
+                    _ => 0,
+                },
+            })
+            .collect()
+    }
+
+    /// Bring a `Disabled` server back online: open a fresh connection with
+    /// its stored configuration, and route its tools to the model again.
+    pub(super) async fn enable(&mut self, name: &str) -> Result<(), String> {
+        let entry = self
+            .servers
+            .get(name)
+            .ok_or_else(|| format!("no MCP server named {name:?} is configured"))?;
+        match &entry.state {
+            InternalState::Disabled => {}
+            InternalState::Ready { .. } => {
+                return Err(format!("mcp server {name} is already enabled"));
+            }
+            InternalState::Failed(why) => {
+                return Err(format!("mcp server {name} failed to start: {why}"));
+            }
+            InternalState::Disconnected => {
+                return Err(format!(
+                    "mcp server {name} is disconnected; reconnect instead"
+                ));
+            }
+        }
+        let config = entry
+            .config
+            .as_ref()
+            .map_err(|why| format!("mcp server {name} cannot be enabled: {why}"))?
+            .clone();
+        // Drop the entry borrow before mutating `self`.
+        let connection = Connection::open(&config).await?;
+        self.adopt_connection(name, connection);
+        Ok(())
+    }
+
+    /// Take a `Ready` server offline: close its connection and pull its
+    /// tools out of the offered set. The configuration is kept so an
+    /// `enable` can bring the server back.
+    pub(super) async fn disable(&mut self, name: &str) -> Result<(), String> {
+        let connection = self.take_ready_connection(name)?;
+        connection.shutdown().await;
+        self.remove_server_tools(name);
+        self.servers
+            .get_mut(name)
+            .expect("server still present")
+            .state = InternalState::Disabled;
+        Ok(())
+    }
+
+    /// Reconnect a server in any state: close any live connection, then
+    /// open a fresh one with the stored configuration.
+    pub(super) async fn reconnect(&mut self, name: &str) -> Result<(), String> {
+        let entry = self
+            .servers
+            .get(name)
+            .ok_or_else(|| format!("no MCP server named {name:?} is configured"))?;
+        let config = entry
+            .config
+            .as_ref()
+            .map_err(|why| format!("mcp server {name} cannot be reconnected: {why}"))?
+            .clone();
+        // Close the old connection (if any) before opening the new one.
+        if let Ok(connection) = self.take_ready_connection(name) {
+            connection.shutdown().await;
+        }
+        // Drop any stale tool entries left over from a previous Ready state.
+        self.remove_server_tools(name);
+        match Connection::open(&config).await {
+            Ok(connection) => {
+                self.adopt_connection(name, connection);
+                Ok(())
+            }
+            Err(why) => {
+                self.servers
+                    .get_mut(name)
+                    .expect("server still present")
+                    .state = InternalState::Failed(why);
+                Err(format!("mcp server {name} failed to reconnect"))
+            }
+        }
+    }
+
+    /// Close a `Ready` server's connection without touching its
+    /// configuration. The server sits in `Disconnected` until `reconnect`
+    /// brings it back.
+    pub(super) async fn disconnect(&mut self, name: &str) -> Result<(), String> {
+        let connection = self.take_ready_connection(name)?;
+        connection.shutdown().await;
+        self.remove_server_tools(name);
+        self.servers
+            .get_mut(name)
+            .expect("server still present")
+            .state = InternalState::Disconnected;
+        Ok(())
+    }
+
     /// End every connection: what a session does on its way out, so that the
     /// programs it started do not outlive it.
     pub(super) async fn shutdown_all(&mut self) {
         let mut connections: Vec<Connection> = Vec::new();
         for entry in self.servers.values_mut() {
-            if let ServerState::Ready { connection, .. } =
-                std::mem::replace(&mut entry.state, ServerState::Failed("shut down".into()))
+            if let InternalState::Ready { connection, .. } =
+                std::mem::replace(&mut entry.state, InternalState::Failed("shut down".into()))
             {
                 connections.push(connection);
             }
@@ -349,21 +498,147 @@ impl HubInner {
     /// that a failure stays a sentence.
     fn offered_names(&self) -> String {
         const NAMES_SHOWN: usize = 12;
-        if self.tool_order.is_empty() {
+        if self.offered.is_empty() {
             return "none came up (see /mcp for which servers did not)".to_string();
         }
-        let names: Vec<&str> = self
-            .tool_order
-            .iter()
+        let names: Vec<String> = self
+            .tool_order()
             .take(NAMES_SHOWN)
-            .map(String::as_str)
+            .map(str::to_owned)
             .collect();
-        let rest = self.tool_order.len() - names.len();
+        let rest = self.offered.len() - names.len();
         let mut listed = names.join(", ");
         if rest > 0 {
             listed.push_str(&format!(" (and {rest} more)"));
         }
         listed
+    }
+
+    /// The ordered list of public tool names, ready servers only. The order
+    /// is "all ready servers in name order, each one's tools in the order
+    /// the connection reported them".
+    fn tool_order(&self) -> impl Iterator<Item = &str> {
+        self.server_tools
+            .iter()
+            .filter(|(name, _)| {
+                self.servers
+                    .get(*name)
+                    .is_some_and(|e| matches!(e.state, InternalState::Ready { .. }))
+            })
+            .flat_map(|(_, tools)| tools.iter().map(String::as_str))
+    }
+
+    /// Pull the tools a connection offers into `routes`, `offered`, and
+    /// `server_tools`. Returns the server's own tool names, in the order
+    /// the connection reported them.
+    fn add_connection_tools(&mut self, server: &str, connection: &Connection) -> Vec<String> {
+        let mut names = Vec::with_capacity(connection.tools.len());
+        for tool in &connection.tools {
+            let name = tool_name(server, &tool.name);
+            if self.routes.contains_key(&name) {
+                self.warnings.push(format!(
+                    "{name}: two tools would carry this name, so the one from {server} is not \
+                     offered"
+                ));
+                continue;
+            }
+            self.routes.insert(
+                name.clone(),
+                Route {
+                    server: server.to_string(),
+                    tool: tool.name.clone(),
+                },
+            );
+            self.offered.insert(
+                name.clone(),
+                ToolDef {
+                    r#type: "function".into(),
+                    function: caocli_core::FunctionDef {
+                        name: name.clone(),
+                        description: tool.description.clone(),
+                        parameters: Some(tool.schema.clone()),
+                    },
+                },
+            );
+            names.push(tool.name.clone());
+            self.server_tools
+                .entry(server.to_string())
+                .or_default()
+                .push(name);
+        }
+        names
+    }
+
+    /// Remove every tool of `server` from `offered` and `server_tools`. The
+    /// `routes` table is left alone — a call to a tool whose server has
+    /// been disabled or disconnected should still reach the `call()` method
+    /// and get a state-aware error ("is disabled", "is disconnected")
+    /// rather than a "no such tool" message that confuses the model about
+    /// what changed.
+    fn remove_server_tools(&mut self, server: &str) {
+        if let Some(names) = self.server_tools.remove(server) {
+            for name in &names {
+                self.offered.remove(name);
+            }
+        }
+    }
+
+    /// Take a `Ready` connection out of its server entry, leaving the server
+    /// in `Failed("closing")` until the caller decides the next state. Pulls
+    /// the server's tools out of the offered set so a `Ready -> Ready` cycle
+    /// (e.g. through `reconnect`) does not temporarily advertise two copies
+    /// of the same tool.
+    fn take_ready_connection(&mut self, name: &str) -> Result<Connection, String> {
+        let entry = self
+            .servers
+            .get_mut(name)
+            .ok_or_else(|| format!("no MCP server named {name:?} is configured"))?;
+        match std::mem::replace(&mut entry.state, InternalState::Failed("closing".into())) {
+            InternalState::Ready { connection, .. } => Ok(connection),
+            other => {
+                let reason = match &other {
+                    InternalState::Failed(why) => format!("failed to start: {why}"),
+                    InternalState::Disabled => "is disabled".into(),
+                    InternalState::Disconnected => "is disconnected".into(),
+                    InternalState::Ready { .. } => unreachable!("we just matched it"),
+                };
+                entry.state = other;
+                Err(format!("mcp server {name} {reason}"))
+            }
+        }
+    }
+
+    /// Adopt `connection` as the server's new link: clear any routes the
+    /// server used to advertise (so a re-enabled server's tools do not
+    /// collide with the stale routes left behind from a `disable` or
+    /// `disconnect`), build fresh tool entries, then write the server's
+    /// entry in `Ready { connection, tools }`.
+    fn adopt_connection(&mut self, server: &str, connection: Connection) {
+        // Find every route that belongs to this server and drop it. Done
+        // against `routes` rather than `server_tools` because the latter is
+        // empty after a disable or disconnect, while the former is what
+        // `add_connection_tools` checks for collisions.
+        let stale: Vec<String> = self
+            .routes
+            .iter()
+            .filter(|(_, route)| route.server == server)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in stale {
+            self.routes.remove(&name);
+        }
+        let names = self.add_connection_tools(server, &connection);
+        for note in &connection.notes {
+            self.warnings.push(format!("{server}: {note}"));
+        }
+        let entry = self
+            .servers
+            .get_mut(server)
+            .expect("server was present when the connection opened");
+        entry.state = InternalState::Ready {
+            connection,
+            tools: names,
+        };
     }
 }
 

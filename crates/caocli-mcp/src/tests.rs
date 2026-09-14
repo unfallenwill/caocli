@@ -303,6 +303,150 @@ async fn shutting_the_hub_down_ends_every_server() {
 }
 
 #[tokio::test]
+async fn list_names_every_server_with_its_state_and_tools_count() {
+    let alpha = Stub::new();
+    let beta = Stub::new();
+    let hub = hub_of(vec![
+        named(&alpha, "alpha", &[("STUB_TOOLS", "echo,fail")]),
+        named(&beta, "beta", &[("STUB_TOOLS", "ping")]),
+    ])
+    .await;
+    let statuses = hub.list().await;
+    assert_eq!(
+        statuses,
+        vec![
+            ServerStatus {
+                name: "alpha".into(),
+                state: ServerState::Ready,
+                tools_count: 2,
+            },
+            ServerStatus {
+                name: "beta".into(),
+                state: ServerState::Ready,
+                tools_count: 1,
+            },
+        ]
+    );
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn disable_takes_a_server_out_of_service_and_pulls_its_tools() {
+    let stub = Stub::new();
+    let hub = hub_of(vec![named(&stub, "alpha", &[("STUB_TOOLS", "echo")])]).await;
+    assert_eq!(names(&hub).await, vec!["mcp__alpha__echo"]);
+
+    hub.disable("alpha").await.expect("disable ready server");
+    assert!(names(&hub).await.is_empty(), "the tools are gone");
+
+    let statuses = hub.list().await;
+    assert_eq!(statuses[0].state, ServerState::Disabled);
+    assert_eq!(statuses[0].tools_count, 0);
+
+    // A call to a tool whose server has been disabled goes through the
+    // routes (so the model gets a meaningful reason, not just "no such
+    // tool") and arrives at the Disabled branch.
+    let refused = hub.call("mcp__alpha__echo", "{}").await;
+    assert!(refused.contains("disabled"), "{refused}");
+
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn enable_brings_a_disabled_server_back_with_its_tools() {
+    let stub = Stub::new();
+    let hub = hub_of(vec![named(&stub, "alpha", &[("STUB_TOOLS", "echo")])]).await;
+    hub.disable("alpha").await.unwrap();
+    hub.enable("alpha").await.unwrap();
+    assert_eq!(names(&hub).await, vec!["mcp__alpha__echo"]);
+    let result = hub.call("mcp__alpha__echo", r#"{"text":"again"}"#).await;
+    assert_eq!(result, "called with {text:again}");
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn enable_rejects_servers_that_are_not_disabled() {
+    let stub = Stub::new();
+    let hub = hub_of(vec![named(&stub, "alpha", &[("STUB_TOOLS", "echo")])]).await;
+
+    // Already Ready -> "already enabled".
+    let err = hub.enable("alpha").await.unwrap_err();
+    assert!(err.contains("already enabled"), "{err}");
+
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn disconnect_closes_the_connection_and_enable_again_does_not_work() {
+    let stub = Stub::new();
+    let hub = hub_of(vec![named(&stub, "alpha", &[("STUB_TOOLS", "echo")])]).await;
+    hub.disconnect("alpha").await.unwrap();
+    let statuses = hub.list().await;
+    assert_eq!(statuses[0].state, ServerState::Disconnected);
+
+    // enable rejects a Disconnected server — the operator wants `reconnect`.
+    let err = hub.enable("alpha").await.unwrap_err();
+    assert!(err.contains("disconnected"), "{err}");
+
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn reconnect_restarts_a_disconnected_or_failed_server() {
+    let stub = Stub::new();
+    let hub = hub_of(vec![named(&stub, "alpha", &[("STUB_TOOLS", "echo")])]).await;
+    hub.disconnect("alpha").await.unwrap();
+    hub.reconnect("alpha").await.unwrap();
+    assert_eq!(
+        hub.list().await[0].state,
+        ServerState::Ready,
+        "reconnect brings a Disconnected server back to Ready"
+    );
+    let result = hub.call("mcp__alpha__echo", r#"{"text":"re"}"#).await;
+    assert_eq!(result, "called with {text:re}");
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn disable_then_reconnect_brings_the_server_back() {
+    // The disable/enable cycle goes through state transitions: Ready ->
+    // Disabled -> Ready. `reconnect` is the same shape regardless of the
+    // starting state, so it works from Disabled too.
+    let stub = Stub::new();
+    let hub = hub_of(vec![named(&stub, "alpha", &[("STUB_TOOLS", "echo")])]).await;
+    hub.disable("alpha").await.unwrap();
+    hub.reconnect("alpha").await.unwrap();
+    assert_eq!(hub.list().await[0].state, ServerState::Ready);
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn disable_disconnect_reconnect_on_a_missing_server_errors() {
+    let hub = Hub::empty();
+    assert!(hub.enable("ghost").await.is_err());
+    assert!(hub.disable("ghost").await.is_err());
+    assert!(hub.reconnect("ghost").await.is_err());
+    assert!(hub.disconnect("ghost").await.is_err());
+}
+
+#[tokio::test]
+async fn list_reports_disabled_and_disconnected_states_for_banner() {
+    let stub = Stub::new();
+    let hub = hub_of(vec![named(&stub, "alpha", &[("STUB_TOOLS", "echo")])]).await;
+    hub.disable("alpha").await.unwrap();
+
+    let notes = hub.notes().await;
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("alpha") && n.contains("disabled")),
+        "notes do not mention the disabled server: {notes:?}"
+    );
+
+    hub.shutdown().await;
+}
+
+#[tokio::test]
 async fn the_notes_say_what_is_wrong_with_an_entry_nobody_could_use() {
     // A configuration warning is carried through: it is the same "what
     // happened on the way in" the report is about.

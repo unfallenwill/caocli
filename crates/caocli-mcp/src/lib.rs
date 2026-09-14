@@ -59,6 +59,7 @@ use tokio::sync::{mpsc, oneshot};
 use caocli_core::ToolDef;
 
 use inner::HubInner;
+pub use inner::{ServerState, ServerStatus};
 
 /// What a tool from a server is named, in front of the tool's own name.
 pub const PREFIX: &str = "mcp__";
@@ -148,6 +149,25 @@ enum Command {
     },
     Report {
         reply: oneshot::Sender<Vec<String>>,
+    },
+    List {
+        reply: oneshot::Sender<Vec<ServerStatus>>,
+    },
+    Enable {
+        name: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    Disable {
+        name: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    Reconnect {
+        name: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    Disconnect {
+        name: String,
+        reply: oneshot::Sender<Result<(), String>>,
     },
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -255,6 +275,96 @@ impl Hub {
         rx.await.unwrap_or_default()
     }
 
+    /// One row per server, with the state it stands in and how many of its
+    /// tools are being offered. What `/mcp list` prints.
+    pub async fn list(&self) -> Vec<ServerStatus> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Command::List { reply }).await.is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// Bring a `Disabled` server back online: open a fresh connection with
+    /// its stored configuration, and route its tools to the model again.
+    /// Errors out if the server is in any other state (`Ready`, `Failed`,
+    /// `Disconnected`) or is not configured.
+    pub async fn enable(&self, name: &str) -> Result<(), String> {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(Command::Enable {
+                name: name.to_string(),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return Err("mcp hub is shut down".into());
+        }
+        rx.await
+            .unwrap_or_else(|_| Err("mcp hub dropped the reply".into()))
+    }
+
+    /// Take a `Ready` server offline: close its connection and pull its
+    /// tools out of the offered set. The configuration is kept so an
+    /// `enable` can bring the server back.
+    pub async fn disable(&self, name: &str) -> Result<(), String> {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(Command::Disable {
+                name: name.to_string(),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return Err("mcp hub is shut down".into());
+        }
+        rx.await
+            .unwrap_or_else(|_| Err("mcp hub dropped the reply".into()))
+    }
+
+    /// Reconnect a server in any state: close any live connection, then
+    /// open a fresh one with the stored configuration.
+    pub async fn reconnect(&self, name: &str) -> Result<(), String> {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(Command::Reconnect {
+                name: name.to_string(),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return Err("mcp hub is shut down".into());
+        }
+        rx.await
+            .unwrap_or_else(|_| Err("mcp hub dropped the reply".into()))
+    }
+
+    /// Close a `Ready` server's connection without touching its
+    /// configuration. The server sits in `Disconnected` until `reconnect`
+    /// brings it back.
+    pub async fn disconnect(&self, name: &str) -> Result<(), String> {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(Command::Disconnect {
+                name: name.to_string(),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return Err("mcp hub is shut down".into());
+        }
+        rx.await
+            .unwrap_or_else(|_| Err("mcp hub dropped the reply".into()))
+    }
+
     /// End every connection. Used by [`McpGuard`] on the way out — there is
     /// no public reason to shut a hub down from the inside.
     pub async fn shutdown(&self) {
@@ -288,6 +398,21 @@ where
                 }
                 Command::Report { reply } => {
                     let _ = reply.send(inner.report());
+                }
+                Command::List { reply } => {
+                    let _ = reply.send(inner.list());
+                }
+                Command::Enable { name, reply } => {
+                    let _ = reply.send(inner.enable(&name).await);
+                }
+                Command::Disable { name, reply } => {
+                    let _ = reply.send(inner.disable(&name).await);
+                }
+                Command::Reconnect { name, reply } => {
+                    let _ = reply.send(inner.reconnect(&name).await);
+                }
+                Command::Disconnect { name, reply } => {
+                    let _ = reply.send(inner.disconnect(&name).await);
                 }
                 Command::Shutdown { reply } => {
                     inner.shutdown_all().await;
