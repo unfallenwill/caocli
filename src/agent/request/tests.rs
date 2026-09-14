@@ -845,12 +845,12 @@ fn the_anthropic_request_prefix_is_frozen() {
 }
 
 #[test]
-fn a_session_that_switched_wires_strips_the_other_wires_thinking() {
-    // A session that started on MiniMax and continues on DeepSeek must not
-    // send the Anthropic thinking blocks to a backend that rejects fields it
-    // does not know; the OpenAI request is byte-for-byte what it would have
-    // been without them.
-    let mut carried = Message {
+fn a_session_that_switched_wires_strips_the_other_wires_reasoning() {
+    // A message carries the reasoning under whichever wire it came in on. The
+    // builder for the wire we are sending on reads its own field and drops
+    // the other two — a session that switched providers must not send a
+    // field the new backend rejects. Three cases, one per wire pair.
+    let carried_with_anthropic_thinking = || Message {
         role: Role::Assistant,
         content: Some("done".into()),
         reasoning_content: Some("reasoned".into()),
@@ -862,30 +862,69 @@ fn a_session_that_switched_wires_strips_the_other_wires_thinking() {
         }]),
         reasoning: None,
     };
-    let history = vec![Message::user("hi"), carried.clone()];
+    let carried_with_responses_reasoning = || Message {
+        role: Role::Assistant,
+        content: Some("done".into()),
+        reasoning_content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        thinking: None,
+        reasoning: Some(vec![crate::types::ReasoningItem {
+            id: "rs_1".into(),
+            text: "reasoned".into(),
+        }]),
+    };
+
+    // Sending on the chat wire: the chat wire's own `reasoning_content`
+    // rides back through extra_body; the Anthropic signed block and the
+    // Responses item are both dropped.
+    let chat_history = vec![Message::user("hi"), carried_with_anthropic_thinking()];
     let req = openai_of(&build_request(
         &provider::DEEPSEEK,
         &test_meta(),
-        &history,
+        &chat_history,
         &[],
     ));
-    // The Anthropic-only `thinking` block has no slot on the SDK request —
-    // it is stripped on the send path.
     let assistant_msg = match &req.messages[2] {
         openai::ChatCompletionMessageParam::Assistant(m) => m,
         other => panic!("expected assistant, got {other:?}"),
     };
     assert!(!assistant_msg.extra_body.contains_key("thinking"));
-    // `reasoning_content` is the GLM/DeepSeek-side field: it rides through
-    // the assistant message's extra_body so a session that switched from
-    // OpenAI replays it verbatim.
+    assert!(!assistant_msg.extra_body.contains_key("reasoning"));
     assert_eq!(
         assistant_msg.extra_body.get("reasoning_content"),
         Some(&serde_json::json!("reasoned"))
     );
-    // The log's own message is untouched: stripping is on the send path.
-    assert!(carried.thinking.is_some());
-    carried.thinking = None;
+
+    // Sending on the Anthropic wire: the chat wire's `reasoning_content`
+    // and the Responses item are dropped; only `thinking` reaches the body.
+    let anth_history = vec![Message::user("hi"), carried_with_responses_reasoning()];
+    let req = anthropic_of(&build_request(
+        &provider::MINIMAX,
+        &minimax_meta(Some("on")),
+        &anth_history,
+        &[],
+    ));
+    let v = serde_json::to_value(&req).unwrap();
+    let blocks = v["messages"][1]["content"].as_array().unwrap();
+    assert!(blocks.iter().all(|b| b["type"] != "reasoning"));
+    assert!(v["messages"][1].get("reasoning_content").is_none());
+
+    // Sending on the Responses wire: the chat wire's `reasoning_content`
+    // and the Anthropic signed block are dropped; only the Responses item
+    // reaches the input array.
+    let resp_history = vec![Message::user("hi"), carried_with_anthropic_thinking()];
+    let req = responses_of(&build_request(
+        &provider::MIMO,
+        &mimo_meta(Some("high")),
+        &resp_history,
+        &[],
+    ));
+    let v = serde_json::to_value(&req).unwrap();
+    let items = v["input"].as_array().unwrap();
+    assert!(items.iter().all(|i| i["type"] != "reasoning"));
+    assert!(items.iter().all(|i| i.get("thinking").is_none()));
+    assert!(items.iter().all(|i| i.get("signature").is_none()));
 }
 
 // ============================================================================

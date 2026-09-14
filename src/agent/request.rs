@@ -200,15 +200,31 @@ fn openai_request(
     if let Some(text) = meta.instructions.as_deref().filter(|t| !t.is_empty()) {
         messages.push(Message::user(text));
     }
+    // Every wire saves the chain of thought under its own field:
+    // `reasoning_content` (chat wire), `thinking` (Anthropic, signed), and
+    // `reasoning` (Responses, item id + text). The wire we are sending on
+    // reads its own and ignores the others — so before any wire gets the
+    // message, the other two are dropped. Replaying a different wire's
+    // field to a backend that rejects fields it does not know is a 400.
+    // Each wire saves the chain of thought under its own field:
+    // `reasoning_content` (chat wire), `thinking` (Anthropic, signed), and
+    // `reasoning` (Responses, item id + text). The wire we are sending
+    // on reads its own and ignores the others — but a builder that does
+    // not strip them leaks a foreign wire's field to a backend that
+    // rejects fields it does not know. The chat wire's `reasoning_content`
+    // is its own and stays; the other two go.
+    let strip_other_wires = |m: &Message| -> Message {
+        let mut m = m.clone();
+        m.thinking = None;
+        m.reasoning = None;
+        m
+    };
+
     // A message that arrived on the Anthropic wire carries its thinking
     // blocks with it; those are that wire's business and are stripped here,
     // so a session that switched providers never sends them to a backend
     // that rejects fields it does not know.
-    messages.extend(history.iter().map(|m| {
-        let mut m = m.clone();
-        m.thinking = None;
-        m
-    }));
+    messages.extend(history.iter().map(strip_other_wires));
     // Specification tripwire (debug builds only): the history being sent must
     // satisfy the executable specification. A violation is a shape the
     // backend answers with a 400 — catch it during development rather than in
@@ -269,13 +285,21 @@ fn responses_request(
     }
     let mut replayed = Vec::with_capacity(history.len());
     for message in history {
+        // Drop the other wires' reasoning fields: the Responses builder
+        // reads its own `reasoning` items and ignores the rest, but a
+        // chat-wire `reasoning_content` or an Anthropic signed block
+        // that followed a switch in providers would survive and reach an
+        // endpoint that rejects it.
+        let mut message = message.clone();
+        message.reasoning_content = None;
+        message.thinking = None;
         match message.role {
             crate::types::Role::System => {
                 if let Some(text) = message.text() {
                     instructions.push(text);
                 }
             }
-            _ => replayed.push(message.clone()),
+            _ => replayed.push(message),
         }
     }
     api::responses_request(
@@ -315,6 +339,14 @@ fn anthropic_request(
         system.push(text.to_string());
     }
     for msg in history {
+        // Drop the other wires' reasoning fields: the Anthropic builder
+        // reads its own `thinking` and ignores the rest, but a chat-wire
+        // `reasoning_content` or a Responses `reasoning` item that
+        // followed a switch in providers would survive the SDK's own
+        // serializer and reach an endpoint that rejects it.
+        let mut msg = msg.clone();
+        msg.reasoning_content = None;
+        msg.reasoning = None;
         match msg.role {
             crate::types::Role::System => {
                 if let Some(text) = msg.text() {
@@ -323,15 +355,15 @@ fn anthropic_request(
             }
             crate::types::Role::User => messages.push(anthropic::MessageParam {
                 role: anthropic::Role::User,
-                content: user_content(msg),
+                content: user_content(&msg),
             }),
-            crate::types::Role::Assistant => messages.push(assistant_message(msg)),
+            crate::types::Role::Assistant => messages.push(assistant_message(&msg)),
             crate::types::Role::Tool => {
                 // Results ride in the user turn that follows the calls, so
                 // consecutive results fold into one user message of
                 // tool_result blocks — the shape the wire expects, and one
                 // the window specification above guarantees is well placed.
-                let block = tool_result_block(msg);
+                let block = tool_result_block(&msg);
                 match messages.last_mut() {
                     Some(anthropic::MessageParam {
                         role: anthropic::Role::User,
