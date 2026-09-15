@@ -28,6 +28,14 @@ use crate::ui::theme::Rgb;
 /// `OSC 11 ; ? ST`, which every terminal that implements the query answers with
 /// `OSC 11 ; rgb:RRRR/GGGG/BBBB ST`. Spelled with the `ST` terminator rather than
 /// `BEL`, because `BEL` is a character a reply could contain and `ESC \` is not.
+///
+/// Unix only, like the round trip that asks it: [`RealTerminal::background`]
+/// writes this and reads the answer with `termios` and `poll`. On a platform
+/// where that round trip has no spelling there is nothing to ask with, so the
+/// asker answers `None` -- the same "the terminal was not asked" every caller
+/// already has a default for -- and this query, its deadline and the parse
+/// below are unix-only with it.
+#[cfg(unix)]
 const BACKGROUND_QUERY: &str = "\x1b]11;?\x1b\\";
 
 /// How long the reply is waited for, in milliseconds.
@@ -36,6 +44,7 @@ const BACKGROUND_QUERY: &str = "\x1b]11;?\x1b\\";
 /// short: a terminal that answers at all answers in single-digit milliseconds, and
 /// one that does not is not going to answer in a hundred. The cost of being wrong
 /// is the default theme, which is the answer anyway.
+#[cfg(unix)]
 const BACKGROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(60);
 
 /// The colour in an `OSC 11` reply, or `None` when the reply is not one.
@@ -45,6 +54,7 @@ const BACKGROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis
 /// variously send `rgb:ff/ff/ff` and `#ffffff` and `#fff`, and a terminal that
 /// does not implement the query often answers with something else entirely --
 /// which has to be `None` rather than a colour.
+#[cfg(unix)]
 pub(crate) fn parse_osc11(reply: &str) -> Option<Rgb> {
     // The reply carries the query it answers; anything before it is none of our
     // business (a bracketed paste, a key the user pressed first).
@@ -87,6 +97,7 @@ pub(crate) fn parse_osc11(reply: &str) -> Option<Rgb> {
 /// all full -- scaling the short form down instead of up is how a white terminal
 /// comes out grey, which for this question means a light theme read as a dark
 /// one.
+#[cfg(unix)]
 fn scale_channel(digits: &str) -> Option<u8> {
     if digits.is_empty() || digits.len() > 4 || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
@@ -352,7 +363,9 @@ impl Terminal for RealTerminal {
     }
 }
 
-#[cfg(test)]
+/// Gated with what it tests: `parse_osc11` is unix-only, so a platform without
+/// the round trip has no parser to cover.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::ui::theme::Rgb;
