@@ -98,6 +98,17 @@ class Screen:
         # How far the buffer had been read when the last expected thing was
         # found: what `ready` measures a fresh prompt from.
         self.mark = 0
+        # Whether the run has already been reported as gone: every wait after
+        # that fails for the same reason, and saying so once is a diagnosis
+        # where saying it fifteen times is noise.
+        self.gone = False
+
+    def ended(self, what: str) -> None:
+        """The run closed its side: report it once, with what it said last."""
+        if self.gone:
+            return
+        self.gone = True
+        print(f"  ✗ the run ended {what}; last seen: {self.buf[-300:]!r}")
 
     def ready(self, timeout: float = 15) -> bool:
         """Wait for a prompt drawn after the last thing that was expected, which is
@@ -117,9 +128,14 @@ class Screen:
             r, _, _ = select.select([self.master], [], [], 0.5)
             if self.master in r:
                 try:
-                    self.buf += os.read(self.master, 65536)
+                    chunk = os.read(self.master, 65536)
                 except OSError:
+                    self.ended("while waiting for a prompt")
                     return False
+                if not chunk:
+                    self.ended("while waiting for a prompt")
+                    return False
+                self.buf += chunk
         print(f"  ✗ no prompt; tail seen: {self.buf[start:][-300:]!r}")
         return False
 
@@ -135,8 +151,11 @@ class Screen:
                 try:
                     chunk = os.read(self.master, 65536)
                 except OSError:
-                    return False
+                    chunk = b""
                 if not chunk:
+                    # The run is gone: whatever it said on its way out is the
+                    # diagnosis, and it is at the end of what was read.
+                    self.ended(f"before {needle!r}")
                     return False
                 self.buf += chunk
         print(f"  ✗ timed out waiting for {needle!r}; tail seen: {self.buf[-300:]!r}")
@@ -175,8 +194,16 @@ def login_case() -> bool:
             if FAKE_KEY.encode() in scr.buf:
                 print("  ✗ the key was echoed by the terminal")
                 ok = False
-            settings = json.load(open(os.path.join(home, ".caocli", "settings.json")))
-            if settings["providers"]["zai-coding-cn"]["api_key"] != FAKE_KEY:
+            # Read defensively: a run that never got as far as the login has no
+            # file to read, and that is a failure of a case above, not a reason
+            # for this one to end in a traceback.
+            stored = None
+            try:
+                with open(os.path.join(home, ".caocli", "settings.json")) as f:
+                    stored = json.load(f)["providers"]["zai-coding-cn"]["api_key"]
+            except (OSError, KeyError, ValueError):
+                pass
+            if stored != FAKE_KEY:
                 print("  ✗ the key did not reach settings.json")
                 ok = False
             # A model is named by its provider. After the change, the
