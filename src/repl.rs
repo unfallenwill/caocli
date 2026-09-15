@@ -278,18 +278,28 @@ async fn login(agent: &mut Agent, ui: &mut dyn Front, provider_id: &str) {
         Err(e) => return ui.error(&format!("{e:#}")),
     };
     // A key that is only read at startup would leave the next turn failing with
-    // no way to see why, so a login for the provider in use is taken up now.
-    if agent.provider().id == provider.id {
-        match Client::for_provider(&provider, key.to_owned()) {
-            Ok(api) => agent.bind(provider, api),
-            Err(e) => return ui.error(&format!("{e:#}")),
-        }
-    }
+    // no way to see why, so a login for the provider in use is taken up now --
+    // and a session that has no key for the provider it is on moves to the one
+    // just funded. That session is a first run: it started before this login
+    // (which is why it has no key), and a key for a provider it is not talking
+    // to would leave it exactly as unable to send anything as it was.
     ui.info(&format!(
         "stored the {} API key in {}",
         provider.name,
         path.display()
     ));
+    if agent.provider().id == provider.id {
+        match Client::for_provider(&provider, key.to_owned()) {
+            Ok(api) => agent.bind(provider, api),
+            Err(e) => ui.error(&format!("{e:#}")),
+        }
+    } else if !config::has_key(&agent.provider()) {
+        choose_model(
+            agent,
+            ui,
+            &format!("{}/{}", provider.id, provider.models[0]),
+        );
+    }
 }
 
 /// `/model <provider>/<modelid>`: switch the session's model, and the provider
@@ -1410,6 +1420,50 @@ mod tests {
         submit(&mut agent, &mut ui, &dir, "/login").await;
         assert_eq!(ui.info, vec![login_menu()]);
         assert!(ui.prompts.is_empty(), "nothing was asked for yet");
+        drop(guard);
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn login_moves_an_unfunded_session_to_the_provider_it_funded() {
+        // A session that started with no key at all -- a first run -- is on the
+        // first provider. Logging into another one is what makes it able to send
+        // anything, so it moves there, model and all: staying on the provider it
+        // has no key for would leave it exactly as stuck as it was.
+        let (guard, home) = own_home();
+        let dir = tmpdir("login-moves");
+        let mut agent = agent_in_session_of(&dir, "deepseek", "deepseek-flash");
+        assert!(!crate::config::has_key(&agent.provider()));
+        let mut ui = Recording {
+            secret: Some("sk-glm-123\n".into()),
+            ..Default::default()
+        };
+        submit(&mut agent, &mut ui, &dir, "/login zai-coding-cn").await;
+        assert!(ui.errors.is_empty(), "{:?}", ui.errors);
+        assert_eq!(agent.provider().id, "zai-coding-cn");
+        assert_eq!(
+            agent.session.meta.provider.as_deref(),
+            Some("zai-coding-cn")
+        );
+        assert_eq!(agent.session.meta.model, "glm-5.3-flash");
+        // In the log, not only in memory: the meta line is what a resume reads.
+        let text = std::fs::read_to_string(&agent.session.path).unwrap();
+        assert!(text.contains("glm-5.3-flash"), "{text}");
+        // And the session that logged in for itself keeps its own provider.
+        let mut agent = agent_in_session_of(&dir, "deepseek", "deepseek-flash");
+        crate::config::store_key("deepseek", "sk-deepseek").unwrap();
+        let mut ui = Recording {
+            secret: Some("sk-glm-123\n".into()),
+            ..Default::default()
+        };
+        submit(&mut agent, &mut ui, &dir, "/login zai-coding-cn").await;
+        assert_eq!(
+            agent.provider().id,
+            "deepseek",
+            "a funded session is not moved by another provider's key"
+        );
         drop(guard);
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&home).unwrap();
