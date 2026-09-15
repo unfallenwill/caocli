@@ -68,7 +68,12 @@ Every rule below follows from those two sentences.
 - One session, one file, one writer at a time (an exclusive `flock` in
   production; the constraint is what keeps the trace ordered).
 - **Location: `~/.caocli/sessions/<escaped working directory>/<id>.jsonl`**,
-  mode `0600` (new files).
+  mode `0600` (new files). The layer is the absolute working directory with
+  `%` spelled `%25`, `/` spelled `%2F`, `\` spelled `%5C` and `:` spelled
+  `%3A`; everything else, non-ASCII included, is literal. One directory name
+  on either platform -- `C:\Users\me` is `C%3A%5CUsers%5Cme`, which is a name
+  and not a path for a caller to follow -- and decoding it gives the
+  workspace back, which is how `--list --all` names them.
 - Durability: an append is a `write(2)` into the page cache. There is no
   `fsync`. A power cut can lose the tail; the reader's `heal` then makes
   the loss look like an ordinary interruption.
