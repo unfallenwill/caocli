@@ -56,9 +56,21 @@ pub fn resolve_startup(cli: &Cli) -> Result<Startup> {
     // The provider this run starts from: `--model`, when it names one of its
     // own; otherwise the first provider with a key behind it — so a fresh run
     // does not start by talking to a backend it has no key for.
+    //
+    // A machine where no provider has a key is a machine that has not run
+    // `/login` yet, and `/login` is a command of the interactive session: a run
+    // that refused to start without a key would be a door locked from the
+    // inside. So those modes start on the first provider, unfunded — the banner
+    // says which command fixes it, and `/login` for that provider (or `/model`
+    // for another) is one keystroke away. A one-shot run has nowhere to ask, and
+    // fails here, before any work has been done.
     let start = match &cli.model {
         Some(spec) => provider::model_spec(spec)?.0,
-        None => first_available_provider()?,
+        None => match first_available_provider() {
+            Some(start) => start,
+            None if matches!(mode, Mode::OneShot { .. }) => bail!("{}", no_key_hint()),
+            None => provider::PROVIDERS[0],
+        },
     };
 
     let source = SessionSource::from_cli(cli.resume.as_deref(), cli.cont);
@@ -93,22 +105,29 @@ pub fn resolve_startup(cli: &Cli) -> Result<Startup> {
 }
 
 /// First provider in [`provider::PROVIDERS`] that has a stored key, with its
-/// `models[0]` as the model. The fallback path for any "no choice was made"
-/// case: a fresh run with no `--model`, or a resumed session whose meta has no
-/// provider field (the pre-providers sessions). When no provider has a key, the
-/// error explains what to do.
-fn first_available_provider() -> Result<provider::Provider> {
-    for p in provider::PROVIDERS {
-        if config::has_key(p) {
-            return Ok(*p);
-        }
-    }
+/// `models[0]` as the model.
+///
+/// `None` is a machine where nothing has been logged into yet, and what a run
+/// makes of that depends on whether it can be asked — see [`resolve_startup`],
+/// which is the only caller.
+fn first_available_provider() -> Option<provider::Provider> {
+    provider::PROVIDERS
+        .iter()
+        .find(|p| config::has_key(p))
+        .copied()
+}
+
+/// What a run that cannot ask says when no provider has a key: every provider,
+/// and the command that would give it one.
+fn no_key_hint() -> String {
     let names = provider::PROVIDERS
         .iter()
         .map(|p| format!("{} (/login {})", p.name, p.id))
         .collect::<Vec<_>>()
         .join(", ");
-    bail!("no provider has a stored key; run /login <provider id> for one of: {names}")
+    format!(
+        "no provider has a stored key; start caocli and run /login <provider id> for one of: {names}"
+    )
 }
 
 /// Build the client the session will use, with one-shot runs failing on a
@@ -492,13 +511,15 @@ mod tests {
 
     #[test]
     fn first_available_provider_walks_to_the_first_with_a_key() {
-        // No keys: the error explains how to land on one.
+        // No keys at all is not an error here: it is a state `resolve_startup`
+        // decides what to do about, and the decision is tested below.
         let (guard, home) = own_home();
-        let err = first_available_provider().unwrap_err().to_string();
-        assert!(err.contains("/login"), "{err}");
-        assert!(err.contains("deepseek"), "{err}");
-        assert!(err.contains("zai-coding-cn"), "{err}");
-        assert!(err.contains("minimax"), "{err}");
+        assert!(first_available_provider().is_none());
+        let hint = no_key_hint();
+        assert!(hint.contains("/login"), "{hint}");
+        assert!(hint.contains("deepseek"), "{hint}");
+        assert!(hint.contains("zai-coding-cn"), "{hint}");
+        assert!(hint.contains("minimax"), "{hint}");
         // DeepSeek has no key: the walk steps over it.
         crate::config::store_key("zai-coding-cn", "sk-test").unwrap();
         let p = first_available_provider().unwrap();
@@ -507,6 +528,49 @@ mod tests {
         crate::config::store_key("deepseek", "sk-test").unwrap();
         let p = first_available_provider().unwrap();
         assert_eq!(p.id, "deepseek");
+        drop(guard);
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// The first run on a machine with no key at all: the session has to start,
+    /// because `/login` is a command of the session. It starts on the first
+    /// provider, unfunded, and the banner is what says so.
+    #[test]
+    fn a_run_that_can_be_asked_starts_without_a_key_on_the_first_provider() {
+        let (guard, home) = own_home();
+        let startup = resolve_startup(&cli(&[])).unwrap();
+        assert_eq!(startup.provider.id, provider::PROVIDERS[0].id);
+        assert_eq!(
+            startup.session.meta.provider.as_deref(),
+            Some(provider::PROVIDERS[0].id)
+        );
+        assert_eq!(startup.session.meta.model, provider::PROVIDERS[0].models[0]);
+        // The hint the banner carries is the one that names the command.
+        let note = startup.api_key.missing_note().unwrap_or_default();
+        assert!(note.contains("/login deepseek"), "{note}");
+        drop(guard);
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// A run that cannot be asked fails where the failure belongs: before any
+    /// session is built, with the command that would fix it.
+    #[test]
+    fn a_one_shot_run_with_no_key_fails_before_any_work() {
+        let (guard, home) = own_home();
+        let err = match resolve_startup(&cli(&["-p", "hello"])) {
+            Ok(_) => panic!("a one-shot run with no key must not start"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("no provider has a stored key"), "{err}");
+        assert!(err.contains("/login deepseek"), "{err}");
+        // The refusal comes before the session is created, so nothing was
+        // written: a run with no key does not leave a session behind.
+        assert_eq!(
+            std::fs::read_dir(config::sessions_dir().unwrap())
+                .unwrap()
+                .count(),
+            0
+        );
         drop(guard);
         std::fs::remove_dir_all(&home).unwrap();
     }
