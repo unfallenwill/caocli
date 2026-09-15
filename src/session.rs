@@ -1053,9 +1053,6 @@ impl SessionSource {
 
 /// Reject an id that would let `--resume` escape `sessions_dir` or clash with
 /// the escape encoding.
-#[allow(dead_code)] // wired into SessionSource::resolve below; the symbol
-// lives at module scope because the unescape helper below
-// is part of the same public surface (used by G3+).
 pub fn validate_resume_id(id: &str) -> Result<()> {
     if id.is_empty() {
         bail!("--resume id is empty");
