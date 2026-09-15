@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -98,10 +99,51 @@ pub fn has_key(provider: &Provider) -> bool {
     matches!(stored_key(provider.id), Ok(Some(_)))
 }
 
+/// The home directory the environment names, or the error that says it names
+/// none.
+///
+/// `HOME` is the variable every Unix sets, and the one a user who keeps their
+/// dotfiles somewhere else sets deliberately. Windows does not set it: the
+/// profile is named by `USERPROFILE`, and `HOMEDRIVE` + `HOMEPATH` is the pair
+/// an environment that dropped it still spells the same path with. Those two
+/// come first there, because the shells that do set `HOME` on Windows -- MSYS,
+/// Cygwin -- spell it `/c/Users/me`, which no native program can open: taking it
+/// would put a `~/.caocli` under whatever the current drive happens to be
+/// instead of in the profile. `HOME` is last rather than absent, so an
+/// environment stripped of everything Windows sets still names a home.
 fn home_dir() -> Result<PathBuf> {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .context("cannot determine HOME directory")
+    let windows = cfg!(windows);
+    home_from(&|name| std::env::var_os(name), windows).with_context(|| {
+        if windows {
+            "cannot determine HOME directory: USERPROFILE, HOMEDRIVE+HOMEPATH and HOME are unset \
+             or empty"
+        } else {
+            "cannot determine HOME directory: HOME is unset or empty"
+        }
+    })
+}
+
+/// [`home_dir`]'s rule, with the environment and the platform passed in rather
+/// than read from the process.
+///
+/// The order is the part worth a test, and a test binary runs on one platform:
+/// taking both as arguments is what lets the Windows order be a test on the
+/// machine this is developed on, instead of only on the one it applies to.
+fn home_from(get: &impl Fn(&str) -> Option<OsString>, windows: bool) -> Option<PathBuf> {
+    // A variable that holds nothing names no directory. Taking it would turn
+    // `~/.caocli` into a `.caocli` beside whatever the program was run from.
+    let set = |name: &str| get(name).filter(|value| !value.is_empty());
+    if windows {
+        if let Some(profile) = set("USERPROFILE") {
+            return Some(PathBuf::from(profile));
+        }
+        if let (Some(drive), Some(path)) = (set("HOMEDRIVE"), set("HOMEPATH")) {
+            let mut joined = drive;
+            joined.push(path);
+            return Some(PathBuf::from(joined));
+        }
+    }
+    set("HOME").map(PathBuf::from)
 }
 
 /// `~/.caocli`, where the settings, the history and the sessions live.
@@ -670,9 +712,77 @@ mod tests {
     #[test]
     fn missing_home_is_error() {
         let _g = env_lock();
-        unsafe { std::env::remove_var("HOME") };
+        // Every name the rule reads, so the answer does not depend on which
+        // platform the tests run on: this test is about the error, not about
+        // which variable names a home here. Each one goes back afterwards, so
+        // the next test to read one of them reads what it was given.
+        let names = ["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"];
+        let saved: Vec<Option<OsString>> = names.iter().map(std::env::var_os).collect();
+        for name in names {
+            // SAFETY: env_lock held, and every name is put back below.
+            unsafe { std::env::remove_var(name) };
+        }
         let err = home_dir().unwrap_err().to_string();
         assert!(err.contains("HOME"), "err: {err}");
+        for (name, value) in names.iter().zip(saved) {
+            match value {
+                // SAFETY: env_lock held.
+                Some(value) => unsafe { std::env::set_var(name, value) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
+    }
+
+    /// An environment as [`home_from`] reads it: these names, these values, and
+    /// nothing else.
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+        let map: BTreeMap<String, OsString> = pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), OsString::from(value)))
+            .collect();
+        move |name| map.get(name).cloned()
+    }
+
+    /// The order, asked of both platforms from whichever one is running. Unix has
+    /// one answer and Windows has three, and which one is taken is the whole of
+    /// the rule -- `home_from` takes the platform so this can be a test
+    /// anywhere, and the one place the platform is read is `home_dir`.
+    #[test]
+    fn unix_home_is_home_and_windows_home_is_the_profile() {
+        let unix = env_of(&[("HOME", "/home/u"), ("USERPROFILE", r"C:\Users\u")]);
+        assert_eq!(home_from(&unix, false), Some(PathBuf::from("/home/u")));
+
+        // Windows: the profile Windows itself hands a program wins even when
+        // HOME is set, because what an MSYS shell sets HOME to -- `/c/Users/u`
+        // -- is a path this program cannot open.
+        let both = env_of(&[("HOME", "/c/Users/u"), ("USERPROFILE", r"C:\Users\u")]);
+        assert_eq!(home_from(&both, true), Some(PathBuf::from(r"C:\Users\u")));
+
+        // A profile with no USERPROFILE is still spelled by the two halves, in
+        // one piece and with no separator to add.
+        let halves = env_of(&[("HOMEDRIVE", "C:"), ("HOMEPATH", r"\Users\u")]);
+        assert_eq!(home_from(&halves, true), Some(PathBuf::from(r"C:\Users\u")));
+
+        // And HOME is what is left when Windows' own names are gone.
+        let only_home = env_of(&[("HOME", r"C:\tools\home")]);
+        assert_eq!(
+            home_from(&only_home, true),
+            Some(PathBuf::from(r"C:\tools\home"))
+        );
+    }
+
+    #[test]
+    fn a_variable_that_names_nothing_is_no_home() {
+        // An empty variable is not a directory, and the path built from one is
+        // relative: `.caocli` would land beside whatever the program was run
+        // from.
+        let empty = env_of(&[("HOME", ""), ("USERPROFILE", ""), ("HOMEDRIVE", "")]);
+        assert_eq!(home_from(&empty, false), None);
+        assert_eq!(home_from(&empty, true), None);
+
+        // Half of the pair is not a home either.
+        let half = env_of(&[("HOMEDRIVE", "C:"), ("HOME", "")]);
+        assert_eq!(home_from(&half, true), None);
     }
 
     #[test]
@@ -764,6 +874,16 @@ mod layout_tests {
             "sessions_dir sits under the sessions root: {} under {}",
             s.display(),
             expected_root.display()
+        );
+        // The workspace layer is one directory name, not a path that `join`
+        // follows: an escaped `C:\Users\me` would be read as absolute and
+        // replace the sessions root it was meant to be joined to, which is how
+        // sessions end up in the workspace itself. This is the assertion that
+        // fails on the platform where that happens.
+        let layer = s.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            !layer.contains(['/', '\\', ':']),
+            "one directory name: {layer}"
         );
         assert!(s.is_dir(), "the directory is created on first access");
         let _ = std::fs::remove_dir_all(&expected_root);

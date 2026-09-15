@@ -1039,23 +1039,20 @@ impl SessionSource {
 //
 // The working-directory layout under `sessions_dir` is the same story in the
 // other direction: an absolute path is the directory the session ran in, and
-// the layout turns it into a directory name. The mapping has to be reversible
-// (`unescape_working_directory` is what `--resume` would walk when looking
-// across workspaces) and injective (no two distinct paths collide on the
-// same name). The order matters: `%` is escaped first, otherwise a literal
-// `%2F` in the original would be double-escaped.
+// the layout turns it into a directory name (`sessions_dir` asks
+// `escape_working_directory` for the layer it builds, `--list --all` asks
+// `unescape_working_directory` for the name to show). The mapping has to be
+// reversible and injective (no two distinct paths collide on the same name).
+// The order matters: `%` is escaped first, otherwise a literal `%2F` in the
+// original would be double-escaped.
 //
-// `escape_working_directory` and `unescape_working_directory` are not yet
-// wired into `sessions_dir()` — that change moves the layout from flat to
-// nested and is its own commit. They are defined and tested here so the
-// mapping has a unit test before any caller depends on it.
+// The escape is over the characters a directory name cannot hold rather than
+// over one platform's separators, because the path is one on either: `C:\Users\me`
+// is not a name but a path that `join` would follow out of `sessions_dir`.
 // ============================================================================
 
 /// Reject an id that would let `--resume` escape `sessions_dir` or clash with
 /// the escape encoding.
-#[allow(dead_code)] // wired into SessionSource::resolve below; the symbol
-// lives at module scope because the unescape helper below
-// is part of the same public surface (used by G3+).
 pub fn validate_resume_id(id: &str) -> Result<()> {
     if id.is_empty() {
         bail!("--resume id is empty");
@@ -1085,8 +1082,15 @@ pub fn validate_resume_id(id: &str) -> Result<()> {
 }
 
 /// Turn an absolute working directory into a layout-safe directory name.
+///
+/// One directory name, whatever the path holds. A path left as it stands is not
+/// a name: `join` reads `C:\Users\me` as an absolute path and replaces the
+/// directory it was joining to, so a Windows session would land in the workspace
+/// itself, and a `:` is not a character a file name can hold there at all.
+///
 /// `None` (cwd not known) maps to a fixed sentinel that no escaped absolute
-/// path can produce (every escaped absolute path starts with `%2F`).
+/// path can produce: every escaped path starts at its root, and `_` is not how
+/// any of them start.
 pub fn escape_working_directory(cwd: Option<&Path>) -> Result<String> {
     let Some(path) = cwd else {
         return Ok("_no-working-directory".to_string());
@@ -1097,41 +1101,92 @@ pub fn escape_working_directory(cwd: Option<&Path>) -> Result<String> {
             path.display()
         );
     }
-    let s = path.to_string_lossy();
-    // `%` first: escaping it after `/` would produce `%252F` for a literal
-    // `%2F`, and unescape would then need a second pass to recognise.
-    let escaped = s.replace('%', "%25").replace('/', "%2F");
-    Ok(escaped)
+    Ok(escape_path_text(&path.to_string_lossy()))
+}
+
+/// The name a path is written under.
+///
+/// `%` first, and as its own pass: escaping it along with the rest would let the
+/// escape of a literal `%2F` be read back as the escape of a `/`, and a
+/// directory name one path in and another out. The four characters that follow
+/// are the ones a directory name cannot hold -- the escape's own `%`, the two
+/// separators (one per platform, and both of them separators on Windows even
+/// where it takes `/`) and the `:` that every drive-absolute Windows path
+/// starts with, which is illegal in a file name rather than merely unusual.
+/// Everything else is literal, including the bytes of a non-ASCII name, which
+/// need no escaping to survive a round trip.
+///
+/// Windows has two more file-name rules this does not have to answer for, and
+/// the reason is the root: a name always starts with the escape of one (`%2F`,
+/// `C%3A`, `%5C%5C` for a UNC share), so no name is ever a device name (`CON`,
+/// `NUL`, `COM1`), and only a path the Windows API would not hand out could end
+/// in the space or period that a name there may not end in.
+fn escape_path_text(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            '/' => out.push_str("%2F"),
+            '\\' => out.push_str("%5C"),
+            ':' => out.push_str("%3A"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Inverse of [`escape_working_directory`]. Used by a `--resume` that walks
 /// across workspaces and by `--list --all`, which names directories back to
 /// the user.
+///
+/// A name has to decode to an absolute path to be one of ours: what else could
+/// be sitting under `sessions/` is somebody else's directory, and naming it back
+/// to the user as a workspace would be a lie. The question is asked of the
+/// decoded path and not of the name's first characters, because how an absolute
+/// path is spelled is the platform's business -- `%2F...` here, `C%3A%5C...` on
+/// Windows -- and the answer for a path is `is_absolute`.
 pub fn unescape_working_directory(name: &str) -> Result<PathBuf> {
     if name == "_no-working-directory" {
         bail!("this directory holds sessions whose working directory was not recorded");
     }
-    if !name.starts_with("%2F") {
-        bail!("directory name does not start with '%2F' and is not a known sentinel: {name}");
+    let path = PathBuf::from(unescape_path_text(name)?);
+    if !path.is_absolute() {
+        bail!("directory name is not the escape of an absolute path: {name}");
     }
-    let mut out = String::with_capacity(name.len());
+    Ok(path)
+}
+
+/// The path a layout directory name was made from, its escapes decoded.
+///
+/// The escapes spell one byte each, so what comes out is bytes and UTF-8 is what
+/// reads them: a writer that spelled `é` as `%C3%A9` gets the letter back,
+/// where pushing each byte as a character would make it two Latin-1 ones. Bytes
+/// that are not UTF-8 at all are refused rather than shown mangled -- no name
+/// this layout writes spells one that way, so such a name belongs to somebody
+/// else and naming it back to the user would be a guess.
+fn unescape_path_text(name: &str) -> Result<String> {
+    let mut out: Vec<u8> = Vec::with_capacity(name.len());
     let mut chars = name.chars();
     while let Some(c) = chars.next() {
-        if c == '%' {
-            let a = chars.next();
-            let b = chars.next();
-            let Some(hex) = a.zip(b).map(|(a, b)| format!("{a}{b}")) else {
-                bail!("truncated percent escape in directory name: {name}");
-            };
-            let byte = u8::from_str_radix(&hex, 16).map_err(|e| {
-                anyhow::anyhow!("invalid percent escape '%{hex}' in directory name: {e}")
-            })?;
-            out.push(byte as char);
-        } else {
-            out.push(c);
+        if c != '%' {
+            // A literal character is already the bytes of its UTF-8 encoding;
+            // only the escapes are spelled one byte at a time.
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
         }
+        let a = chars.next();
+        let b = chars.next();
+        let Some(hex) = a.zip(b).map(|(a, b)| format!("{a}{b}")) else {
+            bail!("truncated percent escape in directory name: {name}");
+        };
+        let byte = u8::from_str_radix(&hex, 16).map_err(|e| {
+            anyhow::anyhow!("invalid percent escape '%{hex}' in directory name: {e}")
+        })?;
+        out.push(byte);
     }
-    Ok(PathBuf::from(out))
+    String::from_utf8(out)
+        .map_err(|_| anyhow::anyhow!("directory name does not decode to UTF-8: {name}"))
 }
 
 #[cfg(test)]
@@ -1674,43 +1729,85 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The mapping, as the string pass that does it: a Unix path, a Windows
+    /// path, and the escape's own character. Both platforms' spellings are here
+    /// on purpose -- the pass is the same on either, so this is one test rather
+    /// than one per platform -- and what it asserts is that the name is one
+    /// name: no separator, no drive colon, and nothing that would be read back
+    /// as a path to join to.
     #[test]
-    fn escape_escapes_slashes_and_percent() {
+    fn the_escape_is_reversible_and_injective() {
+        for (path, encoded) in [
+            ("/home/u/proj", "%2Fhome%2Fu%2Fproj"),
+            ("/", "%2F"),
+            ("/a%2Fb", "%2Fa%252Fb"),
+            ("/home/u/a:b\\c", "%2Fhome%2Fu%2Fa%3Ab%5Cc"),
+            (r"C:\Users\me\proj", "C%3A%5CUsers%5Cme%5Cproj"),
+            // Non-ASCII is literal on both sides: the escape is over the
+            // characters a name cannot hold, not over everything unusual.
+            ("/home/u/工程", "%2Fhome%2Fu%2F工程"),
+        ] {
+            assert_eq!(escape_path_text(path), encoded, "{path}");
+            assert_eq!(unescape_path_text(encoded).unwrap(), path, "{encoded}");
+            assert!(!encoded.contains(['/', '\\', ':']), "{encoded}");
+        }
+        // Injective: the escape of a literal `%2F` is nobody else's name.
+        assert_ne!(escape_path_text("/a/b"), escape_path_text("/a%2Fb"));
+    }
+
+    /// A name written by somebody else may spell a non-ASCII byte with escapes,
+    /// and the decode is over bytes, so the letter comes back whole. Bytes that
+    /// are not UTF-8 are refused: this layout never spells one that way, so such
+    /// a name is not a workspace this program wrote.
+    #[test]
+    fn unescape_reads_escaped_bytes_as_utf8() {
+        assert_eq!(unescape_path_text("%2Fhome%2F%C3%A9").unwrap(), "/home/é");
+        assert_eq!(unescape_path_text("/home/é").unwrap(), "/home/é");
+        assert!(unescape_path_text("%2Fhome%2F%C3").is_err());
+        assert!(unescape_path_text("%2Fhome%2F%FF").is_err());
+        // And through the function the layout calls: the decoded path is the
+        // one a Unix workspace would have, so it is named back as itself.
         assert_eq!(
-            escape_working_directory(Some(Path::new("/home/u/proj"))).unwrap(),
-            "%2Fhome%2Fu%2Fproj"
+            unescape_working_directory("%2Fhome%2F%C3%A9").unwrap(),
+            PathBuf::from("/home/é")
         );
-        assert_eq!(
-            escape_working_directory(Some(Path::new("/a%2Fb"))).unwrap(),
-            "%2Fa%252Fb"
-        );
-        assert_eq!(
-            escape_working_directory(Some(Path::new("/"))).unwrap(),
-            "%2F"
-        );
+    }
+
+    /// The same round trip through the two functions the layout calls, for a
+    /// path the running platform calls absolute: on Unix the root and the
+    /// separators, on Windows the drive and the backslashes -- the case the
+    /// colon was added for.
+    #[test]
+    fn a_workspace_round_trips_through_the_two_functions() {
+        let original = if cfg!(windows) {
+            PathBuf::from(r"C:\Users\me\proj")
+        } else {
+            PathBuf::from("/home/u/proj")
+        };
+        let encoded = escape_working_directory(Some(&original)).unwrap();
+        assert_eq!(unescape_working_directory(&encoded).unwrap(), original);
+    }
+
+    /// The sentinel for a cwd that was not recorded, and the refusal: a relative
+    /// path is not a workspace, and a name built from one would be a directory
+    /// under whichever directory the program happened to be run from.
+    #[test]
+    fn escape_takes_an_absolute_path_or_the_sentinel() {
         assert_eq!(
             escape_working_directory(None).unwrap(),
             "_no-working-directory"
         );
-    }
-
-    #[test]
-    fn escape_rejects_a_relative_path() {
         assert!(escape_working_directory(Some(Path::new("relative"))).is_err());
-    }
-
-    #[test]
-    fn unescape_is_the_inverse_of_escape() {
-        let original = PathBuf::from("/home/u/proj");
-        let encoded = escape_working_directory(Some(&original)).unwrap();
-        let back = unescape_working_directory(&encoded).unwrap();
-        assert_eq!(back, original);
     }
 
     #[test]
     fn unescape_rejects_an_escaped_relative_path() {
         assert!(unescape_working_directory("home").is_err());
         assert!(unescape_working_directory("foo%2Fbar").is_err());
+        // A name that decodes to `../etc` is not ours twice over: it is not
+        // absolute, and the layout never writes it (`.` is left literal, so the
+        // escape of `/../etc` reads `%2F..%2Fetc`).
+        assert!(unescape_working_directory("%2E%2E%2Fetc").is_err());
     }
 
     #[test]

@@ -1113,8 +1113,15 @@ mod tests {
 
     /// No `path` is the working directory, which is the one directory a call
     /// may leave unnamed.
+    ///
+    /// The cwd is one directory for the whole test binary, and a test that moves
+    /// the process into a workspace of its own holds [`crate::config::env_lock`]
+    /// while it does. Without that lock here, this call could read the other
+    /// test's directory -- which has no `Cargo.toml` in it -- and be answered
+    /// with nothing at all.
     #[test]
     fn a_call_without_a_path_searches_the_working_directory() {
+        let _g = crate::config::env_lock();
         let out = glob(r#"{"pattern":"Cargo.toml"}"#);
         let paths = listed(&out);
         assert!(
