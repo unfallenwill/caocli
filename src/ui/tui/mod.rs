@@ -98,8 +98,8 @@ pub async fn run(
     };
     let history_path = crate::config::history_file()?;
     screen.state.edit.history = history::load(&history_path);
-    screen.state.model = Some(agent.model_label().to_owned());
-    screen.state.effort = Some(agent.effort_label().to_owned());
+    screen.state.view.status.set_model(&agent.model_label());
+    screen.state.view.status.set_effort(agent.effort_label());
     screen.state.show(Cell::Notice(banner.to_owned()));
     screen
         .state

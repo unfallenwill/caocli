@@ -18,7 +18,11 @@ use super::screen_for_test;
 #[test]
 fn zz_visual_review_dump() {
     let mut screen = screen_for_test(96, 30);
-    screen.state.model = Some("deepseek/deepseek-flash".to_owned());
+    screen
+        .state
+        .view
+        .status
+        .set_model("deepseek/deepseek-flash");
     screen.state.show(Cell::Notice(
         "caocli \u{b7} session 20260910-224129 (12 messages) \u{b7} deepseek/deepseek-flash".into(),
     ));

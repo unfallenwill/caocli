@@ -79,15 +79,11 @@ pub struct Renderer {
     /// process's own terminal -- its width, whether it can take escape
     /// sequences, how to silence its echo -- comes from here.
     term: Box<dyn Terminal>,
-    /// What the status bar reports: cache statistics only. The model and
-    /// effort tier moved to the per-prompt metadata row written just
-    /// before each user line.
+    /// What the status bar reports: model, effort, and session cache stats.
+    /// `model` and `effort` are also read by the per-prompt metadata row on
+    /// the TUI front end; on the plain front end they live on the bar only,
+    /// because there is no metadata row to share them with.
     status: Status,
-    /// The model id in effect. Set once at session start and on `/model`;
-    /// joins the metadata row above the next user line.
-    model: Option<String>,
-    /// The reasoning effort tier in effect. Same lifetime as `model`.
-    effort: Option<String>,
     pub(super) bar: Option<StatusBar>,
     /// Whether the front end currently has the tty in raw mode. The prompt sets
     /// it before reading keys; `ask_secret` reads it to decide which read path
@@ -124,8 +120,6 @@ impl Renderer {
             writer: PlainWriter::new(out, color),
             term,
             status: Status::default(),
-            model: None,
-            effort: None,
             bar: None,
             in_raw_mode: false,
             open_step: None,
@@ -235,12 +229,12 @@ impl Front for Renderer {
     }
 
     fn set_model(&mut self, model: &str) {
-        self.model = Some(model.to_owned());
+        self.status.set_model(model);
         self.redraw_status_bar();
     }
 
     fn set_effort(&mut self, effort: &str) {
-        self.effort = Some(effort.to_owned());
+        self.status.set_effort(effort);
         self.redraw_status_bar();
     }
 

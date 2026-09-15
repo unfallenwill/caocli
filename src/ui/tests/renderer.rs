@@ -363,12 +363,12 @@ fn the_plain_front_ends_stream_is_frozen() {
     // Dracula palette -- secondary text in the comment colour, body text in
     // the foreground, weight on the painted styles.
     let expected = concat!(
-        // The pinned row is now cache-only: "cache 0.0% · 0/0" is 18
-        // columns, so the bar pads 80-18=62 spaces to put it flush with
-        // the right edge. The model + effort are gone from this row.
+        // The pinned row carries the model id and effort tier ahead of the
+        // cache stats. With `cache 0.0%` at 10 columns and the rest fixed,
+        // the label is 47 columns; the bar pads 79 - 47 = 32 spaces.
         "\x1b[24;1H\x1b[2K\x1b[1;23r\x1b[23;1H",
-        "\x1b7\x1b[24;1H\x1b[2K                                                               ",
-        "\x1b[38;2;154;161;181mcache 0.0% · 0/0\x1b[0m\x1b8",
+        "\x1b7\x1b[24;1H\x1b[2K                                ",
+        "\x1b[38;2;154;161;181mdeepseek-v4-pro · effort max · cache 0.0% · 0/0\x1b[0m\x1b8",
         // the banner is an info cell, set in behind its own marker
         "\x1b[38;2;154;161;181m* caocli · session 20260910-213122 (2 messages) · deepseek-v4-pro\x1b[0m\n",
         "\n",
@@ -391,13 +391,11 @@ fn the_plain_front_ends_stream_is_frozen() {
         // settles in one line, so live and replay read the same.
         "\x1b[1m\x1b[38;2;143;217;163m✔ Bash ls -la · exit_code: 0\x1b[0m\n",
         "\x1b[38;2;154;161;181m≡ tokens: in 10/10 · hit 6/miss 4 · out 0\x1b[0m\n",
-        // the bar picks up the usage the line just recorded, then the gate asks.
-        // The label is now 48 columns (cache 60.0% · 6/4), so the pad is 31.
-        // Cache hits accumulate to 60.0% on the second redraw; the row
-        // is cache-only now, so the label is "cache 60.0% · 6/4" -- 18
-        // columns, 62 spaces of padding.
-        "\x1b7\x1b[24;1H\x1b[2K                                                              ",
-        "\x1b[38;2;154;161;181mcache 60.0% · 6/4\x1b[0m\x1b8\n",
+        // The bar picks up the usage the line just recorded; the same label
+        // shape (`model · effort · cache X% · h/m`) is 48 columns, so the
+        // pad stays at 31 spaces.
+        "\x1b7\x1b[24;1H\x1b[2K                               ",
+        "\x1b[38;2;154;161;181mdeepseek-v4-pro · effort max · cache 60.0% · 6/4\x1b[0m\x1b8\n",
         "\x1b[1m\x1b[38;2;226;177;92m▸ Write /tmp/x · run it? y/N \x1b[0m",
         "\x1b[1m\x1b[38;2;226;177;92m  ▪ interrupted (Ctrl-C)\x1b[0m\n",
         // and the bar goes down as the terminal is handed back

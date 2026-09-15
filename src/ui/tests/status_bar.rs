@@ -192,25 +192,30 @@ fn status_bar_chooses_variants_by_display_width() {
     assert_bar_exactly(11, "cache 60.0");
 }
 
+/// Model id is back on the bar at the head of the segment list, ahead of
+/// cache stats. The metadata row above each User cell still carries the
+/// model for that prompt; the bar carries the current model so a reader
+/// can see which one will run the next turn.
 #[test]
 fn status_bar_shows_model_and_updates_on_switch() {
-    // The bar carries cache stats only now; the model id lives in
-    // `state.model` and shows up above each user prompt as a metadata
-    // row, not on the pinned line. The bar still reflects cache hits
-    // as the session records them.
     let bar = StatusBar { rows: 10, cols: 80 };
     let (mut r, buf) = with_buffer(false);
     r.apply_status_bar(Some(bar));
     r.usage(&usage_fixture(6, 4), Duration::ZERO);
     let s = buf_of(&buf);
+    // No model set yet — the bar shows cache stats only, the same as before.
     assert!(s.contains("cache 60.0% · 6/4"), "{s:?}");
 
-    // switching models is not visible on the bar any more -- the
-    // metadata row carries that -- but resetting stats is.
-    r.usage(&usage_fixture(0, 0), Duration::ZERO);
+    // Switching models lands at the head of the bar; cache stats stay where
+    // they are, the redraw is the only thing that changes.
+    r.set_model("m-1");
+    let tail = &buf_of(&buf)[s.len()..];
+    assert!(tail.contains("m-1 · cache 60.0% · 6/4"), "{tail:?}");
+
+    // Resetting stats keeps the model on the bar and zeros the cache.
     r.reset_stats();
     let tail = &buf_of(&buf)[s.len()..];
-    assert!(tail.contains("cache 0.0% · 0/0"), "{tail:?}");
+    assert!(tail.contains("m-1 · cache 0.0% · 0/0"), "{tail:?}");
 }
 
 #[test]
