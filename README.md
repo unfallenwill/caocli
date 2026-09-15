@@ -37,6 +37,8 @@ execution trace, and its format is specified in
 
 - Rust 1.85+ (edition 2024)
 - An API key, which is stored by `/login` (see below)
+- On Windows, Git Bash (installed with Git for Windows), which the Bash tool
+  finds at its install location; where none is installed, a `bash` on the PATH
 
 ## Quick start
 
