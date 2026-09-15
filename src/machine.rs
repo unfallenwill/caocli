@@ -278,11 +278,9 @@ mod tests {
         Message {
             role: Role::Assistant,
             content: Some("".into()),
-            reasoning_content: None,
+            cot: None,
             tool_calls: (!calls.is_empty()).then_some(calls),
             tool_call_id: None,
-            thinking: None,
-            reasoning: None,
         }
     }
 

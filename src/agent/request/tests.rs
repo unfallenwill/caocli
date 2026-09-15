@@ -9,7 +9,7 @@
 use crate::provider;
 use crate::session::{SessionMeta, WireKind};
 use crate::types::{
-    Content, FunctionDef, Message, Role, ThinkingBlock, ToolCall, ToolCallFunction, ToolDef,
+    Content, Cot, FunctionDef, Message, Role, ThinkingBlock, ToolCall, ToolCallFunction, ToolDef,
     WireRequest,
 };
 use anthropic::{
@@ -220,7 +220,9 @@ fn freeze_history() -> Vec<Message> {
         Message {
             role: Role::Assistant,
             content: Some("".into()),
-            reasoning_content: Some("think".into()),
+            cot: Some(Cot::OpenAiText {
+                text: "think".into(),
+            }),
             tool_calls: Some(vec![ToolCall {
                 id: "call_f1".into(),
                 r#type: "function".into(),
@@ -230,8 +232,6 @@ fn freeze_history() -> Vec<Message> {
                 },
             }]),
             tool_call_id: None,
-            thinking: None,
-            reasoning: None,
         },
         Message::tool("call_f1", "exit_code: 0"),
         Message::user("again"),
@@ -616,7 +616,12 @@ fn anthropic_request_replays_thinking_blocks_verbatim() {
         Message {
             role: Role::Assistant,
             content: Some("running".into()),
-            reasoning_content: Some("I should run it".into()),
+            cot: Some(Cot::AnthropicBlocks {
+                blocks: vec![ThinkingBlock {
+                    thinking: "I should run it".into(),
+                    signature: "sig-cafe".into(),
+                }],
+            }),
             tool_calls: Some(vec![ToolCall {
                 id: "call_x".into(),
                 r#type: "function".into(),
@@ -626,11 +631,6 @@ fn anthropic_request_replays_thinking_blocks_verbatim() {
                 },
             }]),
             tool_call_id: None,
-            thinking: Some(vec![ThinkingBlock {
-                thinking: "I should run it".into(),
-                signature: "sig-cafe".into(),
-            }]),
-            reasoning: None,
         },
         Message::tool("call_x", "out"),
     ];
@@ -659,11 +659,11 @@ fn anthropic_request_does_not_replay_openai_style_reasoning() {
     let history = vec![Message {
         role: Role::Assistant,
         content: Some("done".into()),
-        reasoning_content: Some("reasoned about it".into()),
+        cot: Some(Cot::OpenAiText {
+            text: "reasoned about it".into(),
+        }),
         tool_calls: None,
         tool_call_id: None,
-        thinking: None,
-        reasoning: None,
     }];
     let req = anthropic_of(&build_request(
         &provider::MINIMAX,
@@ -692,11 +692,9 @@ fn anthropic_request_folds_consecutive_results_into_one_user_turn() {
         Message {
             role: Role::Assistant,
             content: Some(Content::Text(String::new())),
-            reasoning_content: None,
+            cot: None,
             tool_calls: Some(vec![call("c1"), call("c2")]),
             tool_call_id: None,
-            thinking: None,
-            reasoning: None,
         },
         Message::tool("c1", "first"),
         Message::tool("c2", "second"),
@@ -737,11 +735,9 @@ fn anthropic_request_splits_a_data_url_into_a_base64_image_source() {
             ]
             .to_vec(),
         )),
-        reasoning_content: None,
+        cot: None,
         tool_calls: None,
         tool_call_id: None,
-        thinking: None,
-        reasoning: None,
     }];
     let req = anthropic_of(&build_request(
         &provider::MINIMAX,
@@ -772,7 +768,7 @@ fn anthropic_request_maps_an_unparseable_call_to_an_empty_input() {
         Message {
             role: Role::Assistant,
             content: None,
-            reasoning_content: None,
+            cot: None,
             tool_calls: Some(vec![ToolCall {
                 id: "c".into(),
                 r#type: "function".into(),
@@ -782,8 +778,6 @@ fn anthropic_request_maps_an_unparseable_call_to_an_empty_input() {
                 },
             }]),
             tool_call_id: None,
-            thinking: None,
-            reasoning: None,
         },
         Message::tool("c", "result"),
     ];
@@ -846,39 +840,51 @@ fn the_anthropic_request_prefix_is_frozen() {
 
 #[test]
 fn a_session_that_switched_wires_strips_the_other_wires_reasoning() {
-    // A message carries the reasoning under whichever wire it came in on. The
-    // builder for the wire we are sending on reads its own field and drops
-    // the other two — a session that switched providers must not send a
-    // field the new backend rejects. Three cases, one per wire pair.
+    // A message carries the reasoning under whichever wire it came in on.
+    // The builder for the wire we are sending on reads its own `Cot`
+    // variant and ignores the others — a session that switched providers
+    // must not send a field the new backend rejects. Three cases, one per
+    // wire pair: the variant on the message does not match the wire we
+    // send on, so the pattern match in the builder contributes nothing.
     let carried_with_anthropic_thinking = || Message {
         role: Role::Assistant,
         content: Some("done".into()),
-        reasoning_content: Some("reasoned".into()),
+        cot: Some(Cot::AnthropicBlocks {
+            blocks: vec![ThinkingBlock {
+                thinking: "reasoned".into(),
+                signature: "sig".into(),
+            }],
+        }),
         tool_calls: None,
         tool_call_id: None,
-        thinking: Some(vec![ThinkingBlock {
-            thinking: "reasoned".into(),
-            signature: "sig".into(),
-        }]),
-        reasoning: None,
     };
     let carried_with_responses_reasoning = || Message {
         role: Role::Assistant,
         content: Some("done".into()),
-        reasoning_content: None,
+        cot: Some(Cot::ResponsesItems {
+            items: vec![crate::types::ReasoningItem {
+                id: "rs_1".into(),
+                text: "reasoned".into(),
+            }],
+        }),
         tool_calls: None,
         tool_call_id: None,
-        thinking: None,
-        reasoning: Some(vec![crate::types::ReasoningItem {
-            id: "rs_1".into(),
+    };
+    // The chat wire's own variant — what an assistant message that came
+    // from DeepSeek or Z.AI carries, replayed here on a chat wire.
+    let carried_with_openai_text = || Message {
+        role: Role::Assistant,
+        content: Some("done".into()),
+        cot: Some(Cot::OpenAiText {
             text: "reasoned".into(),
-        }]),
+        }),
+        tool_calls: None,
+        tool_call_id: None,
     };
 
-    // Sending on the chat wire: the chat wire's own `reasoning_content`
-    // rides back through extra_body; the Anthropic signed block and the
-    // Responses item are both dropped.
-    let chat_history = vec![Message::user("hi"), carried_with_anthropic_thinking()];
+    // Sending on the chat wire with the chat wire's own `Cot::OpenAiText`:
+    // it rides back through extra_body.
+    let chat_history = vec![Message::user("hi"), carried_with_openai_text()];
     let req = openai_of(&build_request(
         &provider::DEEPSEEK,
         &test_meta(),
@@ -896,9 +902,26 @@ fn a_session_that_switched_wires_strips_the_other_wires_reasoning() {
         Some(&serde_json::json!("reasoned"))
     );
 
-    // Sending on the Anthropic wire: the chat wire's `reasoning_content`
-    // and the Responses item are dropped; only `thinking` reaches the body.
-    let anth_history = vec![Message::user("hi"), carried_with_responses_reasoning()];
+    // Sending on the chat wire with `Cot::AnthropicBlocks` (the message
+    // came from Anthropic before the switch): the chat wire builder's
+    // pattern match contributes nothing, so the field the chat wire has
+    // no slot for never reaches the body.
+    let chat_history_anthropic = vec![Message::user("hi"), carried_with_anthropic_thinking()];
+    let req = openai_of(&build_request(
+        &provider::DEEPSEEK,
+        &test_meta(),
+        &chat_history_anthropic,
+        &[],
+    ));
+    let assistant_msg = match &req.messages[2] {
+        openai::ChatCompletionMessageParam::Assistant(m) => m,
+        other => panic!("expected assistant, got {other:?}"),
+    };
+    assert!(!assistant_msg.extra_body.contains_key("reasoning_content"));
+
+    // Sending on the Anthropic wire with the Anthropic wire's own variant:
+    // thinking blocks reach the body.
+    let anth_history = vec![Message::user("hi"), carried_with_anthropic_thinking()];
     let req = anthropic_of(&build_request(
         &provider::MINIMAX,
         &minimax_meta(Some("on")),
@@ -907,13 +930,29 @@ fn a_session_that_switched_wires_strips_the_other_wires_reasoning() {
     ));
     let v = serde_json::to_value(&req).unwrap();
     let blocks = v["messages"][1]["content"].as_array().unwrap();
-    assert!(blocks.iter().all(|b| b["type"] != "reasoning"));
+    assert!(
+        blocks.iter().any(|b| b["type"] == "thinking"),
+        "Anthropic's own variant should reach the body, got {blocks:?}"
+    );
+
+    // Sending on the Anthropic wire with `Cot::ResponsesItems` (the
+    // message came from Responses before the switch): the Anthropic
+    // builder's pattern match contributes nothing.
+    let anth_history_responses = vec![Message::user("hi"), carried_with_responses_reasoning()];
+    let req = anthropic_of(&build_request(
+        &provider::MINIMAX,
+        &minimax_meta(Some("on")),
+        &anth_history_responses,
+        &[],
+    ));
+    let v = serde_json::to_value(&req).unwrap();
+    let blocks = v["messages"][1]["content"].as_array().unwrap();
+    assert!(blocks.iter().all(|b| b["type"] != "thinking"));
     assert!(v["messages"][1].get("reasoning_content").is_none());
 
-    // Sending on the Responses wire: the chat wire's `reasoning_content`
-    // and the Anthropic signed block are dropped; only the Responses item
-    // reaches the input array.
-    let resp_history = vec![Message::user("hi"), carried_with_anthropic_thinking()];
+    // Sending on the Responses wire with the Responses wire's own variant:
+    // reasoning items reach the input array.
+    let resp_history = vec![Message::user("hi"), carried_with_responses_reasoning()];
     let req = responses_of(&build_request(
         &provider::MIMO,
         &mimo_meta(Some("high")),
@@ -922,9 +961,10 @@ fn a_session_that_switched_wires_strips_the_other_wires_reasoning() {
     ));
     let v = serde_json::to_value(&req).unwrap();
     let items = v["input"].as_array().unwrap();
-    assert!(items.iter().all(|i| i["type"] != "reasoning"));
-    assert!(items.iter().all(|i| i.get("thinking").is_none()));
-    assert!(items.iter().all(|i| i.get("signature").is_none()));
+    assert!(
+        items.iter().any(|i| i["type"] == "reasoning"),
+        "Responses' own variant should reach the input array, got {items:?}"
+    );
 }
 
 // ============================================================================
@@ -1069,11 +1109,11 @@ fn responses_request_replays_only_this_wires_own_reasoning() {
     let flat = vec![Message {
         role: Role::Assistant,
         content: Some("done".into()),
-        reasoning_content: Some("plain reasoning".into()),
+        cot: Some(Cot::OpenAiText {
+            text: "plain reasoning".into(),
+        }),
         tool_calls: None,
         tool_call_id: None,
-        thinking: None,
-        reasoning: None,
     }];
     let req = responses_of(&build_request(
         &provider::MIMO,
@@ -1092,14 +1132,14 @@ fn responses_request_replays_only_this_wires_own_reasoning() {
     let carried = vec![Message {
         role: Role::Assistant,
         content: Some("done".into()),
-        reasoning_content: Some("reasoned".into()),
+        cot: Some(Cot::ResponsesItems {
+            items: vec![crate::types::ReasoningItem {
+                id: "rs_1".into(),
+                text: "reasoned".into(),
+            }],
+        }),
         tool_calls: None,
         tool_call_id: None,
-        thinking: None,
-        reasoning: Some(vec![crate::types::ReasoningItem {
-            id: "rs_1".into(),
-            text: "reasoned".into(),
-        }]),
     }];
     let req = responses_of(&build_request(
         &provider::MIMO,

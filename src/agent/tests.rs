@@ -168,7 +168,7 @@ async fn mock_full_tool_loop_replays_reasoning_content() {
     assert_eq!(agent.session.messages.len(), 4);
     let assistant1 = &agent.session.messages[1];
     assert_eq!(
-        assistant1.reasoning_content.as_deref(),
+        assistant1.cot.as_ref().and_then(|c| c.as_text()).as_deref(),
         Some("I need to run a command.")
     );
     let calls = assistant1.tool_calls.as_ref().unwrap();
@@ -558,12 +558,16 @@ async fn mock_anthropic_loop_replays_thinking_blocks_verbatim() {
     assert_eq!(agent.session.messages.len(), 4);
     let assistant1 = &agent.session.messages[1];
     assert_eq!(assistant1.text().as_deref(), Some(""));
+    let blocks = match &assistant1.cot {
+        Some(crate::types::Cot::AnthropicBlocks { blocks }) => blocks,
+        other => panic!("expected AnthropicBlocks cot, got {other:?}"),
+    };
     assert_eq!(
-        assistant1.thinking,
-        Some(vec![crate::types::ThinkingBlock {
+        blocks,
+        &vec![crate::types::ThinkingBlock {
             thinking: "I need to run a command.".into(),
             signature: "sig-mock-1".into(),
-        }])
+        }]
     );
     let calls = assistant1.tool_calls.as_ref().unwrap();
     assert_eq!(calls.len(), 1, "block indexes 0/1 are not tool ordinals");
@@ -695,12 +699,16 @@ async fn mock_responses_loop_replays_reasoning_items() {
     // session history: user / assistant(reasoning + tool_calls) / tool / assistant
     assert_eq!(agent.session.messages.len(), 4);
     let assistant1 = &agent.session.messages[1];
+    let items = match &assistant1.cot {
+        Some(crate::types::Cot::ResponsesItems { items }) => items,
+        other => panic!("expected ResponsesItems cot, got {other:?}"),
+    };
     assert_eq!(
-        assistant1.reasoning,
-        Some(vec![crate::types::ReasoningItem {
+        items,
+        &vec![crate::types::ReasoningItem {
             id: "rs_mock_1".into(),
             text: "I need to run a command.".into(),
-        }]),
+        }],
         "the item the wire assigned an id to is kept whole"
     );
     let calls = assistant1.tool_calls.as_ref().unwrap();

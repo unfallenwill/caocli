@@ -403,7 +403,11 @@ fn message_to_param(m: &Message) -> openai::ChatCompletionMessageParam {
             // `reasoning_content` is a vendor field the SDK does not name on
             // the assistant message; ride through extra_body so the GLM
             // multi-turn tool dialogs that require it get it back verbatim.
-            if let Some(text) = &m.reasoning_content {
+            // The `if let` is also the strip: a `Cot` variant other than
+            // `OpenAiText` (Anthropic blocks or Responses items) does not
+            // match, so a session that switched providers never leaks a
+            // foreign wire's field onto the chat wire.
+            if let Some(crate::types::Cot::OpenAiText { text }) = &m.cot {
                 param = param.with_extra_body("reasoning_content", Value::String(text.clone()));
             }
             openai::ChatCompletionMessageParam::Assistant(param)
@@ -925,10 +929,16 @@ fn push_input_items(items: &mut Vec<openai::ResponseInputItem>, message: &Messag
             openai::EasyInputMessage::user(content_to_input(message.content.as_ref())),
         )),
         crate::types::Role::Assistant => {
-            for item in message.reasoning.iter().flatten() {
-                items.push(openai::ResponseInputItem::Reasoning(
-                    openai::ReasoningItemInput::new(item.id.clone(), item.text.clone()),
-                ));
+            // The `if let` is also the strip: a `Cot` variant other than
+            // `ResponsesItems` (chat text or Anthropic blocks) does not
+            // match, so a session that switched providers never leaks a
+            // foreign wire's field onto the Responses wire.
+            if let Some(crate::types::Cot::ResponsesItems { items: reasoning }) = &message.cot {
+                for item in reasoning {
+                    items.push(openai::ResponseInputItem::Reasoning(
+                        openai::ReasoningItemInput::new(item.id.clone(), item.text.clone()),
+                    ));
+                }
             }
             // A turn that only called tools has nothing to say, and an empty
             // assistant message is not a thing this wire has: the calls below
@@ -1037,7 +1047,7 @@ mod tests {
     use super::test_helpers as h;
     use super::*;
     use crate::provider::{MIMO, MINIMAX};
-    use crate::types::TurnAccumulator;
+    use crate::types::{Cot, TurnAccumulator};
 
     // -----------------------------------------------------------------------
     // The OpenAI wire adapter.
@@ -1084,27 +1094,45 @@ mod tests {
 
     #[test]
     fn openai_request_strips_anthropic_thinking_blocks() {
-        // A message that came in on the Anthropic wire carries a
-        // `thinking` block — the SDK has no slot for it on the request
-        // side, so it must not leak onto the OpenAI wire.
+        // A message that came in on the Anthropic wire carries a `Cot::AnthropicBlocks`
+        // — the chat wire has no slot for it, so the pattern match in the
+        // builder contributes nothing. The wire's own `reasoning_content`
+        // would ride through extra_body when present; it is absent here.
         let msg = Message {
             role: crate::types::Role::Assistant,
             content: Some("answer".into()),
-            reasoning_content: Some("thought".into()),
+            cot: Some(Cot::AnthropicBlocks {
+                blocks: vec![crate::types::ThinkingBlock {
+                    thinking: "thought".into(),
+                    signature: "sig".into(),
+                }],
+            }),
             tool_calls: None,
             tool_call_id: None,
-            thinking: Some(vec![crate::types::ThinkingBlock {
-                thinking: "thought".into(),
-                signature: "sig".into(),
-            }]),
-            reasoning: None,
         };
         let req = openai_request("minimax", 131_072, &[msg], None, None, false, None);
         let v: serde_json::Value = serde_json::to_value(&req).unwrap();
         let msg_json = &v["messages"][0];
         assert!(msg_json.get("thinking").is_none(), "{msg_json}");
-        // reasoning_content, by contrast, is a vendor field GLM requires
-        // to be replayed — it rides through extra_body on the message.
+        assert!(
+            msg_json.get("reasoning_content").is_none(),
+            "Anthropic's variant is dropped on the chat wire: {msg_json}"
+        );
+
+        // A message that came in on the chat wire carries `Cot::OpenAiText` —
+        // it rides back through extra_body as `reasoning_content`.
+        let msg = Message {
+            role: crate::types::Role::Assistant,
+            content: Some("answer".into()),
+            cot: Some(Cot::OpenAiText {
+                text: "thought".into(),
+            }),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let req = openai_request("minimax", 131_072, &[msg], None, None, false, None);
+        let v: serde_json::Value = serde_json::to_value(&req).unwrap();
+        let msg_json = &v["messages"][0];
         assert_eq!(msg_json["reasoning_content"], "thought");
     }
 
@@ -1344,13 +1372,18 @@ mod tests {
         }
         let msg = acc.finish();
         assert_eq!(msg.text().as_deref(), Some("running"));
-        assert_eq!(msg.reasoning_content.as_deref(), Some("let me check."));
+        // The wire was Anthropic, so the CoT carries the signed blocks the
+        // wire demands back. The flat text in `reasoning_content` (the
+        // chat wire's spelling) is folded into the same blocks by
+        // `TurnAccumulator` and is not kept on its own.
         assert_eq!(
-            msg.thinking,
-            Some(vec![crate::types::ThinkingBlock {
-                thinking: "let me check.".into(),
-                signature: "sig-1".into(),
-            }])
+            msg.cot,
+            Some(Cot::AnthropicBlocks {
+                blocks: vec![crate::types::ThinkingBlock {
+                    thinking: "let me check.".into(),
+                    signature: "sig-1".into(),
+                }],
+            })
         );
         let calls = msg.tool_calls.unwrap();
         assert_eq!(calls.len(), 1);
@@ -1614,16 +1647,14 @@ mod tests {
         assert_eq!(calls[0].id, "call_1");
         assert_eq!(calls[0].function.name, "Bash");
         assert_eq!(calls[0].function.arguments, r#"{"command": "echo hi"}"#);
-        // The reasoning is one item, under the id the endpoint gave it, and the
-        // flat text is there for the front end to show.
-        let reasoning = message.reasoning.as_ref().unwrap();
+        // The reasoning is one item, under the id the endpoint gave it.
+        let reasoning = match &message.cot {
+            Some(Cot::ResponsesItems { items }) => items,
+            other => panic!("expected ResponsesItems cot, got {other:?}"),
+        };
         assert_eq!(reasoning.len(), 1);
         assert_eq!(reasoning[0].id, "rs_1");
         assert_eq!(reasoning[0].text, "I should run a command.");
-        assert_eq!(
-            message.reasoning_content.as_deref(),
-            Some("I should run a command.")
-        );
         // The end of the answer, and the prompt-cache counts it carried.
         assert_eq!(finish.as_deref(), Some("stop"));
         let usage = usage.expect("the completed event carries the usage");
@@ -1716,7 +1747,12 @@ mod tests {
             Message {
                 role: crate::types::Role::Assistant,
                 content: Some("calling".into()),
-                reasoning_content: Some("I should run a command.".into()),
+                cot: Some(Cot::ResponsesItems {
+                    items: vec![crate::types::ReasoningItem {
+                        id: "rs_1".into(),
+                        text: "I should run a command.".into(),
+                    }],
+                }),
                 tool_calls: Some(vec![crate::types::ToolCall {
                     id: "call_1".into(),
                     r#type: "function".into(),
@@ -1726,21 +1762,18 @@ mod tests {
                     },
                 }]),
                 tool_call_id: None,
-                thinking: None,
-                reasoning: Some(vec![crate::types::ReasoningItem {
-                    id: "rs_1".into(),
-                    text: "I should run a command.".into(),
-                }]),
             },
             Message::tool("call_1", "exit_code: 0\nhi"),
         ];
         // The thinking block of the *other* wire rides along to prove it is
-        // dropped: this wire has no field for a signed block.
+        // dropped: this wire has no variant for a signed block.
         let mut carried = history.clone();
-        carried[1].thinking = Some(vec![crate::types::ThinkingBlock {
-            thinking: "other wire".into(),
-            signature: "sig".into(),
-        }]);
+        carried[1].cot = Some(Cot::AnthropicBlocks {
+            blocks: vec![crate::types::ThinkingBlock {
+                thinking: "other wire".into(),
+                signature: "sig".into(),
+            }],
+        });
         let request = responses_request(
             "mimo-v2.5-pro",
             131_072,
@@ -1756,8 +1789,32 @@ mod tests {
         assert_eq!(v["instructions"], "You are caocli.\n\nproject rules");
         assert_eq!(v["tool_choice"], "auto");
         assert_eq!(v["reasoning"]["effort"], "high");
-        // The items, in the order the model produced them: what it thought,
-        // what it said, what it called — then the result that answers the call.
+        // The carried Anthropic block was dropped: this wire has no variant
+        // for it, and the pattern match in the builder contributes nothing.
+        // The assistant message and its function_call still reach the input.
+        let items = v["input"].as_array().unwrap();
+        let kinds: Vec<&str> = items.iter().map(|i| i["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "message",
+                "message",
+                "function_call",
+                "function_call_output"
+            ]
+        );
+
+        // Sending the original history (Responses wire's own variant):
+        // reasoning items reach the input array.
+        let request = responses_request(
+            "mimo-v2.5-pro",
+            131_072,
+            "You are caocli.\n\nproject rules",
+            &history,
+            None,
+            Some("high"),
+        );
+        let v: serde_json::Value = serde_json::to_value(&request).unwrap();
         let items = v["input"].as_array().unwrap();
         let kinds: Vec<&str> = items.iter().map(|i| i["type"].as_str().unwrap()).collect();
         assert_eq!(
@@ -1802,7 +1859,7 @@ mod tests {
         let history = vec![Message {
             role: crate::types::Role::Assistant,
             content: Some("".into()),
-            reasoning_content: None,
+            cot: None,
             tool_calls: Some(vec![crate::types::ToolCall {
                 id: "call_1".into(),
                 r#type: "function".into(),
@@ -1812,8 +1869,6 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
-            thinking: None,
-            reasoning: None,
         }];
         let request = responses_request(
             "mimo-v2.5-pro",

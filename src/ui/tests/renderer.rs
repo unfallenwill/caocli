@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use crate::types::{Message, Role};
+use crate::types::{Cot, Message, Role};
 
 use super::super::status_bar::StatusBar;
 use super::*;
@@ -176,7 +176,9 @@ fn replay_renders_history_compactly_with_colors() {
         Message {
             role: Role::Assistant,
             content: Some("running it".into()),
-            reasoning_content: Some("let me think".into()),
+            cot: Some(Cot::OpenAiText {
+                text: "let me think".into(),
+            }),
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".into(),
                 r#type: "function".into(),
@@ -186,8 +188,6 @@ fn replay_renders_history_compactly_with_colors() {
                 },
             }]),
             tool_call_id: None,
-            thinking: None,
-            reasoning: None,
         },
         Message::tool("call_1", "exit_code: 0\n--- stdout ---\nSECRET_BODY"),
         Message::system("must not appear"),
@@ -260,11 +260,11 @@ fn replay_skips_empty_assistant_fields() {
     r.replay(&[Message {
         role: Role::Assistant,
         content: Some("".into()),
-        reasoning_content: Some(String::new()),
+        cot: Some(Cot::OpenAiText {
+            text: String::new(),
+        }),
         tool_calls: None,
         tool_call_id: None,
-        thinking: None,
-        reasoning: None,
     }]);
     assert_eq!(
         String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
@@ -297,7 +297,9 @@ fn live_and_replay_lay_out_a_turn_identically() {
         Message {
             role: Role::Assistant,
             content: Some("running it".into()),
-            reasoning_content: Some("let me think".into()),
+            cot: Some(Cot::OpenAiText {
+                text: "let me think".into(),
+            }),
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".into(),
                 r#type: "function".into(),
@@ -307,8 +309,6 @@ fn live_and_replay_lay_out_a_turn_identically() {
                 },
             }]),
             tool_call_id: None,
-            thinking: None,
-            reasoning: None,
         },
         Message::tool("call_1", "exit_code: 0\n--- stdout ---\nBODY"),
     ]);
@@ -339,11 +339,11 @@ fn the_plain_front_ends_stream_is_frozen() {
         Message {
             role: Role::Assistant,
             content: Some("running it".into()),
-            reasoning_content: Some("let me think".into()),
+            cot: Some(Cot::OpenAiText {
+                text: "let me think".into(),
+            }),
             tool_calls: None,
             tool_call_id: None,
-            thinking: None,
-            reasoning: None,
         },
     ]);
     r.reasoning_delta("weigh");
@@ -508,11 +508,11 @@ fn a_streamed_block_and_the_same_block_replayed_are_the_same_bytes() {
     replayed.replay(&[Message {
         role: Role::Assistant,
         content: Some("answer".into()),
-        reasoning_content: Some("thinking".into()),
+        cot: Some(Cot::OpenAiText {
+            text: "thinking".into(),
+        }),
         tool_calls: None,
         tool_call_id: None,
-        thinking: None,
-        reasoning: None,
     }]);
 
     // The replay's own trailing separator is the one thing that is not the same:

@@ -138,11 +138,11 @@ mod tests {
         crate::types::Message {
             role: crate::types::Role::Assistant,
             content: content.map(Into::into),
-            reasoning_content: reasoning.map(str::to_owned),
+            cot: reasoning.map(|text| crate::types::Cot::OpenAiText {
+                text: text.to_owned(),
+            }),
             tool_calls: calls,
             tool_call_id: None,
-            thinking: None,
-            reasoning: None,
         }
     }
 
