@@ -147,9 +147,15 @@ fn status_notices_reach_the_status_line() {
         },
         Duration::ZERO,
     ));
-    assert_eq!(screen.view.status.full_line(), "cache 60.0% · 6/4");
+    assert_eq!(
+        screen.view.status.full_line(),
+        "m-1 · effort high · cache 60.0% · 6/4"
+    );
     screen.apply_app(AppNotice::ResetStats);
-    assert_eq!(screen.view.status.full_line(), "cache 0.0% · 0/0");
+    assert_eq!(
+        screen.view.status.full_line(),
+        "m-1 · effort high · cache 0.0% · 0/0"
+    );
 }
 
 #[test]
@@ -227,7 +233,7 @@ fn submit_picks_up_the_current_model_at_submit_time() {
     let mut screen = State::for_test_with_meta("deepseek/deepseek-v4-flash", "max");
     screen.submit("first");
     // The user switches models mid-history.
-    screen.model = Some("deepseek/deepseek-v4-pro".to_owned());
+    screen.view.status.set_model("deepseek/deepseek-v4-pro");
     screen.submit("second");
 
     let cells = &screen.view.transcript;

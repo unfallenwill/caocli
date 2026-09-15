@@ -55,13 +55,6 @@ pub(super) struct State {
     pub(super) overlay: Overlay,
     /// The running turn's clock and the line queue.
     pub(super) turn: Turn,
-    /// The model id in effect. Set once at session start (the front end's
-    /// `model_label`) and on `/model`. Drives the per-prompt metadata row
-    /// above each User cell. `None` until the agent picks one.
-    pub(super) model: Option<String>,
-    /// The reasoning effort tier in effect. Set at session start and on
-    /// `/effort`. Joins the model in the per-prompt metadata row.
-    pub(super) effort: Option<String>,
     /// Bumped by everything that changes what the screen should show, so a
     /// draw can be skipped when nothing has. Lives on [`State`] rather than
     /// any one half because every half can change the picture: a notice
@@ -78,11 +71,14 @@ impl State {
     /// patterns does not flag the test fixture.
     #[cfg(test)]
     pub(super) fn for_test_with_meta(model: &str, effort: &str) -> Self {
-        Self {
-            model: Some(model.to_owned()),
-            effort: Some(effort.to_owned()),
-            ..Self::default()
+        let mut s = Self::default();
+        if !model.is_empty() {
+            s.view.status.set_model(model);
         }
+        if !effort.is_empty() {
+            s.view.status.set_effort(effort);
+        }
+        s
     }
 
     /// Put a cell in the transcript that the machine did not send -- the banner,
@@ -218,8 +214,8 @@ impl State {
             }
             AppNotice::Info(text) => self.close_and_push(Cell::Notice(text)),
             AppNotice::Error(text) => self.close_and_push(Cell::Failure(text)),
-            AppNotice::SetModel(model) => self.model = Some(model),
-            AppNotice::SetEffort(effort) => self.effort = Some(effort),
+            AppNotice::SetModel(model) => self.view.status.set_model(&model),
+            AppNotice::SetEffort(effort) => self.view.status.set_effort(&effort),
             AppNotice::ResetStats => self.view.status.reset_stats(),
             AppNotice::SetVerbose(_) => {
                 // The verbose toggle is gone -- settled-Done step children
@@ -408,16 +404,19 @@ impl State {
 
     /// The per-prompt metadata row's text: `provider/model · effort tier`,
     /// or `None` when neither field is known yet.
+    ///
+    /// Reads from [`View::status`], the same place the bar reads: model and
+    /// effort are stored once and read from both ends. The metadata row
+    /// captures the value at the moment the user submits (so a session that
+    /// switched models mid-history keeps the line that asked the old one),
+    /// and the bar redraws with the new value (so a reader looking at the
+    /// bottom line sees what is current).
     pub(super) fn metadata_text(&self) -> Option<String> {
         let mut parts = Vec::new();
-        if let Some(m) = &self.model
-            && !m.is_empty()
-        {
-            parts.push(m.clone());
+        if let Some(m) = self.view.status.model() {
+            parts.push(m.to_owned());
         }
-        if let Some(e) = &self.effort
-            && !e.is_empty()
-        {
+        if let Some(e) = self.view.status.effort() {
             parts.push(format!("effort {e}"));
         }
         if parts.is_empty() {

@@ -36,7 +36,7 @@ fn the_status_line_is_the_summary_whether_or_not_a_turn_runs() {
     // to the per-prompt metadata row; the pinned row carries only the
     // cache stats that are truly session-level.
     let mut screen = screen_for_test(60, 20);
-    screen.state.model = Some("m-1".to_owned());
+    screen.state.view.status.set_model("m-1");
     screen.state.apply(MachineNotice::Usage(
         Usage {
             prompt_cache_hit_tokens: 6,
@@ -47,7 +47,7 @@ fn the_status_line_is_the_summary_whether_or_not_a_turn_runs() {
     ));
     screen.draw().unwrap();
     let last = screen.terminal.backend().buffer().area.height - 1;
-    assert_eq!(row(&screen, last), "cache 60.0% · 6/4");
+    assert_eq!(row(&screen, last), "m-1 · cache 60.0% · 6/4");
     screen.state.begin_turn(Instant::now());
     screen.state.apply(MachineNotice::ToolStart {
         name: "read_file".into(),
@@ -59,7 +59,7 @@ fn the_status_line_is_the_summary_whether_or_not_a_turn_runs() {
     screen.draw().unwrap();
     assert_eq!(
         row(&screen, last),
-        "cache 60.0% · 6/4",
+        "m-1 · cache 60.0% · 6/4",
         "a running turn does not take the row over"
     );
 }
