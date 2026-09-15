@@ -875,6 +875,16 @@ mod layout_tests {
             s.display(),
             expected_root.display()
         );
+        // The workspace layer is one directory name, not a path that `join`
+        // follows: an escaped `C:\Users\me` would be read as absolute and
+        // replace the sessions root it was meant to be joined to, which is how
+        // sessions end up in the workspace itself. This is the assertion that
+        // fails on the platform where that happens.
+        let layer = s.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            !layer.contains(['/', '\\', ':']),
+            "one directory name: {layer}"
+        );
         assert!(s.is_dir(), "the directory is created on first access");
         let _ = std::fs::remove_dir_all(&expected_root);
     }
