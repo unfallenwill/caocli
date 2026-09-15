@@ -227,7 +227,7 @@ def login_case() -> bool:
             scr.send("/model\r".encode())
             ok &= scr.expect("choose a model", 15)   # the menu, for the plain front end
             ok &= scr.ready()
-            scr.send("/exit\r".encode())
+            scr.send("/quit\r".encode())
             deadline = time.time() + 15
             while time.time() < deadline:
                 got = os.waitpid(pid, os.WNOHANG)
@@ -283,7 +283,7 @@ def live_case(home: str, ok: bool) -> int:
         ok &= scr.expect(INTERRUPTED, 20)               # cancellation notice
         # The "new" prompt must be awaited: expect scans the accumulated buffer, so
         # a leftover › from before the cancellation would immediately give a false
-        # positive and /exit would be sent before readline switches to raw mode —
+        # positive and /quit would be sent before readline switches to raw mode —
         # cooked-mode ICRNL turns \r into \n, rustyline treats it as Ctrl-J
         # (newline) rather than Enter, and the submission never arrives. The new
         # prompt is rendered after raw mode is entered, so anchoring on the last
@@ -307,7 +307,7 @@ def live_case(home: str, ok: bool) -> int:
         if not fresh:
             print("  ✗ no fresh prompt after cancellation")
             ok = False
-        scr.send("/exit\r".encode())
+        scr.send("/quit\r".encode())
         deadline = time.time() + 15
         status = None
         while time.time() < deadline:

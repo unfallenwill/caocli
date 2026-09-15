@@ -74,7 +74,7 @@ place for a key to hide in.
 | `/effort` | Choose the reasoning effort tier — the list is the provider in use's own (`low`, `high`, `max`), with the one in effect marked; the choice is stored in the session, so a resume keeps it |
 | `/image <path> [text]` | Ask about a picture: the image is read and sent with the text that follows the path (none is fine). A path with spaces in it may be quoted with `"` or `'` |
 | `/mcp` | Show the MCP servers of this session: which came up, what they call themselves, and the names their tools are offered under ([MCP servers](#mcp-servers)). Subcommands (see below): `list`, `enable <name>`, `disable <name>`, `reconnect <name>`, `disconnect <name>` |
-| `/exit`, `/quit`, `/q` | Quit |
+| `/quit` | Quit |
 
 `/login` asks for the key as a question rather than as a line: the prompt is
 drawn, the answer is typed with the text masked in the full-screen front end and
@@ -208,7 +208,7 @@ cache 95.3% · hit 846912 · miss 41538
   the turn ends the head of the queue runs next, so stopping a turn with `Ctrl-C`
   redirects to what was queued rather than throwing it away; a `Ctrl-C` during a
   queued turn stops that one and moves on to the next, which is how a queue is
-  abandoned from the front. Commands queue too — a queued `/exit` leaves when it
+  abandoned from the front. Commands queue too — a queued `/quit` leaves when it
   reaches the head — and a queued `/resume` with no id opens its picker when it
   runs, with the rest of the queue waiting behind the choice, since the choice is
   what is typed next.

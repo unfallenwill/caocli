@@ -1047,7 +1047,7 @@ def main() -> int:
             status = None
             deadline = time.time() + 90
             while time.time() < deadline and status is None:
-                term.send("/exit\r")
+                term.send("/quit\r")
                 sent = time.time()
                 while time.time() < sent + 5:
                     got = os.waitpid(pid, os.WNOHANG)

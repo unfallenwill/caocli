@@ -65,7 +65,7 @@ pub async fn handle(
     front: FrontKind,
 ) -> Result<Outcome> {
     match line {
-        "/exit" | "/quit" | "/q" => return Ok(Outcome::Exit),
+        "/quit" => return Ok(Outcome::Exit),
         "/help" => ui.info(&help(front)),
         "/debug" => ui.info(&debug_summary(agent)),
         "/sessions" => {
@@ -529,15 +529,7 @@ pub const COMMANDS: &[Command] = &[
         description: "MCP servers: report; subcommands list / enable / disable / reconnect / disconnect",
     },
     Command {
-        name: "/exit",
-        description: "quit",
-    },
-    Command {
         name: "/quit",
-        description: "quit",
-    },
-    Command {
-        name: "/q",
         description: "quit",
     },
 ];
@@ -743,15 +735,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_exit_spelling_leaves() {
-        let dir = tmpdir("exit");
+    async fn quit_leaves_and_the_retired_spellings_do_not() {
+        let dir = tmpdir("quit");
         let mut agent = agent_in(&dir, "m");
         let mut ui = Recording::default();
-        for spelling in ["/exit", "/quit", "/q"] {
+        assert_eq!(
+            submit(&mut agent, &mut ui, &dir, "/quit").await,
+            Outcome::Exit,
+            "/quit should leave"
+        );
+        // The two aliases that used to do the same are gone: one of them typed
+        // now lands on the unknown-command notice rather than leaving.
+        for retired in ["/exit", "/q"] {
+            ui.info.clear();
             assert_eq!(
-                submit(&mut agent, &mut ui, &dir, spelling).await,
-                Outcome::Exit,
-                "{spelling} should leave"
+                submit(&mut agent, &mut ui, &dir, retired).await,
+                Outcome::Continue,
+                "{retired} should no longer leave"
+            );
+            assert!(
+                ui.info[0].contains("unknown command"),
+                "{retired} is not a command: {:?}",
+                ui.info
             );
         }
         std::fs::remove_dir_all(&dir).unwrap();
