@@ -85,7 +85,7 @@ message  format  format_version  id
 | Key | Type | Meaning |
 |---|---|---|
 | `type` | string | Line type: `header`, `msg`, `ev`, `meta` (the reader's dispatch key) |
-| `sequence` | int ≥ 1 | Position in this file. Strictly monotonic. The only ordering authority |
+| `sequence` | int ≥ 1 | Position in this file. Strictly monotonic. The only ordering authority. Every line but the header carries one, `meta` included, and the reader must track all of them: skipping a line type here leaves the next line looking like a gap |
 | `timestamp_ms` | int? | Wall clock UTC epoch milliseconds (optional; absent means not recorded) |
 | `turn` | int? | One user message and every sub-request that follows until the next |
 | `kind` | string? | On `ev` lines: `request_prefix`, `request`, `reply`, `gate`, `call_end`, `stop` |
@@ -217,7 +217,7 @@ Nothing in a `v0` file is renamed on disk: those files are read as they are.
 | Unknown `kind` without the marker | **Refuse to reconstruct**, and say which event it was. |
 | Line that is not valid JSON (or not valid UTF-8) | Warn and skip. |
 | Such a line that is **not** the last non-empty line | Warn differently and loudly: append-only says only the tail can be damaged. |
-| `sequence` gap or duplicate | Warn: lines went missing. |
+| `sequence` gap or duplicate | **Refuse to load**: the counter slipped, so every line past it has a `sequence` that no longer says where it belongs and a resume cannot be trusted. |
 | No valid header | `v0`: fatal (the meta lives only there). `v1`: warn, take the `id` from the file stem, fold anyway. |
 
 ## Writer rules

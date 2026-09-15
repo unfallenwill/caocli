@@ -294,6 +294,23 @@ fn validate_sequence(s: u64, next: &mut u64, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The envelope `sequence` of a v1 line, whatever its type. Every line
+/// except the header carries one, and the writer advances one counter for
+/// all of them (`set_meta`, `append_message` and `append_event` each take
+/// the next value), so a reader that tracks only some of them loses its
+/// place: a `meta` line in the middle of a trace — what a `/model` writes —
+/// leaves the next `msg` looking like a gap.
+///
+/// Read from the JSON envelope rather than from the parsed [`V1Line`], so a
+/// line type this build does not know still advances the counter the writer
+/// advanced.
+fn envelope_sequence(raw: &[u8]) -> Option<u64> {
+    serde_json::from_slice::<serde_json::Value>(raw)
+        .ok()?
+        .get("sequence")?
+        .as_u64()
+}
+
 // ============================================================================
 // Event payload types (the body of an `ev` line).
 //
@@ -664,30 +681,21 @@ impl Session {
                             continue;
                         }
                     };
+                    if let Some(s) = envelope_sequence(raw) {
+                        validate_sequence(s, &mut next_sequence, path)?;
+                    }
                     match line {
                         V1Line::Header(_) => {
                             // Two headers is not corruption: the second
                             // header is what became the meta line for v0.
                         }
-                        V1Line::Msg {
-                            sequence, message, ..
-                        } => {
-                            if let Some(s) = sequence {
-                                validate_sequence(s, &mut next_sequence, path)?;
-                            }
-                            messages.push(message);
-                        }
+                        V1Line::Msg { message, .. } => messages.push(message),
                         V1Line::Meta { meta: m, .. } => meta = m,
-                        V1Line::Ev { sequence, .. } => {
-                            // Events that fail to parse are dropped
-                            // silently: they describe lines already
-                            // present, and a sequence mismatch here is
-                            // not a fold error (it cannot change the
-                            // messages). But a duplicate or a gap is a
-                            // sign of corruption and worth surfacing.
-                            if let Some(s) = sequence {
-                                validate_sequence(s, &mut next_sequence, path)?;
-                            }
+                        V1Line::Ev { .. } => {
+                            // The event itself is not folded: it describes
+                            // lines already present, so nothing here changes
+                            // the messages. Its sequence is still checked
+                            // above — a gap means lines went missing.
                         }
                     }
                 }
@@ -1886,6 +1894,35 @@ mod tests {
         drop(f);
         let loaded = load_when_released(&path);
         assert_eq!(loaded.messages.len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_resumes_across_a_mid_session_meta_line() {
+        // A `/model` writes a `meta` line into the middle of the trace. The
+        // writer takes the next `sequence` for it like for any other line, so
+        // a reader that does not count it lands on the following `msg` one
+        // short and refuses a file that is perfectly intact.
+        let dir = tmpdir();
+        let mut s = Session::create(&dir, test_meta()).unwrap();
+        s.append_message(&Message::user("first")).unwrap();
+        s.append_message(&Message {
+            role: Role::Assistant,
+            content: Some(crate::types::Content::Text("answer".into())),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut switched = s.meta.clone();
+        switched.model = "other-model".into();
+        s.set_meta(switched).unwrap();
+        s.append_message(&Message::user("after the switch"))
+            .unwrap();
+        let path = s.path.clone();
+        drop(s);
+        let loaded = load_when_released(&path);
+        assert_eq!(loaded.messages.len(), 3);
+        assert_eq!(loaded.meta.model, "other-model");
+        assert_eq!(loaded.last_sequence(), Some(4));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
