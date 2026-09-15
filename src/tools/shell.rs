@@ -660,6 +660,58 @@ fn kill_group(pgroup: Option<u32>) {
     let _ = pgroup;
 }
 
+/// The program a Bash call runs.
+///
+/// Git for Windows's own `bash.exe` where there is one, and `bash` by name
+/// otherwise -- found on PATH the way any spawn finds a program. Windows ships
+/// no bash, and the installer puts `git.exe` on the PATH but leaves
+/// `bash.exe` in its install directory, so the name alone finds it nowhere;
+/// the homes the installer writes are probed ahead of the name, which is what
+/// keeps a native Windows run out of the WSL launcher the PATH usually
+/// resolves -- a native shell rather than a virtual machine behind every call.
+/// When nothing is found at all the plain name is kept, and the failure is the
+/// one the spawn already reports.
+fn bash_program() -> PathBuf {
+    first_existing(&bash_candidates()).unwrap_or_else(|| PathBuf::from("bash"))
+}
+
+/// The first of `candidates` that exists as a file, if one does.
+fn first_existing(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates.iter().find(|p| p.is_file()).cloned()
+}
+
+/// Where Git for Windows's bash lives, on the platform that ships none;
+/// empty where the PATH is all there is.
+#[cfg(windows)]
+fn bash_candidates() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = GIT_BASH_CANDIDATES.iter().map(PathBuf::from).collect();
+    // A per-user install (the installer's second choice) puts Git under
+    // LOCALAPPDATA rather than Program Files, so it is environment-dependent
+    // and added here rather than in the fixed list.
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(PathBuf::from(local).join(r"Programs\Git\bin\bash.exe"));
+    }
+    candidates
+}
+
+#[cfg(not(windows))]
+fn bash_candidates() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// Where Git for Windows writes `bash.exe`, in the order they are probed.
+///
+/// `bin\bash.exe` is the one Git for Windows documents (it sets the
+/// environment up as Git's own tools expect); `usr\bin\bash.exe` is the MSYS2
+/// bash underneath, which runs but without that setup; the x86 home is what a
+/// 32-bit install uses.
+#[cfg(windows)]
+const GIT_BASH_CANDIDATES: &[&str] = &[
+    r"C:\Program Files\Git\bin\bash.exe",
+    r"C:\Program Files\Git\usr\bin\bash.exe",
+    r"C:\Program Files (x86)\Git\bin\bash.exe",
+];
+
 /// `bash -c command`, with nothing of ours on its standard input, in a session of
 /// its own, and with the editor variables pointed somewhere harmless.
 ///
@@ -681,7 +733,7 @@ fn kill_group(pgroup: Option<u32>) {
 /// into the result before giving its own error, and with them it gives only the
 /// error. A call that sets either one itself still overrides this.
 fn bash(command: &str) -> Command {
-    let mut spawn = Command::new("bash");
+    let mut spawn = Command::new(bash_program());
     spawn
         .arg("-c")
         .arg(command)
@@ -860,6 +912,38 @@ fn omitted(bytes: u64, lines: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Of several homes, the first one that is actually there is the one taken,
+    /// and none being there is none taken.
+    #[test]
+    fn first_existing_takes_the_first_that_is_there() {
+        let dir =
+            std::env::temp_dir().join(format!("caocli-first-existing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let there = dir.join("there.exe");
+        std::fs::write(&there, b"").unwrap();
+        let later = dir.join("later.exe");
+        std::fs::write(&later, b"").unwrap();
+        let gone = dir.join("gone.exe");
+        assert_eq!(first_existing(&[gone, there.clone(), later]), Some(there));
+        assert_eq!(first_existing(&[dir.join("nope.exe")]), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Where no candidate list can be offered, the plain name runs -- the case
+    /// every unix machine is in. On Windows the result is either the plain name
+    /// or a bash.exe that was found by existing.
+    #[test]
+    fn bash_program_is_the_plain_name_where_nothing_was_probed() {
+        let program = bash_program();
+        if program != Path::new("bash") {
+            assert!(
+                program.is_file(),
+                "{} was probed but is not there",
+                program.display()
+            );
+        }
+    }
     use crate::tools::Silent;
     /// The tool called with nobody watching, which is what every test that is not
     /// about the live view is about.
