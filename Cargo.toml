@@ -9,7 +9,7 @@ resolver = "3"
 
 [package]
 name = "caocli"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 description = "Terminal coding agent backed by DeepSeek, Zhipu GLM or MiniMax M3, with thinking mode and a Bash tool loop"
 license = "MIT"

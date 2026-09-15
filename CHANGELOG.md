@@ -6,13 +6,6 @@ semantic-version bumps per release.
 
 ## [Unreleased]
 
-### Changed — the quit command is spelled `/quit` only
-
-`/exit` and `/q` are gone from the command table, which listed one action three
-times — three rows in the picker and three lines in `/help`. `Ctrl-D` on an
-empty line still leaves, and a typed `/exit` or `/q` now lands on the
-unknown-command notice like any other name that is not in the table.
-
 ### Changed — visual design: two themes, glyph set, measured palette
 
 The screen was redesigned from the ground up, with two themes (`ink` and
@@ -313,6 +306,15 @@ The schema is documented in `docs/session-format.md`.
   would read as an answer. `Ctrl-O`'s expanded view is the same picture
   one level down, with the tool calls inside the region keeping the markers
   that carry their verdict.
+
+## [0.1.7] — 2026-09-15
+
+### Changed — the quit command is spelled `/quit` only
+
+`/exit` and `/q` are gone from the command table, which listed one action three
+times — three rows in the picker and three lines in `/help`. `Ctrl-D` on an
+empty line still leaves, and a typed `/exit` or `/q` now lands on the
+unknown-command notice like any other name that is not in the table.
 
 ## [0.1.6] — 2026-09-14
 
