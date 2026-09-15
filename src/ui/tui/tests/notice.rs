@@ -9,6 +9,7 @@ use std::time::Duration;
 use super::super::notice::{AppNotice, MachineNotice};
 use super::super::render;
 use super::super::state::State;
+use crate::types::Cot;
 use crate::types::Message;
 use crate::types::Role;
 use crate::types::Usage;
@@ -167,11 +168,11 @@ fn replay_and_the_live_stream_produce_the_same_cells() {
         Message {
             role: Role::Assistant,
             content: Some("running it".into()),
-            reasoning_content: Some("let me think".into()),
+            cot: Some(Cot::OpenAiText {
+                text: "let me think".into(),
+            }),
             tool_calls: None,
             tool_call_id: None,
-            thinking: None,
-            reasoning: None,
         },
         Message::tool("call_1", "exit_code: 0\n--- stdout ---\nbody"),
     ]));

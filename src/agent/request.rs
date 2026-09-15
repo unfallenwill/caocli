@@ -200,31 +200,13 @@ fn openai_request(
     if let Some(text) = meta.instructions.as_deref().filter(|t| !t.is_empty()) {
         messages.push(Message::user(text));
     }
-    // Every wire saves the chain of thought under its own field:
-    // `reasoning_content` (chat wire), `thinking` (Anthropic, signed), and
-    // `reasoning` (Responses, item id + text). The wire we are sending on
-    // reads its own and ignores the others — so before any wire gets the
-    // message, the other two are dropped. Replaying a different wire's
-    // field to a backend that rejects fields it does not know is a 400.
-    // Each wire saves the chain of thought under its own field:
-    // `reasoning_content` (chat wire), `thinking` (Anthropic, signed), and
-    // `reasoning` (Responses, item id + text). The wire we are sending
-    // on reads its own and ignores the others — but a builder that does
-    // not strip them leaks a foreign wire's field to a backend that
-    // rejects fields it does not know. The chat wire's `reasoning_content`
-    // is its own and stays; the other two go.
-    let strip_other_wires = |m: &Message| -> Message {
-        let mut m = m.clone();
-        m.thinking = None;
-        m.reasoning = None;
-        m
-    };
-
-    // A message that arrived on the Anthropic wire carries its thinking
-    // blocks with it; those are that wire's business and are stripped here,
-    // so a session that switched providers never sends them to a backend
-    // that rejects fields it does not know.
-    messages.extend(history.iter().map(strip_other_wires));
+    // The wire we are sending on reads its own `Cot` variant and ignores
+    // the others — the `if let` further down is the strip: a chat wire
+    // message carrying `Cot::AnthropicBlocks` does not match `Cot::OpenAiText`
+    // and contributes nothing to the request, so a session that switched
+    // providers never leaks a foreign wire's field to a backend that
+    // rejects fields it does not know.
+    messages.extend(history.iter().cloned());
     // Specification tripwire (debug builds only): the history being sent must
     // satisfy the executable specification. A violation is a shape the
     // backend answers with a 400 — catch it during development rather than in
@@ -284,15 +266,12 @@ fn responses_request(
         instructions.push(text.to_string());
     }
     let mut replayed = Vec::with_capacity(history.len());
-    for message in history {
-        // Drop the other wires' reasoning fields: the Responses builder
-        // reads its own `reasoning` items and ignores the rest, but a
-        // chat-wire `reasoning_content` or an Anthropic signed block
-        // that followed a switch in providers would survive and reach an
-        // endpoint that rejects it.
-        let mut message = message.clone();
-        message.reasoning_content = None;
-        message.thinking = None;
+    for message in history.iter().cloned() {
+        // The `if let` further down is the strip: the Responses builder
+        // reads only `Cot::ResponsesItems` and contributes nothing for
+        // any other variant, so a chat-wire `Cot::OpenAiText` or an
+        // Anthropic `Cot::AnthropicBlocks` that followed a switch in
+        // providers is silently dropped.
         match message.role {
             crate::types::Role::System => {
                 if let Some(text) = message.text() {
@@ -338,15 +317,12 @@ fn anthropic_request(
     if let Some(text) = meta.instructions.as_deref().filter(|t| !t.is_empty()) {
         system.push(text.to_string());
     }
-    for msg in history {
-        // Drop the other wires' reasoning fields: the Anthropic builder
-        // reads its own `thinking` and ignores the rest, but a chat-wire
-        // `reasoning_content` or a Responses `reasoning` item that
-        // followed a switch in providers would survive the SDK's own
-        // serializer and reach an endpoint that rejects it.
-        let mut msg = msg.clone();
-        msg.reasoning_content = None;
-        msg.reasoning = None;
+    for msg in history.iter().cloned() {
+        // The `if let` further down is the strip: the Anthropic builder
+        // reads only `Cot::AnthropicBlocks` and contributes nothing for
+        // any other variant, so a chat-wire `Cot::OpenAiText` or a
+        // Responses `Cot::ResponsesItems` that followed a switch in
+        // providers is silently dropped.
         match msg.role {
             crate::types::Role::System => {
                 if let Some(text) = msg.text() {
@@ -464,17 +440,20 @@ fn user_content(msg: &Message) -> anthropic::MessageContent {
 
 /// An assistant message as blocks, in the order the model wrote them: thinking
 /// (replayed verbatim, signature included), then text, then the calls it
-/// declared. `reasoning_content` — the OpenAI-wire spelling of the same
-/// reasoning — is deliberately not replayed: without the signature that came
-/// with it on this wire it would not be the content the model returned, and a
-/// made-up signature would be worse than none.
+/// declared. A message that came from a wire other than Anthropic carries
+/// its reasoning under a different `Cot` variant and contributes no thinking
+/// block here — without the signature that came with it on this wire, it
+/// would not be the content the model returned, and a made-up signature
+/// would be worse than none.
 fn assistant_message(msg: &Message) -> anthropic::MessageParam {
     let mut blocks: Vec<anthropic::Block> = Vec::new();
-    for block in msg.thinking.iter().flatten() {
-        blocks.push(anthropic::Block::thinking(
-            &block.thinking,
-            &block.signature,
-        ));
+    if let Some(crate::types::Cot::AnthropicBlocks { blocks: thinking }) = &msg.cot {
+        for block in thinking {
+            blocks.push(anthropic::Block::thinking(
+                &block.thinking,
+                &block.signature,
+            ));
+        }
     }
     if let Some(text) = msg.text().filter(|text| !text.is_empty()) {
         blocks.push(anthropic::Block::text(text));
@@ -532,3 +511,124 @@ fn anthropic_tool(def: ToolDef) -> anthropic::Tool {
 
 #[cfg(test)]
 mod tests;
+
+/// The byte-stable contract: the bytes a builder puts on the wire must
+/// not change just because `Cot` replaced the three legacy fields. The
+/// `Cot` is a wire-neutral representation; the builder's `if let Some(Cot::X)`
+/// pattern match produces the same wire bytes the old "read your own
+/// field, strip the others" path produced. A drift here is a cache miss
+/// on every session that ran before the refactor. Pinned as a regression
+/// gate.
+#[cfg(test)]
+mod byte_stable {
+    use crate::agent::request::build_request;
+    use crate::provider;
+    use crate::session::SessionMeta;
+    use crate::types::{Cot, Message, Role, ThinkingBlock};
+
+    fn meta() -> SessionMeta {
+        SessionMeta {
+            provider: Some("deepseek".into()),
+            model: "deepseek-v4-pro".into(),
+            reasoning_effort: None,
+            instructions: None,
+        }
+    }
+
+    fn history_with_chat_text() -> Vec<Message> {
+        vec![
+            Message::user("hi"),
+            Message {
+                role: Role::Assistant,
+                content: Some("done".into()),
+                cot: Some(Cot::OpenAiText {
+                    text: "thinking".into(),
+                }),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ]
+    }
+
+    fn history_with_anthropic_blocks() -> Vec<Message> {
+        vec![
+            Message::user("hi"),
+            Message {
+                role: Role::Assistant,
+                content: Some("done".into()),
+                cot: Some(Cot::AnthropicBlocks {
+                    blocks: vec![ThinkingBlock {
+                        thinking: "thinking".into(),
+                        signature: "sig".into(),
+                    }],
+                }),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn chat_wire_request_bytes_match_for_openai_text_cot() {
+        let req = build_request(&provider::DEEPSEEK, &meta(), &history_with_chat_text(), &[]);
+        let v: serde_json::Value = serde_json::to_value(&req).unwrap();
+        // WireRequest is externally tagged: the chat body sits under "OpenAi".
+        let messages = v["OpenAi"]["messages"].as_array().unwrap();
+        let assistant = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("an assistant message");
+        assert_eq!(
+            assistant["reasoning_content"], "thinking",
+            "chat wire's flat-text CoT must reach the body byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn anthropic_wire_request_bytes_match_for_anthropic_blocks_cot() {
+        let req = build_request(
+            &provider::MINIMAX,
+            &meta(),
+            &history_with_anthropic_blocks(),
+            &[],
+        );
+        let v: serde_json::Value = serde_json::to_value(&req).unwrap();
+        // WireRequest is externally tagged: the Anthropic body sits under
+        // "Anthropic".
+        let messages = v["Anthropic"]["messages"].as_array().unwrap();
+        let assistant = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("an assistant message");
+        let blocks = assistant["content"]
+            .as_array()
+            .expect("anthropic assistant content is an array of blocks");
+        let thinking: Vec<&serde_json::Value> =
+            blocks.iter().filter(|b| b["type"] == "thinking").collect();
+        assert_eq!(thinking.len(), 1, "exactly one thinking block");
+        assert_eq!(thinking[0]["thinking"], "thinking");
+        assert_eq!(thinking[0]["signature"], "sig");
+    }
+
+    #[test]
+    fn chat_wire_drops_anthropic_blocks_cot() {
+        // Cross-wire: an Anthropic message replayed on the chat wire must
+        // produce no `reasoning_content` and no `thinking` — the byte-level
+        // expression of "the strip". The legacy code stripped via field
+        // assignment; the refactor strips via the pattern match.
+        let req = build_request(
+            &provider::DEEPSEEK,
+            &meta(),
+            &history_with_anthropic_blocks(),
+            &[],
+        );
+        let v: serde_json::Value = serde_json::to_value(&req).unwrap();
+        let messages = v["OpenAi"]["messages"].as_array().unwrap();
+        let assistant = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("an assistant message");
+        assert!(assistant.get("reasoning_content").is_none());
+        assert!(assistant.get("thinking").is_none());
+    }
+}

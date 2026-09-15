@@ -130,10 +130,11 @@ impl From<String> for Content {
     }
 }
 
-/// A thinking block as the Anthropic wire returned it, carried on the assistant
-/// message so the next request on that wire replays it verbatim — MiniMax
-/// requires the complete content (the signature included) to come back in
-/// multi-turn tool dialogs, to keep the chain of thought continuous.
+/// A thinking block as the Anthropic wire returned it: the body of a
+/// thinking segment and the signature that closes it. Kept under [`Cot`] so
+/// the next request on this wire replays it verbatim — MiniMax requires
+/// the complete content (the signature included) to come back in multi-turn tool
+/// dialogs, to keep the chain of thought continuous.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThinkingBlock {
     pub thinking: String,
@@ -141,13 +142,11 @@ pub struct ThinkingBlock {
     pub signature: String,
 }
 
-/// A reasoning item as the Responses wire returned it, carried on the assistant
-/// message so the next request on that wire replays it verbatim. This wire
-/// hands the chain of thought over as items tagged with an id of its own, and
-/// asks for them back whole — id and text both — for the same reason: the
-/// model's own context is what the next turn reasons from. Dropping them is not
-/// a 400 on this wire, it is a model that has to re-derive what it already
-/// worked out.
+/// A reasoning item as the Responses wire returned it, kept under [`Cot`]
+/// so the next request on that wire replays it verbatim. This wire hands the
+/// chain of thought over as items tagged with an id of its own, and asks for
+/// them back whole — id and text both — for the same reason: the model's
+/// own context is what the next turn reasons from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningItem {
     /// The id the endpoint assigned to this item, kept verbatim.
@@ -156,31 +155,86 @@ pub struct ReasoningItem {
     pub text: String,
 }
 
+/// The chain of thought a wire returned. One slot on [`Message`], regardless
+/// of which wire the assistant message came from.
+///
+/// The three variants correspond to the three shapes the wires speak:
+/// - `OpenAiText`: the chat wire's flat `reasoning_content` text.
+/// - `AnthropicBlocks`: the Messages wire's signed thinking blocks.
+/// - `ResponsesItems`: the Responses wire's id-tagged reasoning items.
+///
+/// `Unknown` is the catch-all for a tag this build does not know — added so
+/// a future wire does not strand an old build reading a newer session, and
+/// stripped on the send path because the variant carries no replay bytes.
+///
+/// Each variant carries exactly what its wire needs to see on replay: the
+/// request builder folds the variant into the SDK shape and the wire does the
+/// rest. The internal history is the enum; the wire shape is derived.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Cot {
+    /// OpenAI Chat wire — a flat string under `reasoning_content`.
+    /// DeepSeek requires this field back on multi-turn tool dialogs;
+    /// omitting it is a 400.
+    OpenAiText { text: String },
+    /// Anthropic Messages wire — thinking blocks, signature included.
+    AnthropicBlocks { blocks: Vec<ThinkingBlock> },
+    /// OpenAI Responses wire — reasoning items, id and text both.
+    ResponsesItems { items: Vec<ReasoningItem> },
+    /// An unknown wire tag read from a session this build does not know
+    /// yet. Carries no bytes; the request builder drops it.
+    #[serde(other)]
+    Unknown,
+}
+
+impl Cot {
+    /// The reasoning as a single string, for display. Concatenates blocks
+    /// or items in arrival order; returns the flat text on `OpenAiText`;
+    /// `None` on `Unknown`.
+    pub fn as_text(&self) -> Option<String> {
+        match self {
+            Cot::OpenAiText { text } => Some(text.clone()),
+            Cot::AnthropicBlocks { blocks } => {
+                let joined: Vec<&str> = blocks.iter().map(|b| b.thinking.as_str()).collect();
+                if joined.is_empty() {
+                    None
+                } else {
+                    Some(joined.join(""))
+                }
+            }
+            Cot::ResponsesItems { items } => {
+                let joined: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+                if joined.is_empty() {
+                    None
+                } else {
+                    Some(joined.join(""))
+                }
+            }
+            Cot::Unknown => None,
+        }
+    }
+}
+
 /// Message. Field names match the API exactly:
-/// - assistant: content / reasoning_content / tool_calls (a request carrying
-///   tools must send reasoning_content back; missing it means a 400)
+/// - assistant: content / tool_calls (and `cot`, which one of three builders
+///   replays onto its own wire's field)
 /// - tool:      content / tool_call_id
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<Content>,
+    /// The chain of thought the assistant message carries, in whatever form
+    /// the wire it came from returned it. Wire-agnostic in name and shape;
+    /// the request builder reads it and folds it onto the wire's own field.
+    /// This is the one slot a future wire extends — `Cot` gains a variant,
+    /// nothing on `Message` changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_content: Option<String>,
+    pub cot: Option<Cot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
-    /// Anthropic-wire thinking blocks, set only for an answer that came from
-    /// that wire. Never sent on the OpenAI wire: the request builder strips
-    /// the field before an OpenAi-shaped request is serialized.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thinking: Option<Vec<ThinkingBlock>>,
-    /// Responses-wire reasoning items, set only for an answer that came from
-    /// that wire. Each builder replays its own wire's form of the reasoning
-    /// and ignores the other two: the flat text, the signed blocks, or these.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<Vec<ReasoningItem>>,
 }
 
 impl Message {
@@ -485,34 +539,33 @@ impl TurnAccumulator {
                     .collect(),
             )
         };
-        // A thinking body no signature ever closed stays out of the blocks:
-        // without its signature it is not the content the model returned,
-        // and replaying a made-up block would be worse than replaying none.
-        // The text itself is kept in `reasoning_content` either way.
-        let thinking = if self.thinking.is_empty() {
-            None
+        // Fold whatever the wire returned into one `Cot` variant. The
+        // priority is the form the wire that produced the answer speaks:
+        // signed Anthropic blocks first (they need their signatures to be
+        // whole), Responses items next (id-tagged, must stay grouped),
+        // and the flat OpenAI chat text last — a value that has none of the
+        // other two always falls here.
+        let cot = if !self.thinking.is_empty() {
+            Some(Cot::AnthropicBlocks {
+                blocks: self.thinking,
+            })
+        } else if !self.reasoning.is_empty() {
+            Some(Cot::ResponsesItems {
+                items: self.reasoning,
+            })
+        } else if !self.reasoning_content.is_empty() {
+            Some(Cot::OpenAiText {
+                text: self.reasoning_content,
+            })
         } else {
-            Some(self.thinking)
-        };
-        // A reasoning item is whole by construction — every fragment arrived
-        // under an id the wire assigned — so what is here is what goes back.
-        let reasoning = if self.reasoning.is_empty() {
             None
-        } else {
-            Some(self.reasoning)
         };
         Message {
             role: Role::Assistant,
             content: Some(Content::Text(self.content)),
-            reasoning_content: if self.reasoning_content.is_empty() {
-                None
-            } else {
-                Some(self.reasoning_content)
-            },
+            cot,
             tool_calls,
             tool_call_id: None,
-            thinking,
-            reasoning,
         }
     }
 }
@@ -521,12 +574,136 @@ impl TurnAccumulator {
 mod tests {
     use super::*;
 
+    /// Pinned: the wire-neutral `Cot` JSON shape. A future wire's variant
+    /// must extend this without breaking these tests — the contract that
+    /// makes `Message` truly protocol-agnostic.
+    #[test]
+    fn cot_serde_shapes_are_pinned() {
+        // OpenAI Chat wire: a flat string under `text`, tagged by variant.
+        let m = Message {
+            role: Role::Assistant,
+            content: Some("hi".into()),
+            cot: Some(Cot::OpenAiText {
+                text: "think".into(),
+            }),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(
+            json,
+            r#"{"role":"assistant","content":"hi","cot":{"type":"open_ai_text","text":"think"}}"#
+        );
+
+        // Anthropic wire: signed blocks under `blocks`, tagged by variant.
+        let m = Message {
+            role: Role::Assistant,
+            content: Some("hi".into()),
+            cot: Some(Cot::AnthropicBlocks {
+                blocks: vec![ThinkingBlock {
+                    thinking: "think".into(),
+                    signature: "sig".into(),
+                }],
+            }),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains(r#""type":"anthropic_blocks""#));
+        assert!(json.contains(r#""signature":"sig""#));
+
+        // Responses wire: id-tagged items, tagged by variant.
+        let m = Message {
+            role: Role::Assistant,
+            content: Some("hi".into()),
+            cot: Some(Cot::ResponsesItems {
+                items: vec![ReasoningItem {
+                    id: "rs_1".into(),
+                    text: "think".into(),
+                }],
+            }),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains(r#""type":"responses_items""#));
+        assert!(json.contains(r#""id":"rs_1""#));
+    }
+
+    /// `Cot::Unknown` is the catch-all: a tag this build does not know
+    /// yet lands here on read, and contributes nothing on the send path.
+    /// Pinned because losing this would strand an old build on a newer
+    /// session, which is a real failure mode after a wire is added.
+    #[test]
+    fn cot_unknown_is_catch_all_and_carries_no_replay_bytes() {
+        let m: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":"hi","cot":{"type":"future_wire_42","bytes":[1,2,3]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(m.cot, Some(Cot::Unknown)));
+        // No text is recoverable: the variant carries no replay bytes, by
+        // design — sending an unknown wire's bytes back is worse than not
+        // sending them.
+        assert_eq!(m.cot.as_ref().and_then(Cot::as_text), None);
+    }
+
+    /// `Cot::as_text` is the one place blocks / items flatten into a
+    /// display string. The UI replay reads it.
+    #[test]
+    fn cot_as_text_concatenates_blocks_and_items() {
+        assert_eq!(
+            Cot::OpenAiText {
+                text: "hello".into()
+            }
+            .as_text()
+            .as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            Cot::AnthropicBlocks {
+                blocks: vec![
+                    ThinkingBlock {
+                        thinking: "foo".into(),
+                        signature: "1".into()
+                    },
+                    ThinkingBlock {
+                        thinking: "bar".into(),
+                        signature: "2".into()
+                    },
+                ],
+            }
+            .as_text()
+            .as_deref(),
+            Some("foobar")
+        );
+        assert_eq!(
+            Cot::ResponsesItems {
+                items: vec![
+                    ReasoningItem {
+                        id: "a".into(),
+                        text: "1".into()
+                    },
+                    ReasoningItem {
+                        id: "b".into(),
+                        text: "2".into()
+                    },
+                ],
+            }
+            .as_text()
+            .as_deref(),
+            Some("12")
+        );
+        assert_eq!(Cot::Unknown.as_text(), None);
+    }
+
     #[test]
     fn assistant_message_serde_roundtrip() {
         let msg = Message {
             role: Role::Assistant,
             content: Some("answer".into()),
-            reasoning_content: Some("thinking...".into()),
+            cot: Some(Cot::OpenAiText {
+                text: "thinking...".into(),
+            }),
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".into(),
                 r#type: "function".into(),
@@ -536,11 +713,10 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
-            thinking: None,
-            reasoning: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""reasoning_content":"thinking...""#));
+        assert!(json.contains(r#""type":"open_ai_text""#));
+        assert!(json.contains(r#""text":"thinking...""#));
         let back: Message = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, back);
     }
@@ -552,22 +728,24 @@ mod tests {
         let msg = Message {
             role: Role::Assistant,
             content: Some("done".into()),
-            reasoning_content: Some("reasoned".into()),
+            cot: Some(Cot::AnthropicBlocks {
+                blocks: vec![ThinkingBlock {
+                    thinking: "reasoned".into(),
+                    signature: "cafe".into(),
+                }],
+            }),
             tool_calls: None,
             tool_call_id: None,
-            thinking: Some(vec![ThinkingBlock {
-                thinking: "reasoned".into(),
-                signature: "cafe".into(),
-            }]),
-            reasoning: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""thinking":[{"thinking":"reasoned","signature":"cafe"}]"#));
+        assert!(json.contains(r#""type":"anthropic_blocks""#));
+        assert!(json.contains(r#""thinking":"reasoned""#));
+        assert!(json.contains(r#""signature":"cafe""#));
         let back: Message = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, back);
-        // A log line written before the field existed reads back as no blocks.
+        // A log line written before the field existed reads back as no CoT.
         let old: Message = serde_json::from_str(r#"{"role":"assistant","content":"hi"}"#).unwrap();
-        assert_eq!(old.thinking, None);
+        assert_eq!(old.cot, None);
     }
 
     #[test]
@@ -714,7 +892,14 @@ mod tests {
         ));
         let msg = acc.finish();
         assert_eq!(msg.text().as_deref(), Some("9.11 vs 9.8"));
-        assert_eq!(msg.reasoning_content.as_deref(), Some("let me compare."));
+        // The wire was chat (no signature, no item id), so the CoT carries
+        // the flat text the chat wire demands back.
+        assert_eq!(
+            msg.cot,
+            Some(Cot::OpenAiText {
+                text: "let me compare.".into()
+            })
+        );
         let tcs = msg.tool_calls.unwrap();
         assert_eq!(tcs.len(), 1);
         assert_eq!(tcs[0].id, "call_1");
@@ -787,7 +972,11 @@ mod tests {
         // A second block opens: the buffer restarted, and closes signed too.
         acc.feed(&delta(Some("second block."), Some("sig-2")));
         let msg = acc.finish();
-        let blocks = msg.thinking.unwrap();
+        // Two signed thinking blocks, the way Anthropic writes them.
+        let blocks = match msg.cot {
+            Some(Cot::AnthropicBlocks { blocks }) => blocks,
+            other => panic!("expected AnthropicBlocks cot, got {other:?}"),
+        };
         assert_eq!(
             blocks,
             vec![
@@ -801,11 +990,13 @@ mod tests {
                 },
             ]
         );
-        // The flat field keeps the whole reasoning for whoever reads text.
-        assert_eq!(
-            msg.reasoning_content.as_deref(),
-            Some("step one. step two.second block.")
-        );
+        // The text concatenates the blocks' bodies for whoever reads text.
+        let concatenated: String = blocks
+            .iter()
+            .map(|b| b.thinking.as_str())
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(concatenated, "step one. step two.second block.");
     }
 
     #[test]
@@ -825,16 +1016,27 @@ mod tests {
         acc.feed(&delta(Some("unsealed thought"), None));
         acc.feed(&delta(None, Some("")));
         let msg = acc.finish();
-        assert_eq!(msg.thinking, None);
-        assert_eq!(msg.reasoning_content.as_deref(), Some("unsealed thought"));
+        // No block was ever sealed: the body without its signature is not
+        // the content the model returned, so the CoT stays on the chat
+        // wire's flat-text slot rather than claiming to be AnthropicBlocks.
+        assert_eq!(
+            msg.cot,
+            Some(Cot::OpenAiText {
+                text: "unsealed thought".into()
+            })
+        );
 
         // The DeepSeek shape: reasoning without any signature at all, so no
         // block is ever produced and the message is what it always was.
         let mut acc = TurnAccumulator::default();
         acc.feed(&delta(Some("plain reasoning"), None));
         let msg = acc.finish();
-        assert_eq!(msg.thinking, None);
-        assert_eq!(msg.reasoning_content.as_deref(), Some("plain reasoning"));
+        assert_eq!(
+            msg.cot,
+            Some(Cot::OpenAiText {
+                text: "plain reasoning".into()
+            })
+        );
     }
 
     #[test]
@@ -858,9 +1060,13 @@ mod tests {
         // A wire with no item id at all — the chat shape — adds no item.
         acc.feed(&delta(" flat tail", None));
         let msg = acc.finish();
+        let items = match msg.cot {
+            Some(Cot::ResponsesItems { items }) => items,
+            other => panic!("expected ResponsesItems cot, got {other:?}"),
+        };
         assert_eq!(
-            msg.reasoning,
-            Some(vec![
+            items,
+            vec![
                 ReasoningItem {
                     id: "rs_1".into(),
                     text: "first item.".into()
@@ -869,17 +1075,17 @@ mod tests {
                     id: "rs_2".into(),
                     text: "second item.".into()
                 },
-            ])
+            ]
         );
-        // The flat field keeps everything, including the text that arrived
-        // without an item to belong to.
-        assert_eq!(
-            msg.reasoning_content.as_deref(),
-            Some("first item.second item. flat tail")
-        );
-        // The other wires' slots stay empty: this message carries no signed
-        // block, and the builder for that wire reads its own field.
-        assert_eq!(msg.thinking, None);
+        // The flat text concatenates the items' bodies for whoever reads
+        // text, including the text that arrived without an item to belong
+        // to (it rides on the chat wire's slot inside the same message).
+        let concatenated: String = items
+            .iter()
+            .map(|i| i.text.as_str())
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(concatenated, "first item.second item.");
     }
 
     #[test]
@@ -887,25 +1093,24 @@ mod tests {
         let msg = Message {
             role: Role::Assistant,
             content: Some("done".into()),
-            reasoning_content: Some("reasoned".into()),
+            cot: Some(Cot::ResponsesItems {
+                items: vec![ReasoningItem {
+                    id: "rs_1".into(),
+                    text: "reasoned".into(),
+                }],
+            }),
             tool_calls: None,
             tool_call_id: None,
-            thinking: None,
-            reasoning: Some(vec![ReasoningItem {
-                id: "rs_1".into(),
-                text: "reasoned".into(),
-            }]),
         };
         let json = serde_json::to_string(&msg).unwrap();
-        assert!(
-            json.contains(r#""reasoning":[{"id":"rs_1","text":"reasoned"}]"#),
-            "{json}"
-        );
+        assert!(json.contains(r#""type":"responses_items""#), "{json}");
+        assert!(json.contains(r#""id":"rs_1""#), "{json}");
+        assert!(json.contains(r#""text":"reasoned""#), "{json}");
         let back: Message = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, back);
         // A log line written before the field existed reads back as none.
         let old: Message = serde_json::from_str(r#"{"role":"assistant","content":"hi"}"#).unwrap();
-        assert_eq!(old.reasoning, None);
+        assert_eq!(old.cot, None);
     }
 
     #[test]

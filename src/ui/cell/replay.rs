@@ -50,10 +50,14 @@ pub fn from_messages(messages: &[Message]) -> Vec<Cell> {
                 }
             }
             Role::Assistant => {
-                if let Some(r) = &m.reasoning_content
+                // The CoT is one slot regardless of wire; the rendering
+                // wants the text, and `Cot::as_text` is the one place
+                // that knows how to flatten blocks / items into a string.
+                if let Some(cot) = &m.cot
+                    && let Some(r) = cot.as_text()
                     && !r.is_empty()
                 {
-                    cells.push(Cell::Reasoning(r.clone()));
+                    cells.push(Cell::Reasoning(r));
                 }
                 if let Some(text) = m.text()
                     && !text.is_empty()
@@ -132,11 +136,11 @@ mod tests {
         Message {
             role: Role::Assistant,
             content: content.map(Into::into),
-            reasoning_content: reasoning.map(str::to_owned),
+            cot: reasoning.map(|text| crate::types::Cot::OpenAiText {
+                text: text.to_owned(),
+            }),
             tool_calls: calls,
             tool_call_id: None,
-            thinking: None,
-            reasoning: None,
         }
     }
 

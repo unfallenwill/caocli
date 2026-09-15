@@ -1192,6 +1192,7 @@ fn unescape_path_text(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Cot;
 
     fn tmpdir() -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1221,7 +1222,9 @@ mod tests {
         s.append_message(&Message {
             role: Role::Assistant,
             content: Some("answer".into()),
-            reasoning_content: Some("reasoning trace".into()),
+            cot: Some(Cot::OpenAiText {
+                text: "reasoning trace".into(),
+            }),
             tool_calls: Some(vec![crate::types::ToolCall {
                 id: "call_1".into(),
                 r#type: "function".into(),
@@ -1231,8 +1234,6 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
-            thinking: None,
-            reasoning: None,
         })
         .unwrap();
         s.append_message(&Message::tool("call_1", "file.txt"))
@@ -1245,8 +1246,10 @@ mod tests {
         assert_eq!(loaded.id, id);
         assert_eq!(loaded.messages.len(), 3);
         assert_eq!(
-            loaded.messages[1].reasoning_content.as_deref(),
-            Some("reasoning trace")
+            loaded.messages[1].cot,
+            Some(Cot::OpenAiText {
+                text: "reasoning trace".into()
+            })
         );
         assert_eq!(loaded.messages[2].tool_call_id.as_deref(), Some("call_1"));
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1438,7 +1441,7 @@ mod tests {
         s.append_message(&crate::types::Message {
             role: Role::Assistant,
             content: Some("".into()),
-            reasoning_content: None,
+            cot: None,
             tool_calls: Some(vec![
                 crate::types::ToolCall {
                     id: "call_1".into(),
@@ -1458,8 +1461,6 @@ mod tests {
                 },
             ]),
             tool_call_id: None,
-            thinking: None,
-            reasoning: None,
         })
         .unwrap();
         s.append_message(&Message::tool("call_1", "ok")).unwrap();
