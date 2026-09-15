@@ -7,8 +7,7 @@
 //! describe *what is about to think for me*, and a narrow terminal that loses
 //! everything else still tells me which model will run the next turn. Cache
 //! stats come second because they accumulate over the session: every dropped
-//! segment is one the user can recover from the transcript's per-prompt
-//! metadata row above each User cell.
+//! segment is one the user can recover by widening the terminal.
 
 use crate::types::{CacheTokens, Usage};
 use crate::ui::glyphs;
@@ -50,20 +49,18 @@ impl CacheStats {
     }
 }
 
-/// The status line's content: the session's model and effort tier, plus the
-/// cache statistics. The model and effort are also carried in the per-prompt
-/// metadata row above each User cell, but the bar shows what is *current*: a
-/// reader looking at the bottom line before typing wants to know which model
-/// will run the next turn, not which one ran the last one.
+/// The status line's content: the session's model id, its effort tier, and
+/// the cumulative cache statistics. The bar shows what is *current*: a reader
+/// looking at the bottom line before typing wants to know which model will
+/// run the next turn, not which one ran the last one.
 #[derive(Debug, Default)]
 pub struct Status {
     stats: CacheStats,
     /// The model id in effect. Set at session start and on `/model`. Drives
-    /// the first segment of the bar; the same value also feeds the per-prompt
-    /// metadata row above each User cell.
+    /// the first segment of the bar.
     model: Option<String>,
     /// The reasoning effort tier in effect. Set at session start and on
-    /// `/effort`. Joins the model on the bar and on the metadata row.
+    /// `/effort`. Joins the model on the bar.
     effort: Option<String>,
 }
 
@@ -80,16 +77,6 @@ impl Status {
     /// "not set".
     pub fn set_effort(&mut self, effort: &str) {
         self.effort = non_empty(effort);
-    }
-
-    /// The current model id, read-only.
-    pub fn model(&self) -> Option<&str> {
-        self.model.as_deref()
-    }
-
-    /// The current effort tier, read-only.
-    pub fn effort(&self) -> Option<&str> {
-        self.effort.as_deref()
     }
 
     /// Fold one sub-request's usage into the cache statistics.
@@ -170,8 +157,6 @@ mod tests {
     fn default_status_full_line_is_cache_only() {
         let s = Status::default();
         assert_eq!(s.full_line(), "cache 0.0% · 0/0");
-        assert!(s.model().is_none());
-        assert!(s.effort().is_none());
     }
 
     /// Model id lands at the head of the segment list, ahead of cache stats,
@@ -196,7 +181,6 @@ mod tests {
 
     /// A blank or whitespace-only string clears the field rather than
     /// leaving an empty segment that would render as ` · cache ...`.
-    /// Mirrors the rule `metadata_text` already keeps on the TUI side.
     #[test]
     fn blank_string_clears_the_field() {
         let mut s = Status::default();
@@ -205,8 +189,6 @@ mod tests {
         s.set_model("");
         s.set_effort("   ");
         assert_eq!(s.full_line(), "cache 0.0% · 0/0");
-        assert!(s.model().is_none());
-        assert!(s.effort().is_none());
     }
 
     /// Progressive disclosure drops whole segments from the end, starting

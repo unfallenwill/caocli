@@ -6,6 +6,20 @@ semantic-version bumps per release.
 
 ## [Unreleased]
 
+### Changed — the per-prompt metadata row is gone; the status bar is the only place the model id is shown
+
+The TUI used to push a `provider/model · effort tier` line above every User
+cell in the transcript, and the plain front end echoed the same line as a
+dim row before each model run. Both surfaces are removed: the row repeated
+the same information turn after turn, and the status bar already carries
+the current model id and effort tier — so a reader looking at the bottom
+line before typing still sees which model will run the next turn.
+
+The `Status::model` and `Status::effort` fields stay; they continue to feed
+the status bar (now the only reader of either one). `State::metadata_text`,
+`repl::prompt_metadata`, and the corresponding tests are deleted; live and
+replay both push only the message cells back on the transcript.
+
 ### Changed — visual design: two themes, glyph set, measured palette
 
 The screen was redesigned from the ground up, with two themes (`ink` and

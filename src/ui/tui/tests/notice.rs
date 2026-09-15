@@ -126,17 +126,18 @@ fn a_fragment_in_the_other_style_opens_a_new_block() {
     assert!(screen.view.stream.current().is_none());
 }
 
-/// `SetModel` and `SetEffort` notices update the model's metadata
-/// (which rides above each user prompt), not the bottom status line.
-/// `Usage` notices still record cache stats into the status bar.
+/// `SetModel` and `SetEffort` notices update the status bar (the only place
+/// the model id is shown now), and `Usage` notices record cache stats into
+/// the same line.
 #[test]
 fn status_notices_reach_the_status_line() {
     let mut screen = State::default();
     screen.apply_app(AppNotice::SetModel("m-1".into()));
     screen.apply_app(AppNotice::SetEffort("high".into()));
-    // The metadata row carries the model+effort in transcript cells.
-    let meta = screen.metadata_text().expect("model+effort are set");
-    assert_eq!(meta, "m-1 · effort high");
+    assert_eq!(
+        screen.view.status.full_line(),
+        "m-1 · effort high · cache 0.0% · 0/0"
+    );
     screen.apply(MachineNotice::Usage(
         Usage {
             prompt_tokens: 6,
@@ -189,116 +190,55 @@ fn replay_and_the_live_stream_produce_the_same_cells() {
     );
 }
 
-/// A submitted user line gets a metadata row above it on the transcript:
-/// `provider/model · effort tier`, drawn dim, that names which model and
-/// tier ran the line that follows it. The metadata is current at the
-/// time the line is asked, so a session that switches models mid-history
-/// reads the way the user asked it.
+/// Submitting a user line lands one User cell on the transcript and nothing
+/// else: the model + effort are not echoed above the prompt, they live on
+/// the status bar. The transcript stays a record of what was asked and
+/// what the model said.
 #[test]
-fn submit_pushes_a_metadata_row_above_each_user_line() {
+fn submit_pushes_only_the_user_cell() {
     let mut screen = State::for_test_with_meta("deepseek/deepseek-v4-flash", "max");
     screen.submit("first");
     screen.submit("second");
 
-    // Two user lines, each preceded by its own metadata cell.
     let cells = &screen.view.transcript;
-    assert!(cells.len() >= 4, "two metadata + two user lines: {cells:?}");
-    let metadata_1 = cells[0].clone();
-    let user_1 = cells[1].clone();
-    let metadata_2 = cells[2].clone();
-    let user_2 = cells[3].clone();
-    if let Cell::Notice(t) = &metadata_1 {
-        assert_eq!(
-            t, "deepseek/deepseek-v4-flash · effort max",
-            "metadata carries the model+effort pair"
-        );
-    } else {
-        panic!("metadata_1 was not a Notice: {metadata_1:?}");
-    }
-    assert!(matches!(user_1, Cell::User { .. }));
-    if let Cell::Notice(t) = &metadata_2 {
-        assert_eq!(
-            t, "deepseek/deepseek-v4-flash · effort max",
-            "same metadata repeated for each user line"
-        );
-    } else {
-        panic!("metadata_2 was not a Notice: {metadata_2:?}");
-    }
-    assert!(matches!(user_2, Cell::User { .. }));
+    assert_eq!(
+        cells.len(),
+        2,
+        "two submits, two user cells, no metadata rows: {cells:?}"
+    );
+    let user_1 = &cells[0];
+    let user_2 = &cells[1];
+    let Cell::User { text, .. } = user_1 else {
+        panic!("cells[0] should be a User cell, got {user_1:?}");
+    };
+    assert_eq!(text, "first");
+    let Cell::User { text, .. } = user_2 else {
+        panic!("cells[1] should be a User cell, got {user_2:?}");
+    };
+    assert_eq!(text, "second");
 }
 
-/// Switching models mid-session: the metadata row reflects the model at
-/// the time the line is asked, not the model the session began with.
+/// Replay puts only the message cells back on the transcript. The current
+/// model id and effort stay on the status bar; they are not duplicated on
+/// the replay surface, so a resumed session and a live session read the
+/// same way.
 #[test]
-fn submit_picks_up_the_current_model_at_submit_time() {
-    let mut screen = State::for_test_with_meta("deepseek/deepseek-v4-flash", "max");
-    screen.submit("first");
-    // The user switches models mid-history.
-    screen.view.status.set_model("deepseek/deepseek-v4-pro");
-    screen.submit("second");
-
-    let cells = &screen.view.transcript;
-    let metadata_1 = &cells[0];
-    let user_1 = &cells[1];
-    let metadata_2 = &cells[2];
-    let user_2 = &cells[3];
-    if let Cell::Notice(t) = metadata_1 {
-        assert!(
-            t.contains("v4-flash"),
-            "first line keeps the original model: {metadata_1:?}"
-        );
-    } else {
-        panic!("metadata_1 was not a Notice: {metadata_1:?}");
-    }
-    if let Cell::Notice(t) = metadata_2 {
-        assert!(
-            t.contains("v4-pro"),
-            "second line picks up the switched model: {metadata_2:?}"
-        );
-    } else {
-        panic!("metadata_2 was not a Notice: {metadata_2:?}");
-    }
-    assert!(matches!(user_1, Cell::User { .. }));
-    assert!(matches!(user_2, Cell::User { .. }));
-}
-
-/// A session resumed from a log: each replayed user line picks up the
-/// current model's metadata, so a resumed session reads the same as one
-/// that was watched live. Live and replay produce identical cells.
-#[test]
-fn replay_pushes_metadata_above_each_replayed_user_line() {
+fn replay_pushes_only_the_message_cells() {
     let mut screen = State::for_test_with_meta("zai-coding-cn/glm-5.3", "high");
     screen.apply_app(AppNotice::Replay(vec![
         Message::user("first"),
         Message::user("second"),
     ]));
     let cells = &screen.view.transcript;
-    // Each user line gets its own metadata row above it.
-    let metadata_1 = &cells[0];
-    let user_1 = &cells[1];
-    let metadata_2 = &cells[2];
-    let user_2 = &cells[3];
-    assert!(
-        matches!(metadata_1, Cell::Notice(t) if t == "zai-coding-cn/glm-5.3 · effort high"),
-        "first replayed line gets a metadata row"
-    );
-    assert!(matches!(user_1, Cell::User { .. }));
-    assert!(matches!(metadata_2, Cell::Notice(_)));
-    assert!(matches!(user_2, Cell::User { .. }));
-}
-
-#[test]
-fn metadata_text_is_none_when_no_model_or_effort_is_set() {
-    let screen = State::default();
-    assert!(screen.metadata_text().is_none());
-}
-
-#[test]
-fn metadata_text_omits_a_blank_field() {
-    let screen = State::for_test_with_meta("m-1", "");
-    assert_eq!(screen.metadata_text().as_deref(), Some("m-1"));
-    let screen = State::for_test_with_meta("", "high");
-    assert_eq!(screen.metadata_text().as_deref(), Some("effort high"));
+    assert_eq!(cells.len(), 2, "two replayed user lines, no metadata rows");
+    let Cell::User { text, .. } = &cells[0] else {
+        panic!("cells[0] should be a User cell, got {:?}", cells[0]);
+    };
+    assert_eq!(text, "first");
+    let Cell::User { text, .. } = &cells[1] else {
+        panic!("cells[1] should be a User cell, got {:?}", cells[1]);
+    };
+    assert_eq!(text, "second");
 }
 
 /// Settled-Done step children stay hidden: the verbose toggle that used
