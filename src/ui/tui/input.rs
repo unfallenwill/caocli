@@ -401,12 +401,6 @@ impl State {
         self.remember(line);
         if !line.starts_with('/') {
             self.revision += 1;
-            // The per-prompt metadata row: model and effort at the time
-            // the line is asked, so a session that switched models reads
-            // the way the user asked it.
-            if let Some(meta) = self.metadata_text() {
-                self.view.transcript.push(Cell::Notice(meta));
-            }
             self.view.transcript.push(Cell::user(line));
         }
         // What was just asked is what the user wants to watch, so the transcript

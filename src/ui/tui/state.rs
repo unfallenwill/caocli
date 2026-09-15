@@ -27,7 +27,6 @@ use tokio::sync::oneshot;
 
 use crate::ui::Verdict;
 use crate::ui::cell::{self, Cell, Style, Thought, ThoughtStatus};
-use crate::ui::glyphs;
 
 use super::edit::Edit;
 use super::notice::{AppNotice, MachineNotice};
@@ -64,11 +63,11 @@ pub(super) struct State {
 }
 
 impl State {
-    /// A `State` configured for tests that exercise the per-prompt
-    /// metadata row: a known model and effort, no other state. Built
-    /// through a constructor rather than `Default::default() + field
-    /// assignment` so the lint that catches "init-then-overwrite"
-    /// patterns does not flag the test fixture.
+    /// A `State` configured for tests that exercise the status bar:
+    /// a known model and effort, no other state. Built through a
+    /// constructor rather than `Default::default() + field assignment`
+    /// so the lint that catches "init-then-overwrite" patterns does
+    /// not flag the test fixture.
     #[cfg(test)]
     pub(super) fn for_test_with_meta(model: &str, effort: &str) -> Self {
         let mut s = Self::default();
@@ -203,11 +202,6 @@ impl State {
                 self.end_block();
                 let mut buf = Vec::new();
                 for m in messages {
-                    if matches!(m.role, crate::types::Role::User)
-                        && let Some(meta) = self.metadata_text()
-                    {
-                        buf.push(Cell::Notice(meta));
-                    }
                     buf.extend(cell::from_messages(std::slice::from_ref(&m)));
                 }
                 self.view.transcript.extend(buf);
@@ -399,30 +393,6 @@ impl State {
             Some(Cell::Question(_)) | Some(Cell::Todo(_))
         ) {
             self.close_and_push(Cell::Notice(result.to_owned()));
-        }
-    }
-
-    /// The per-prompt metadata row's text: `provider/model · effort tier`,
-    /// or `None` when neither field is known yet.
-    ///
-    /// Reads from [`View::status`], the same place the bar reads: model and
-    /// effort are stored once and read from both ends. The metadata row
-    /// captures the value at the moment the user submits (so a session that
-    /// switched models mid-history keeps the line that asked the old one),
-    /// and the bar redraws with the new value (so a reader looking at the
-    /// bottom line sees what is current).
-    pub(super) fn metadata_text(&self) -> Option<String> {
-        let mut parts = Vec::new();
-        if let Some(m) = self.view.status.model() {
-            parts.push(m.to_owned());
-        }
-        if let Some(e) = self.view.status.effort() {
-            parts.push(format!("effort {e}"));
-        }
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join(glyphs::sep()))
         }
     }
 

@@ -162,19 +162,15 @@ ok: package.name = caocli (312 bytes)
 ─────────────────────────────────────────⠸ 12s · running Bash · ~38 token/s
 ›  the turn is running · Enter queues · Ctrl-C stops
 ──────────────────────────────────────────────────────────────────────────
-› deepseek-v4-pro · effort max
-cache 95.3% · hit 846912 · miss 41538
+deepseek-v4-pro · effort max · cache 95.3% · hit 846912 · miss 41538
 ```
 
-- **The status line** is the row under the box, always the session's cache stats:
-  hit rate and raw hit/miss counts. A new session opens with the defaults
-  (`cache 0.0% · 0/0`) and the counts move as the provider reports usage. Stats reset
-  when the session, the model, or the provider switches — what is true of a row
-  that names only what is cumulative.
-- **The metadata row** rides one line above each user prompt, naming the
-  `provider/model · effort tier` the next request will carry. The renderer
-  flips when `/model` or `/effort` changes a future one, so a session that
-  switched mid-history reads the way the user asked it.
+- **The status line** is the row under the box. It carries the current model
+  id (`provider/model`), the reasoning effort tier in effect, and the
+  cumulative cache stats (`cache 95.3% · hit N · miss M`). The model id and
+  effort sit at the head of the line so a narrow terminal that drops everything
+  else still tells the reader which model will run the next turn. Cache
+  stats reset when the session, the model, or the provider switches.
 - **The border above the box says what the agent is doing**: `thinking`
   while a Reasoning block streams, `running Bash` (or whatever verb) while a tool
   call is in flight, `working` otherwise. The spinner character and the elapsed
@@ -240,19 +236,18 @@ a terminal), which is the front end the status bar below belongs to.
 
 ### Status bar
 
-In the plain REPL (`--no-tui`), a status bar pinned to the bottom line shows the session's
-cumulative cache hit rate, right-aligned:
+In the plain REPL (`--no-tui`), a status bar pinned to the bottom line shows the
+session's model id, reasoning effort tier, and cumulative cache hit rate,
+right-aligned:
 
 ```
-cache 98.6% · hit 32384 · miss 461
+deepseek-v4-pro · effort max · cache 98.6% · hit 32384 · miss 461
 ```
 
-The cache stats are the only session-level signal that belongs on a pinned row —
-they are cumulative, they follow the session, and they reset on `/new`, `/resume`,
-and `/model`. The model id and reasoning effort tier, by contrast, are per-turn
-and were moved to a metadata row above each User cell in the TUI transcript
-(and echoed as a dim line by the plain front end), since the pinned row used to
-be a snapshot the reader did not ask for.
+The cache stats are cumulative: they follow the session, and they reset on
+`/new`, `/resume`, and `/model`. The model id and reasoning effort tier sit
+at the head of the same line; a reader looking at the bottom row before
+typing wants to know which model will run the next turn.
 
 `--no-status-bar` turns the bar off. The bar reserves the last terminal line via
 a scroll region, so output scrolls above it — the trade-off is that lines

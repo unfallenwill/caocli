@@ -160,11 +160,6 @@ pub async fn handle(
             ui.info("unknown command; /help lists the available commands")
         }
         _ => {
-            // Echo the per-prompt metadata the TUI's transcript already
-            // carries: a plain-front-end user does not get a transcript
-            // of their own, so the metadata row lands as a dim line just
-            // before the model starts answering.
-            ui.info(&prompt_metadata(agent));
             if let Err(e) = agent.turn(line, ui, cancel, approve, ask).await {
                 ui.error(&format!("{e:#}"));
             }
@@ -579,7 +574,7 @@ pub fn help(front: FrontKind) -> String {
 /// The `/debug` summary: model, provider, and effort. The cache stats
 /// the bottom row already carries; `/debug` is for what the bottom row
 /// cannot say -- which provider and model a session is on, for the
-/// reader who has scrolled away from the metadata row.
+/// reader who has scrolled away from the status bar.
 pub fn debug_summary(agent: &Agent) -> String {
     let mut out = String::new();
     out.push_str(&format!("model:  {}\n", agent.model_label()));
@@ -595,14 +590,6 @@ pub fn debug_summary(agent: &Agent) -> String {
     out.push_str(&format!("theme:  {}\n", theme::theme().describe()));
     out.push_str(&format!("glyphs:  {}\n", glyphs::get().name()));
     out
-}
-
-/// The single-line per-prompt metadata the plain front end echoes before
-/// the model starts answering. The TUI carries the same text in a
-/// transcript cell above each user prompt; the plain front end writes
-/// it as a dim line because it has no transcript of its own to hold it.
-pub fn prompt_metadata(agent: &Agent) -> String {
-    format!("{} · effort {}", agent.model_label(), agent.effort_label())
 }
 
 #[cfg(test)]
@@ -1791,21 +1778,5 @@ mod tests {
         fn assert_front<T: Front>() {}
         assert_front::<Renderer>();
         assert_front::<Recording>();
-    }
-
-    #[tokio::test]
-    async fn prompt_metadata_pairs_model_and_effort() {
-        // The plain front end echoes this line as a dim row before each
-        // model run; the TUI carries the same text in a transcript cell
-        // above each User prompt. Both surfaces say the same thing.
-        // The first arg is the *provider id*, the second is the bare
-        // model id; `Agent::model_label` joins them, so the prefix here
-        // is the provider and the suffix the model.
-        let dir = tmpdir("prompt-meta");
-        let agent = agent_in(&dir, "deepseek-v4-pro");
-        assert_eq!(
-            prompt_metadata(&agent),
-            "deepseek/deepseek-v4-pro · effort max"
-        );
     }
 }

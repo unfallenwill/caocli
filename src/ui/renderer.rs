@@ -80,9 +80,8 @@ pub struct Renderer {
     /// sequences, how to silence its echo -- comes from here.
     term: Box<dyn Terminal>,
     /// What the status bar reports: model, effort, and session cache stats.
-    /// `model` and `effort` are also read by the per-prompt metadata row on
-    /// the TUI front end; on the plain front end they live on the bar only,
-    /// because there is no metadata row to share them with.
+    /// `model` and `effort` are set once at session start and on `/model`
+    /// or `/effort`; the bar is the only place either one is shown.
     status: Status,
     pub(super) bar: Option<StatusBar>,
     /// Whether the front end currently has the tty in raw mode. The prompt sets

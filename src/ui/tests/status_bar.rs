@@ -143,9 +143,8 @@ fn usage_paints_session_cache_bar_and_reset_clears_it() {
 }
 
 /// The status bar line the renderer draws at the given terminal width, with
-/// cache statistics already in place. The bar's only segment is the
-/// cache line; the model id has moved to the metadata row above each
-/// user prompt and is no longer a segment here.
+/// cache statistics already in place. No model has been set yet, so what is
+/// on screen is the cache-only default a fresh session opens with.
 fn bar_line(cols: u16) -> String {
     let (mut r, buf) = with_buffer(false);
     r.usage(&usage_fixture(6, 4), Duration::ZERO);
@@ -192,10 +191,9 @@ fn status_bar_chooses_variants_by_display_width() {
     assert_bar_exactly(11, "cache 60.0");
 }
 
-/// Model id is back on the bar at the head of the segment list, ahead of
-/// cache stats. The metadata row above each User cell still carries the
-/// model for that prompt; the bar carries the current model so a reader
-/// can see which one will run the next turn.
+/// Model id sits at the head of the bar, ahead of cache stats. The bar
+/// is the only place the model id is shown, so a reader looking at the
+/// bottom line sees the model that will run the next turn.
 #[test]
 fn status_bar_shows_model_and_updates_on_switch() {
     let bar = StatusBar { rows: 10, cols: 80 };

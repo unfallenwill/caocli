@@ -32,9 +32,8 @@ use crate::types::Usage;
 fn the_status_line_is_the_summary_whether_or_not_a_turn_runs() {
     // The line as drawn, not as formatted: while a turn runs the row is the
     // same session summary it is at rest, and the turn's own doings are the
-    // transcript's cells, not the status line's. The model id has moved
-    // to the per-prompt metadata row; the pinned row carries only the
-    // cache stats that are truly session-level.
+    // transcript's cells, not the status line's. The model id sits at the
+    // head of the bar; the cache stats that follow are truly session-level.
     let mut screen = screen_for_test(60, 20);
     screen.state.view.status.set_model("m-1");
     screen.state.apply(MachineNotice::Usage(
