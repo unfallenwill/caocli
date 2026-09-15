@@ -1118,6 +1118,12 @@ pub fn escape_working_directory(cwd: Option<&Path>) -> Result<String> {
 /// starts with, which is illegal in a file name rather than merely unusual.
 /// Everything else is literal, including the bytes of a non-ASCII name, which
 /// need no escaping to survive a round trip.
+///
+/// Windows has two more file-name rules this does not have to answer for, and
+/// the reason is the root: a name always starts with the escape of one (`%2F`,
+/// `C%3A`, `%5C%5C` for a UNC share), so no name is ever a device name (`CON`,
+/// `NUL`, `COM1`), and only a path the Windows API would not hand out could end
+/// in the space or period that a name there may not end in.
 fn escape_path_text(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for c in path.chars() {
@@ -1154,25 +1160,36 @@ pub fn unescape_working_directory(name: &str) -> Result<PathBuf> {
 }
 
 /// The path a layout directory name was made from, its escapes decoded.
+///
+/// The escapes spell one byte each, so what comes out is bytes and UTF-8 is what
+/// reads them: a writer that spelled `é` as `%C3%A9` gets the letter back,
+/// where pushing each byte as a character would make it two Latin-1 ones. Bytes
+/// that are not UTF-8 at all are refused rather than shown mangled -- no name
+/// this layout writes spells one that way, so such a name belongs to somebody
+/// else and naming it back to the user would be a guess.
 fn unescape_path_text(name: &str) -> Result<String> {
-    let mut out = String::with_capacity(name.len());
+    let mut out: Vec<u8> = Vec::with_capacity(name.len());
     let mut chars = name.chars();
     while let Some(c) = chars.next() {
-        if c == '%' {
-            let a = chars.next();
-            let b = chars.next();
-            let Some(hex) = a.zip(b).map(|(a, b)| format!("{a}{b}")) else {
-                bail!("truncated percent escape in directory name: {name}");
-            };
-            let byte = u8::from_str_radix(&hex, 16).map_err(|e| {
-                anyhow::anyhow!("invalid percent escape '%{hex}' in directory name: {e}")
-            })?;
-            out.push(byte as char);
-        } else {
-            out.push(c);
+        if c != '%' {
+            // A literal character is already the bytes of its UTF-8 encoding;
+            // only the escapes are spelled one byte at a time.
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
         }
+        let a = chars.next();
+        let b = chars.next();
+        let Some(hex) = a.zip(b).map(|(a, b)| format!("{a}{b}")) else {
+            bail!("truncated percent escape in directory name: {name}");
+        };
+        let byte = u8::from_str_radix(&hex, 16).map_err(|e| {
+            anyhow::anyhow!("invalid percent escape '%{hex}' in directory name: {e}")
+        })?;
+        out.push(byte);
     }
-    Ok(out)
+    String::from_utf8(out)
+        .map_err(|_| anyhow::anyhow!("directory name does not decode to UTF-8: {name}"))
 }
 
 #[cfg(test)]
@@ -1729,6 +1746,9 @@ mod tests {
             ("/a%2Fb", "%2Fa%252Fb"),
             ("/home/u/a:b\\c", "%2Fhome%2Fu%2Fa%3Ab%5Cc"),
             (r"C:\Users\me\proj", "C%3A%5CUsers%5Cme%5Cproj"),
+            // Non-ASCII is literal on both sides: the escape is over the
+            // characters a name cannot hold, not over everything unusual.
+            ("/home/u/工程", "%2Fhome%2Fu%2F工程"),
         ] {
             assert_eq!(escape_path_text(path), encoded, "{path}");
             assert_eq!(unescape_path_text(encoded).unwrap(), path, "{encoded}");
@@ -1736,6 +1756,24 @@ mod tests {
         }
         // Injective: the escape of a literal `%2F` is nobody else's name.
         assert_ne!(escape_path_text("/a/b"), escape_path_text("/a%2Fb"));
+    }
+
+    /// A name written by somebody else may spell a non-ASCII byte with escapes,
+    /// and the decode is over bytes, so the letter comes back whole. Bytes that
+    /// are not UTF-8 are refused: this layout never spells one that way, so such
+    /// a name is not a workspace this program wrote.
+    #[test]
+    fn unescape_reads_escaped_bytes_as_utf8() {
+        assert_eq!(unescape_path_text("%2Fhome%2F%C3%A9").unwrap(), "/home/é");
+        assert_eq!(unescape_path_text("/home/é").unwrap(), "/home/é");
+        assert!(unescape_path_text("%2Fhome%2F%C3").is_err());
+        assert!(unescape_path_text("%2Fhome%2F%FF").is_err());
+        // And through the function the layout calls: the decoded path is the
+        // one a Unix workspace would have, so it is named back as itself.
+        assert_eq!(
+            unescape_working_directory("%2Fhome%2F%C3%A9").unwrap(),
+            PathBuf::from("/home/é")
+        );
     }
 
     /// The same round trip through the two functions the layout calls, for a
