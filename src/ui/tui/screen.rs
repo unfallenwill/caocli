@@ -48,11 +48,20 @@ pub(super) struct Screen<B: Backend> {
 /// the encoding that spells a notch out as a sequence of its own, rather than
 /// folding its coordinates into the bytes that name the button.
 ///
-/// Written out rather than taken from crossterm's own `EnableMouseCapture`, which
-/// asks for `?1003` as well. What it also costs is the terminal's own selection:
-/// a terminal that has handed the mouse over keeps it, and gives it back under
-/// `Shift`.
+/// On Unix, written out rather than taken from crossterm's own
+/// `EnableMouseCapture`, which asks for `?1003` as well. What it also costs is
+/// the terminal's own selection: a terminal that has handed the mouse over
+/// keeps it, and gives it back under `Shift`.
+///
+/// On Windows, crossterm reads events through the Console API (`ReadConsoleInput`)
+/// rather than by parsing VT input, so raw VT mouse sequences would enable
+/// SGR-encoded reports that nothing consumes -- the bytes leak into the input
+/// box as garbled text. Instead, crossterm's `EnableMouseCapture` is used, which
+/// enables `ENABLE_MOUSE_INPUT` through the Console API and does not suffer from
+/// the `?1003` concern (Windows reports button and wheel events only).
+#[cfg(unix)]
 const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
+#[cfg(unix)]
 const MOUSE_OFF: &str = "\x1b[?1000l\x1b[?1006l";
 
 /// The terminal, held by the screen that took it.
@@ -72,11 +81,19 @@ impl Tty {
     pub(super) fn take() -> io::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
         let taken = Self;
+        #[cfg(unix)]
         crossterm::execute!(
             std::io::stdout(),
             crossterm::terminal::EnterAlternateScreen,
             crossterm::event::EnableBracketedPaste,
             crossterm::style::Print(MOUSE_ON)
+        )?;
+        #[cfg(windows)]
+        crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::event::EnableBracketedPaste,
+            crossterm::event::EnableMouseCapture
         )?;
         Ok(taken)
     }
@@ -85,13 +102,23 @@ impl Tty {
 /// Give the terminal back: the mouse, the alternate screen, so what the user had
 /// on it reappears, and the cursor where a shell prompt expects to find it.
 fn restore() -> io::Result<()> {
+    #[cfg(unix)]
     crossterm::execute!(
         std::io::stdout(),
         crossterm::style::Print(MOUSE_OFF),
         crossterm::event::DisableBracketedPaste,
         crossterm::terminal::LeaveAlternateScreen,
         crossterm::cursor::Show
-    )
+    )?;
+    #[cfg(windows)]
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show
+    )?;
+    Ok(())
 }
 
 /// Restoring the terminal does not depend on the success path running. Raw mode is
