@@ -20,6 +20,9 @@ use crate::cli::{Cli, Mode};
 use crate::config::{self, ApiKey};
 use crate::provider::{self, Provider};
 use crate::session::{Session, SessionMeta, SessionSource};
+use crate::ui::glyphs;
+use crate::ui::terminal::{RealTerminal, Terminal};
+use crate::ui::theme;
 
 /// Everything `main::run` needs to drive the agent: the session, the provider
 /// the request will go to, the client bound to that provider, and the policy
@@ -191,6 +194,86 @@ fn apply_overrides(meta: &mut SessionMeta, cli: &Cli, fallback: Provider) -> Res
         changed = true;
     }
     Ok(changed)
+}
+
+/// Settle how this run paints and how it draws, and install both.
+///
+/// Called by `main` before anything is written to the terminal, because both are
+/// process-wide values that every front end reads
+/// ([`crate::ui::theme`], [`crate::ui::glyphs`]) and neither can be changed once
+/// the first line has been painted.
+///
+/// The two settings have the same shape -- a flag, then a key in
+/// `~/.caocli/settings.json`, then a default -- and they differ in what the
+/// default is allowed to consult. The theme's `auto` asks the environment, which
+/// is the only way a light terminal gets the light palette without being told;
+/// the glyph set has no such question to ask, so its default is simply the
+/// designed one.
+///
+/// Everything here is fallible on purpose: a name nothing answers to is a typo in
+/// a file the user edits by hand, and silently painting the default is how they
+/// never find out. The error names what would have worked.
+pub fn install_visuals(cli: &Cli) -> Result<()> {
+    install_glyphs(cli)?;
+    install_theme(cli)
+}
+
+/// The glyph set: `--glyphs`, then the `glyphs` setting, then the designed one.
+fn install_glyphs(cli: &Cli) -> Result<()> {
+    let named = match &cli.glyphs {
+        Some(value) => Some(value.clone()),
+        None => setting_string("glyphs")?,
+    };
+    let set = match named.as_deref().map(str::trim) {
+        None | Some("") | Some("unicode") => glyphs::UNICODE,
+        Some("ascii") => glyphs::ASCII,
+        Some(other) => bail!("unknown glyph set `{other}`: expected unicode or ascii"),
+    };
+    glyphs::install(set);
+    Ok(())
+}
+
+/// The palette: `--theme`, then the `theme` setting, then `auto`.
+///
+/// `auto` is resolved from the cheapest source that has an answer: `COLORFGBG`,
+/// which the terminal set when it started, and only then a query to the terminal
+/// itself. The query is skipped entirely when one of the other two has already
+/// decided, because it is a round trip in the middle of startup and a reader who
+/// passed `--theme paper` is not a reader who wants to wait for a question whose
+/// answer will be discarded.
+fn install_theme(cli: &Cli) -> Result<()> {
+    let named = match &cli.theme {
+        Some(value) => Some(value.clone()),
+        None => setting_string("theme")?,
+    };
+    let choice = match named.as_deref() {
+        None => theme::Choice::Auto,
+        Some(value) => theme::Choice::parse(value).ok_or_else(|| {
+            anyhow::anyhow!("unknown theme `{value}`: expected {}", theme::theme_names())
+        })?,
+    };
+
+    let term = RealTerminal;
+    // The terminal owns the background, so the palette has to be calibrated to
+    // it rather than to us: `COLORFGBG` is what it already told us, and the query
+    // is asking it the same thing directly.
+    let colorfgbg = std::env::var("COLORFGBG").ok();
+    let queried = match (&choice, &colorfgbg) {
+        (theme::Choice::Auto, None) => term.background().map(theme::theme_from_background),
+        _ => None,
+    };
+    let name = theme::resolve(choice, colorfgbg.as_deref(), queried);
+    let tier = theme::tier_from_env(|key| std::env::var(key).ok());
+    theme::install(theme::Theme::new(name.palette(), tier, term.wants_color()));
+    Ok(())
+}
+
+/// One top-level setting, when it is a string. A key that holds something else
+/// is not a value this can read, and saying so would be worse than the error the
+/// user gets from the thing they wrote: it is reported as no setting at all, and
+/// the flag or the default answers.
+fn setting_string(key: &str) -> Result<Option<String>> {
+    Ok(config::setting(key)?.and_then(|value| value.as_str().map(str::to_owned)))
 }
 
 #[cfg(test)]

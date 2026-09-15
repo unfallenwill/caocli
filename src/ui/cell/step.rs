@@ -23,6 +23,7 @@ use std::time::Instant;
 
 use super::DiffLine;
 use super::call::{diff_lines, hint, result_summary};
+use super::glyphs;
 
 /// One step's identity: a monotonically-increasing counter, paired with the
 /// machine's wire id by being created at `ToolStart` time. The cell layer
@@ -82,13 +83,16 @@ impl StepStatus {
     ///
     /// The vocabulary is the one the rest of the transcript uses: `▸` for
     /// something about to happen (a running step), `✔` for something that
-    /// finished well, `✘` for something that did not.
+    /// finished well, `✘` for something that did not. It comes from the glyph
+    /// set rather than from here, because the marker's *width* is load-bearing --
+    /// it is the two columns every line of the cell is indented by -- and a set
+    /// that swapped one of these for something a column wider would move the
+    /// whole cell, not just its first line.
     pub fn marker(&self) -> &'static str {
         match self {
-            StepStatus::Running => "▸ ",
-            StepStatus::Done => "✔ ",
-            StepStatus::Failed => "✘ ",
-            StepStatus::Denied => "✘ ",
+            StepStatus::Running => glyphs::get().running,
+            StepStatus::Done => glyphs::get().done,
+            StepStatus::Failed | StepStatus::Denied => glyphs::get().failed,
         }
     }
 }
@@ -233,7 +237,13 @@ impl Step {
         match (self.status.is_settled(), self.verdict.is_empty()) {
             (false, _) => format!("{} {}", self.verb, self.subject),
             (true, true) => format!("{} {}", self.verb, self.subject),
-            (true, false) => format!("{} {} · {}", self.verb, self.subject, self.verdict),
+            (true, false) => format!(
+                "{} {}{}{}",
+                self.verb,
+                self.subject,
+                glyphs::sep(),
+                self.verdict
+            ),
         }
     }
 
@@ -334,9 +344,10 @@ fn diff_span_pub(line: &DiffLine) -> crate::ui::cell::Span {
     match &line.kind {
         DiffKind::Removed => crate::ui::cell::Span::new(Style::Red, format!("\n- {}", line.text)),
         DiffKind::Added => crate::ui::cell::Span::new(Style::Green, format!("\n+ {}", line.text)),
-        DiffKind::Omitted(n) => {
-            crate::ui::cell::Span::new(Style::Dim, format!("\n… {n} more lines"))
-        }
+        DiffKind::Omitted(n) => crate::ui::cell::Span::new(
+            Style::Dim,
+            format!("\n{} {n} more lines", glyphs::get().ellipsis),
+        ),
         DiffKind::Context => crate::ui::cell::Span::new(Style::Plain, format!("\n {}", line.text)),
         DiffKind::Hunk {
             old_start,

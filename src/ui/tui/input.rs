@@ -14,39 +14,58 @@ use ratatui::style::Style as RStyle;
 use ratatui_textarea::{CursorMove, TextArea};
 
 use super::overlay::Answer;
-use super::panel::PANEL_PLACEHOLDER;
+use super::panel::panel_placeholder;
 use super::picker::Choosing;
 use super::state::State;
 use crate::history;
 use crate::ui::Verdict;
 use crate::ui::cell::Cell;
+use crate::ui::glyphs;
 use crate::ui::tui::layout::box_rows;
 
 /// What the box says while a turn runs: the line being typed is not this turn's
 /// message, it is the one to run when this turn ends -- and the turn itself can
 /// be stopped, which is worth saying, since a key that stops work is no good to
 /// a reader who cannot find it.
-pub(super) const QUEUE_PLACEHOLDER: &str = "the turn is running · Enter queues · Ctrl-C stops";
+pub(super) fn queue_placeholder() -> String {
+    format!(
+        "the turn is running{}Enter queues{}Ctrl-C stops",
+        glyphs::sep(),
+        glyphs::sep()
+    )
+}
 
 /// What the box says while nothing runs.
 ///
 /// Neither it nor the queue line carries the box's marker: the marker is the
 /// box's own, drawn in the column before this text whatever the text says, so a
 /// placeholder cannot displace it and typing cannot take it away.
-pub(super) const IDLE_PLACEHOLDER: &str = "type a message · /help for commands";
+pub(super) fn idle_placeholder() -> String {
+    format!("type a message{}/help for commands", glyphs::sep())
+}
 
 /// What the box says while the approval gate is open. The box is where the answer
 /// goes, so it says so rather than inviting the next message.
-pub(super) const ANSWER_PLACEHOLDER: &str = "y to allow · anything else denies";
+pub(super) fn answer_placeholder() -> String {
+    format!("y to allow{}anything else denies", glyphs::sep())
+}
 
 /// What the box says while a secret is being asked for. The text is not shown --
 /// the box masks it -- so the line has to say what is expected of it.
-pub(super) const SECRET_PLACEHOLDER: &str = "type or paste it · Enter saves · empty cancels";
+pub(super) fn secret_placeholder() -> String {
+    format!(
+        "type or paste it{}Enter saves{}empty cancels",
+        glyphs::sep(),
+        glyphs::sep()
+    )
+}
 
 /// What a secret's characters are drawn as. A character and not a blank: the
 /// length of a key is not the key, but a box that shows nothing at all looks
 /// like a box that is not taking anything.
-pub(super) const SECRET_MASK: char = '•';
+pub(super) fn secret_mask() -> char {
+    glyphs::get().mask
+}
 
 /// The input box's editor. Enter submits and Ctrl-J inserts a newline, matching
 /// the plain prompt's keys.
@@ -69,7 +88,7 @@ pub(super) const SECRET_MASK: char = '•';
 /// column it starts in is not one anything can be compared against.
 pub(super) fn input_box() -> TextArea<'static> {
     let mut textarea = TextArea::default();
-    textarea.set_placeholder_text(IDLE_PLACEHOLDER);
+    textarea.set_placeholder_text(idle_placeholder());
     textarea.set_cursor_line_style(RStyle::new());
     textarea.set_cursor_style(RStyle::new());
     textarea
@@ -294,7 +313,7 @@ impl State {
         self.edit.held_draft = Some(self.text());
         self.edit.textarea = input_box();
         if secret {
-            self.edit.textarea.set_mask_char(SECRET_MASK);
+            self.edit.textarea.set_mask_char(secret_mask());
         }
         self.refresh_placeholder();
     }
@@ -398,13 +417,13 @@ impl State {
     /// The placeholder for what the box is for right now: the answer while a
     /// question is open, the queue while a turn runs, the next message
     /// otherwise.
-    pub(super) fn placeholder(&self) -> &'static str {
+    pub(super) fn placeholder(&self) -> String {
         match self.overlay.reply {
-            Some(Answer::YesNo(_)) => ANSWER_PLACEHOLDER,
-            Some(Answer::Secret(_)) => SECRET_PLACEHOLDER,
-            None if self.panel_open() => PANEL_PLACEHOLDER,
-            None if self.turn.running => QUEUE_PLACEHOLDER,
-            None => IDLE_PLACEHOLDER,
+            Some(Answer::YesNo(_)) => answer_placeholder(),
+            Some(Answer::Secret(_)) => secret_placeholder(),
+            None if self.panel_open() => panel_placeholder(),
+            None if self.turn.running => queue_placeholder(),
+            None => idle_placeholder(),
         }
     }
 

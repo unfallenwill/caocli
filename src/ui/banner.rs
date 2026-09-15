@@ -6,6 +6,7 @@
 //! only the outermost call asks the terminal for one.
 
 use super::cell;
+use super::glyphs;
 use super::terminal::RealTerminal;
 use super::terminal::Terminal;
 use super::text;
@@ -37,7 +38,7 @@ pub(super) fn banner_at(id: &str, messages: usize, model: &str, columns: Option<
     // it counts rather than joined to it the way the top-level segments are.
     let parts: [(&str, String); 5] = [
         ("", "caocli".to_owned()),
-        (" · ", format!("session {id}")),
+        (glyphs::sep(), format!("session {id}")),
         (
             " ",
             match messages {
@@ -45,8 +46,8 @@ pub(super) fn banner_at(id: &str, messages: usize, model: &str, columns: Option<
                 n => format!("({n} messages)"),
             },
         ),
-        (" · ", model.to_owned()),
-        (" · ", "/help".to_owned()),
+        (glyphs::sep(), model.to_owned()),
+        (glyphs::sep(), "/help".to_owned()),
     ];
     let line = |keep: usize| {
         parts[..keep]

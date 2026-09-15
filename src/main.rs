@@ -34,6 +34,11 @@ fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    // Before anything is written: how this run paints and how it draws. Both are
+    // process-wide and both are read by every front end, so they are settled once
+    // here, from the flags and the settings file, while the terminal still has
+    // nothing on it to redo.
+    startup::install_visuals(&cli)?;
     // Migrate: a CLI verb that runs before any agent or MCP work is
     // started. It only needs the sessions directory, which the cli
     // path resolution can answer on its own.

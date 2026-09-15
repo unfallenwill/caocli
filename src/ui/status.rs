@@ -12,6 +12,7 @@
 //! the progressive-disclosure rule lives in one place.
 
 use crate::types::Usage;
+use crate::ui::glyphs;
 
 /// Session-level cache statistics. Accumulates the hit/miss of every sub-request
 /// within this process.
@@ -86,7 +87,7 @@ impl Status {
         let parts = self.parts();
         let mut label = String::new();
         for n in (1..=parts.len()).rev() {
-            label = parts[..n].join(" · ");
+            label = parts[..n].join(glyphs::sep());
             if super::text::width(&label) <= width {
                 break;
             }
@@ -101,6 +102,6 @@ impl Status {
     /// Every segment joined: what a line wide enough for everything displays.
     #[allow(dead_code)]
     pub fn full_line(&self) -> String {
-        self.parts().join(" · ")
+        self.parts().join(glyphs::sep())
     }
 }

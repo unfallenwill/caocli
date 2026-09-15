@@ -120,7 +120,7 @@ fn escape_while_a_turn_runs_gives_the_queue_line_back() {
     assert!(screen.overlay.picker.is_none());
     assert_eq!(
         screen.edit.textarea.placeholder_text(),
-        super::super::input::QUEUE_PLACEHOLDER,
+        super::super::input::queue_placeholder(),
         "the box still belongs to the turn that is running"
     );
 }

@@ -12,6 +12,7 @@
 //! have taken what they need.
 
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::symbols::border;
 use ratatui::widgets::{Block, Borders};
 
 use crate::ui::cell;
@@ -96,6 +97,36 @@ pub(super) fn screen_rows(area: Rect, todos: u16, input: u16, queued: u16) -> st
     ])
     .split(area)
 }
+
+/// The glyphs the box's rules are drawn from.
+///
+/// `ratatui`'s plain set draws `─` and `│`, which are Unicode East Asian
+/// *Ambiguous*: a terminal that widens those characters spends two columns on a
+/// cell `ratatui` drew one column wide, and a rule that is one column too long
+/// wraps, which moves the whole frame down a row. So the ASCII arm of the glyph
+/// set carries a border set of its own -- corners and edges that every terminal
+/// has agreed about since the teletype -- and the choice is made here rather than
+/// at the call site, because there is exactly one box.
+pub(super) fn box_border_set() -> border::Set<'static> {
+    match crate::ui::glyphs::get().kind {
+        crate::ui::glyphs::Kind::Unicode => border::PLAIN,
+        crate::ui::glyphs::Kind::Ascii => ASCII_BORDER,
+    }
+}
+
+/// A box drawn with the three characters a terminal has always had. Corners are
+/// `+` because the box has only a top and a bottom edge: with no verticals to
+/// meet, `-` corners read as a rule that stops one short at each end.
+const ASCII_BORDER: border::Set<'static> = border::Set {
+    top_left: "+",
+    top_right: "+",
+    bottom_left: "+",
+    bottom_right: "+",
+    horizontal_top: "-",
+    horizontal_bottom: "-",
+    vertical_left: "|",
+    vertical_right: "|",
+};
 
 /// The window a list of `total` rows is seen through, for the picker with
 /// `selected` highlighted and `room` rows to draw in.

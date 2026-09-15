@@ -32,12 +32,13 @@ mod cell;
 mod contract;
 #[cfg(test)]
 pub(crate) mod doubles;
+pub(crate) mod glyphs;
 pub(crate) mod paint;
 mod plain_writer;
 mod renderer;
 mod status;
 mod status_bar;
-mod terminal;
+pub(crate) mod terminal;
 pub(crate) mod text;
 pub(crate) mod theme;
 pub mod tui;

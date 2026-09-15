@@ -8,6 +8,7 @@
 
 use crate::tools::ask::Question;
 use crate::ui::cell::{Span, Style};
+use crate::ui::glyphs;
 
 /// The question tool's cell: what is being asked, and what there is to choose
 /// from.
@@ -28,7 +29,10 @@ pub(super) fn question_spans(questions: &[Question]) -> Vec<Span> {
         };
         spans.push(Span::new(Style::Yellow, format!("{lead}{heading}")));
         if question.multi_select {
-            spans.push(Span::new(Style::Dim, " · choose any"));
+            spans.push(Span::new(
+                Style::Dim,
+                format!("{}choose any", glyphs::sep()),
+            ));
         }
         if question.options.is_empty() {
             spans.push(Span::new(Style::Dim, "\n  answer in your own words"));
@@ -38,7 +42,10 @@ pub(super) fn question_spans(questions: &[Question]) -> Vec<Span> {
             spans.push(Span::new(Style::Dim, format!("\n  {}. ", n + 1)));
             spans.push(Span::new(Style::Plain, option.label.clone()));
             if !option.description.is_empty() {
-                spans.push(Span::new(Style::Dim, format!(" · {}", option.description)));
+                spans.push(Span::new(
+                    Style::Dim,
+                    format!("{}{}", glyphs::sep(), option.description),
+                ));
             }
         }
     }

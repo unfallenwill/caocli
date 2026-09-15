@@ -25,6 +25,7 @@ use crate::config::ApiKey;
 use crate::image;
 use crate::session;
 use crate::types::Message;
+use crate::ui::glyphs;
 use crate::ui::tui;
 use crate::ui::{Front, Renderer, Style};
 use crate::ui::{Sigint, StdinApproval, StdinQuestions};
@@ -173,14 +174,16 @@ async fn run_one_shot(os: OneShot, agent: &mut Agent, ui: &mut Renderer) -> Resu
     // does not want a session summary, and the model + effort line is what a
     // person running one-shot by hand most wants to see first.
     ui.info(&format!(
-        "session {} · {} · effort {}{}",
+        "session {}{}{}{}effort {}{}",
         agent.session.id,
+        glyphs::sep(),
         agent.model_label(),
+        glyphs::sep(),
         agent.effort_label(),
         if agent.session.meta.instructions.is_some() {
-            " · AGENTS.md"
+            format!("{}AGENTS.md", glyphs::sep())
         } else {
-            ""
+            String::new()
         }
     ));
     for note in &os.mcp_notes {

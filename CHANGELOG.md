@@ -6,6 +6,65 @@ semantic-version bumps per release.
 
 ## [Unreleased]
 
+### Changed — visual design: two themes, glyph set, measured palette
+
+The screen was redesigned from the ground up, with two themes (`ink` and
+`paper`) where there was one, a glyph set (`unicode` / `ascii`) for every
+non-ASCII character the screen draws, and a colour resolver that picks the
+right tier from the terminal. The shape of the change is in
+`docs/visual-design.md`; what is here is what is visible.
+
+- **Palette.** Dracula was replaced. The new `ink` (`#D7DAE4` body on
+  `#16161E`) is calibrated against four neighbouring dark backgrounds and
+  every text role clears WCAG 4.5:1 on all of them. The new `paper`
+  (`#23252E` body on `#FFFFFF`) does the same for light terminals, including
+  themed editors with `#E8E8E4` paper. `ok` and `bad` are deliberately
+  arranged by tone (1.78:1 in ink, 1.83:1 in paper) rather than by hue, so
+  colour blindness sees them as two colours rather than the same colour.
+- **Theme selection.** `--theme ink|paper|auto`, or `theme: "auto"` in
+  `~/.caocli/settings.json`. `auto` resolves from `COLORFGBG` first, then
+  asks the terminal for its background with `OSC 11`, then takes the
+  default. The query is a 60 ms round trip, gated on raw mode and stdin
+  being a TTY, and skipped entirely when a flag or setting has decided.
+- **Glyph set.** Every character the screen draws is a field on
+  [`GlyphSet`](src/ui/glyphs.rs): gutter markers (`›`, `▸`, `✔`, `✘`, `☐`,
+  `≡`), separator `·`, ellipsis `…`, em-dash `—`, spinner (Braille, all
+  East Asian Neutral), box rule `─`, secret mask `•`. `--glyphs ascii`
+  swaps the whole set for ASCII equivalents; the box border switches to
+  `+`/`-`/`|` along with it. Width-preserving substitutions keep the
+  transcript from re-flowing when the setting flips; the ellipsis and the
+  arrows are the two exceptions, both called out in
+  `docs/visual-design.md`.
+- **Spinner.** The four-frame `◐◓◑◒` mix Ambiguous and Neutral East Asian
+  width classes, which made the box rule twitch sideways twice per
+  revolution in CJK-width terminals. The new set is Braille
+  (`⣾⣽⣻⢿⡿⣟⣯⣷`), uniformly Neutral, eight frames at 100 ms each.
+  Frame-by-frame math is `frame(elapsed)` in the tests; the strings
+  themselves are not pinned.
+- **Glyph swaps.** `⏹` (the stop sign) is replaced by `▪` (the small black
+  square). `⏹` lives in Miscellaneous Technical, the one block most
+  monospace fonts skip.
+- **Tiers.** Truecolor, 256 colors with a CIELAB nearest match and a
+  lightness bound on `ok`/`bad`, 16 colors mapping onto the conventional
+  ANSI slots, and `NO_COLOR` (no SGR, everything still works because
+  colour never carries meaning alone). The 16-color tier drops `SGR 1`
+  because in a 16-color terminal bold brightens rather than thickens.
+- **Box border and working indicator.** The box rule is now painted in the
+  palette's `rule` colour, not with `Modifier::DIM` — the modifier renders
+  as anything from "slightly grey" to "invisible" depending on the
+  terminal, which is the signal painted out of sight. The working
+  indicator (spinner + verb + seconds + tokens/sec) is painted in
+  `signal`, not in `remove_modifier(DIM)`: a dim indicator on a dim rule
+  is the same defect in another colour.
+- **Picker cursor.** Selected rows now carry a `❯` cursor in `signal`
+  alongside the existing `REVERSED` highlight, and the detail column drops
+  its muted colour on the selected row (mod+colour under reverse video is
+  undefined). The cursor's colour is the foreground of the inverted cell,
+  so it reads as a mark rather than as a highlight of its own.
+- **`/debug`.** Two extra lines report `theme: ink · 24-bit` and
+  `glyphs: unicode`, the one thing about a session that is decided before
+  it starts and cannot be asked again from inside it.
+
 ### Added — Xiaomi MiMo V2.5
 
 A fourth provider on a third wire. Xiaomi's `https://api.xiaomimimo.com`

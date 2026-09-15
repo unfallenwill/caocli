@@ -24,10 +24,13 @@ use tokio::sync::oneshot;
 use crate::tools::ask::{Answer, Question};
 
 use super::state::State;
+use crate::ui::glyphs;
 
 /// What the box says while a question is open: the panel is what offers the
 /// choices, so the box says what it is for -- the answer in the user's own words.
-pub(super) const PANEL_PLACEHOLDER: &str = "or type an answer · Enter confirms";
+pub(super) fn panel_placeholder() -> String {
+    format!("or type an answer{}Enter confirms", glyphs::sep())
+}
 
 /// The question tool's panel: the questions, which one is on screen, and what has
 /// been chosen so far.
